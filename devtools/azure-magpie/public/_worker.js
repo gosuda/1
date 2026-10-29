@@ -58,7 +58,7 @@ var worker_default = {
       return redirectResponse(targetUrl);
     } catch (err) {
       const message = err instanceof Error ? err.message : "upstream error";
-      const status = message.includes("not found") ? 404 : 502;
+      const status = message.includes("not found") ? 404 : 500;
       return jsonResponse({ error: message }, status);
     }
   }
@@ -307,19 +307,33 @@ async function resolveGithubAuthToken(env) {
   let installationId = env.MAGPIE_INSTALLATION_ID || env.CAPY_INSTALLATION_ID || cachedInstallationId || "";
   if (!installationId) {
     const repo = env.GITHUB_REPO || "gosuda/0";
+    const jwtHeaders = {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${jwt}`,
+      "user-agent": USER_AGENT,
+      "x-github-api-version": "2022-11-28"
+    };
     const instResp = await fetch(`https://api.github.com/repos/${repo}/installation`, {
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${jwt}`,
-        "user-agent": USER_AGENT,
-        "x-github-api-version": "2022-11-28"
-      }
+      headers: jwtHeaders
     });
-    if (!instResp.ok) {
-      throw new Error(`GitHub App installation lookup failed with status ${instResp.status}`);
+    if (instResp.ok) {
+      const instData = await instResp.json();
+      installationId = String(instData.id);
+    } else {
+      const listResp = await fetch("https://api.github.com/app/installations", {
+        headers: jwtHeaders
+      });
+      if (!listResp.ok) {
+        throw new Error(`GitHub App JWT auth failed (${listResp.status}): check MAGPIE_APP_ID and MAGPIE_APP_PRIVATE_KEY`);
+      }
+      const listData = await listResp.json();
+      if (!Array.isArray(listData) || listData.length === 0) {
+        throw new Error(`GitHub App is not installed on any organization or repository yet (install it on ${repo})`);
+      }
+      const owner = repo.split("/")[0]?.toLowerCase();
+      const matched = listData.find((x) => x.account?.login?.toLowerCase() === owner) || listData[0];
+      installationId = String(matched.id);
     }
-    const instData = await instResp.json();
-    installationId = String(instData.id);
     cachedInstallationId = installationId;
   }
   const resp = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
