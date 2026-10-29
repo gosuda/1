@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Magpie · gosuda/0 Snapshot &amp; Diff Studio</title>
+  <meta name="description" content="Scandinavian SaaS diff link generator, workspace inspector, and refs/suda/main snapshot explorer for the gosuda/0 monorepo.">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <span class="brand-badge" aria-hidden="true">0</span>
+        <div>
+          <span class="brand-title">Azure-Winged Magpie</span>
+          <span class="brand-sub">gosuda/0 CAS Snapshot &amp; Diff Studio</span>
+        </div>
+      </div>
+
+      <div class="trunk-pills" aria-label="Trunk Reference Status">
+        <div class="pill">
+          <span class="pill-dot dot-live" aria-hidden="true"></span>
+          <span class="pill-label">suda/main</span>
+          <a id="pill-main-link" class="pill-sha" href="https://github.com/gosuda/0" target="_blank" rel="noopener">loading…</a>
+        </div>
+        <div class="pill">
+          <span class="pill-dot dot-history" aria-hidden="true"></span>
+          <span class="pill-label">suda/history</span>
+          <a id="pill-history-link" class="pill-sha" href="https://github.com/gosuda/0" target="_blank" rel="noopener">loading…</a>
+        </div>
+        <button type="button" id="theme-toggle" class="btn-icon" aria-label="Toggle color theme" title="Toggle Light/Dark Theme">
+          Theme
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-grid">
+    <section class="card hero-card" aria-labelledby="diff-studio-heading">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">01 · ORPHAN-SAFE COMPARE ENGINE</span>
+          <h1 id="diff-studio-heading">Diff Link Generator</h1>
+          <p class="card-desc">
+            Generate two-dot tree comparison links across parentless <code>refs/suda/main</code> snapshots, isolated <code>refs/ws/*</code> branches, and <code>refs/heads/land/*</code> queues.
+          </p>
+        </div>
+        <div class="preset-group" role="group" aria-label="Quick Base Presets">
+          <button type="button" class="chip" data-set-base="suda/main">Base: suda/main</button>
+          <button type="button" class="chip" data-set-base="suda/history">Base: suda/history</button>
+        </div>
+      </div>
+
+      <form id="diff-form" class="diff-form" novalidate>
+        <div class="field-grid">
+          <div class="field">
+            <label for="base-ref">Base Reference</label>
+            <span id="base-hint" class="hint">Format: suda/main, suda/history, ws/actor/id, or 7-40 char SHA</span>
+            <input
+              type="text"
+              id="base-ref"
+              name="base"
+              value="suda/main"
+              required
+              pattern="[A-Za-z0-9_./\-]{2,120}"
+              aria-describedby="base-hint"
+              aria-errormessage="base-error"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <div id="base-error" class="error-msg">Enter a valid Git reference or commit SHA.</div>
+          </div>
+
+          <div class="field">
+            <label for="head-ref">Head Reference (Workspace or Commit)</label>
+            <span id="head-hint" class="hint">Format: ws/agent-dalgona/task-402, land/task-402, or commit SHA</span>
+            <input
+              type="text"
+              id="head-ref"
+              name="head"
+              value="ws/agent-dalgona/task-402"
+              required
+              pattern="[A-Za-z0-9_./\-]{2,120}"
+              aria-describedby="head-hint"
+              aria-errormessage="head-error"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <div id="head-error" class="error-msg">Enter a workspace branch (ws/actor/id) or commit SHA.</div>
+          </div>
+
+          <div class="field">
+            <label for="diff-mode">Comparison Operator</label>
+            <span id="mode-hint" class="hint">Use two-dot (..) for parentless refs/suda/main snapshots</span>
+            <select id="diff-mode" name="mode" aria-describedby="mode-hint">
+              <option value="..">Two-dot (..) Direct Tree Diff</option>
+              <option value="...">Three-dot (...) Merge-Base Diff</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="output-panel" aria-live="polite">
+          <div class="output-row">
+            <div class="output-meta">
+              <span class="output-tag">Short Redirect Permalink</span>
+              <code id="short-url-output" class="output-code">/diff/ws/agent-dalgona/task-402</code>
+            </div>
+            <div class="output-actions">
+              <button type="button" id="copy-short-btn" class="btn btn-secondary">Copy Short Link</button>
+              <button type="button" id="copy-md-btn" class="btn btn-ghost">Copy Markdown</button>
+            </div>
+          </div>
+
+          <div class="output-row">
+            <div class="output-meta">
+              <span class="output-tag">Resolved GitHub Compare URL</span>
+              <code id="github-url-output" class="output-code">https://github.com/gosuda/0/compare/suda/main..ws/agent-dalgona/task-402</code>
+            </div>
+            <div class="output-actions">
+              <button type="button" id="resolve-sha-btn" class="btn btn-secondary">Resolve Exact SHAs</button>
+              <a id="open-github-btn" class="btn btn-primary" href="https://github.com/gosuda/0" target="_blank" rel="noopener">
+                Open Diff on GitHub
+              </a>
+            </div>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="workspaces-heading">
+      <div class="card-header">
+        <div>
+          <span class="eyebrow">02 · LIVE ISOLATED REFERENCES</span>
+          <h2 id="workspaces-heading">Active Workspaces &amp; Landing Queue</h2>
+          <p class="card-desc">
+            Click any <code>refs/ws/*</code> or <code>refs/heads/land/*</code> branch to load it into the Diff Generator above or open its two-dot comparison against <code>refs/suda/main</code>.
+          </p>
+        </div>
+        <div class="filter-bar">
+          <div class="field compact-field">
+            <label for="ws-filter" class="sr-only">Filter workspaces</label>
+            <input type="search" id="ws-filter" placeholder="Filter by actor or task ID…" autocomplete="off">
+          </div>
+          <button type="button" id="refresh-refs-btn" class="btn btn-secondary">Refresh</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Namespace</th>
+              <th>Reference Path</th>
+              <th>Tip Commit</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="workspaces-tbody">
+            <tr>
+              <td colspan="4" class="empty-cell">Fetching active workspace references…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <section class="card" aria-labelledby="explorer-heading">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">03 · GOOGLE3 DOMAIN TAXONOMY</span>
+            <h2 id="explorer-heading">Snapshot Subtree Explorer</h2>
+            <p class="card-desc">
+              Jump directly to any domain directory inside the latest <code>refs/suda/main</code> snapshot or inspect its linear commit history on <code>refs/suda/history</code>.
+            </p>
+          </div>
+        </div>
+
+        <div class="field subtree-jump-field">
+          <label for="custom-path">Custom Monorepo Path</label>
+          <span id="path-hint" class="hint">Example: ipc/hqq/HQQ or web/gosuda</span>
+          <div class="inline-input-group">
+            <input
+              type="text"
+              id="custom-path"
+              placeholder="ipc/hqq/HQQ"
+              aria-describedby="path-hint"
+              autocomplete="off"
+              spellcheck="false"
+            >
+            <a id="jump-tree-btn" class="btn btn-secondary" href="/tree" target="_blank" rel="noopener">Tree</a>
+            <a id="jump-history-btn" class="btn btn-secondary" href="/history" target="_blank" rel="noopener">History</a>
+            <a id="jump-blame-btn" class="btn btn-ghost" href="/blame" target="_blank" rel="noopener">Blame</a>
+          </div>
+        </div>
+
+        <div id="projects-grid" class="projects-grid" aria-label="Mounted Monorepo Projects"></div>
+      </section>
+
+      <section class="card" aria-labelledby="cli-heading">
+        <div class="card-header">
+          <div>
+            <span class="eyebrow">04 · PURE-GIT WORKSPACE PROCEDURE</span>
+            <h2 id="cli-heading">Workspace CLI Snippet Builder</h2>
+            <p class="card-desc">
+              Generate copy-ready sparse-checkout and workspace commands obeying <code>AGENTS.md</code> reference boundaries.
+            </p>
+          </div>
+        </div>
+
+        <div class="cli-form">
+          <div class="field">
+            <label for="cli-actor">Actor Identifier</label>
+            <span id="actor-hint" class="hint">Format: agent-dalgona or developer handle</span>
+            <input
+              type="text"
+              id="cli-actor"
+              value="agent-dalgona"
+              required
+              pattern="[A-Za-z0-9_\-]{2,40}"
+              aria-describedby="actor-hint"
+            >
+          </div>
+          <div class="field">
+            <label for="cli-task">Task Identifier</label>
+            <span id="task-hint" class="hint">Format: task-402 or fix-header</span>
+            <input
+              type="text"
+              id="cli-task"
+              value="task-402"
+              required
+              pattern="[A-Za-z0-9_\-]{2,60}"
+              aria-describedby="task-hint"
+            >
+          </div>
+          <div class="field">
+            <label for="cli-paths">Sparse Checkout Directories</label>
+            <span id="sparse-hint" class="hint">Space-separated google3 paths</span>
+            <input
+              type="text"
+              id="cli-paths"
+              value="ipc/hqq/HQQ web/gosuda"
+              required
+              aria-describedby="sparse-hint"
+            >
+          </div>
+        </div>
+
+        <div class="code-block-wrap">
+          <pre id="cli-snippet-output" class="code-block"></pre>
+          <button type="button" id="copy-cli-btn" class="btn btn-secondary copy-floating">Copy Commands</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="footer container">
+    <span>gosuda/0 CAS Monorepo · Powered by Azure-Winged Magpie &amp; Cloudflare Pages</span>
+    <div class="footer-links">
+      <a href="/api/refs" target="_blank" rel="noopener">API (/api/refs)</a>
+      <a href="https://github.com/gosuda/0" target="_blank" rel="noopener">GitHub (gosuda/0)</a>
+    </div>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
