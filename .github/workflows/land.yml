@@ -1,0 +1,48 @@
+name: land
+on:
+  push:
+    branches:
+      - "land/**"
+  repository_dispatch:
+    types:
+      - suda-land
+  workflow_dispatch:
+    inputs:
+      land_ref:
+        description: "Landing branch reference (for example: refs/heads/land/e2e-sync)"
+        required: true
+
+concurrency:
+  group: land-suda-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  land:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Azure-Winged Magpie App token
+        id: app-token
+        if: ${{ (secrets.MAGPIE_APP_ID != '' || vars.MAGPIE_APP_ID != '' || secrets.CAPY_APP_ID != '' || vars.CAPY_APP_ID != '') && (secrets.MAGPIE_APP_PRIVATE_KEY != '' || secrets.CAPY_APP_PRIVATE_KEY != '') }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.MAGPIE_APP_ID || vars.MAGPIE_APP_ID || secrets.CAPY_APP_ID || vars.CAPY_APP_ID }}
+          private-key: ${{ secrets.MAGPIE_APP_PRIVATE_KEY || secrets.CAPY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Checkout control plane
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/main
+          filter: blob:none
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: .github/scripts/capy/go.mod
+      - name: Merge into refs/suda/main and synchronize mirrors
+        env:
+          LAND_REF: ${{ github.event.client_payload.land_ref || inputs.land_ref || github.ref }}
+          MIRROR_TOKEN: ${{ steps.app-token.outputs.token || secrets.SUDA_MIRROR_TOKEN }}
+        run: ./.github/scripts/land.sh "$LAND_REF"
