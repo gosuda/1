@@ -85,6 +85,10 @@ export default {
         });
       }
 
+      if (url.pathname === "/api/land") {
+        return handleApiLand(url, env, repo);
+      }
+
       if (url.pathname === "/api/refs") {
         const workspaces = await listActiveWorkspaceRefs(env, repo);
         return jsonResponse({
@@ -487,6 +491,48 @@ async function resolveGithubAuthToken(env: Env): Promise<string> {
   return data.token;
 }
 
+async function handleApiLand(url: URL, env: Env, monorepo: string): Promise<Response> {
+  const rawRef = (url.searchParams.get("ref") || "").trim();
+  if (!rawRef) {
+    return jsonResponse({ error: "missing ?ref=refs/heads/land/<id>" }, 400);
+  }
+  const landRef = rawRef.startsWith("refs/heads/land/")
+    ? rawRef
+    : rawRef.startsWith("land/")
+      ? `refs/heads/${rawRef}`
+      : `refs/heads/land/${rawRef}`;
+
+  const headers = await buildGithubHeaders(env);
+  const checkResp = await fetch(
+    `https://api.github.com/repos/${monorepo}/git/ref/${landRef.slice("refs/".length)}`,
+    { headers },
+  );
+  if (!checkResp.ok) {
+    return jsonResponse({ error: `landing branch ${landRef} not found on ${monorepo}` }, 404);
+  }
+
+  const token = await resolveGithubAuthToken(env);
+  const runnerRepo = "gosuda/azure-magpie";
+  const dispatchResp = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "user-agent": USER_AGENT,
+    },
+    body: JSON.stringify({
+      event_type: "suda-land",
+      client_payload: { land_ref: landRef },
+    }),
+  });
+  cachedRefs = null;
+  return jsonResponse(
+    { status: "dispatched", runner: runnerRepo, land_ref: landRef, code: dispatchResp.status },
+    dispatchResp.ok ? 200 : 500,
+  );
+}
+
 async function handleGithubWebhook(request: Request, env: Env, monorepo: string): Promise<Response> {
   if (!env.WEBHOOK_SECRET) {
     return new Response("Webhook secret not configured", { status: 500 });
@@ -511,7 +557,30 @@ async function handleGithubWebhook(request: Request, env: Env, monorepo: string)
 
   const fullName = payload.repository?.full_name || "";
   const shortName = payload.repository?.name || "";
-  if (!fullName || fullName === monorepo) {
+  const runnerRepo = "gosuda/azure-magpie";
+  if (!fullName) {
+    return jsonResponse({ status: "cache-cleared" });
+  }
+  if (fullName === monorepo) {
+    if (event === "push" && payload.ref && payload.ref.startsWith("refs/heads/land/")) {
+      const token = await resolveGithubAuthToken(env);
+      if (token) {
+        const r = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
+          method: "POST",
+          headers: {
+            accept: "application/vnd.github+json",
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+            "user-agent": USER_AGENT,
+          },
+          body: JSON.stringify({
+            event_type: "suda-land",
+            client_payload: { land_ref: payload.ref },
+          }),
+        });
+        return jsonResponse({ status: "land-dispatched", ref: payload.ref, code: r.status });
+      }
+    }
     return jsonResponse({ status: "cache-cleared" });
   }
 

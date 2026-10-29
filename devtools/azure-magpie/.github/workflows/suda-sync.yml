@@ -1,0 +1,73 @@
+name: Suda Monorepo Land and Sync
+
+on:
+  repository_dispatch:
+    types:
+      - suda-land
+      - capy-inbound
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: "Operation type (suda-land or capy-inbound)"
+        required: true
+        default: "suda-land"
+      land_ref:
+        description: "Landing branch reference (for example: refs/heads/land/e2e-sync)"
+        required: false
+      workflow:
+        description: "Mirror workflow name for capy-inbound"
+        required: false
+      ref:
+        description: "External ref for capy-inbound"
+        required: false
+        default: "refs/heads/main"
+      mode:
+        description: "Inbound sync mode (ws or land)"
+        required: false
+        default: "ws"
+
+concurrency:
+  group: land-suda-main
+  cancel-in-progress: false
+
+jobs:
+  suda-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Azure-Winged Magpie App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.MAGPIE_APP_ID }}
+          private-key: ${{ secrets.MAGPIE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout gosuda/0 Control Plane
+        uses: actions/checkout@v4
+        with:
+          repository: gosuda/0
+          ref: refs/heads/main
+          filter: blob:none
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: .github/scripts/capy/go.mod
+
+      - name: Execute Monorepo Land or Inbound Sync
+        env:
+          MIRROR_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_ACTION: ${{ github.event.action || inputs.action_type }}
+          LAND_REF: ${{ github.event.client_payload.land_ref || inputs.land_ref }}
+          WF_NAME: ${{ github.event.client_payload.workflow || inputs.workflow }}
+          EXT_REF: ${{ github.event.client_payload.ref || inputs.ref || 'refs/heads/main' }}
+          SYNC_MODE: ${{ github.event.client_payload.mode || inputs.mode || 'ws' }}
+        run: |
+          git config user.name "Azure-Winged Magpie"
+          git config user.email "magpie@gosuda.org"
+          if [ "$EVENT_ACTION" = "capy-inbound" ]; then
+            ./.github/scripts/sync-inbound.sh "$WF_NAME" "$EXT_REF" "$SYNC_MODE"
+          else
+            ./.github/scripts/land.sh "$LAND_REF"
+          fi
