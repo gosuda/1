@@ -30,3 +30,5 @@ bun test
 bun run build
 npx wrangler pages deploy public --project-name=azure-magpie
 ```
+
+Live deployment: [https://magpie.gosuda.org](https://magpie.gosuda.org)
