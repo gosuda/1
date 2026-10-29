@@ -1,0 +1,12 @@
+{
+  "name": "magpie",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Azure-Winged Magpie: Scandinavian SaaS Diff Link Generator, Snapshot Explorer, and Webhook Router for gosuda/0",
+  "scripts": {
+    "build": "bun run build.ts",
+    "test": "bun test",
+    "deploy:pages": "bun run build.ts && npx wrangler pages deploy public --project-name=gosuda-magpie",
+    "deploy:worker": "bun run build.ts && npx wrangler deploy"
+  }
+}

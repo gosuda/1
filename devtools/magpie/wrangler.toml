@@ -1,0 +1,7 @@
+name = "gosuda-magpie"
+pages_build_output_dir = "public"
+compatibility_date = "2026-10-01"
+
+[vars]
+GITHUB_REPO = "gosuda/0"
+CACHE_TTL_SECONDS = "5"
