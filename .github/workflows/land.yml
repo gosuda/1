@@ -25,7 +25,7 @@ jobs:
     steps:
       - name: Generate Azure-Winged Magpie App token
         id: app-token
-        if: ${{ (secrets.MAGPIE_APP_ID != '' || vars.MAGPIE_APP_ID != '' || secrets.CAPY_APP_ID != '' || vars.CAPY_APP_ID != '') && (secrets.MAGPIE_APP_PRIVATE_KEY != '' || secrets.CAPY_APP_PRIVATE_KEY != '') }}
+        continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.MAGPIE_APP_ID || vars.MAGPIE_APP_ID || secrets.CAPY_APP_ID || vars.CAPY_APP_ID }}
