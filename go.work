@@ -1,0 +1,11 @@
+go 1.27.0
+
+use (
+	./ipc/hqq/HQQ
+	./ipc/hqq/hqq-sqlite3
+	./ipc/hqq/hqq-zstd
+	./net/ivnp
+	./net/portalite
+	./web/gosuda
+	./web/securl
+)

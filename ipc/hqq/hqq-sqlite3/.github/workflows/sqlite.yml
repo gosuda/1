@@ -1,0 +1,37 @@
+name: SQLite CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Checkout HQQ core
+        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.24.x'
+          cache: false
+      - name: Install Ninja
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ninja-build
+          else
+            command -v ninja >/dev/null || brew install ninja
+          fi
+      - name: Build hqq-sqlite-server and run Go tests
+        run: |
+          eval "$(sqlite3/build.sh -T)"
+          go test -p 1 -v -race -timeout 10m ./...
