@@ -193,133 +193,137 @@ describe("worker.fetch", () => {
       );
       expect(diffRedirect.status).toBe(302);
       expect(diffRedirect.headers.get("location")).toBe(
-        `https://github.com/gosuda/0/compare/${SAMPLE_REFS.mainSha}..${wsSha}`,
+        `https://github.com/gosuda/1/compare/${SAMPLE_REFS.mainSha}..${wsSha}`,
       );
     } finally {
       globalThis.fetch = origFetch;
     }
   });
 
-  test("rejects webhook requests with invalid HMAC signature and dispatches valid mirror pushes", async () => {
-    const secret = "webhook-test-secret";
-    const payload = JSON.stringify({
-      ref: "refs/heads/main",
-      repository: { full_name: "gosuda/HQQ", name: "HQQ", default_branch: "main" },
-      head_commit: { message: "fix: external contributor commit" },
-    });
-
-    const badReq = new Request("https://0.gosuda.org/webhook", {
-      method: "POST",
-      headers: {
-        "x-github-event": "push",
-        "x-hub-signature-256": "sha256=deadbeef",
-      },
-      body: payload,
-    });
-    const badRes = await worker.fetch(badReq, { WEBHOOK_SECRET: secret, GITHUB_TOKEN: "tok" });
-    expect(badRes.status).toBe(401);
-
-    const key = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"],
-    );
-    const sigBuf = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-    const sigHex = Array.from(new Uint8Array(sigBuf))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    let dispatchedUrl = "";
-    let dispatchedBody = "";
+  test("reads workspaces from the user repository and landing refs only from the user repository", async () => {
+    const wsSha = "1111222233334444555566667777888899990000";
+    const urls: string[] = [];
     const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      dispatchedUrl = String(input);
-      dispatchedBody = String(init?.body || "");
-      return new Response(null, { status: 204 });
-    }) as typeof fetch;
-
-    try {
-      const goodReq = new Request("https://0.gosuda.org/webhook", {
-        method: "POST",
-        headers: {
-          "x-github-event": "push",
-          "x-hub-signature-256": `sha256=${sigHex}`,
-        },
-        body: payload,
-      });
-      const goodRes = await worker.fetch(goodReq, {
-        GITHUB_REPO: "gosuda/0",
-        WEBHOOK_SECRET: secret,
-        GITHUB_TOKEN: "tok",
-      });
-      expect(goodRes.status).toBe(200);
-      expect(dispatchedUrl).toBe("https://api.github.com/repos/gosuda/azure-magpie/dispatches");
-      expect(JSON.parse(dispatchedBody)).toEqual({
-        event_type: "capy-inbound",
-        client_payload: {
-          workflow: "HQQ",
-          ref: "refs/heads/main",
-          mode: "ws",
-        },
-      });
-    } finally {
-      globalThis.fetch = origFetch;
-    }
-  });
-
-  test("dispatches capy-inbound in ws mode for mirror pushes to a non-main default branch", async () => {
-    const dispatched: unknown[] = [];
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === "https://api.github.com/repos/gosuda/azure-magpie/dispatches") {
-        dispatched.push(JSON.parse(String(init?.body)));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith("/git/matching-refs/suda/")) {
+        return new Response(
+          JSON.stringify([
+            { ref: "refs/suda/main", object: { sha: SAMPLE_REFS.mainSha } },
+            { ref: "refs/suda/history", object: { sha: SAMPLE_REFS.historySha } },
+          ]),
+          { status: 200 },
+        );
       }
-      return new Response(null, { status: 204 });
+      if (url.endsWith("/git/ref/heads/land/task-9")) {
+        return new Response(JSON.stringify({ object: { sha: wsSha } }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
     }) as typeof fetch;
-
     try {
-      const res = await worker.fetch(
-        await signedWebhookRequest("push", {
-          ref: "refs/heads/master",
-          repository: { full_name: "gosuda/portalite", name: "portalite", default_branch: "master" },
-          head_commit: { message: "fix: external contributor commit" },
-        }),
-        { GITHUB_REPO: "gosuda/0", WEBHOOK_SECRET, GITHUB_TOKEN: "tok" },
-      );
+      const res = await worker.fetch(new Request("https://0.gosuda.org/diff/land/task-9?format=json"), {
+        GITHUB_REPO: "gosuda/0",
+        USER_REPO: "gosuda/1",
+        GITHUB_TOKEN: "t",
+        CACHE_TTL_SECONDS: "0",
+      });
       expect(res.status).toBe(200);
-      expect(dispatched).toEqual([
-        {
-          event_type: "capy-inbound",
-          client_payload: { workflow: "portalite", ref: "refs/heads/master", mode: "ws" },
-        },
-      ]);
+      const body = (await res.json()) as { compareUrl: string };
+      expect(body.compareUrl).toBe(`https://github.com/gosuda/1/compare/${SAMPLE_REFS.mainSha}..${wsSha}`);
+      expect(urls).toContain("https://api.github.com/repos/gosuda/1/git/ref/heads/land/task-9");
+      expect(urls.some((u) => u.includes("/repos/gosuda/0/git/ref/heads/land"))).toBe(false);
     } finally {
       globalThis.fetch = origFetch;
     }
   });
 
-  test("ignores pushes to non-default branches without calling GitHub", async () => {
+  test("rejects webhook requests with an invalid HMAC signature without waking the lander", async () => {
     const calls: string[] = [];
     const origFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
       return new Response(null, { status: 204 });
     }) as typeof fetch;
+    try {
+      const res = await worker.fetch(
+        new Request("https://0.gosuda.org/webhook", {
+          method: "POST",
+          headers: { "x-github-event": "push", "x-hub-signature-256": "sha256=deadbeef" },
+          body: "{}",
+        }),
+        { WEBHOOK_SECRET, LANDER_WAKE_URL: "https://lander.example/wake", LANDER_WAKE_SECRET: "wake" },
+      );
+      expect(res.status).toBe(401);
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 
+  test("a valid webhook only wakes the lander with an HMAC-signed body and never dispatches work", async () => {
+    const wakeSecret = "wake-secret";
+    const seen: Array<{ url: string; body: string; sig: string }> = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({
+        url: String(input),
+        body: String(init?.body instanceof Uint8Array ? new TextDecoder().decode(init.body) : init?.body),
+        sig: new Headers(init?.headers).get("x-hub-signature-256") || "",
+      });
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
     try {
       const res = await worker.fetch(
         await signedWebhookRequest("push", {
-          ref: "refs/heads/feature/external",
+          ref: "refs/heads/main",
           repository: { full_name: "gosuda/HQQ", name: "HQQ", default_branch: "main" },
-          head_commit: { message: "feat: external branch" },
+          head_commit: { message: "GitOrigin-RevId: forged" },
         }),
-        { GITHUB_REPO: "gosuda/0", WEBHOOK_SECRET, GITHUB_TOKEN: "tok" },
+        { WEBHOOK_SECRET, LANDER_WAKE_URL: "https://lander.example/wake", LANDER_WAKE_SECRET: wakeSecret },
       );
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ status: "ignored-event" });
-      expect(calls).toEqual([]);
+      expect(await res.json()).toEqual({ status: "woken", code: 202 });
+      expect(seen.length).toBe(1);
+      expect(seen[0].url).toBe("https://lander.example/wake");
+      // The payload (commit message, repository, ref) is not forwarded as input.
+      expect(JSON.parse(seen[0].body)).toEqual({ event: "push" });
+      const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(wakeSecret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+      );
+      const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(seen[0].body)));
+      const hex = Array.from(mac)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      expect(seen[0].sig).toBe(`sha256=${hex}`);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("without wake configuration the webhook only clears the cache, and a failing lander yields 502", async () => {
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      throw new Error("lander down");
+    }) as typeof fetch;
+    try {
+      const quiet = await worker.fetch(await signedWebhookRequest("push", { ref: "refs/heads/x" }), { WEBHOOK_SECRET });
+      expect(quiet.status).toBe(200);
+      expect(await quiet.json()).toEqual({ status: "cache-cleared" });
+      expect(calls).toBe(0);
+
+      const failing = await worker.fetch(await signedWebhookRequest("push", { ref: "refs/heads/x" }), {
+        WEBHOOK_SECRET,
+        LANDER_WAKE_URL: "https://lander.example/wake",
+        LANDER_WAKE_SECRET: "wake",
+      });
+      expect(failing.status).toBe(502);
     } finally {
       globalThis.fetch = origFetch;
     }

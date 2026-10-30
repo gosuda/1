@@ -13,6 +13,9 @@ export interface Env {
   CAPY_INSTALLATION_ID?: string;
   CAPY_APP_PRIVATE_KEY?: string;
   WEBHOOK_SECRET?: string;
+  USER_REPO?: string;
+  LANDER_WAKE_URL?: string;
+  LANDER_WAKE_SECRET?: string;
   CACHE_TTL_SECONDS?: string;
 }
 
@@ -65,7 +68,7 @@ export default {
     const repo = env.GITHUB_REPO || "gosuda/0";
 
     if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleGithubWebhook(request, env, repo);
+      return handleGithubWebhook(request, env);
     }
 
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -89,7 +92,7 @@ export default {
 
       if (url.pathname === "/api/refs") {
         const [workspaces, projects] = await Promise.all([
-          listActiveWorkspaceRefs(env, repo),
+          listActiveWorkspaceRefs(env),
           resolveMountedProjects(env, repo),
         ]);
         return jsonResponse({
@@ -113,7 +116,7 @@ export default {
       if (url.pathname.startsWith("/commit/")) {
         const refSpec = decodeURIComponent(url.pathname.slice("/commit/".length));
         const sha = await resolveRefSha(env, repo, refSpec, refs);
-        return redirectResponse(`https://github.com/${repo}/commit/${sha}`);
+        return redirectResponse(`https://github.com/${userRepoOf(env)}/commit/${sha}`);
       }
 
       const targetUrl = buildRedirectLocation(url.pathname, repo, refs);
@@ -220,7 +223,7 @@ async function handleDiffRequest(
       const indexUrl = new URL("/index.html", url.origin);
       return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
     }
-    const activeRefs = await listActiveWorkspaceRefs(env, repo);
+    const activeRefs = await listActiveWorkspaceRefs(env);
     const html = renderFallbackDiffHtml(url.origin, repo, refs, activeRefs);
     return new Response(html, {
       status: 200,
@@ -233,7 +236,7 @@ async function handleDiffRequest(
 
   const baseSha = await resolveRefSha(env, repo, spec.baseRef, refs);
   const headSha = await resolveRefSha(env, repo, spec.headRef, refs);
-  const compareUrl = `https://github.com/${repo}/compare/${baseSha}${spec.operator}${headSha}`;
+  const compareUrl = `https://github.com/${userRepoOf(env)}/compare/${baseSha}${spec.operator}${headSha}`;
   const shortPath =
     spec.baseRef === "suda/main" && spec.operator === ".."
       ? `/diff/${spec.headRef}`
@@ -273,24 +276,32 @@ export async function resolveRefSha(
     return cleaned;
   }
 
-  const candidates: string[] = [];
+  const userRepo = userRepoOf(env);
+  const candidates: Array<{ repo: string; path: string }> = [];
+  const user = (path: string) => candidates.push({ repo: userRepo, path });
+  const trunk = (path: string) => candidates.push({ repo, path });
   if (cleaned.startsWith("refs/")) {
-    candidates.push(cleaned.slice("refs/".length));
-  } else if (cleaned.startsWith("ws/") || cleaned.startsWith("suda/")) {
-    candidates.push(cleaned);
+    const path = cleaned.slice("refs/".length);
+    (path.startsWith("suda/") ? trunk : user)(path);
+  } else if (cleaned.startsWith("suda/")) {
+    trunk(cleaned);
+  } else if (cleaned.startsWith("ws/")) {
+    user(cleaned);
   } else if (cleaned.startsWith("land/")) {
-    candidates.push(`heads/${cleaned}`);
+    user(`heads/${cleaned}`);
   } else if (cleaned.startsWith("heads/")) {
-    candidates.push(cleaned);
+    user(cleaned);
   } else if (cleaned.startsWith("pr/")) {
-    candidates.push(`pull/${cleaned.slice("pr/".length)}/head`);
+    user(`pull/${cleaned.slice("pr/".length)}/head`);
   } else {
-    candidates.push(`ws/${cleaned}`, `heads/land/${cleaned}`, `heads/${cleaned}`);
+    user(`ws/${cleaned}`);
+    user(`heads/land/${cleaned}`);
+    user(`heads/${cleaned}`);
   }
 
   const headers = await buildGithubHeaders(env);
   for (const candidate of candidates) {
-    const apiUrl = `https://api.github.com/repos/${repo}/git/ref/${candidate}`;
+    const apiUrl = `https://api.github.com/repos/${candidate.repo}/git/ref/${candidate.path}`;
     const resp = await fetch(apiUrl, { headers });
     if (resp.ok) {
       const data = (await resp.json()) as { object?: { sha?: string } };
@@ -300,13 +311,18 @@ export async function resolveRefSha(
     }
   }
 
-  throw new Error(`ref '${refSpec}' not found on ${repo}`);
+  throw new Error(`ref '${refSpec}' not found`);
+}
+
+// Workspaces, landing requests, and review branches live in the user repository (gosuda/1).
+export function userRepoOf(env: Env): string {
+  return env.USER_REPO || "gosuda/1";
 }
 
 async function listActiveWorkspaceRefs(
   env: Env,
-  repo: string,
 ): Promise<Array<{ ref: string; label: string; sha: string }>> {
+  const repo = userRepoOf(env);
   const headers = await buildGithubHeaders(env);
   const results: Array<{ ref: string; label: string; sha: string }> = [];
 
@@ -527,34 +543,9 @@ async function resolveGithubAuthToken(env: Env): Promise<string> {
   return data.token;
 }
 
-async function ensureLandRef(
-  env: Env,
-  monorepo: string,
-  landRef: string,
-  targetSha: string,
-): Promise<boolean> {
-  const headers = await buildGithubHeaders(env);
-  headers["content-type"] = "application/json";
-  const createResp = await fetch(`https://api.github.com/repos/${monorepo}/git/refs`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ref: landRef, sha: targetSha }),
-  });
-  if (createResp.ok) {
-    return true;
-  }
-  const updateResp = await fetch(
-    `https://api.github.com/repos/${monorepo}/git/refs/${landRef.slice("refs/".length)}`,
-    {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ sha: targetSha, force: true }),
-    },
-  );
-  return updateResp.ok;
-}
-
-async function handleGithubWebhook(request: Request, env: Env, monorepo: string): Promise<Response> {
+// The webhook never decides anything. It authenticates GitHub, drops the ref cache, and wakes the
+// lander, which re-derives all work from repository state. The payload is not forwarded as input.
+async function handleGithubWebhook(request: Request, env: Env): Promise<Response> {
   if (!env.WEBHOOK_SECRET) {
     return new Response("Webhook secret not configured", { status: 500 });
   }
@@ -567,112 +558,43 @@ async function handleGithubWebhook(request: Request, env: Env, monorepo: string)
 
   cachedRefs = null;
 
-  const event = request.headers.get("x-github-event") || "";
-  const payload = JSON.parse(new TextDecoder().decode(rawBody)) as {
-    ref?: string;
-    repository?: { full_name?: string; name?: string; default_branch?: string };
-    head_commit?: { message?: string };
-    action?: string;
-    number?: number;
-    pull_request?: {
-      merged?: boolean;
-      head?: { ref?: string; sha?: string };
-      base?: { ref?: string };
-    };
-  };
-
-  const fullName = payload.repository?.full_name || "";
-  const shortName = payload.repository?.name || "";
-  const runnerRepo = "gosuda/azure-magpie";
-  if (!fullName) {
+  if (!env.LANDER_WAKE_URL || !env.LANDER_WAKE_SECRET) {
     return jsonResponse({ status: "cache-cleared" });
   }
-  if (fullName === monorepo) {
-    let targetLandRef = "";
-    if (event === "push" && payload.ref && payload.ref.startsWith("refs/heads/land/")) {
-      targetLandRef = payload.ref;
-    } else if (
-      event === "pull_request" &&
-      payload.action === "closed" &&
-      payload.pull_request?.merged === true
-    ) {
-      const headRef = payload.pull_request?.head?.ref || "";
-      const headSha = payload.pull_request?.head?.sha || "";
-      if (headRef.startsWith("review/") && headSha) {
-        const taskId = headRef.slice("review/".length);
-        targetLandRef = `refs/heads/land/${taskId}`;
-        await ensureLandRef(env, monorepo, targetLandRef, headSha);
-      }
-    }
-
-    if (targetLandRef) {
-      const token = await resolveGithubAuthToken(env);
-      if (token) {
-        const r = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
-          method: "POST",
-          headers: {
-            accept: "application/vnd.github+json",
-            authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-            "user-agent": USER_AGENT,
-          },
-          body: JSON.stringify({
-            event_type: "suda-land",
-            client_payload: { land_ref: targetLandRef },
-          }),
-        });
-        return jsonResponse({ status: "land-dispatched", ref: targetLandRef, code: r.status });
-      }
-    }
-    return jsonResponse({ status: "cache-cleared" });
-  }
-
-  let extRef = "";
-  const defaultRef = payload.repository?.default_branch
-    ? `refs/heads/${payload.repository.default_branch}`
-    : "";
-  if (event === "push" && defaultRef && payload.ref === defaultRef) {
-    const msg = payload.head_commit?.message || "";
-    if (msg.includes("GitOrigin-RevId:")) {
-      return jsonResponse({ status: "ignored-echo" });
-    }
-    extRef = defaultRef;
-  } else if (
-    event === "pull_request" &&
-    (payload.action === "opened" || payload.action === "synchronize")
-  ) {
-    extRef = `refs/pull/${payload.number}/head`;
-  } else {
-    return jsonResponse({ status: "ignored-event" });
-  }
-
-  const token = await resolveGithubAuthToken(env);
-  if (!token) {
-    return new Response("Missing GitHub token for repository_dispatch", { status: 500 });
-  }
-
-  const dispatchResp = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
-    method: "POST",
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      "user-agent": USER_AGENT,
-    },
-    body: JSON.stringify({
-      event_type: "capy-inbound",
-      client_payload: {
-        workflow: shortName,
-        ref: extRef,
-        mode: "ws",
-      },
-    }),
-  });
-
-  return jsonResponse(
-    { status: "dispatched", code: dispatchResp.status },
-    dispatchResp.ok ? 200 : 502,
+  const wakeBody = new TextEncoder().encode(
+    JSON.stringify({ event: request.headers.get("x-github-event") || "" }),
   );
+  const signature = await hmacSha256Hex(env.LANDER_WAKE_SECRET, wakeBody);
+  try {
+    const resp = await fetch(env.LANDER_WAKE_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": USER_AGENT,
+        "x-hub-signature-256": `sha256=${signature}`,
+      },
+      body: wakeBody,
+      signal: AbortSignal.timeout(5000),
+    });
+    return jsonResponse({ status: "woken", code: resp.status }, resp.ok ? 200 : 502);
+  } catch {
+    // The lander also polls; a missed wake only delays the next cycle.
+    return jsonResponse({ status: "wake-failed" }, 502);
+  }
+}
+
+async function hmacSha256Hex(secret: string, data: BufferSource): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
+  return Array.from(sig)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function verifyWebhookSignature(

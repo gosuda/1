@@ -37,12 +37,14 @@ jobs:
           MAGPIE_INSTALLATION_ID: ${{ secrets.MAGPIE_INSTALLATION_ID || vars.MAGPIE_INSTALLATION_ID || secrets.CAPY_INSTALLATION_ID || vars.CAPY_INSTALLATION_ID }}
           MAGPIE_APP_PRIVATE_KEY: ${{ secrets.MAGPIE_APP_PRIVATE_KEY || secrets.CAPY_APP_PRIVATE_KEY }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          LANDER_WAKE_URL: ${{ secrets.LANDER_WAKE_URL || vars.LANDER_WAKE_URL }}
+          LANDER_WAKE_SECRET: ${{ secrets.LANDER_WAKE_SECRET }}
           GITHUB_TOKEN_FALLBACK: ${{ secrets.SUDA_MIRROR_TOKEN }}
         run: |
           python3 - <<'PY' > /tmp/worker-secrets.json
           import json, os
           secrets = {}
-          for key in ("MAGPIE_APP_ID", "MAGPIE_INSTALLATION_ID", "MAGPIE_APP_PRIVATE_KEY", "WEBHOOK_SECRET"):
+          for key in ("MAGPIE_APP_ID", "MAGPIE_INSTALLATION_ID", "MAGPIE_APP_PRIVATE_KEY", "WEBHOOK_SECRET", "LANDER_WAKE_URL", "LANDER_WAKE_SECRET"):
               val = os.environ.get(key, "").strip()
               if val:
                   secrets[key] = val
