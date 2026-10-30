@@ -45,6 +45,7 @@ const STATIC_UI_PATHS = new Set(["/", "/index.html", "/styles.css", "/app.js", "
 const MOUNTED_PROJECTS = [
   { prefix: "web/gosuda", mirror: "gosuda/website" },
   { prefix: "web/securl", mirror: "gosuda/securl" },
+  { prefix: "net/grt", mirror: "gosuda/GRT" },
   { prefix: "net/ivnp", mirror: "gosuda/IVNP" },
   { prefix: "net/portalite", mirror: "gosuda/portalite" },
   { prefix: "ipc/hqq/HQQ", mirror: "gosuda/HQQ" },
@@ -54,6 +55,7 @@ const MOUNTED_PROJECTS = [
 ];
 
 let cachedRefs: SudaRefs | null = null;
+let cachedProjects: { items: Array<{ prefix: string; mirror: string }>; fetchedAtMs: number } | null = null;
 let cachedInstallationId: string | null = null;
 let cachedInstallationToken: CachedAppToken | null = null;
 
@@ -90,13 +92,16 @@ export default {
       }
 
       if (url.pathname === "/api/refs") {
-        const workspaces = await listActiveWorkspaceRefs(env, repo);
+        const [workspaces, projects] = await Promise.all([
+          listActiveWorkspaceRefs(env, repo),
+          resolveMountedProjects(env, repo),
+        ]);
         return jsonResponse({
           repo,
           "suda/main": refs.mainSha,
           "suda/history": refs.historySha,
           workspaces,
-          projects: MOUNTED_PROJECTS,
+          projects,
         });
       }
 
@@ -325,6 +330,41 @@ async function listActiveWorkspaceRefs(
     }
   }
   return results;
+}
+
+async function resolveMountedProjects(
+  env: Env,
+  repo: string,
+): Promise<Array<{ prefix: string; mirror: string }>> {
+  const now = Date.now();
+  if (cachedProjects && now - cachedProjects.fetchedAtMs < 60_000) {
+    return cachedProjects.items;
+  }
+  try {
+    const headers = await buildGithubHeaders(env);
+    headers.accept = "application/vnd.github.raw+json";
+    const resp = await fetch(
+      `https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/heads/main`,
+      { headers },
+    );
+    if (resp.ok) {
+      const text = await resp.text();
+      const parsed: Array<{ prefix: string; mirror: string }> = [];
+      const tupleRe = /\(\s*"[^"]+"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"/g;
+      for (const match of text.matchAll(tupleRe)) {
+        if (match[1] && match[2]) {
+          parsed.push({ prefix: match[1], mirror: match[2] });
+        }
+      }
+      if (parsed.length > 0) {
+        cachedProjects = { items: parsed, fetchedAtMs: now };
+        return parsed;
+      }
+    }
+  } catch {
+    // Fall back to static project table
+  }
+  return MOUNTED_PROJECTS;
 }
 
 function renderFallbackDiffHtml(

@@ -20,6 +20,7 @@ interface ApiRefsPayload {
 const DEFAULT_PROJECTS: ProjectItem[] = [
   { prefix: "web/gosuda", mirror: "gosuda/website" },
   { prefix: "web/securl", mirror: "gosuda/securl" },
+  { prefix: "net/grt", mirror: "gosuda/GRT" },
   { prefix: "net/ivnp", mirror: "gosuda/IVNP" },
   { prefix: "net/portalite", mirror: "gosuda/portalite" },
   { prefix: "ipc/hqq/HQQ", mirror: "gosuda/HQQ" },

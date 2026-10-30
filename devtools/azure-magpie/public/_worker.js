@@ -4,6 +4,7 @@ var STATIC_UI_PATHS = new Set(["/", "/index.html", "/styles.css", "/app.js", "/f
 var MOUNTED_PROJECTS = [
   { prefix: "web/gosuda", mirror: "gosuda/website" },
   { prefix: "web/securl", mirror: "gosuda/securl" },
+  { prefix: "net/grt", mirror: "gosuda/GRT" },
   { prefix: "net/ivnp", mirror: "gosuda/IVNP" },
   { prefix: "net/portalite", mirror: "gosuda/portalite" },
   { prefix: "ipc/hqq/HQQ", mirror: "gosuda/HQQ" },
@@ -12,6 +13,7 @@ var MOUNTED_PROJECTS = [
   { prefix: "devtools/azure-magpie", mirror: "gosuda/azure-magpie" }
 ];
 var cachedRefs = null;
+var cachedProjects = null;
 var cachedInstallationId = null;
 var cachedInstallationToken = null;
 var worker_default = {
@@ -40,13 +42,16 @@ var worker_default = {
         return handleApiLand(url, env, repo);
       }
       if (url.pathname === "/api/refs") {
-        const workspaces = await listActiveWorkspaceRefs(env, repo);
+        const [workspaces, projects] = await Promise.all([
+          listActiveWorkspaceRefs(env, repo),
+          resolveMountedProjects(env, repo)
+        ]);
         return jsonResponse({
           repo,
           "suda/main": refs.mainSha,
           "suda/history": refs.historySha,
           workspaces,
-          projects: MOUNTED_PROJECTS
+          projects
         });
       }
       if (url.pathname === "/diff" || url.pathname === "/diff/" || url.pathname.startsWith("/diff/") || url.pathname.startsWith("/compare/")) {
@@ -224,6 +229,32 @@ async function listActiveWorkspaceRefs(env, repo) {
     }
   }
   return results;
+}
+async function resolveMountedProjects(env, repo) {
+  const now = Date.now();
+  if (cachedProjects && now - cachedProjects.fetchedAtMs < 60000) {
+    return cachedProjects.items;
+  }
+  try {
+    const headers = await buildGithubHeaders(env);
+    headers.accept = "application/vnd.github.raw+json";
+    const resp = await fetch(`https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/heads/main`, { headers });
+    if (resp.ok) {
+      const text = await resp.text();
+      const parsed = [];
+      const tupleRe = /\(\s*"[^"]+"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"/g;
+      for (const match of text.matchAll(tupleRe)) {
+        if (match[1] && match[2]) {
+          parsed.push({ prefix: match[1], mirror: match[2] });
+        }
+      }
+      if (parsed.length > 0) {
+        cachedProjects = { items: parsed, fetchedAtMs: now };
+        return parsed;
+      }
+    }
+  } catch {}
+  return MOUNTED_PROJECTS;
 }
 function renderFallbackDiffHtml(origin, repo, refs, activeRefs) {
   const rows = activeRefs.map((item) => `<li><code>${encodeHtml(item.ref)}</code> (<a href="${encodeHtml(origin)}/diff/${encodeHtml(item.label)}">Diff vs suda/main</a>)</li>`).join("");
