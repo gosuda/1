@@ -1,5 +1,7 @@
 [alias]
 	suda-init = "!cp \"$(git rev-parse --show-toplevel)/.gitconfig\" \"$(git rev-parse --git-dir)/suda.gitconfig\" 2>/dev/null || true; git config include.path suda.gitconfig && git config --replace-all remote.origin.fetch '+refs/suda/*:refs/remotes/origin/suda/*' '\\+refs/suda/\\*' && git fetch --filter=blob:none origin"
+	suda-sync-ctrl = "!f() { \"$(git rev-parse --show-toplevel)/.github/scripts/sync-control-plane.sh\"; }; f"
+	suda-sync-in = "!f() { \"$(git rev-parse --show-toplevel)/.github/scripts/sync-inbound.sh\" \"$@\"; }; f"
 	suda-tree = "!git ls-tree -d -r refs/remotes/origin/suda/main"
 	ws-sparse = "!f() { git sparse-checkout set .agents .github \"$@\"; }; f"
 	ws-new = "!f() { if [ \"$(git config --bool core.sparseCheckout 2>/dev/null)\" = \"true\" ]; then git sparse-checkout add .agents .github 2>/dev/null || true; fi; git fetch --filter=blob:none origin && git switch -c \"ws/$1\" origin/suda/main; }; f"
