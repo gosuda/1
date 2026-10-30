@@ -144,10 +144,10 @@ function renderWorkspacesTable(): void {
       const shortSha = item.sha.slice(0, 10);
       const shortDiffPath = `/diff/${escapeHtml(item.label)}`;
       return `<tr>
-        <td><span class="badge-ns">${ns}</span></td>
-        <td><code>${escapeHtml(item.ref)}</code></td>
-        <td><code>${escapeHtml(shortSha)}</code></td>
-        <td>
+        <td data-label="Namespace"><span class="badge-ns">${ns}</span></td>
+        <td data-label="Reference"><code class="ref-code">${escapeHtml(item.ref)}</code></td>
+        <td data-label="Tip Commit"><code>${escapeHtml(shortSha)}</code></td>
+        <td data-label="Actions" class="td-actions">
           <div class="output-actions">
             <button type="button" class="btn btn-secondary" data-load-head="${escapeHtml(item.label)}">Use as Head</button>
             <a class="btn btn-primary" href="${shortDiffPath}" target="_blank" rel="noopener">Open Diff</a>

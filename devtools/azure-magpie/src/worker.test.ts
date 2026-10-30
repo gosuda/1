@@ -230,7 +230,7 @@ describe("worker.fetch", () => {
         GITHUB_TOKEN: "tok",
       });
       expect(goodRes.status).toBe(200);
-      expect(dispatchedUrl).toBe("https://api.github.com/repos/gosuda/0/dispatches");
+      expect(dispatchedUrl).toBe("https://api.github.com/repos/gosuda/azure-magpie/dispatches");
       expect(JSON.parse(dispatchedBody)).toEqual({
         event_type: "capy-inbound",
         client_payload: {

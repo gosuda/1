@@ -444,7 +444,7 @@ async function handleGithubWebhook(request, env, monorepo) {
   if (!token) {
     return new Response("Missing GitHub token for repository_dispatch", { status: 500 });
   }
-  const dispatchResp = await fetch(`https://api.github.com/repos/${monorepo}/dispatches`, {
+  const dispatchResp = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
     method: "POST",
     headers: {
       accept: "application/vnd.github+json",

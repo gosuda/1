@@ -2,7 +2,7 @@
   "name": "azure-magpie",
   "version": "1.0.0",
   "private": true,
-  "description": "Azure-Winged Magpie: Scandinavian SaaS Diff Link Generator, Snapshot Explorer, and Webhook Router for gosuda/0",
+  "description": "Azure-Winged Magpie: Diff Link Generator, Snapshot Explorer, and Edge Webhook Router for gosuda/0",
   "scripts": {
     "build": "bun run build.ts",
     "test": "bun test",
