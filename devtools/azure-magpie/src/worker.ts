@@ -352,7 +352,7 @@ async function resolveMountedProjects(
       const parsed: Array<{ prefix: string; mirror: string }> = [];
       const tupleRe = /\(\s*"[^"]+"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"/g;
       for (const match of text.matchAll(tupleRe)) {
-        if (match[1] && match[2]) {
+        if (match[1] && match[2] && match[1].includes("/") && match[2].includes("/")) {
           parsed.push({ prefix: match[1], mirror: match[2] });
         }
       }
