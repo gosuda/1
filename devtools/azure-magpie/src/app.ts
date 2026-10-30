@@ -155,35 +155,12 @@ function renderWorkspacesTable(): void {
         <td data-label="Actions" class="td-actions">
           <div class="output-actions">
             <button type="button" class="btn btn-secondary" data-load-head="${escapeHtml(item.label)}">Use as Head</button>
-            <button type="button" class="btn btn-secondary" data-land-ref="${escapeHtml(item.ref)}">Land</button>
             <a class="btn btn-primary" href="${shortDiffPath}" target="_blank" rel="noopener">Open Diff</a>
           </div>
         </td>
       </tr>`;
     })
     .join("");
-}
-
-async function triggerWorkspaceLand(btn: HTMLButtonElement, ref: string): Promise<void> {
-  const prev = btn.textContent || "Land";
-  btn.disabled = true;
-  btn.textContent = "Landing…";
-  try {
-    const resp = await fetch(`/api/land?ref=${encodeURIComponent(ref)}`);
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-    btn.textContent = "Dispatched";
-    setTimeout(() => {
-      void fetchTrunkAndWorkspaces();
-    }, 2500);
-  } catch {
-    btn.textContent = "Failed";
-    setTimeout(() => {
-      btn.textContent = prev;
-      btn.disabled = false;
-    }, 2000);
-  }
 }
 
 function renderProjectsGrid(): void {
@@ -346,10 +323,6 @@ function init(): void {
       updateDiffOutputs();
       window.scrollTo({ top: 0, behavior: "smooth" });
       return;
-    }
-    const landBtn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-land-ref]");
-    if (landBtn && landBtn.dataset.landRef) {
-      void triggerWorkspaceLand(landBtn, landBtn.dataset.landRef);
     }
   });
 

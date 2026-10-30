@@ -4,6 +4,7 @@ use (
 	./ipc/hqq/HQQ
 	./ipc/hqq/hqq-sqlite3
 	./ipc/hqq/hqq-zstd
+	./net/grt
 	./net/ivnp
 	./net/portalite
 	./web/gosuda

@@ -18,8 +18,7 @@
 | `/diff/<base>..<head>` | `GET` | Resolves `<base>` and `<head>` to commit SHAs and redirects (`302`) to `https://github.com/gosuda/0/compare/<base-sha>..<head-sha>` (append `?format=json` for JSON metadata) |
 | `/api/refs` | `GET` | Returns JSON containing `suda/main`, `suda/history`, active `refs/ws/*` and `refs/heads/land/*` tips, and mounted `google3` projects |
 | `/refs.json` or `/sha` | `GET` | Returns JSON containing `repo`, `suda/main`, and `suda/history` commit SHAs |
-| `/api/land?ref=<land-ref>` | `GET` | Verifies `<land-ref>` on `gosuda/0` and dispatches `suda-land` on `gosuda/azure-magpie` |
-| `/webhook` | `POST` | Validates `X-Hub-Signature-256` (`WEBHOOK_SECRET`), invalidates cached refs, and dispatches `suda-land` or `capy-inbound` on `gosuda/azure-magpie` |
+| `/webhook` | `POST` | Validates `X-Hub-Signature-256` (`WEBHOOK_SECRET`), invalidates cached refs, and dispatches `suda-land` on `gosuda/azure-magpie` for `refs/heads/land/*` pushes and merged `review/*` PRs on `gosuda/0`. Mirror pushes to the mirror's default branch and PR `opened`/`synchronize` events dispatch `capy-inbound` in `ws` mode (staging only) |
 
 ## 2. Public Runner Workflows and Secrets
 

@@ -7,6 +7,31 @@ const SAMPLE_REFS = {
   fetchedAtMs: Date.now(),
 };
 
+const WEBHOOK_SECRET = "webhook-test-secret";
+
+async function signedWebhookRequest(event: string, payload: unknown): Promise<Request> {
+  const body = JSON.stringify(payload);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(WEBHOOK_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sigBuf = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  const sigHex = Array.from(new Uint8Array(sigBuf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return new Request("https://0.gosuda.org/webhook", {
+    method: "POST",
+    headers: {
+      "x-github-event": event,
+      "x-hub-signature-256": `sha256=${sigHex}`,
+    },
+    body,
+  });
+}
+
 describe("buildRedirectLocation", () => {
   test("routes root and subtree paths to refs/suda/main tree URLs", () => {
     expect(buildRedirectLocation("/", "gosuda/0", SAMPLE_REFS)).toBe(
@@ -179,7 +204,7 @@ describe("worker.fetch", () => {
     const secret = "webhook-test-secret";
     const payload = JSON.stringify({
       ref: "refs/heads/main",
-      repository: { full_name: "gosuda/HQQ", name: "HQQ" },
+      repository: { full_name: "gosuda/HQQ", name: "HQQ", default_branch: "main" },
       head_commit: { message: "fix: external contributor commit" },
     });
 
@@ -236,9 +261,95 @@ describe("worker.fetch", () => {
         client_payload: {
           workflow: "HQQ",
           ref: "refs/heads/main",
-          mode: "land",
+          mode: "ws",
         },
       });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("dispatches capy-inbound in ws mode for mirror pushes to a non-main default branch", async () => {
+    const dispatched: unknown[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "https://api.github.com/repos/gosuda/azure-magpie/dispatches") {
+        dispatched.push(JSON.parse(String(init?.body)));
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+
+    try {
+      const res = await worker.fetch(
+        await signedWebhookRequest("push", {
+          ref: "refs/heads/master",
+          repository: { full_name: "gosuda/portalite", name: "portalite", default_branch: "master" },
+          head_commit: { message: "fix: external contributor commit" },
+        }),
+        { GITHUB_REPO: "gosuda/0", WEBHOOK_SECRET, GITHUB_TOKEN: "tok" },
+      );
+      expect(res.status).toBe(200);
+      expect(dispatched).toEqual([
+        {
+          event_type: "capy-inbound",
+          client_payload: { workflow: "portalite", ref: "refs/heads/master", mode: "ws" },
+        },
+      ]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("ignores pushes to non-default branches without calling GitHub", async () => {
+    const calls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+
+    try {
+      const res = await worker.fetch(
+        await signedWebhookRequest("push", {
+          ref: "refs/heads/feature/external",
+          repository: { full_name: "gosuda/HQQ", name: "HQQ", default_branch: "main" },
+          head_commit: { message: "feat: external branch" },
+        }),
+        { GITHUB_REPO: "gosuda/0", WEBHOOK_SECRET, GITHUB_TOKEN: "tok" },
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: "ignored-event" });
+      expect(calls).toEqual([]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("GET /api/land never dispatches and falls through to the normal redirect", async () => {
+    const calls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(`${init?.method ?? "GET"} ${url}`);
+      if (url.endsWith("/git/matching-refs/suda/")) {
+        return new Response(
+          JSON.stringify([{ ref: "refs/suda/main", object: { sha: SAMPLE_REFS.mainSha } }]),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      const res = await worker.fetch(
+        new Request("https://0.gosuda.org/api/land?ref=refs/heads/land/task-402"),
+        { GITHUB_REPO: "gosuda/0", GITHUB_TOKEN: "test-token", CACHE_TTL_SECONDS: "60" },
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe(
+        `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}/api/land`,
+      );
+      expect(calls.filter((c) => c.includes("/dispatches") || c.startsWith("POST"))).toEqual([]);
     } finally {
       globalThis.fetch = origFetch;
     }

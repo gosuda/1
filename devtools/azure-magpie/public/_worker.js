@@ -38,9 +38,6 @@ var worker_default = {
           "suda/history": refs.historySha
         });
       }
-      if (url.pathname === "/api/land") {
-        return handleApiLand(url, env, repo);
-      }
       if (url.pathname === "/api/refs") {
         const [workspaces, projects] = await Promise.all([
           listActiveWorkspaceRefs(env, repo),
@@ -407,54 +404,6 @@ async function ensureLandRef(env, monorepo, landRef, targetSha) {
   });
   return updateResp.ok;
 }
-async function handleApiLand(url, env, monorepo) {
-  const rawRef = (url.searchParams.get("ref") || "").trim();
-  if (!rawRef) {
-    return jsonResponse({ error: "missing ?ref=refs/heads/land/<id>" }, 400);
-  }
-  const headers = await buildGithubHeaders(env);
-  let landRef = "";
-  if (rawRef.startsWith("refs/ws/") || rawRef.startsWith("ws/") || rawRef.startsWith("refs/heads/review/") || rawRef.startsWith("review/")) {
-    const normalized = rawRef.startsWith("refs/") ? rawRef.slice("refs/".length) : rawRef.startsWith("review/") ? `heads/${rawRef}` : rawRef;
-    const refResp = await fetch(`https://api.github.com/repos/${monorepo}/git/ref/${normalized}`, {
-      headers
-    });
-    if (!refResp.ok) {
-      return jsonResponse({ error: `source branch ${rawRef} not found on ${monorepo}` }, 404);
-    }
-    const refData = await refResp.json();
-    const sha = refData.object?.sha || "";
-    const taskId = rawRef.split("/").pop() || "task";
-    landRef = `refs/heads/land/${taskId}`;
-    const ok = await ensureLandRef(env, monorepo, landRef, sha);
-    if (!ok) {
-      return jsonResponse({ error: `failed to promote ${rawRef} to ${landRef}` }, 500);
-    }
-  } else {
-    landRef = rawRef.startsWith("refs/heads/land/") ? rawRef : rawRef.startsWith("land/") ? `refs/heads/${rawRef}` : `refs/heads/land/${rawRef}`;
-    const checkResp = await fetch(`https://api.github.com/repos/${monorepo}/git/ref/${landRef.slice("refs/".length)}`, { headers });
-    if (!checkResp.ok) {
-      return jsonResponse({ error: `landing branch ${landRef} not found on ${monorepo}` }, 404);
-    }
-  }
-  const token = await resolveGithubAuthToken(env);
-  const runnerRepo = "gosuda/azure-magpie";
-  const dispatchResp = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
-    method: "POST",
-    headers: {
-      accept: "application/vnd.github+json",
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      "user-agent": USER_AGENT
-    },
-    body: JSON.stringify({
-      event_type: "suda-land",
-      client_payload: { land_ref: landRef }
-    })
-  });
-  cachedRefs = null;
-  return jsonResponse({ status: "dispatched", runner: runnerRepo, land_ref: landRef, code: dispatchResp.status }, dispatchResp.ok ? 200 : 500);
-}
 async function handleGithubWebhook(request, env, monorepo) {
   if (!env.WEBHOOK_SECRET) {
     return new Response("Webhook secret not configured", { status: 500 });
@@ -509,12 +458,13 @@ async function handleGithubWebhook(request, env, monorepo) {
     return jsonResponse({ status: "cache-cleared" });
   }
   let extRef = "";
-  if (event === "push" && payload.ref === "refs/heads/main") {
+  const defaultRef = payload.repository?.default_branch ? `refs/heads/${payload.repository.default_branch}` : "";
+  if (event === "push" && defaultRef && payload.ref === defaultRef) {
     const msg = payload.head_commit?.message || "";
     if (msg.includes("GitOrigin-RevId:")) {
       return jsonResponse({ status: "ignored-echo" });
     }
-    extRef = "refs/heads/main";
+    extRef = defaultRef;
   } else if (event === "pull_request" && (payload.action === "opened" || payload.action === "synchronize")) {
     extRef = `refs/pull/${payload.number}/head`;
   } else {
@@ -537,7 +487,7 @@ async function handleGithubWebhook(request, env, monorepo) {
       client_payload: {
         workflow: shortName,
         ref: extRef,
-        mode: event === "push" ? "land" : "ws"
+        mode: "ws"
       }
     })
   });

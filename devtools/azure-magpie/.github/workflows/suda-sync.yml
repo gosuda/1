@@ -21,18 +21,15 @@ on:
         description: "External ref for capy-inbound"
         required: false
         default: "refs/heads/main"
-      mode:
-        description: "Inbound sync mode (ws or land)"
-        required: false
-        default: "ws"
-
-concurrency:
-  group: land-suda-main
-  cancel-in-progress: false
 
 jobs:
   suda-sync:
     runs-on: ubuntu-latest
+    # capy-inbound is always staging (ws) and uses a per-mirror group, so it never
+    # shares the land lock. Land runs serialize on land-suda-main and never cancel.
+    concurrency:
+      group: ${{ (github.event.action || inputs.action_type) == 'capy-inbound' && format('stage-{0}', github.event.client_payload.workflow || inputs.workflow) || 'land-suda-main' }}
+      cancel-in-progress: ${{ (github.event.action || inputs.action_type) == 'capy-inbound' }}
     steps:
       - name: Generate Azure-Winged Magpie App token
         id: app-token
@@ -41,6 +38,18 @@ jobs:
           app-id: ${{ secrets.MAGPIE_APP_ID }}
           private-key: ${{ secrets.MAGPIE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          # Must match the capy.star destinations (plus the gosuda/0 control plane).
+          repositories: |
+            0
+            GRT
+            website
+            IVNP
+            HQQ
+            hqq-sqlite3
+            hqq-zstd
+            securl
+            portalite
+            azure-magpie
 
       - name: Checkout gosuda/0 Control Plane
         uses: actions/checkout@v4
@@ -62,7 +71,8 @@ jobs:
           LAND_REF: ${{ github.event.client_payload.land_ref || inputs.land_ref }}
           WF_NAME: ${{ github.event.client_payload.workflow || inputs.workflow }}
           EXT_REF: ${{ github.event.client_payload.ref || inputs.ref || 'refs/heads/main' }}
-          SYNC_MODE: ${{ github.event.client_payload.mode || inputs.mode || 'ws' }}
+          # Inbound is staging-only; land mode is not accepted here (it would bypass land-suda-main).
+          SYNC_MODE: ws
         run: |
           git config user.name "Azure-Winged Magpie"
           git config user.email "magpie@gosuda.org"
