@@ -1,1 +1,4 @@
-* @gosuda/core
+# Root google3 OWNERS for gosuda/0 (refs/suda/main).
+# Subdirectories may add an OWNERS file with `set noparent` to restrict approvals
+# to specific maintainers or `per-file <glob>=@owner` rules.
+*

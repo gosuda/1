@@ -314,7 +314,7 @@ async function listActiveWorkspaceRefs(
   const headers = await buildGithubHeaders(env);
   const results: Array<{ ref: string; label: string; sha: string }> = [];
 
-  for (const prefix of ["ws/", "heads/land/"]) {
+  for (const prefix of ["ws/", "heads/review/", "heads/land/"]) {
     const resp = await fetch(`https://api.github.com/repos/${repo}/git/matching-refs/${prefix}`, {
       headers,
     });
@@ -531,24 +531,76 @@ async function resolveGithubAuthToken(env: Env): Promise<string> {
   return data.token;
 }
 
+async function ensureLandRef(
+  env: Env,
+  monorepo: string,
+  landRef: string,
+  targetSha: string,
+): Promise<boolean> {
+  const headers = await buildGithubHeaders(env);
+  headers["content-type"] = "application/json";
+  const createResp = await fetch(`https://api.github.com/repos/${monorepo}/git/refs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ref: landRef, sha: targetSha }),
+  });
+  if (createResp.ok) {
+    return true;
+  }
+  const updateResp = await fetch(
+    `https://api.github.com/repos/${monorepo}/git/refs/${landRef.slice("refs/".length)}`,
+    {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ sha: targetSha, force: true }),
+    },
+  );
+  return updateResp.ok;
+}
+
 async function handleApiLand(url: URL, env: Env, monorepo: string): Promise<Response> {
   const rawRef = (url.searchParams.get("ref") || "").trim();
   if (!rawRef) {
     return jsonResponse({ error: "missing ?ref=refs/heads/land/<id>" }, 400);
   }
-  const landRef = rawRef.startsWith("refs/heads/land/")
-    ? rawRef
-    : rawRef.startsWith("land/")
-      ? `refs/heads/${rawRef}`
-      : `refs/heads/land/${rawRef}`;
 
   const headers = await buildGithubHeaders(env);
-  const checkResp = await fetch(
-    `https://api.github.com/repos/${monorepo}/git/ref/${landRef.slice("refs/".length)}`,
-    { headers },
-  );
-  if (!checkResp.ok) {
-    return jsonResponse({ error: `landing branch ${landRef} not found on ${monorepo}` }, 404);
+  let landRef = "";
+
+  if (rawRef.startsWith("refs/ws/") || rawRef.startsWith("ws/") || rawRef.startsWith("refs/heads/review/") || rawRef.startsWith("review/")) {
+    const normalized = rawRef.startsWith("refs/")
+      ? rawRef.slice("refs/".length)
+      : rawRef.startsWith("review/")
+        ? `heads/${rawRef}`
+        : rawRef;
+    const refResp = await fetch(`https://api.github.com/repos/${monorepo}/git/ref/${normalized}`, {
+      headers,
+    });
+    if (!refResp.ok) {
+      return jsonResponse({ error: `source branch ${rawRef} not found on ${monorepo}` }, 404);
+    }
+    const refData = (await refResp.json()) as { object?: { sha?: string } };
+    const sha = refData.object?.sha || "";
+    const taskId = rawRef.split("/").pop() || "task";
+    landRef = `refs/heads/land/${taskId}`;
+    const ok = await ensureLandRef(env, monorepo, landRef, sha);
+    if (!ok) {
+      return jsonResponse({ error: `failed to promote ${rawRef} to ${landRef}` }, 500);
+    }
+  } else {
+    landRef = rawRef.startsWith("refs/heads/land/")
+      ? rawRef
+      : rawRef.startsWith("land/")
+        ? `refs/heads/${rawRef}`
+        : `refs/heads/land/${rawRef}`;
+
+    const checkResp = await fetch(
+      `https://api.github.com/repos/${monorepo}/git/ref/${landRef.slice("refs/".length)}`,
+      { headers },
+    );
+    if (!checkResp.ok) {
+      return jsonResponse({ error: `landing branch ${landRef} not found on ${monorepo}` }, 404);
+    }
   }
 
   const token = await resolveGithubAuthToken(env);
@@ -593,6 +645,11 @@ async function handleGithubWebhook(request: Request, env: Env, monorepo: string)
     head_commit?: { message?: string };
     action?: string;
     number?: number;
+    pull_request?: {
+      merged?: boolean;
+      head?: { ref?: string; sha?: string };
+      base?: { ref?: string };
+    };
   };
 
   const fullName = payload.repository?.full_name || "";
@@ -602,7 +659,24 @@ async function handleGithubWebhook(request: Request, env: Env, monorepo: string)
     return jsonResponse({ status: "cache-cleared" });
   }
   if (fullName === monorepo) {
+    let targetLandRef = "";
     if (event === "push" && payload.ref && payload.ref.startsWith("refs/heads/land/")) {
+      targetLandRef = payload.ref;
+    } else if (
+      event === "pull_request" &&
+      payload.action === "closed" &&
+      payload.pull_request?.merged === true
+    ) {
+      const headRef = payload.pull_request?.head?.ref || "";
+      const headSha = payload.pull_request?.head?.sha || "";
+      if (headRef.startsWith("review/") && headSha) {
+        const taskId = headRef.slice("review/".length);
+        targetLandRef = `refs/heads/land/${taskId}`;
+        await ensureLandRef(env, monorepo, targetLandRef, headSha);
+      }
+    }
+
+    if (targetLandRef) {
       const token = await resolveGithubAuthToken(env);
       if (token) {
         const r = await fetch(`https://api.github.com/repos/${runnerRepo}/dispatches`, {
@@ -615,10 +689,10 @@ async function handleGithubWebhook(request: Request, env: Env, monorepo: string)
           },
           body: JSON.stringify({
             event_type: "suda-land",
-            client_payload: { land_ref: payload.ref },
+            client_payload: { land_ref: targetLandRef },
           }),
         });
-        return jsonResponse({ status: "land-dispatched", ref: payload.ref, code: r.status });
+        return jsonResponse({ status: "land-dispatched", ref: targetLandRef, code: r.status });
       }
     }
     return jsonResponse({ status: "cache-cleared" });
