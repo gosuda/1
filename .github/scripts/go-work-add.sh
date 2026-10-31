@@ -67,10 +67,18 @@ go_line = gm.group(1) if gm else "1.21"
 if need > cur:
     go_line = ".".join(str(x) for x in need)
     print(f"go.work: raising go directive to {go_line}")
-if not added and go_line == (gm.group(1) if gm else None):
+if not added and gm and go_line == gm.group(1):
     print("go.work: nothing to add")
     sys.exit(0)
-new = f"go {go_line}\n\nuse (\n" + "".join(f"\t{d}\n" for d in merged) + ")\n"
+use_block = "use (\n" + "".join(f"\t{d}\n" for d in merged) + ")\n"
+if m:
+    new = work[: m.start()] + use_block + work[m.end():]
+else:
+    new = re.sub(r"(?m)^use\s+\S+\s*\n", "", work).rstrip("\n") + "\n\n" + use_block
+if gm:
+    new = re.sub(r"(?m)^go\s+\S+\s*$", f"go {go_line}", new, count=1)
+else:
+    new = f"go {go_line}\n\n" + new
 open("go.work", "w", encoding="utf-8").write(new)
 for d in added:
     print(f"go.work: use {d}")
