@@ -391,7 +391,7 @@ func TestGitHubForgeCreateAndUpdatePullUseWriteScopedTokensAndDecodeListings(t *
 	env := newAppEnv(t, func(f *fakeGitHub) {
 		f.routes = map[string]fakeRoute{
 			"POST /repos/gosuda/1/pulls": func(w http.ResponseWriter, r *http.Request, g grant) {
-				if !checkPerms(w, g, map[string]string{"pull_requests": "write"}) {
+				if !checkPerms(w, g, map[string]string{"pull_requests": "write", "contents": "read"}) {
 					return
 				}
 				mu.Lock()

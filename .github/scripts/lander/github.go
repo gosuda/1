@@ -36,6 +36,9 @@ var (
 	permPulls    = map[string]string{"pull_requests": "read"}
 	permStatuses = map[string]string{"statuses": "write"}
 	permPullsW   = map[string]string{"pull_requests": "write"}
+	// Creating a pull request reads both branches: without contents:read GitHub answers 422 "not all refs
+	// are readable".
+	permPullsNew = map[string]string{"pull_requests": "write", "contents": "read"}
 	permMembers  = map[string]string{"members": "read"}
 )
 
@@ -180,7 +183,7 @@ func (f *GitHubForge) ClosePull(ctx context.Context, repo string, number int, co
 	return f.rest(ctx, repo, permPullsW, http.MethodPost, fmt.Sprintf("%s/issues/%d/comments", rp, number), map[string]string{"body": comment}, nil)
 }
 
-// CreatePull implements Forge with POST /repos/{repo}/pulls (pull_requests:write).
+// CreatePull implements Forge with POST /repos/{repo}/pulls (pull_requests:write and contents:read).
 func (f *GitHubForge) CreatePull(ctx context.Context, repo, head, base, title, body string) (int, error) {
 	rp, err := repoPath(repo)
 	if err != nil {
@@ -190,7 +193,7 @@ func (f *GitHubForge) CreatePull(ctx context.Context, repo, head, base, title, b
 	var out struct {
 		Number int `json:"number"`
 	}
-	if err := f.rest(ctx, repo, permPullsW, http.MethodPost, rp+"/pulls", in, &out); err != nil {
+	if err := f.rest(ctx, repo, permPullsNew, http.MethodPost, rp+"/pulls", in, &out); err != nil {
 		return 0, err
 	}
 	return out.Number, nil
