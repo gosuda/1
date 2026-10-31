@@ -266,14 +266,16 @@ func TestCheckOwnersEnforcesHierarchyAndApprovals(t *testing.T) {
 	}
 }
 
-// A bot login granted one generated file by a root per-file rule may change that file and nothing else,
-// and only when it is the authenticated requester.
+// A bot login granted one generated file by a per-file rule in that file's own directory may change that
+// file and nothing else, and only when it is the authenticated requester.
 func TestCheckOwnersPerFileBotGrantCoversOnlyItsFile(t *testing.T) {
 	repo := initTestRepo(t)
 	writeRepoFiles(t, repo, map[string]string{
-		"OWNERS":                          "@rootadmin\nper-file web/gosuda/zdata/data.json.zstd=@github-actions[bot]\n",
+		"OWNERS":                          "@rootadmin\n",
+		"web/gosuda/zdata/OWNERS":         "per-file data.json.zstd=@github-actions[bot]\n",
 		"web/gosuda/zdata/data.json.zstd": "v1",
 		"web/gosuda/zdata/other.json":     "v1",
+		"web/gosuda/data.json.zstd":       "v1",
 		"web/gosuda/main.go":              "package main\n",
 	})
 	base := commitTree(t, repo)
@@ -287,10 +289,14 @@ func TestCheckOwnersPerFileBotGrantCoversOnlyItsFile(t *testing.T) {
 		t.Fatalf("others must not gain the grant: %v", v)
 	}
 
-	writeRepoFiles(t, repo, map[string]string{"web/gosuda/zdata/other.json": "v2", "web/gosuda/main.go": "package main\n// x\n"})
+	writeRepoFiles(t, repo, map[string]string{
+		"web/gosuda/zdata/other.json": "v2",
+		"web/gosuda/data.json.zstd":   "v2",
+		"web/gosuda/main.go":          "package main\n// x\n",
+	})
 	other := commitTree(t, repo)
-	if v := checkOwners(t, repo, base, other, "github-actions[bot]"); len(v) != 2 {
-		t.Fatalf("the bot must not own anything else in the directory: %v", v)
+	if v := checkOwners(t, repo, base, other, "github-actions[bot]"); len(v) != 3 {
+		t.Fatalf("the bot must not own anything else, not even a same-named file above the directory: %v", v)
 	}
 }
 
