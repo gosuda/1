@@ -8,6 +8,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '17 2 * * *'
 
 permissions:
   contents: read
@@ -170,9 +172,8 @@ jobs:
       - name: Differential gate
         run: go test -count=1 -timeout 0 -run '^TestPG184Differential$' -v .
       - name: Regression corpus
-        # Push/PR runs the pinned 18.4 reference corpus. The nightly schedule that
-        # also ran the REL_18_STABLE auxiliary corpus (189/233 files identical) is
-        # disabled: the workflow has no schedule trigger.
+        # Push/PR runs the pinned 18.4 reference corpus; the nightly schedule
+        # also runs the REL_18_STABLE auxiliary corpus (189/233 files identical).
         env:
           SUPERSQL_REGRESS_CORPORA: ${{ github.event_name == 'schedule' && 'postgres184,postgres' || 'postgres184' }}
         run: NEOSEPIA_POSTGRES_REGRESS=1 go test -count=1 -timeout 0 -run '^TestPostgres18OfficialRegression$' -v .
