@@ -144,7 +144,16 @@ git push ws refs/remotes/ws/ws/capy/HQQ-pr-12:refs/heads/land/hqq-pr-12
 
 Review it like any other change. You become the requester, so `OWNERS` applies to you.
 
-## 7. Rules that matter
+## 7. Security fixes under embargo
+
+If you are fixing an undisclosed vulnerability, do **not** use ordinary branch names or land it. Follow
+[`docs/security-embargo.md`](https://github.com/gosuda/0/blob/main/docs/security-embargo.md): use an opaque id
+`sec-<YYYYMM>-<8 hex>`, a branch `<login>/sec/<id>`, and neutral commit text (`<id>: <neutral summary>`).
+References with a `sec` or `sec-*` path segment are hidden from the public site, kept past the 14-day cleanup,
+and can be landed only by the security response team. Never put the vulnerability, the project, or a CVE
+number in a branch name, commit subject, pull request title, or status.
+
+## 8. Rules that matter
 
 1. Push only to the `ws` remote (`git ws-save`, `git ws-land`, `git ws-pr`). `origin` is read-only.
 2. One task per workspace branch. Do not reuse a branch for unrelated work.
@@ -153,7 +162,7 @@ Review it like any other change. You become the requester, so `OWNERS` applies t
 5. Workspace branches under `refs/ws/` are pruned after 14 days without a push.
 6. Do not run scripts or aliases from branches of `gosuda/1` that you did not write.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause and fix |
 | :--- | :--- |
