@@ -164,6 +164,9 @@ number in a branch name, commit subject, pull request title, or status.
 4. Never put credentials in any ref: everyone in the organization can read `refs/ws/*`.
 5. Workspace branches under `refs/ws/` are pruned after 14 days without a push.
 6. Do not run scripts or aliases from branches of `gosuda/1` that you did not write.
+7. Go modules: never commit a `replace x => ../y` in `go.mod` (the lander rejects it). Sibling modules resolve through
+   the root `go.work`; add a new module with `.github/scripts/go-work-add.sh <prefix>`. A `require` of another
+   monorepo module names a published version.
 
 ## 9. Troubleshooting
 
