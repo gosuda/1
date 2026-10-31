@@ -19,6 +19,12 @@ The unified source tree on `refs/suda/main` and the linear commit chain on `refs
 | `//ipc/hqq/hqq-zstd` | `gosuda/hqq-zstd` | [Browse `//ipc/hqq/hqq-zstd`](https://magpie.gosuda.org/tree/ipc/hqq/hqq-zstd) | [Commits `//ipc/hqq/hqq-zstd`](https://magpie.gosuda.org/history/ipc/hqq/hqq-zstd) |
 | `//devtools/azure-magpie` | `gosuda/azure-magpie` | [Browse `//devtools/azure-magpie`](https://magpie.gosuda.org/tree/devtools/azure-magpie) | [Commits `//devtools/azure-magpie`](https://magpie.gosuda.org/history/devtools/azure-magpie) |
 | `//net/grt` | `gosuda/GRT` | [Browse `//net/grt`](https://magpie.gosuda.org/tree/net/grt) | [Commits `//net/grt`](https://magpie.gosuda.org/history/net/grt) |
+| `//crypto/keyless_tls` | `gosuda/keyless_tls` | [Browse `//crypto/keyless_tls`](https://magpie.gosuda.org/tree/crypto/keyless_tls) | [Commits `//crypto/keyless_tls`](https://magpie.gosuda.org/history/crypto/keyless_tls) |
+| `//crypto/x402-facilitator` | `gosuda/x402-facilitator` | [Browse `//crypto/x402-facilitator`](https://magpie.gosuda.org/tree/crypto/x402-facilitator) | [Commits `//crypto/x402-facilitator`](https://magpie.gosuda.org/history/crypto/x402-facilitator) |
+| `//net/portal-tunnel` | `gosuda/portal-tunnel` | [Browse `//net/portal-tunnel`](https://magpie.gosuda.org/tree/net/portal-tunnel) | [Commits `//net/portal-tunnel`](https://magpie.gosuda.org/history/net/portal-tunnel) |
+| `//devtools/potly` | `gosuda/potly` | [Browse `//devtools/potly`](https://magpie.gosuda.org/tree/devtools/potly) | [Commits `//devtools/potly`](https://magpie.gosuda.org/history/devtools/potly) |
+| `//net/autoirc2p` | `gosuda/AutoIRC2P` | [Browse `//net/autoirc2p`](https://magpie.gosuda.org/tree/net/autoirc2p) | [Commits `//net/autoirc2p`](https://magpie.gosuda.org/history/net/autoirc2p) |
+| `//net/portal-multiplatform-sdk` | `gosuda/portal-multiplatform-sdk` | [Browse `//net/portal-multiplatform-sdk`](https://magpie.gosuda.org/tree/net/portal-multiplatform-sdk) | [Commits `//net/portal-multiplatform-sdk`](https://magpie.gosuda.org/history/net/portal-multiplatform-sdk) |
 <!-- SUDA_EXPLORER_END -->
 
 ## 2. Reference Namespace Map

@@ -10,6 +10,12 @@ PILOT_REPOS = [
     ("securl", "web/securl", "gosuda/securl", False),
     ("portalite", "net/portalite", "gosuda/portalite", False, "master"),
     ("azure-magpie", "devtools/azure-magpie", "gosuda/azure-magpie", False),
+    ("keyless_tls", "crypto/keyless_tls", "gosuda/keyless_tls", False),
+    ("x402-facilitator", "crypto/x402-facilitator", "gosuda/x402-facilitator", False),
+    ("portal-tunnel", "net/portal-tunnel", "gosuda/portal-tunnel", False),
+    ("potly", "devtools/potly", "gosuda/potly", False),
+    ("AutoIRC2P", "net/autoirc2p", "gosuda/AutoIRC2P", False),
+    ("portal-multiplatform-sdk", "net/portal-multiplatform-sdk", "gosuda/portal-multiplatform-sdk", False),
 ]
 
 # Entries are (name, monorepo prefix, mirror repo, strip_replaces[, branch]); branch defaults to "main".
