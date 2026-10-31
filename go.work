@@ -1,5 +1,4 @@
 go 1.27.3
-
 toolchain go1.27.3
 
 use (
@@ -18,6 +17,7 @@ use (
 	./net/ivnp
 	./net/portal-tunnel
 	./net/portalite
+	./net/zeroproxy
 	./storage/supersql
 	./web/gosuda
 	./web/securl

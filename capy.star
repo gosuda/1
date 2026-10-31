@@ -20,6 +20,7 @@ PILOT_REPOS = [
     ("jimin", "ai/jimin", "gosuda/jimin", False),
     ("telemetry.gosuda.org", "web/telemetry", "gosuda/telemetry.gosuda.org", False),
     ("supersql", "storage/supersql", "gosuda/supersql-alpha", False),
+    ("zeroproxy", "net/zeroproxy", "gosuda/zeroproxy", False),
 ]
 
 # Entries are (name, monorepo prefix, mirror repo, strip_replaces[, branch]); branch defaults to "main".
