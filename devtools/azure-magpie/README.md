@@ -17,6 +17,7 @@
 | `/blame/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/blame/<suda-history-sha>/<path>` |
 | `/diff/ws/<actor>/<id>` | `GET` | Resolves `refs/suda/main` and `refs/ws/<actor>/<id>`, then redirects (`302`) to the two-dot GitHub comparison URL on `gosuda/1` (which carries a copy of the trunk refs) |
 | `/diff/<base>..<head>` | `GET` | Resolves `<base>` and `<head>` to commit SHAs and redirects (`302`) to `https://github.com/gosuda/1/compare/<base-sha>..<head-sha>` (append `?format=json` for JSON metadata) |
+| (hidden refs) | any | References with a path segment `sec` or starting `sec-` (embargoed security work, `docs/security-embargo.md`) are never listed and every route answers `404` for them without contacting GitHub |
 | `/api/refs` | `GET` | Returns JSON containing `suda/main`, `suda/history`, active `refs/ws/*` and `refs/heads/land/*` tips, and mounted `google3` projects |
 | `/refs.json` or `/sha` | `GET` | Returns JSON containing `repo`, `suda/main`, and `suda/history` commit SHAs |
 | `/webhook` | `POST` | Validates `X-Hub-Signature-256` (`WEBHOOK_SECRET`), invalidates cached refs, and POSTs a wake signal to the lander (`LANDER_WAKE_URL`, signed with `LANDER_WAKE_SECRET`). The GitHub payload is not forwarded: the lander re-derives all work from repository state and also polls, so a missed wake only delays the next cycle |

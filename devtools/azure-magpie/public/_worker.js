@@ -1,5 +1,8 @@
 // src/worker.ts
 var USER_AGENT = "azure-winged-magpie-worker";
+function isHiddenRef(ref) {
+  return ref.split("/").filter((seg) => seg !== "").some((seg) => seg === "sec" || seg.startsWith("sec-"));
+}
 var DEFAULT_REPO = "gosuda/1";
 var STATIC_UI_PATHS = new Set(["/", "/index.html", "/styles.css", "/app.js", "/favicon.ico"]);
 var MOUNTED_PROJECTS = [
@@ -53,7 +56,7 @@ var worker_default = {
         });
       }
       if (url.pathname === "/diff" || url.pathname === "/diff/" || url.pathname.startsWith("/diff/") || url.pathname.startsWith("/compare/")) {
-        return handleDiffRequest(request, url, env, repo, refs);
+        return await handleDiffRequest(request, url, env, repo, refs);
       }
       if (url.pathname.startsWith("/commit/")) {
         const refSpec = decodeURIComponent(url.pathname.slice("/commit/".length));
@@ -178,6 +181,9 @@ async function handleDiffRequest(request, url, env, repo, refs) {
 }
 async function resolveRefSha(env, repo, refSpec, refs) {
   const cleaned = refSpec.replace(/^\/+|\/+$/g, "");
+  if (isHiddenRef(cleaned)) {
+    throw new Error(`ref '${refSpec}' not found`);
+  }
   if (cleaned === "suda/main" || cleaned === "refs/suda/main" || cleaned === "main") {
     return refs.mainSha;
   }
@@ -224,7 +230,7 @@ async function listActiveWorkspaceRefs(env, repo) {
     }
     const items = await resp.json();
     for (const item of items) {
-      if (item.ref && item.object?.sha) {
+      if (item.ref && item.object?.sha && !isHiddenRef(item.ref)) {
         const label = item.ref.replace(/^refs\/(heads\/)?/, "");
         results.push({ ref: item.ref, label, sha: item.object.sha });
       }
@@ -529,6 +535,7 @@ function base64UrlEncodeBytes(bytes) {
 export {
   buildRedirectLocation,
   worker_default as default,
+  isHiddenRef,
   parseDiffSpec,
   resolveRefSha
 };

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import worker, { buildRedirectLocation, parseDiffSpec } from "./worker";
+import worker, { buildRedirectLocation, isHiddenRef, parseDiffSpec } from "./worker";
 
 const SAMPLE_REFS = {
   mainSha: "7444de65a57c4604e430e202f6754c0a0408b7ed",
@@ -373,6 +373,76 @@ describe("worker.fetch", () => {
         `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/api/land`,
       );
       expect(calls.filter((c) => c.includes("/dispatches") || c.startsWith("POST"))).toEqual([]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+describe("embargoed references", () => {
+  test("isHiddenRef matches any segment that is sec or starts with sec-", () => {
+    for (const ref of [
+      "refs/ws/alice/sec/sec-202610-0a1b2c3d",
+      "ws/alice/sec/anything",
+      "heads/review/sec-202610-0a1b2c3d",
+      "refs/heads/base/sec-x",
+      "land/sec-202610-0a1b2c3d",
+    ]) {
+      expect(isHiddenRef(ref)).toBe(true);
+    }
+    for (const ref of ["ws/alice/security-docs", "ws/alice/second-try", "heads/land/fix-header", "suda/main", "ws/capy/HQQ-pr-12"]) {
+      expect(isHiddenRef(ref)).toBe(false);
+    }
+  });
+
+  test("never lists embargoed workspaces and answers not found for them, without revealing existence", async () => {
+    const shaA = "1111222233334444555566667777888899990000";
+    const shaS = "aaaabbbbccccddddeeeeffff0000111122223333";
+    const origFetch = globalThis.fetch;
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.endsWith("/git/matching-refs/suda/")) {
+        return new Response(
+          JSON.stringify([
+            { ref: "refs/suda/main", object: { sha: SAMPLE_REFS.mainSha } },
+            { ref: "refs/suda/history", object: { sha: SAMPLE_REFS.historySha } },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith("/git/matching-refs/ws/")) {
+        return new Response(
+          JSON.stringify([
+            { ref: "refs/ws/alice/fix-header", object: { sha: shaA } },
+            { ref: "refs/ws/alice/sec/sec-202610-0a1b2c3d", object: { sha: shaS } },
+          ]),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith("/git/matching-refs/heads/review/")) {
+        return new Response(JSON.stringify([{ ref: "refs/heads/review/sec-202610-0a1b2c3d", object: { sha: shaS } }]), { status: 200 });
+      }
+      if (url.includes("/git/ref/")) {
+        return new Response(JSON.stringify({ object: { sha: shaS } }), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const env = { GITHUB_TOKEN: "t", CACHE_TTL_SECONDS: "0" };
+      const api = await worker.fetch(new Request("https://0.gosuda.org/api/refs"), env);
+      const body = (await api.json()) as { workspaces: Array<{ ref: string }> };
+      expect(body.workspaces.map((w) => w.ref)).toEqual(["refs/ws/alice/fix-header"]);
+      expect(JSON.stringify(body)).not.toContain("sec-");
+
+      for (const path of ["/diff/ws/alice/sec/sec-202610-0a1b2c3d", "/diff/review/sec-202610-0a1b2c3d", "/commit/ws/alice/sec/sec-202610-0a1b2c3d"]) {
+        urls.length = 0;
+        const res = await worker.fetch(new Request(`https://0.gosuda.org${path}?format=json`), env);
+        expect(res.status).toBe(404);
+        // A hidden name is rejected before any GitHub lookup of that name.
+        expect(urls.some((u) => u.includes("sec-202610"))).toBe(false);
+      }
     } finally {
       globalThis.fetch = origFetch;
     }

@@ -42,6 +42,16 @@ interface CachedAppToken {
 
 const USER_AGENT = "azure-winged-magpie-worker";
 
+// Embargoed security work (docs/security-embargo.md) lives under opaque reference names in which a
+// path segment is "sec" or starts with "sec-". Magpie is public: it never lists such references and
+// answers "not found" for them, so their existence is not disclosed.
+export function isHiddenRef(ref: string): boolean {
+  return ref
+    .split("/")
+    .filter((seg) => seg !== "")
+    .some((seg) => seg === "sec" || seg.startsWith("sec-"));
+}
+
 // Everything magpie links to or reads lives in the user repository: it carries the workspaces and
 // landing requests and a copy of refs/suda/{main,history} (kept current by the lander), so
 // redirects never depend on read access to the trunk repository.
@@ -114,7 +124,7 @@ export default {
         url.pathname.startsWith("/diff/") ||
         url.pathname.startsWith("/compare/")
       ) {
-        return handleDiffRequest(request, url, env, repo, refs);
+        return await handleDiffRequest(request, url, env, repo, refs);
       }
 
       if (url.pathname.startsWith("/commit/")) {
@@ -278,6 +288,9 @@ export async function resolveRefSha(
   refs: SudaRefs,
 ): Promise<string> {
   const cleaned = refSpec.replace(/^\/+|\/+$/g, "");
+  if (isHiddenRef(cleaned)) {
+    throw new Error(`ref '${refSpec}' not found`);
+  }
   if (cleaned === "suda/main" || cleaned === "refs/suda/main" || cleaned === "main") {
     return refs.mainSha;
   }
@@ -332,7 +345,7 @@ async function listActiveWorkspaceRefs(
     }
     const items = (await resp.json()) as Array<{ ref: string; object?: { sha?: string } }>;
     for (const item of items) {
-      if (item.ref && item.object?.sha) {
+      if (item.ref && item.object?.sha && !isHiddenRef(item.ref)) {
         const label = item.ref.replace(/^refs\/(heads\/)?/, "");
         results.push({ ref: item.ref, label, sha: item.object.sha });
       }
