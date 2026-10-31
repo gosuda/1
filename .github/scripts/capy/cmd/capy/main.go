@@ -60,6 +60,24 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "check-replaces":
+		fs := flag.NewFlagSet("check-replaces", flag.ExitOnError)
+		repoDir := fs.String("repo", ".", "path to git repository")
+		baseTreeOID := fs.String("base-tree", "", "optional base tree-ish to diff against")
+		treeOID := fs.String("tree", "HEAD", "tree-ish to inspect")
+		_ = fs.Parse(args)
+
+		violations, err := capy.CheckLocalReplaces(ctx, *repoDir, *baseTreeOID, *treeOID)
+		if err != nil {
+			fatal(err)
+		}
+		if len(violations) > 0 {
+			for _, v := range violations {
+				fmt.Fprintln(os.Stderr, v)
+			}
+			os.Exit(1)
+		}
+
 	case "check-owners":
 		fs := flag.NewFlagSet("check-owners", flag.ExitOnError)
 		repoDir := fs.String("repo", ".", "path to git repository")
@@ -192,7 +210,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: capy <list|check-visibility|check-owners|export-tree|import-tree|format-msg> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: capy <list|check-visibility|check-replaces|check-owners|export-tree|import-tree|format-msg> [flags]")
 }
 
 func fatal(err error) {

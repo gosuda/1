@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Creates a project in the current workspace branch as one local commit: <prefix>/README.md,
 # <prefix>/OWNERS, <prefix>/go.mod, the capy.star PILOT_REPOS entry, and the docs/README.md
-# explorer row. Never pushes. Run `git ws-save` and `git ws-land` afterwards.
+# explorer row, plus a second commit adding the module to the root go.work. corp/ and experimental/
+# prefixes get no capy.star entry and no explorer row. Never pushes. Run `git ws-save` and `git ws-land` afterwards.
 #
 # Usage: create-repo.sh <prefix> <owner/repo> [go-module-path]
 #   <prefix>      google3 path under a known domain, e.g. net/relaysrv
@@ -35,5 +36,7 @@ ws_write_new "$PREFIX/OWNERS" "@$OWNER"
 ws_write_new "$PREFIX/go.mod" "$(printf 'module %s\n\ngo 1.27.0' "$MOD_PATH")"
 
 if ws_commit "$PREFIX" "feat($PREFIX): initialize project //$PREFIX ($REPO)"; then
-  ws_next_steps "$REPO"
+  # The new module joins the root go.work in its own commit (the root go.work is never exported).
+  [ ! -f go.work ] || "$SCRIPT_DIR/go-work-add.sh" "$PREFIX"
+  ws_next_steps "$REPO" "$PREFIX"
 fi

@@ -51,6 +51,14 @@ Keep each project's `.github/workflows/` directory inside its project folder (fo
 
 An edit made directly in a mirror's `.github/workflows/` is an inbound change. It lands only when the mirror pusher owns the prefix and is otherwise staged for a member.
 
+### 2.3 Go Module Layout Rules
+
+1. A committed `go.mod` never contains a local `replace` directive that leaves the module directory (`replace x => ../y`). The lander rejects a landing that adds one. Sibling modules resolve locally through the root `go.work`, which the lander never exports to a mirror.
+2. A `require` of another monorepo module names a published version. Presubmit and the standalone mirror both build against it; the root `go.work` substitutes the local code during monorepo development and presubmit.
+3. Add every new Go module (nested modules included) to the root `go.work` with `.github/scripts/go-work-add.sh <prefix>` in a separate commit. A module that does not compile against the local trunk code of its dependencies stays out of `go.work` until its `require` is updated; presubmit builds it with `GOWORK=off`. A `go.work` `replace` may point an internal version that was never published at its local directory.
+4. Import an external repository as an unmodified copy (`import-repo.sh`) so that the mirror tip equals the export of the trunk prefix and no export commit is needed. Remove a repository's prebuilt binaries and other large files in the source repository before importing it, and make go.mod and `go.work` cleanups in a second commit.
+5. `//corp/*` projects are never mirrored: `import-repo.sh` and `create-repo.sh` skip the `capy.star` entry and the explorer row for `corp/` and `experimental/` prefixes.
+
 ## 3. Mounted Repository Directory Map
 
 Table 2 maps the mounted repositories to their exact paths inside `refs/suda/main`.
@@ -66,6 +74,16 @@ Table 2 maps the mounted repositories to their exact paths inside `refs/suda/mai
 | `gosuda/hqq-sqlite3` | `ipc/hqq/hqq-sqlite3` | `gosuda.org/sqlite3` |
 | `gosuda/hqq-zstd` | `ipc/hqq/hqq-zstd` | `gosuda.org/zstd` |
 | `gosuda/azure-magpie` | `devtools/azure-magpie` | `azure-winged-magpie` |
+| `gosuda/keyless_tls` | `crypto/keyless_tls` | `github.com/gosuda/keyless_tls` |
+| `gosuda/x402-facilitator` | `crypto/x402-facilitator` | `github.com/gosuda/x402-facilitator` (nested modules `/cmd` and `/scheme/evm`) |
+| `gosuda/portal-tunnel` | `net/portal-tunnel` | `github.com/gosuda/portal-tunnel/v2` |
+| `gosuda/potly` | `devtools/potly` | `potly` |
+| `gosuda/AutoIRC2P` | `net/autoirc2p` | `github.com/gosuda/AutoIRC2P` |
+| `gosuda/portal-multiplatform-sdk` | `net/portal-multiplatform-sdk` | `github.com/gosuda/portal-multiplatform-sdk/native/bridge` |
+| `gosuda/randflake` | `crypto/randflake` | `gosuda.org/randflake/v2` |
+| `gosuda/jimin` | `ai/jimin` | `gosuda.org/jimin` |
+| `gosuda/telemetry.gosuda.org` | `web/telemetry` | `telemetry.gosuda.org/telemetry` |
+| `gosuda/rivulet` (private, not mirrored) | `corp/rivulet` | `github.com/gosuda/rivulet` |
 
 ## 4. Internal and External Contribution Processes
 

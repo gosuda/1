@@ -81,6 +81,8 @@ Every change in `gosuda/0` obeys six structural invariants:
 5. **Hierarchical `OWNERS` and Authenticated Identity**: `capy check-owners` reads `OWNERS` files from the base trunk tree. Identities come only from GitHub: the pusher reported by the repository activity API, approvals bound to the exact tip, and organization team membership. Commit author and trailers never grant approval. A path under `//experimental/<actor>/*` is approved for a requester whose login is `<actor>`, without an `OWNERS` entry. Any other requester needs the `OWNERS` chain.
 6. **In-Memory Atomic Landing**: The lander computes the merged tree with `git merge-tree --write-tree`, runs the visibility, `OWNERS`, and presubmit checks, and publishes the result in one `--atomic` push. Every updated reference has a lease, so a trunk ref that moved after evaluation makes the push fail instead of being overwritten.
 
+**Go module convention**: committed `go.mod` files carry no local `replace` (the lander rejects `replace x => ../y`), internal `require`s name published versions, and the root `go.work` resolves sibling modules to local code for development and presubmit. `.github/scripts/go-work-add.sh <prefix>` adds a project's modules to it; see `AGENTS.md` §2.3.
+
 ## 5. Contribution, Review, and Experimental Workflows
 
 1. **Direct Workspace Review and Landing (`refs/ws/*`)**:

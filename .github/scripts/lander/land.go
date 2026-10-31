@@ -298,6 +298,11 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	} else if len(v) > 0 {
 		return reject("visibility: %s", summarize(v))
 	}
+	if v, err := capy.CheckLocalReplaces(ctx, s.Dir, mainTree, newTree); err != nil {
+		return Result{}, false, err
+	} else if len(v) > 0 {
+		return reject("go.mod: %s", summarize(v))
+	}
 	id := capy.Identity{Requester: req.Requester, Approvers: req.Approvers}
 	if v, err := capy.CheckOwners(ctx, s.Dir, mainTree, newTree, id, l.Forge.TeamResolver(ctx)); err != nil {
 		return Result{}, false, err

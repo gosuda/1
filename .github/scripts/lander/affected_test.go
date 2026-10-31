@@ -186,6 +186,9 @@ replace (
 	if f.module != "example.com/m" {
 		t.Fatalf("module = %q", f.module)
 	}
+	if f.goVersion != "1.21" {
+		t.Fatalf("goVersion = %q", f.goVersion)
+	}
 	if !slices.Equal(f.requires, []string{"example.com/a"}) {
 		t.Fatalf("requires = %q", f.requires)
 	}
@@ -200,6 +203,37 @@ replace (
 	}
 	if _, err := parseGoMod("go 1.21\n"); err == nil {
 		t.Fatal("go.mod without module directive was accepted")
+	}
+}
+
+func TestAffectedParseGoWork(t *testing.T) {
+	w := parseGoWork("go 1.25 // trunk\n\nuse (\n\t./a // member\n\t\"./b c\"\n)\nuse ./d\n\n" +
+		"replace github.com/x v1 => ./e\n" +
+		"replace (\n\tgithub.com/y => ../f // local\n\tgithub.com/z => example.com/z v1.0.0\n)\n")
+	if w.goVersion != "1.25" {
+		t.Fatalf("goVersion = %q", w.goVersion)
+	}
+	if want := []string{"a", "b c", "d"}; len(w.uses) != len(want) {
+		t.Fatalf("uses = %v, want %q", w.uses, want)
+	} else {
+		for _, d := range want {
+			if !w.uses[d] {
+				t.Fatalf("uses = %v, lacks %q", w.uses, d)
+			}
+		}
+	}
+	got := map[string]string{}
+	for _, r := range w.replaces {
+		got[r.text] = r.target
+	}
+	want := map[string]string{"github.com/x v1 => ./e": "./e", "github.com/y => ../f": "../f"}
+	if len(got) != len(want) {
+		t.Fatalf("replaces = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("replaces[%q] = %q, want %q", k, got[k], v)
+		}
 	}
 }
 

@@ -136,7 +136,7 @@ Each landing request is one `refs/heads/land/<id>` in `gosuda/1`. The lander pro
 3. **Merge**: When the trunk tree differs from the base, the lander runs `git merge-tree --write-tree --name-only --merge-base=<base tree> <trunk tree> <request tree>`. A conflict rejects the request and lists the conflicting paths.
 4. **Visibility**: The lander runs the visibility check of Section 3.3 on the changed files. A violation rejects the request.
 5. **OWNERS**: The lander checks the change against the `OWNERS` files of the trunk tree, using the requester and approvers from step 1 ([AGENTS.md](../AGENTS.md) §2.1). A missing approval rejects the request.
-6. **Presubmit**: The lander runs the tests of the affected projects in a sandbox ([tooling.md](./tooling.md) §3). A failure rejects the request with the presubmit summary.
+6. **Presubmit**: The lander runs the tests of the affected projects in a sandbox ([tooling.md](./tooling.md) §3). Go modules listed in the trunk's `go.work` are tested together in one generated workspace against the local code of their internal dependencies; other Go modules run with `GOWORK=off`. A failure rejects the request with the presubmit summary.
 7. **Commit and publish**: The lander creates the snapshot commit (parentless) and the history commit (parent `refs/suda/history`) for the new tree. Both copy the author and date of the request tip and carry these trailers:
    - `Suda-Landed-From: refs/heads/land/<id>`
    - `Suda-Requester: <login>` and one `Suda-Approved-By: <login>` for each approver

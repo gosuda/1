@@ -48,6 +48,22 @@ nothing depends on events arriving. Durable state lives only in refs (including
   bound to the exact tip, org team membership). Commit author and trailers are informational.
 - Installation tokens are minted per repository and operation with narrowed permissions.
 
+## Presubmit Go modules
+
+Presubmit tests Go modules in the trunk's workspace (the root `go.work` of `refs/suda/main`) against the
+local code of their internal dependencies. The lander writes a `go.work` at the root of the staging
+directory. It lists the closure's Go modules that the trunk's `go.work` lists in `use`, nested modules
+included, under the highest `go` directive of the closure's `go.mod` files (then the trunk's, then `1.21`).
+Replace directives of the trunk whose local targets lie in the closure are carried over. The trunk's own
+`go.work` is never exported. The sandbox sets `GOWORK=/work/go.work`. The prepare step warms the module
+cache once for the workspace: `go list -e -m -json all`, then one `go mod download` that names the external
+modules, so internal modules are never fetched. Go modules that the trunk's `go.work` does not list are
+built on their own: their commands run with `GOWORK=off`, and their `go mod download` runs per module with
+`GOWORK=off`.
+
+Convention: a committed `go.mod` never contains a local `replace`; the root `go.work` resolves sibling
+modules; a `require` of an internal module names a published version.
+
 ## Layout
 
 The same layout builds in the control plane (`.github/scripts/lander`, `.github/scripts/capy`) and on

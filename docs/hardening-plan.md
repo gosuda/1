@@ -520,10 +520,19 @@ Table 13 lists what exists in the repository and how it was verified. "Tests" me
 3. Presubmit failures are reported through the `suda/land` status (`presubmit: FAILED: <dirs>`); no separate `suda/presubmit` status exists.
 4. Only REST calls retry with backoff. A failed `git push` waits for the next cycle, which re-derives the work.
 5. Not implemented: the `capy.star` `project(prefix, test=[...])` registry (Go projects use the built-in `go vet`/`go test`; other kinds run only when they declare tests the default command can find), the `gosuda/1` `refs/heads/main` stub, recording repository size in GC, and the daily collaborator and installation audit (Section 12, invariant 1).
-6. The sandbox runs with `GOWORK=off`. Modules that depend on siblings need `replace` directives (the HQQ modules have them).
+6. Presubmit tests the trunk workspace's Go modules in workspace mode: the sandbox sets `GOWORK=/work/go.work`, a `go.work` generated from the trunk's root `go.work`. Other Go modules run with `GOWORK=off`. Convention: a committed `go.mod` never contains a local `replace`; the root `go.work` resolves siblings; a `require` of an internal module names a published version.
 7. Gap in the affected set: dependents of a deleted Go module or directory are found only if their own files changed.
 8. npm `workspace:` dependencies are not resolved by the visibility check; `file:` and `link:` are.
 9. `.github/OWNERS` applies `set require-review` to the whole control plane, so every control-plane landing needs an owner other than the requester.
+
+### 15.2a Imported projects and Go module convention
+
+Ten repositories were imported as unmodified copies (the lander wrote each sync baseline without an export commit): `crypto/keyless_tls`, `crypto/x402-facilitator`, `net/portal-tunnel`, `devtools/potly`, `net/autoirc2p`, `net/portal-multiplatform-sdk`, `crypto/randflake`, `ai/jimin`, `web/telemetry`, and the private `corp/rivulet`, which has no `capy.star` entry and is never exported. Excluded on purpose: `portal-flutter-sdk`, `portal-toys`, and `flats` (owner decision, and committed prebuilt binaries up to 37 MB).
+
+1. Committed `go.mod` files carry no local `replace` (`capy check-replaces`, run on every landing). The root `go.work` resolves sibling modules; the HQQ trio was converted (`gosuda.org/hqq v0.7.0`; `v0.1.0` never existed).
+2. The root `go.work` also carries `replace` directives for internal versions that were never published (`x402-facilitator v0.0.5` and `scheme/evm v0.0.1`). The upstream repository relied on a nested `go.work` for them; a nested `go.work` shadows the root one inside its own directory.
+3. `devtools/potly` and `net/portal-multiplatform-sdk/native/bridge` pin `portal-tunnel/v2` v2.4.1 and v2.4.3 and do not compile against the trunk's `portal-tunnel`. They stay out of `go.work` and build with `GOWORK=off` until their callers move to the current `sdk.Expose` and `identity.LoadOrCreate` signatures.
+4. `corp/rivulet` does not compile at its imported commit (`lib/record/chain_definition.go`); `jimin`, `rivulet`, and `telemetry` require the published `gosuda.org/randflake` v1 module, not the local `randflake/v2`, so the workspace does not link them to local code.
 
 ### 15.3 Operator runbook
 

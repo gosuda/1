@@ -193,13 +193,16 @@ ws_commit() {
   echo "committed $(git rev-parse --short HEAD) on $(git symbolic-ref --short HEAD): $(git log -1 --format=%s)"
 }
 
-# ws_next_steps <owner/repo>: prints the submission steps and the mirror prerequisite.
+# ws_next_steps <owner/repo> <prefix>: prints the submission steps and the mirror prerequisite.
 ws_next_steps() {
+  printf '\nNext steps:\n  git ws-save\n  git ws-land\n'
+  case "${2%%/*}" in
+    corp | experimental)
+      printf '\n//%s is never exported, so no mirror repository is needed.\n' "$2"
+      return 0
+      ;;
+  esac
   cat <<EOF
-
-Next steps:
-  git ws-save
-  git ws-land
 
 The mirror repository $1 must exist and be writable by the suda-lander App before the first export.
 If it does not exist yet, an org owner creates it with:

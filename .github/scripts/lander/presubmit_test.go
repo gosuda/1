@@ -26,6 +26,7 @@ var runFixture = map[string]string{
 	"ipc/hqq/hqq-zstd/z.go":      "package zstd\n",
 	"net/grt/go.mod":             "module gosuda.org/0/net/grt\n\ngo 1.21\n",
 	"net/grt/grt.go":             "package grt\n",
+	"go.work":                    "go 1.21\n\nuse (\n\t./ipc/hqq/HQQ\n\t./ipc/hqq/hqq-sqlite3\n\t./ipc/hqq/hqq-zstd\n\t./net/grt\n)\n",
 }
 
 // fakeDocker writes a docker stand-in that appends each invocation's arguments to a log file. An
@@ -247,7 +248,8 @@ func TestPresubmitDefaultTestCommands(t *testing.T) {
 		n    *projectNode
 		want []string
 	}{
-		{"go", &projectNode{Project: Project{Kind: kindGo}}, []string{"go vet ./...", "go test ./..."}},
+		{"go in workspace", &projectNode{Project: Project{Kind: kindGo}, workspace: true}, []string{"go vet ./...", "go test ./..."}},
+		{"go outside workspace", &projectNode{Project: Project{Kind: kindGo}}, []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}},
 		{"cargo locked", &projectNode{Project: Project{Kind: kindCargo}, lock: true}, []string{"cargo test --offline --locked"}},
 		{"cargo unlocked", &projectNode{Project: Project{Kind: kindCargo}}, nil},
 		{"node tests", &projectNode{Project: Project{Kind: kindNode}, tests: true}, []string{"bun test"}},
@@ -266,7 +268,7 @@ func TestPresubmitDefaultTestCommands(t *testing.T) {
 
 func TestPresubmitPrepareFailureFailsProject(t *testing.T) {
 	s, tree := fixtureStore(t, map[string]string{
-		"bad/go.mod": "module example.com/bad\n\ngo 1.21\n\nrequire example.com/nothere v0.0.0\n\nreplace example.com/nothere => ../missing\n",
+		"bad/go.mod": "module example.com/bad\n\ngo 1.21\n\nrequire example.com/nothere\n",
 		"bad/bad.go": "package bad\n",
 	}, nil)
 	bin, logPath := fakeDocker(t, "", "")
@@ -303,7 +305,7 @@ func TestPresubmitSkipsMissingPrepareToolAndRecordsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Passed || !strings.Contains(res.Details, "skipped go mod download in net/grt: go not found") {
+	if !res.Passed || !strings.Contains(res.Details, "skipped go module warm-up: go not found") {
 		t.Fatalf("result = %+v\n%s", res, res.Details)
 	}
 }
@@ -438,9 +440,50 @@ exit 0`
 	}
 }
 
+// TestSandboxWorkspaceBuildsOffline runs the generated workspace in a real container under the sandbox's own
+// environment: the sibling resolves to its local source and the proxy stays off. It skips unless the docker
+// daemon is reachable and the sandbox image (LANDER_PRESUBMIT_IMAGE, default golang:1.27) is present locally.
+func TestSandboxWorkspaceBuildsOffline(t *testing.T) {
+	docker, err := exec.LookPath("docker")
+	if err != nil {
+		t.Skip("docker not installed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if err := exec.CommandContext(ctx, docker, "info").Run(); err != nil {
+		t.Skipf("docker daemon unavailable: %v", err)
+	}
+	image := os.Getenv("LANDER_PRESUBMIT_IMAGE")
+	if image == "" {
+		image = "golang:1.27"
+	}
+	if err := exec.CommandContext(ctx, docker, "image", "inspect", image).Run(); err != nil {
+		t.Skipf("image %s is not present locally (set LANDER_PRESUBMIT_IMAGE): %v", image, err)
+	}
+	dst := siblingStage(t)
+	cfg, err := (&DockerPresubmit{Image: image, Docker: docker, CacheDir: t.TempDir()}).config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(cfg.CacheDir, "gomod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name, err := sandboxName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := Project{Dir: "app", Kind: kindGo}
+	args := sandboxArgs(cfg, name, dst, cfg.CacheDir, p, containerScript(p, []string{"go vet ./...", "go test ./..."}))
+	cmd := exec.CommandContext(ctx, docker, args...)
+	cmd.Env = inheritedEnv(dockerEnvNames)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sandbox workspace run failed: %v\n%s", err, out)
+	}
+}
+
 func TestTarExportCoversClosureOnly(t *testing.T) {
 	s, tree := fixtureStore(t, map[string]string{
-		"go.work":                 "go 1.21\n",
+		"go.work":                 "go 1.21\n\nuse (\n\t./ipc/hqq/HQQ\n\t./ipc/hqq/hqq-zstd\n)\n",
 		"ipc/hqq/HQQ/go.mod":      "module gosuda.org/hqq\n\ngo 1.21\n",
 		"ipc/hqq/HQQ/hqq.go":      "package hqq\n",
 		"ipc/hqq/hqq-zstd/go.mod": "module gosuda.org/hqq/hqq-zstd\n\ngo 1.21\n",
@@ -457,10 +500,14 @@ func TestTarExportCoversClosureOnly(t *testing.T) {
 	if err := exportProjects(ctx, s, tree, g, closure, dst); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{"go.work", "ipc/hqq/HQQ/hqq.go", "ipc/hqq/HQQ/go.mod"} {
+	for _, p := range []string{"ipc/hqq/HQQ/hqq.go", "ipc/hqq/HQQ/go.mod"} {
 		if _, err := os.Stat(filepath.Join(dst, p)); err != nil {
 			t.Fatalf("export lacks %s: %v", p, err)
 		}
+	}
+	// The trunk's go.work is never exported; the generated one names the closure's workspace modules only.
+	if got, err := os.ReadFile(filepath.Join(dst, "go.work")); err != nil || string(got) != "go 1.21\n\nuse (\n\t./ipc/hqq/HQQ\n)\n" {
+		t.Fatalf("go.work = %q, %v", got, err)
 	}
 	if target, err := os.Readlink(filepath.Join(dst, "ipc/hqq/HQQ/hqq-link.go")); err != nil || target != "hqq.go" {
 		t.Fatalf("symlink not exported as a symlink: %q %v", target, err)
@@ -570,6 +617,350 @@ func tarOf(t *testing.T, items ...tarItem) io.Reader {
 		t.Fatal(err)
 	}
 	return &buf
+}
+
+// stagedClosure exports the closure of the changed paths from tree into a fresh directory, as Run does,
+// and returns it with symlinks resolved: go compares its working directory with GOWORK textually.
+func stagedClosure(t *testing.T, s *Store, tree string, changed ...string) string {
+	t.Helper()
+	ctx := context.Background()
+	g, err := loadProjects(ctx, s, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := t.TempDir()
+	if err := exportProjects(ctx, s, tree, g, g.closure(g.affected(changed)), dst); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+// readGoWork returns the go.work written at the root of a staged directory.
+func readGoWork(t *testing.T, dst string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dst, goWorkName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// goCommand runs the go tool in dir with the proxy off and fresh caches. gowork is the GOWORK value: a
+// go.work path, or "off".
+func goCommand(t *testing.T, dir, gowork string, args ...string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command("go", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GOWORK="+gowork,
+		"GOPROXY=off",
+		"GOFLAGS=-mod=readonly",
+		"GOTOOLCHAIN=local",
+		"GOENV=off",
+		"GOMODCACHE="+filepath.Join(t.TempDir(), "mod"),
+		"GOCACHE="+t.TempDir(),
+	)
+	return cmd.CombinedOutput()
+}
+
+// workspaceFixture has a trunk workspace of two modules and a Go module that the trunk's go.work does not
+// list. That module is tested on its own, with GOWORK=off.
+var workspaceFixture = map[string]string{
+	"go.work":               "go 1.22\n\nuse (\n\t./app\n\t./lib\n)\n",
+	"app/go.mod":            "module example.org/app\n\ngo 1.21\n\nrequire example.org/lib v0.0.0\n",
+	"app/app.go":            "package app\n",
+	"lib/go.mod":            "module example.org/lib\n\ngo 1.21\n",
+	"lib/lib.go":            "package lib\n",
+	"devtools/potly/go.mod": "module example.org/potly\n\ngo 1.20\n",
+	"devtools/potly/p.go":   "package potly\n",
+}
+
+func TestGoWorkListsClosureModulesSorted(t *testing.T) {
+	s, tree := fixtureStore(t, map[string]string{
+		"go.work":          "go 1.22\n\nuse (\n\t./lib\n\t./app/inner\n\t./app\n)\n",
+		"app/go.mod":       "module example.org/app\n\ngo 1.22\n\nrequire (\n\texample.org/lib v0.0.0\n\texample.org/app/inner v0.0.0\n)\n",
+		"app/main.go":      "package main\n",
+		"app/inner/go.mod": "module example.org/app/inner\n\ngo 1.23\n",
+		"app/inner/in.go":  "package inner\n",
+		"lib/go.mod":       "module example.org/lib\n\ngo 1.21\n",
+		"lib/lib.go":       "package lib\n",
+		"unused/go.mod":    "module example.org/unused\n\ngo 1.21\n",
+		"web/package.json": `{"name":"web","scripts":{"test":"bun test"}}`,
+		"web/index.ts":     "export {}\n",
+	}, nil)
+	dst := stagedClosure(t, s, tree, "lib/lib.go", "web/index.ts")
+	want := "go 1.23\n\nuse (\n\t./app\n\t./app/inner\n\t./lib\n)\n"
+	if got := readGoWork(t, dst); got != want {
+		t.Fatalf("go.work = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "unused")); !os.IsNotExist(err) {
+		t.Fatalf("unaffected project exported: %v", err)
+	}
+	if got := readGoWork(t, stagedClosure(t, s, tree, "web/index.ts", "lib/lib.go")); got != want {
+		t.Fatalf("go.work differs between runs: %q", got)
+	}
+}
+
+func TestGoWorkWholeTreeReplacesTrunkFile(t *testing.T) {
+	s, tree := fixtureStore(t, map[string]string{
+		"go.work":      "go 1.25\n\nuse (\n\t.\n\t./other\n)\n",
+		"go.mod":       "module example.org/root\n\ngo 1.22\n",
+		"root.go":      "package root\n",
+		"other/go.mod": "module example.org/other\n\ngo 1.21\n",
+		"other/o.go":   "package other\n",
+	}, nil)
+	dst := stagedClosure(t, s, tree, "root.go")
+	if want := "go 1.22\n\nuse (\n\t.\n)\n"; readGoWork(t, dst) != want {
+		t.Fatalf("go.work = %q, want %q", readGoWork(t, dst), want)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "go.mod")); err != nil {
+		t.Fatalf("root go.mod not exported: %v", err)
+	}
+}
+
+func TestGoWorkVersionFallback(t *testing.T) {
+	cases := []struct {
+		name  string
+		files map[string]string
+		want  string
+	}{
+		{
+			name: "trunk go.work",
+			files: map[string]string{
+				"go.work":    "go 1.24\n\nuse (\n\t./lib\n)\n",
+				"lib/go.mod": "module example.org/lib\n",
+				"lib/lib.go": "package lib\n",
+			},
+			want: "go 1.24\n\nuse (\n\t./lib\n)\n",
+		},
+		{
+			name:  "default",
+			files: map[string]string{"lib/go.mod": "module example.org/lib\n", "lib/lib.go": "package lib\n"},
+			want:  "go 1.21\n\nuse (\n)\n",
+		},
+	}
+	for _, c := range cases {
+		s, tree := fixtureStore(t, c.files, nil)
+		if got := readGoWork(t, stagedClosure(t, s, tree, "lib/lib.go")); got != c.want {
+			t.Fatalf("%s: go.work = %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	s, tree := fixtureStore(t, map[string]string{
+		"lib/go.mod": "module example.org/lib\n\ngo banana\n",
+		"lib/lib.go": "package lib\n",
+	}, nil)
+	ctx := context.Background()
+	g, err := loadProjects(ctx, s, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = exportProjects(ctx, s, tree, g, g.closure(g.affected([]string{"lib/lib.go"})), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "invalid go version") {
+		t.Fatalf("invalid go directive accepted: %v", err)
+	}
+}
+
+func TestGoWorkRenderSortsAndQuotes(t *testing.T) {
+	got := renderGoWork("1.22", []string{"a b", ".", "a"}, []string{"b => ./x", "a v1 => ./y"})
+	want := "go 1.22\n\nuse (\n\t.\n\t./a\n\t\"./a b\"\n)\n\nreplace (\n\ta v1 => ./y\n\tb => ./x\n)\n"
+	if got != want {
+		t.Fatalf("renderGoWork = %q, want %q", got, want)
+	}
+	if got := renderGoWork("1.21", nil, nil); got != "go 1.21\n\nuse (\n)\n" {
+		t.Fatalf("empty workspace = %q", got)
+	}
+}
+
+// TestGoWorkCarriesTrunkReplacesIntoClosure checks the trunk's replace directives: those whose local target
+// lies in the closure are carried over in both forms, the others are dropped. The layout mirrors a nested
+// module that a sibling requires at an unpublished version. With Go installed, the generated workspace must
+// also build offline.
+func TestGoWorkCarriesTrunkReplacesIntoClosure(t *testing.T) {
+	s, tree := fixtureStore(t, map[string]string{
+		"go.work": "go 1.25\n\nuse (\n\t./app\n\t./crypto/x402-facilitator\n\t./crypto/x402-facilitator/scheme/evm\n\t./other\n)\n\n" +
+			"replace github.com/gosuda/x402-facilitator v0.0.5 => ./crypto/x402-facilitator\n" +
+			"replace (\n" +
+			"\tgithub.com/gosuda/x402-facilitator/scheme/evm v0.0.1 => ./crypto/x402-facilitator/scheme/evm // local\n" +
+			"\texample.com/outside v1.0.0 => ./other\n" +
+			"\texample.com/fork v1.2.3 => example.com/forked v1.2.4\n" +
+			")\n",
+		"app/go.mod":                                "module example.org/app\n\ngo 1.21\n\nrequire github.com/gosuda/x402-facilitator v0.0.5\n",
+		"app/main.go":                               "package main\n\nimport \"github.com/gosuda/x402-facilitator\"\n\nfunc main() { println(x402.Name()) }\n",
+		"crypto/x402-facilitator/go.mod":            "module github.com/gosuda/x402-facilitator\n\ngo 1.22\n\nrequire github.com/gosuda/x402-facilitator/scheme/evm v0.0.1\n",
+		"crypto/x402-facilitator/x402.go":           "package x402\n\nimport \"github.com/gosuda/x402-facilitator/scheme/evm\"\n\nfunc Name() string { return evm.Name() }\n",
+		"crypto/x402-facilitator/scheme/evm/go.mod": "module github.com/gosuda/x402-facilitator/scheme/evm\n\ngo 1.23\n",
+		"crypto/x402-facilitator/scheme/evm/evm.go": "package evm\n\nfunc Name() string { return \"evm\" }\n",
+		"other/go.mod":                              "module example.org/other\n\ngo 1.21\n",
+	}, nil)
+	dst := stagedClosure(t, s, tree, "crypto/x402-facilitator/scheme/evm/evm.go")
+	want := "go 1.23\n\nuse (\n\t./app\n\t./crypto/x402-facilitator\n\t./crypto/x402-facilitator/scheme/evm\n)\n\n" +
+		"replace (\n" +
+		"\tgithub.com/gosuda/x402-facilitator v0.0.5 => ./crypto/x402-facilitator\n" +
+		"\tgithub.com/gosuda/x402-facilitator/scheme/evm v0.0.1 => ./crypto/x402-facilitator/scheme/evm\n" +
+		")\n"
+	if got := readGoWork(t, dst); got != want {
+		t.Fatalf("go.work = %q, want %q", got, want)
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		return
+	}
+	if out, err := goCommand(t, filepath.Join(dst, "app"), filepath.Join(dst, goWorkName), "build", "./..."); err != nil {
+		t.Fatalf("workspace with carried replaces does not build: %v\n%s", err, out)
+	}
+}
+
+// TestGoWorkModulesOutsideTrunkUseRunWithoutWorkspace checks membership: modules listed in the trunk's go.work
+// are in the generated workspace and get the workspace; a closure module it does not list gets GOWORK=off
+// commands and a standalone prepare step.
+func TestGoWorkModulesOutsideTrunkUseRunWithoutWorkspace(t *testing.T) {
+	s, tree := fixtureStore(t, workspaceFixture, nil)
+	ctx := context.Background()
+	g, err := loadProjects(ctx, s, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closure := g.closure(g.affected([]string{"lib/lib.go", "devtools/potly/p.go"}))
+	if got, err := goWorkFile(g, closure); err != nil || got != "go 1.21\n\nuse (\n\t./app\n\t./lib\n)\n" {
+		t.Fatalf("goWorkFile = %q, %v", got, err)
+	}
+	for dir, inWorkspace := range map[string]bool{"app": true, "lib": true, "devtools/potly": false} {
+		if n := g.nodes[kindGo+":"+dir]; n == nil || n.workspace != inWorkspace {
+			t.Fatalf("%s: workspace = %v, want %v", dir, n != nil && n.workspace, inWorkspace)
+		}
+	}
+	cfg := DockerPresubmit{}
+	if got := cfg.testCommands(g.nodes["go:devtools/potly"]); !slices.Equal(got, []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}) {
+		t.Fatalf("potly commands = %q", got)
+	}
+	if got := cfg.testCommands(g.nodes["go:lib"]); !slices.Equal(got, []string{"go vet ./...", "go test ./..."}) {
+		t.Fatalf("lib commands = %q", got)
+	}
+	spec, skip := cfg.prepareSpecFor(g, g.nodes["go:devtools/potly"])
+	if spec == nil || skip != "" || !slices.Equal(spec.argv, []string{"go", "mod", "download"}) || !slices.Contains(spec.env, "GOWORK=off") {
+		t.Fatalf("potly prepare = %+v %q", spec, skip)
+	}
+	if spec, _ := cfg.prepareSpecFor(g, g.nodes["go:lib"]); spec != nil {
+		t.Fatalf("workspace module prepared per module: %+v", spec)
+	}
+}
+
+// TestPresubmitOutsideWorkspaceCommandsDisableWorkspace runs the presubmit over the workspace fixture and
+// checks the sandbox invocations: workspace modules run plain commands, the module outside the trunk's
+// go.work runs with GOWORK=off.
+func TestPresubmitOutsideWorkspaceCommandsDisableWorkspace(t *testing.T) {
+	s, tree := fixtureStore(t, workspaceFixture, nil)
+	bin, logPath := fakeDocker(t, "", "")
+	p := &DockerPresubmit{Image: "lander/sandbox:test", Docker: bin, CacheDir: t.TempDir()}
+
+	res, err := p.Run(context.Background(), PresubmitInput{Store: s, NewTree: tree, Changed: []string{"lib/lib.go", "devtools/potly/p.go"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Passed || res.Summary != "3 projects passed" {
+		t.Fatalf("result = %+v\n%s", res, res.Details)
+	}
+	calls := readCalls(t, logPath)
+	if len(calls) != 3 {
+		t.Fatalf("docker ran %d times, want 3:\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	for _, c := range calls {
+		switch {
+		case strings.Contains(c, "'/work/devtools/potly'"):
+			if !strings.Contains(c, "GOWORK=off go test ./...") {
+				t.Fatalf("module outside the workspace runs with the workspace: %s", c)
+			}
+		case strings.Contains(c, "'/work/app'"), strings.Contains(c, "'/work/lib'"):
+			if strings.Contains(c, "GOWORK=off") || !strings.Contains(c, "cd '/work/") || !strings.Contains(c, " go test ./...") {
+				t.Fatalf("workspace module lacks the workspace: %s", c)
+			}
+		default:
+			t.Fatalf("unexpected invocation: %s", c)
+		}
+	}
+}
+
+// TestGoWorkFetchListSkipsWorkspaceAndLocal checks which build-list entries the prepare step downloads.
+func TestGoWorkFetchListSkipsWorkspaceAndLocal(t *testing.T) {
+	out := `{"Path":"example.org/app","Main":true,"Dir":"/w/app"}
+{"Path":"example.org/local","Version":"v0.0.0","Replace":{"Path":"./local","Dir":"/w/local"}}
+{"Path":"golang.org/x/text","Version":"v0.14.0","Replace":{"Path":"golang.org/x/text","Version":"v0.14.1"}}
+{"Path":"golang.org/x/mod","Version":"v0.17.0"}
+{"Path":"golang.org/x/tools","Version":"v0.13.0","Indirect":true}
+`
+	got, err := goFetchList([]byte(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"golang.org/x/mod@v0.17.0", "golang.org/x/text@v0.14.1", "golang.org/x/tools@v0.13.0"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("fetch = %q, want %q", got, want)
+	}
+	if _, err := goFetchList([]byte(`{"Path":"example.org/x","Version":"v1.0.0","Error":{"Err":"not found"}}`)); err == nil {
+		t.Fatal("a module that did not load was accepted")
+	}
+}
+
+// TestSandboxWorkspaceEnv checks that the sandbox selects the generated workspace and never disables it.
+func TestSandboxWorkspaceEnv(t *testing.T) {
+	if slices.Contains(sandboxEnv, "GOWORK=off") {
+		t.Fatal("sandbox environment disables the workspace")
+	}
+	cfg, err := (&DockerPresubmit{Image: "lander/sandbox:test", CacheDir: t.TempDir()}).config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := sandboxArgs(cfg, "lander-presubmit-test", "/srv/src", "/srv/cache", Project{Dir: "ipc/x", Kind: kindGo}, "true")
+	if slices.Contains(args, "GOWORK=off") {
+		t.Fatalf("argv disables the workspace: %q", args)
+	}
+	envs := flagValues(args, "-e")
+	for _, want := range []string{"GOWORK=/work/go.work", "GOFLAGS=-mod=readonly", "GOPROXY=off", "GOTOOLCHAIN=local", "GOMODCACHE=/cache/gomod"} {
+		if !slices.Contains(envs, want) {
+			t.Fatalf("container env lacks %s: %q", want, envs)
+		}
+	}
+}
+
+// siblingStage stages a dependent that requires its sibling at a version nobody published, with no replace
+// directive, after the sibling's API changed. It returns the staging root with symlinks resolved.
+func siblingStage(t *testing.T) string {
+	t.Helper()
+	s, tree := fixtureStore(t, map[string]string{
+		"go.work":     "go 1.21\n\nuse (\n\t./app\n\t./dep\n)\n",
+		"dep/go.mod":  "module example.org/dep\n\ngo 1.21\n",
+		"dep/dep.go":  "package dep\n\n// Greeting is the API the candidate introduces.\nfunc Greeting() string { return \"hello\" }\n",
+		"app/go.mod":  "module example.org/app\n\ngo 1.21\n\nrequire example.org/dep v0.1.0\n",
+		"app/main.go": "package main\n\nimport \"example.org/dep\"\n\nfunc main() { println(dep.Greeting()) }\n",
+	}, nil)
+	return stagedClosure(t, s, tree, "dep/dep.go")
+}
+
+// TestGoWorkResolvesSiblingLocally runs the host prepare step and a real build on the staging root: the
+// dependent resolves the sibling's local source, and without the workspace the build fails.
+func TestGoWorkResolvesSiblingLocally(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	dst := siblingStage(t)
+	cfg, err := (&DockerPresubmit{Image: "lander/sandbox:test", CacheDir: t.TempDir()}).config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r presubmitReport
+	if reason, tail, err := cfg.prepareGo(context.Background(), dst, t.TempDir(), &r); err != nil || reason != "" {
+		t.Fatalf("prepare: reason %q, err %v\n%s", reason, err, tail)
+	}
+	if out, err := goCommand(t, filepath.Join(dst, "app"), filepath.Join(dst, goWorkName), "build", "./..."); err != nil {
+		t.Fatalf("build in the workspace: %v\n%s", err, out)
+	}
+	if out, err := goCommand(t, filepath.Join(dst, "app"), "off", "build", "./..."); err == nil {
+		t.Fatalf("build without the workspace succeeded; the fixture does not exercise resolution:\n%s", out)
+	}
 }
 
 func sortedKeys(m map[string]bool) []string {

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Imports https://github.com/<owner/repo> (branch, default main) into <prefix>/ of the current
 # workspace branch as one local commit, plus the capy.star PILOT_REPOS entry and the docs/README.md
-# explorer row. Never pushes. Run `git ws-save` and `git ws-land` afterwards.
+# explorer row (none for corp/ and experimental/ prefixes). Never pushes. The import is an unmodified
+# copy so that the mirror tip equals the export of the prefix: add its Go modules to the root go.work in
+# a second commit with `go-work-add.sh <prefix>`. Run `git ws-save` and `git ws-land` afterwards.
 #
 # Usage: import-repo.sh <prefix> <owner/repo> [branch]
 #   SUDA_IMPORT_URL overrides the fetch URL (tests use a local repository).
@@ -39,5 +41,5 @@ MSG=$(printf 'chore(%s): import %s@%s into //%s\n\nSuda-Import: %s=%s@%s' \
   "$PREFIX" "$REPO" "${SRC_SHA:0:7}" "$PREFIX" "$PREFIX" "$REPO" "$SRC_SHA")
 
 if ws_commit "$PREFIX" "$MSG"; then
-  ws_next_steps "$REPO"
+  ws_next_steps "$REPO" "$PREFIX"
 fi

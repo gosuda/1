@@ -29,10 +29,12 @@ type Project struct {
 // projectNode is a Project with the facts the presubmit needs and its dependency edges.
 type projectNode struct {
 	Project
-	pkgName string          // node: package.json name, matched by workspace:<name> dependencies
-	lock    bool            // lockfile present: Cargo.lock; bun.lock, bun.lockb, or package-lock.json
-	tests   bool            // node: a test script or *.test.ts files exist
-	deps    map[string]bool // ids of the projects this one depends on
+	pkgName   string          // node: package.json name, matched by workspace:<name> dependencies
+	lock      bool            // lockfile present: Cargo.lock; bun.lock, bun.lockb, or package-lock.json
+	tests     bool            // node: a test script or *.test.ts files exist
+	goVersion string          // go: the go directive of the module; empty when absent
+	workspace bool            // go: listed by a use directive of the trunk's root go.work
+	deps      map[string]bool // ids of the projects this one depends on
 }
 
 func (n *projectNode) id() string { return n.Kind + ":" + n.Dir }
@@ -42,13 +44,15 @@ type projectGraph struct {
 	nodes map[string]*projectNode    // by id
 	paths map[string]bool            // every blob path in the tree, symlinks included
 	rdeps map[string]map[string]bool // dependency id -> ids of its dependents
+	trunk goWork                     // the trunk's root go.work; zero when absent
 }
 
 // goModFile is the part of a go.mod the graph uses.
 type goModFile struct {
-	module   string
-	requires []string
-	replaces map[string]string // module path -> local directory target ("./" or "../" relative)
+	module    string
+	goVersion string
+	requires  []string
+	replaces  map[string]string // module path -> local directory target ("./" or "../" relative)
 }
 
 // cargoFile is the part of a Cargo.toml the graph uses.
@@ -119,6 +123,14 @@ func loadProjects(ctx context.Context, s *Store, tree string) (*projectGraph, er
 		}
 	}
 
+	if g.paths[goWorkName] {
+		body, err := s.Git(ctx, "cat-file", "blob", tree+":"+goWorkName)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", goWorkName, err)
+		}
+		g.trunk = parseGoWork(body)
+	}
+
 	goFiles := map[string]goModFile{}
 	cargoFiles := map[string]cargoFile{}
 	pkgFiles := map[string]packageFile{}
@@ -147,7 +159,11 @@ func loadProjects(ctx context.Context, s *Store, tree string) (*projectGraph, er
 	}
 
 	for dir, f := range goFiles {
-		g.add(&projectNode{Project: Project{Dir: dir, Kind: kindGo, Module: f.module}})
+		g.add(&projectNode{
+			Project:   Project{Dir: dir, Kind: kindGo, Module: f.module},
+			goVersion: f.goVersion,
+			workspace: g.trunk.uses[dir],
+		})
 	}
 	for dir := range cargoFiles {
 		if cargoMember(dir, cargoFiles) {
@@ -456,9 +472,14 @@ func isCargoDepSection(section string) bool {
 	return strings.Contains(section, "dependencies") || strings.HasPrefix(section, "patch")
 }
 
-// parseGoMod reads the module path, require paths, and local replace targets of a go.mod.
-func parseGoMod(src string) (goModFile, error) {
-	f := goModFile{replaces: map[string]string{}}
+// goTokenRe matches one token of a directive line: a double-quoted or back-quoted string, which may hold
+// spaces, or a run of other characters.
+var goTokenRe = regexp.MustCompile("\"[^\"]*\"|`[^`]*`|[^\\s\"`]+")
+
+// goDirectives splits a go.mod or go.work into its directives, one token list each. A line inside a block
+// is returned with its verb first ("replace a => b" for a line of "replace ("). Comments are removed.
+func goDirectives(src string) [][]string {
+	var out [][]string
 	block := ""
 	for _, raw := range strings.Split(src, "\n") {
 		line := raw
@@ -476,14 +497,66 @@ func parseGoMod(src string) (goModFile, error) {
 			block = strings.TrimSpace(verb)
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
+		if fields := goTokenRe.FindAllString(line, -1); len(fields) > 0 {
+			out = append(out, fields)
 		}
+	}
+	return out
+}
+
+// goWork is the part of a go.work the presubmit uses.
+type goWork struct {
+	goVersion string
+	uses      map[string]bool // module directories listed by use directives
+	replaces  []goWorkReplace
+}
+
+// goWorkReplace is a replace directive of a go.work whose target is a local directory.
+type goWorkReplace struct {
+	text   string // the directive without its verb, as written: module [version] => target [version]
+	target string // the target, unquoted; relative to the go.work directory
+}
+
+// parseGoWork reads the go directive and the replace directives with local targets of a go.work. Both
+// single-line and block forms are read.
+func parseGoWork(src string) goWork {
+	w := goWork{uses: map[string]bool{}}
+	for _, fields := range goDirectives(src) {
+		switch fields[0] {
+		case "go":
+			if len(fields) >= 2 {
+				w.goVersion = fields[1]
+			}
+		case "use":
+			if len(fields) >= 2 {
+				if d, ok := joinLocal(".", unquoteModPath(fields[1])); ok {
+					w.uses[d] = true
+				}
+			}
+		case "replace":
+			arrow := slices.Index(fields, "=>")
+			if arrow >= 2 && arrow+1 < len(fields) {
+				if target := unquoteModPath(fields[arrow+1]); isLocalRef(target) {
+					w.replaces = append(w.replaces, goWorkReplace{text: strings.Join(fields[1:], " "), target: target})
+				}
+			}
+		}
+	}
+	return w
+}
+
+// parseGoMod reads the module path, go version, require paths, and local replace targets of a go.mod.
+func parseGoMod(src string) (goModFile, error) {
+	f := goModFile{replaces: map[string]string{}}
+	for _, fields := range goDirectives(src) {
 		switch fields[0] {
 		case "module":
 			if len(fields) >= 2 {
 				f.module = unquoteModPath(fields[1])
+			}
+		case "go":
+			if len(fields) >= 2 {
+				f.goVersion = fields[1]
 			}
 		case "require":
 			if len(fields) >= 2 {

@@ -2,11 +2,14 @@ package lander
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"go/version"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -52,6 +55,8 @@ const (
 	sandboxSrc       = "/src"
 	sandboxCache     = "/cache"
 	sandboxWork      = "/work"
+	goWorkName       = "go.work"
+	goWorkDefault    = "1.21" // go version of the generated go.work when no module declares one
 	logTailBytes     = 4 << 10
 	summaryRunes     = 140
 )
@@ -63,7 +68,7 @@ var sandboxEnv = []string{
 	"GOFLAGS=-mod=readonly",
 	"GOPROXY=off",
 	"GOCACHE=/tmp/gocache",
-	"GOWORK=off",
+	"GOWORK=" + sandboxWork + "/" + goWorkName,
 	"GOTOOLCHAIN=local",
 	"CARGO_HOME=/tmp/cargo",
 	"CARGO_NET_OFFLINE=true",
@@ -116,6 +121,11 @@ func (p *DockerPresubmit) Run(ctx context.Context, in PresubmitInput) (Presubmit
 		return PresubmitResult{}, fmt.Errorf("presubmit: %w", err)
 	}
 	defer os.RemoveAll(work)
+	// go compares its working directory with GOWORK textually, so the root must not be reached through a
+	// symlink (macOS /var is one).
+	if work, err = filepath.EvalSymlinks(work); err != nil {
+		return PresubmitResult{}, fmt.Errorf("presubmit: %w", err)
+	}
 	src := filepath.Join(work, "src")
 	home := filepath.Join(work, "home")
 	for _, dir := range []string{src, home} {
@@ -137,6 +147,20 @@ func (p *DockerPresubmit) Run(ctx context.Context, in PresubmitInput) (Presubmit
 
 	r := &presubmitReport{}
 	prepFailed := map[string]bool{}
+	if hasWorkspaceModule(closure) {
+		reason, tail, err := cfg.prepareGo(ctx, src, home, r)
+		if err != nil {
+			return PresubmitResult{}, err
+		}
+		if reason != "" {
+			for _, n := range affected {
+				if n.Kind == kindGo && n.workspace {
+					r.fail(n.Project, reason, tail)
+					prepFailed[n.id()] = true
+				}
+			}
+		}
+	}
 	for _, n := range closure {
 		if err := cfg.prepare(ctx, g, n, src, home, r); err != nil {
 			return PresubmitResult{}, err
@@ -215,6 +239,10 @@ func (cfg DockerPresubmit) testCommands(n *projectNode) []string {
 	}
 	switch n.Kind {
 	case kindGo:
+		if !n.workspace {
+			// Outside the trunk's workspace a module is built on its own, as before the workspace existed.
+			return []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}
+		}
 		return []string{"go vet ./...", "go test ./..."}
 	case kindCargo:
 		if n.lock {
@@ -235,10 +263,14 @@ type prepareSpec struct {
 }
 
 // prepareSpecFor returns the prepare command for n. A nil spec with an empty skip means nothing to do;
-// a non-empty skip explains why a step was not run.
+// a non-empty skip explains why a step was not run. Go modules of the trunk workspace are warmed once by
+// prepareGo; the others are warmed per module with GOWORK=off.
 func (cfg DockerPresubmit) prepareSpecFor(g *projectGraph, n *projectNode) (*prepareSpec, string) {
 	switch n.Kind {
 	case kindGo:
+		if n.workspace {
+			return nil, ""
+		}
 		return &prepareSpec{
 			argv: []string{"go", "mod", "download"},
 			env: []string{
@@ -288,7 +320,7 @@ func (cfg DockerPresubmit) prepare(ctx context.Context, g *projectGraph, n *proj
 		return nil
 	}
 	env := inheritedEnv(prepareEnvNames, append(spec.env, "HOME="+home)...)
-	reason, tail, err := runCommand(ctx, cfg.Timeout, filepath.Join(src, n.Dir), spec.argv, env)
+	reason, tail, err := runCommand(ctx, cfg.Timeout, filepath.Join(src, n.Dir), spec.argv, env, nil)
 	if err != nil {
 		return err
 	}
@@ -296,6 +328,94 @@ func (cfg DockerPresubmit) prepare(ctx context.Context, g *projectGraph, n *proj
 		r.fail(n.Project, "prepare "+label+": "+reason, tail)
 	}
 	return nil
+}
+
+// prepareGo warms the module cache for the Go modules of the trunk workspace, at the staging root. It runs
+// once, in workspace mode, and never executes package code. go list -e -m -json all names the build list.
+// The workspace's own modules and local replacements are local code and are skipped; every other module is
+// fetched by one go mod download that names it. Naming the modules matters: a plain go mod download in
+// workspace mode also fetches the requirements of the workspace's modules, so one internal module whose
+// required version is unpublished fails the whole step, and it writes go.work.sum into the staging root.
+// reason is "" when the step succeeded or had nothing to do; otherwise it names the failed command and
+// tail holds its output. err is non-nil only when ctx ended.
+func (cfg DockerPresubmit) prepareGo(ctx context.Context, src, home string, r *presubmitReport) (reason string, tail []byte, err error) {
+	if _, lookErr := exec.LookPath("go"); lookErr != nil {
+		r.note("skipped go module warm-up: go not found")
+		return "", nil, nil
+	}
+	env := inheritedEnv(prepareEnvNames,
+		"GOWORK="+filepath.Join(src, goWorkName),
+		"GOFLAGS=-mod=readonly",
+		"GOPROXY=https://proxy.golang.org",
+		"GOMODCACHE="+filepath.Join(cfg.CacheDir, "gomod"),
+		"GOTOOLCHAIN=local",
+		"HOME="+home,
+	)
+	var list bytes.Buffer
+	reason, tail, err = runCommand(ctx, cfg.Timeout, src, []string{"go", "list", "-e", "-m", "-json", "all"}, env, &list)
+	if err != nil {
+		return "", nil, err
+	}
+	if reason != "" {
+		return "prepare go list: " + reason, tail, nil
+	}
+	fetch, err := goFetchList(list.Bytes())
+	if err != nil {
+		return "prepare go list: " + err.Error(), nil, nil
+	}
+	if len(fetch) == 0 {
+		return "", nil, nil
+	}
+	reason, tail, err = runCommand(ctx, cfg.Timeout, src, append([]string{"go", "mod", "download"}, fetch...), env, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	if reason != "" {
+		return fmt.Sprintf("prepare go mod download (%d modules): %s", len(fetch), reason), tail, nil
+	}
+	return "", nil, nil
+}
+
+// goFetchList returns the module@version arguments that go mod download needs for the build list in out,
+// the output of go list -e -m -json all. It skips the workspace's own modules and local replacements,
+// which are local code, and fails on a module that did not load.
+func goFetchList(out []byte) ([]string, error) {
+	type listed struct {
+		Path    string
+		Version string
+		Main    bool
+		Replace *struct {
+			Path    string
+			Version string
+		}
+		Error *struct{ Err string }
+	}
+	dec := json.NewDecoder(bytes.NewReader(out))
+	var fetch []string
+	for dec.More() {
+		var m listed
+		if err := dec.Decode(&m); err != nil {
+			return nil, err
+		}
+		switch {
+		case m.Main:
+		case m.Error != nil:
+			return nil, fmt.Errorf("module %s: %s", m.Path, m.Error.Err)
+		case m.Replace != nil && m.Replace.Version == "":
+			// a local directory replacement
+		case m.Replace != nil:
+			fetch = append(fetch, m.Replace.Path+"@"+m.Replace.Version)
+		case m.Version != "":
+			fetch = append(fetch, m.Path+"@"+m.Version)
+		}
+	}
+	slices.Sort(fetch)
+	return fetch, nil
+}
+
+// hasWorkspaceModule reports whether nodes include a Go module of the trunk workspace.
+func hasWorkspaceModule(nodes []*projectNode) bool {
+	return slices.ContainsFunc(nodes, func(n *projectNode) bool { return n.Kind == kindGo && n.workspace })
 }
 
 // runSandbox runs cmds for p in a fresh container. It returns a failure reason ("" on success) and the
@@ -306,7 +426,7 @@ func (cfg DockerPresubmit) runSandbox(ctx context.Context, src string, p Project
 		return "", nil, err
 	}
 	args := sandboxArgs(cfg, name, src, cfg.CacheDir, p, containerScript(p, cmds))
-	reason, tail, err := runCommand(ctx, cfg.Timeout, "", append([]string{cfg.Docker}, args...), inheritedEnv(dockerEnvNames))
+	reason, tail, err := runCommand(ctx, cfg.Timeout, "", append([]string{cfg.Docker}, args...), inheritedEnv(dockerEnvNames), nil)
 	if reason != "" || err != nil {
 		// The docker client may have been killed while the container kept running.
 		cfg.removeContainer(name)
@@ -469,9 +589,10 @@ func tailText(b []byte) string {
 	return string(b)
 }
 
-// runCommand runs argv in dir with exactly env, bounded by timeout. reason is "" on success; otherwise
-// it says how the command failed and tail holds the last output. err is non-nil only when ctx ended.
-func runCommand(ctx context.Context, timeout time.Duration, dir string, argv, env []string) (reason string, tail []byte, err error) {
+// runCommand runs argv in dir with exactly env, bounded by timeout. Standard output goes to stdout when it
+// is non-nil and otherwise into the tail with the standard error. reason is "" on success; otherwise it
+// says how the command failed and tail holds the last output. err is non-nil only when ctx ended.
+func runCommand(ctx context.Context, timeout time.Duration, dir string, argv, env []string, stdout io.Writer) (reason string, tail []byte, err error) {
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out := &tailBuffer{max: logTailBytes}
@@ -479,6 +600,9 @@ func runCommand(ctx context.Context, timeout time.Duration, dir string, argv, en
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdout = out
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
 	cmd.Stderr = out
 	cmd.WaitDelay = time.Second
 	runErr := cmd.Run()
@@ -510,24 +634,23 @@ func inheritedEnv(names []string, extra ...string) []string {
 	return append(env, extra...)
 }
 
-// exportProjects writes the closure's directories, plus root go.work and go.mod when present, from
-// tree into dst. The archive is then checked against the tree listing, so an export-ignore attribute
-// cannot silently remove a file from the candidate.
+// exportProjects writes the closure's directories, plus the root go.mod when present, from tree into dst,
+// then the go.work that joins the closure's Go modules (goWorkFile). The trunk's root go.work is never
+// exported: it lists every module of the monorepo. The archive is checked against the tree listing, so an
+// export-ignore attribute cannot silently remove a file from the candidate.
 func exportProjects(ctx context.Context, s *Store, tree string, g *projectGraph, closure []*projectNode, dst string) error {
 	roots := map[string]bool{}
 	for _, n := range closure {
 		roots[n.Dir] = true
 	}
-	for _, f := range []string{"go.work", "go.mod"} {
-		if g.paths[f] {
-			roots[f] = true
-		}
+	if g.paths["go.mod"] {
+		roots["go.mod"] = true
 	}
 	wholeTree := roots["."]
 
 	want := map[string]bool{}
 	for p := range g.paths {
-		if wholeTree || covered(p, roots) {
+		if p != goWorkName && (wholeTree || covered(p, roots)) {
 			want[p] = true
 		}
 	}
@@ -549,6 +672,13 @@ func exportProjects(ctx context.Context, s *Store, tree string, g *projectGraph,
 	if err != nil {
 		return err
 	}
+	if got[goWorkName] {
+		// Only a whole-tree archive carries the root go.work; the generated one replaces it below.
+		if err := os.Remove(filepath.Join(dst, goWorkName)); err != nil {
+			return err
+		}
+		delete(got, goWorkName)
+	}
 	var missing []string
 	for p := range want {
 		if !got[p] {
@@ -562,7 +692,115 @@ func exportProjects(ctx context.Context, s *Store, tree string, g *projectGraph,
 	if len(got) != len(want) {
 		return fmt.Errorf("archive holds %d files, tree selection has %d", len(got), len(want))
 	}
+	gw, err := goWorkFile(g, closure)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dst, goWorkName), []byte(gw), 0o644)
+}
+
+// goWorkFile renders the go.work of the staging root. It names the closure's Go modules that the trunk's
+// root go.work lists in use directives, nested ones included, and declares the highest go version any Go
+// module of the closure asks for. Go modules outside that list are tested with GOWORK=off. Replace
+// directives of the trunk whose local targets lie in the closure are carried over. When no module declares
+// a go version, the trunk's go.work version is used, then goWorkDefault.
+func goWorkFile(g *projectGraph, closure []*projectNode) (string, error) {
+	var dirs []string
+	best := ""
+	for _, n := range closure {
+		if n.Kind != kindGo {
+			continue
+		}
+		if n.workspace {
+			dirs = append(dirs, n.Dir)
+		}
+		if n.goVersion == "" {
+			continue
+		}
+		if err := checkGoVersion(n.goVersion); err != nil {
+			return "", fmt.Errorf("%s: %w", path.Join(n.Dir, "go.mod"), err)
+		}
+		if best == "" || version.Compare("go"+n.goVersion, "go"+best) > 0 {
+			best = n.goVersion
+		}
+	}
+	if best == "" {
+		best = goWorkDefault
+		if g.trunk.goVersion != "" {
+			best = g.trunk.goVersion
+		}
+		if err := checkGoVersion(best); err != nil {
+			return "", fmt.Errorf("%s: %w", goWorkName, err)
+		}
+	}
+	return renderGoWork(best, dirs, keepReplaces(closure, g.trunk.replaces)), nil
+}
+
+// checkGoVersion rejects a go directive value that go/version does not recognise.
+func checkGoVersion(v string) error {
+	if !version.IsValid("go" + v) {
+		return fmt.Errorf("invalid go version %q", v)
+	}
 	return nil
+}
+
+// keepReplaces returns the trunk's replace directives whose local target is a directory of the closure or
+// lies under one. The staging tree keeps the trunk layout, so such targets stay valid; the others are not
+// exported and are dropped.
+func keepReplaces(closure []*projectNode, reps []goWorkReplace) []string {
+	dirs := map[string]bool{}
+	for _, n := range closure {
+		dirs[n.Dir] = true
+	}
+	var out []string
+	for _, r := range reps {
+		p, ok := joinLocal(".", r.target)
+		if !ok {
+			continue
+		}
+		if dirs["."] || covered(p, dirs) {
+			out = append(out, r.text)
+		}
+	}
+	return out
+}
+
+// renderGoWork formats a go.work: the go directive, one use entry per workspace module directory (the root
+// directory is written as "."), then the replace directives as one block when there are any. Both lists are
+// sorted, so the bytes depend only on their contents.
+func renderGoWork(goVersion string, dirs, replaces []string) string {
+	uses := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if d == "." {
+			uses = append(uses, ".")
+		} else {
+			uses = append(uses, "./"+d)
+		}
+	}
+	slices.Sort(uses)
+	slices.Sort(replaces)
+	var b strings.Builder
+	fmt.Fprintf(&b, "go %s\n\nuse (\n", goVersion)
+	for _, u := range uses {
+		fmt.Fprintf(&b, "\t%s\n", goWorkWord(u))
+	}
+	b.WriteString(")\n")
+	if len(replaces) > 0 {
+		b.WriteString("\nreplace (\n")
+		for _, r := range replaces {
+			fmt.Fprintf(&b, "\t%s\n", r)
+		}
+		b.WriteString(")\n")
+	}
+	return b.String()
+}
+
+// goWorkWord returns a path as one go.work token, quoted when the lexer would split or comment it.
+func goWorkWord(p string) string {
+	if strings.ContainsAny(p, " \t\r\n\"'`()") || strings.Contains(p, "//") || strings.Contains(p, "/*") {
+		return strconv.Quote(p)
+	}
+	return p
 }
 
 // covered reports whether p lies at or under one of roots.

@@ -22,7 +22,9 @@ The `refs/heads/main` branch contains the agent rules, Git aliases, the Starlark
     ├── OWNERS
     └── scripts/
         ├── create-repo.sh        # workspace commit for a new project
-        ├── import-repo.sh        # workspace commit importing an existing repository
+        ├── import-repo.sh        # workspace commit importing an existing repository (unmodified copy)
+        ├── go-work-add.sh        # workspace commit adding a project's Go modules to the root go.work
+        ├── test-workspace-scripts.sh  # offline smoke test of the three helpers above
         ├── capy/                 # Starlark evaluator, visibility and OWNERS checks, export and import
         └── lander/               # the lander service and its deployment (deploy/deploy.sh)
 ```
@@ -103,7 +105,7 @@ Table 3 lists the work of each stage.
 
 | Stage | Runs in | Work |
 | :--- | :--- | :--- |
-| Prepare | Lander process | Computes the merged candidate and the affected set, writes the affected closure of project directories from the object store, and warms dependency caches with commands that run no package code: `go mod download` with `GOPROXY=https://proxy.golang.org`, `bun install --ignore-scripts --frozen-lockfile` when a lockfile exists, and `cargo fetch --locked` unless the repository carries a Cargo configuration file. Each command receives only a fixed list of host variables. |
+| Prepare | Lander process | Computes the merged candidate and the affected set, writes the affected closure of project directories from the object store, and generates the staging `go.work`. It warms dependency caches with commands that run no package code: `go list -e -m -json all` and one `go mod download` naming the external modules for the trunk workspace's Go modules, `go mod download` per module with `GOWORK=off` for the others, all with `GOPROXY=https://proxy.golang.org`; `bun install --ignore-scripts --frozen-lockfile` when a lockfile exists; and `cargo fetch --locked` unless the repository carries a Cargo configuration file. Each command receives only a fixed list of host variables. |
 | Run | Sandbox container | Runs the project's test commands in a fresh container, one per project, with no network and no credentials. The source archive and the caches are mounted read-only. |
 | Verdict | Lander process | A failing project rejects the request. The `suda/land` status reads `presubmit: FAILED: <project directories>`, and the output tail stays in the lander log. A passing run with nothing to test passes with a summary of `no tests declared`. |
 
@@ -113,8 +115,10 @@ Each sandbox container runs with these properties:
 - A non-root user (`65534:65534`), `--pids-limit 512`, and CPU and memory limits from `LANDER_PRESUBMIT_CPUS` (default `2`) and `LANDER_PRESUBMIT_MEMORY` (default `4g`). Memory swap equals memory.
 - Writable `tmpfs` mounts at `/tmp` and at the work directory. The sources are copied into the work directory, and the project's commands run there.
 - The source archive is mounted read-only at `/src`, and the dependency cache is mounted read-only at `/cache`.
-- A fixed environment (`HOME=/tmp`, `GOPROXY=off`, `GOFLAGS=-mod=readonly`, `GOWORK=off`, `GOTOOLCHAIN=local`, `CARGO_NET_OFFLINE=true`, and cache paths). The host environment never enters the container.
+- A fixed environment (`HOME=/tmp`, `GOPROXY=off`, `GOFLAGS=-mod=readonly`, `GOWORK=/work/go.work`, `GOTOOLCHAIN=local`, `CARGO_NET_OFFLINE=true`, and cache paths). The host environment never enters the container. A Go module outside the trunk's workspace runs `GOWORK=off` on its own commands.
 - The timeout is `LANDER_PRESUBMIT_TIMEOUT` (default `15m`) per container and per prepare command. The sandbox image is `LANDER_PRESUBMIT_IMAGE` (default `golang:1.27`).
+
+Go modules are tested in workspace mode. The staging `go.work` lists the closure's modules that the trunk's root `go.work` lists in `use`, with the trunk's local replace directives whose targets lie in the closure; the trunk's own `go.work` is never exported. Presubmit depends on this convention: a committed `go.mod` never contains a local `replace`; the root `go.work` resolves sibling modules; a `require` of an internal module names a published version.
 
 The affected set starts from the changed paths. Each changed path belongs to its nearest ancestor project, which is a directory holding a `go.mod`, `Cargo.toml`, or `package.json`. The set then adds every project that transitively depends on one of them. Dependencies are read from the manifests: Go `require` directives and local `replace` targets, Cargo `path` dependencies, and `package.json` `file:`, `link:`, and `workspace:` references. Only the affected projects run tests, but the closure of their dependencies is exported and warmed so that they can build.
 
@@ -136,6 +140,7 @@ Presubmit runs inside the serialized cycle, so landing latency includes test tim
 | Command | Flags | Behavior |
 | :--- | :--- | :--- |
 | `list` | `-config capy.star`, `-json` | Prints each workflow as name, prefix, destination repository, and branch. |
+| `check-replaces` | `-repo`, `-base-tree`, `-tree` | Prints each `go.mod` local `replace` directive that leaves the module directory (`replace x => ../y` or an absolute path) and exits `1` when there is any. With `-base-tree`, it reads only `go.mod` files added or modified since the base, and a replace that already exists unchanged in the base file is grandfathered. `.github/` is exempt. The lander runs it on every landing. |
 | `check-visibility` | `-repo`, `-base-tree`, `-tree` | Prints each violation and exits `1` when there is any. With `-base-tree`, it evaluates only files added or modified since the base, files whose nearest `go.mod` or `package.json` changed, and Go files that import a changed module path. |
 | `check-owners` | `-repo`, `-base-tree`, `-tree`, `-requester`, `-approvers`, `-team org/slug=login,...`, `-github-repo`, `-github-ref`, `-github-sha`, `-github-review-head` | Applies Section 2.1 of [AGENTS.md](../AGENTS.md). `OWNERS` files are read from `-base-tree`. Identity comes from `-requester` and `-approvers`, or from the GitHub API with `-github-*` (requires `GITHUB_TOKEN`). Exits `1` on violations. |
 | `export-tree` | `-config`, `-workflow`, `-tree` | Prints the export tree of a workflow for a root tree. |

@@ -112,6 +112,32 @@ func TestRejectionsDoNotBlockTheQueue(t *testing.T) {
 	}
 }
 
+func TestLocalReplaceThatLeavesTheModuleIsRejectedAndGoWorkIsFine(t *testing.T) {
+	e := newEnv(t)
+	e.devWork("sibling-replace", map[string]string{
+		"S/dep/go.mod": "module example.org/dep\n\nrequire example.org/lib v0.1.0\n\nreplace example.org/lib => ../lib\n",
+		"S/lib/go.mod": "module example.org/lib\n",
+	}, "S: depend on a sibling through a replace")
+	before := e.trunkRef("refs/suda/main")
+	e.cycle()
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("a go.mod replace pointing at a sibling directory landed")
+	}
+	if !e.hasStatus("suda/land failure go.mod") {
+		t.Fatalf("expected go.mod failure status: %v", e.forge.statuses)
+	}
+
+	e.devWork("sibling-workspace", map[string]string{
+		"S/dep/go.mod": "module example.org/dep\n\nrequire example.org/lib v0.1.0\n",
+		"S/lib/go.mod": "module example.org/lib\n",
+		"go.work":      "go 1.24\n\nuse (\n\t./S/dep\n\t./S/lib\n)\n",
+	}, "S: depend on a sibling through go.work")
+	e.cycle()
+	if !strings.Contains(e.trunkFile("refs/suda/main", "go.work"), "./S/lib") {
+		t.Fatal("the go.work variant did not land")
+	}
+}
+
 func TestFiveConcurrentRequestsAllLand(t *testing.T) {
 	e := newEnv(t)
 	for i, f := range []string{"Q/1.go", "Q/2.go", "Q/3.go", "R/4.go", "R/5.go"} {
