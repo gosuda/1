@@ -254,31 +254,23 @@ func TestUserRepositoryMainIsPublishedFromTheControlPlaneAndRestored(t *testing.
 	}
 }
 
-func TestHeadBranchTracksTheHistoryTipAndIsRestoredWhenRewritten(t *testing.T) {
+// A plain `git clone` of the user repository fetches every branch and tag. Nothing the lander
+// publishes there as a branch or tag may reach into the trunk, or each naive clone downloads the
+// whole monorepo with its history.
+func TestUserRepositoryBranchesAndTagsNeverReachIntoTheTrunk(t *testing.T) {
 	e := newEnv(t)
 	e.cycle()
-	if got, want := git(t, e.user, "rev-parse", "refs/heads/head"), e.trunkRef("refs/suda/history"); got != want {
-		t.Fatalf("head = %s, want the history tip %s", got, want)
-	}
-	// It follows landings.
-	e.devWork("h", map[string]string{"Q/q.go": "package q\n// head\n"}, "Q: head")
+	e.devWork("t", map[string]string{"Q/q.go": "package q\n// t\n"}, "Q: t")
 	e.cycle()
-	if got, want := git(t, e.user, "rev-parse", "refs/heads/head"), e.trunkRef("refs/suda/history"); got != want {
-		t.Fatalf("head = %s after a landing, want %s", got, want)
+	if got := git(t, e.user, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags"); got != "refs/heads/main" {
+		t.Fatalf("user repository branches/tags = %q, want only refs/heads/main", got)
 	}
-	if n := git(t, e.user, "rev-list", "--count", "refs/heads/head"); n != git(t, e.trunk, "rev-list", "--count", "refs/suda/history") {
-		t.Fatalf("head must carry the full history, has %s commits", n)
+	// The front page is tiny and unrelated to the trunk history.
+	if n := git(t, e.user, "rev-list", "--count", "refs/heads/main"); n != "1" {
+		t.Fatalf("front page branch has %s commits", n)
 	}
-	// A member moves it elsewhere: the next cycle puts it back.
-	git(t, e.dev, "checkout", "-q", "--orphan", "evil")
-	git(t, e.dev, "rm", "-rfq", "--cached", ".")
-	git(t, e.dev, "clean", "-fdxq")
-	write(t, e.dev, map[string]string{"x": "y\n"})
-	git(t, e.dev, "add", "-A")
-	git(t, e.dev, "commit", "-qm", "evil")
-	git(t, e.dev, "push", "-q", "--force", e.user, "HEAD:refs/heads/head")
-	e.cycle()
-	if got, want := git(t, e.user, "rev-parse", "refs/heads/head"), e.trunkRef("refs/suda/history"); got != want {
-		t.Fatalf("tampered head not restored: %s, want %s", got, want)
+	trunkMain := e.trunkRef("refs/suda/main")
+	if gitOK(e.user, "merge-base", "--is-ancestor", trunkMain, "refs/heads/main") {
+		t.Fatal("main must not contain the trunk")
 	}
 }
