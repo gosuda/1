@@ -92,6 +92,9 @@ type fakeForge struct {
 	statuses  []string
 	pulls     map[string][]PullRequest
 	closed    []string // "repo#number: comment"
+	created   []fakeCreated
+	updated   []fakeCreated
+	nextPull  int
 }
 
 func (f *fakeForge) PushForTip(_ context.Context, repo, ref, sha string) (capy.Push, error) {
@@ -135,6 +138,34 @@ func (f *fakeForge) ClosePull(_ context.Context, repo string, number int, commen
 	}
 	f.pulls[repo] = rest
 	return nil
+}
+
+func (f *fakeForge) CreatePull(_ context.Context, repo, head, base, title, body string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextPull++
+	n := 1000 + f.nextPull
+	f.pulls[repo] = append(f.pulls[repo], PullRequest{Number: n, HeadRef: head, Title: title})
+	f.created = append(f.created, fakeCreated{Repo: repo, Number: n, Head: head, Base: base, Title: title, Body: body})
+	return n, nil
+}
+
+func (f *fakeForge) UpdatePull(_ context.Context, repo string, number int, title, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updated = append(f.updated, fakeCreated{Repo: repo, Number: number, Title: title, Body: body})
+	for i, p := range f.pulls[repo] {
+		if p.Number == number {
+			f.pulls[repo][i].Title = title
+		}
+	}
+	return nil
+}
+
+// fakeCreated records a pull request opened or updated through the fake forge.
+type fakeCreated struct {
+	Repo, Head, Base, Title, Body string
+	Number                        int
 }
 
 func newEnv(t *testing.T) *env {

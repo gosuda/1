@@ -27,6 +27,7 @@ nothing depends on events arriving. Durable state lives only in refs (including
 | `LANDER_STORE` | `/var/lib/lander/data/store.git` | Bare object store shared by all remotes |
 | `LANDER_INTERVAL` | `1m` | Poll interval for landing requests (a `/wake` ends the wait early) |
 | `LANDER_MIRROR_INTERVAL` | `30m` | Interval of the mirror sweep (a cheap `ls-remote` plus one pull-request listing per mirror). A mirror is reconciled immediately when its project changed in the trunk or a webhook named it |
+| `LANDER_MAGPIE_URL` | `https://magpie.gosuda.org` | Base of the magpie diff link in the review pull requests opened for staged mirror pull requests. Empty omits the link. |
 | `LANDER_DRYRUN` | unset | Decide and log, push nothing |
 | `LANDER_SIGNING_KEY_FILE` or `LANDER_SIGNING_KEY` | unset | SSH private key (path, or content) signing lander commits; when set, an unsigned `refs/suda/history` tip halts the queue. The allowed-signers entry is derived from the key's public half |
 | `LANDER_ALLOWED_SIGNERS` | derived | Optional allowed-signers file overriding the derived one |

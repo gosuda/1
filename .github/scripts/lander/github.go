@@ -139,9 +139,14 @@ func (f *GitHubForge) OpenPulls(ctx context.Context, repo string) ([]PullRequest
 	for page := 1; ; page++ {
 		q := url.Values{"state": {"open"}, "per_page": {strconv.Itoa(perPage)}, "page": {strconv.Itoa(page)}}
 		var items []struct {
-			Number int  `json:"number"`
-			Draft  bool `json:"draft"`
-			Head   struct {
+			Number  int    `json:"number"`
+			Draft   bool   `json:"draft"`
+			Title   string `json:"title"`
+			HTMLURL string `json:"html_url"`
+			User    struct {
+				Login string `json:"login"`
+			} `json:"user"`
+			Head struct {
 				Ref string `json:"ref"`
 				SHA string `json:"sha"`
 			} `json:"head"`
@@ -150,7 +155,8 @@ func (f *GitHubForge) OpenPulls(ctx context.Context, repo string) ([]PullRequest
 			return nil, err
 		}
 		for _, it := range items {
-			out = append(out, PullRequest{Number: it.Number, HeadRef: it.Head.Ref, HeadSHA: it.Head.SHA, Draft: it.Draft})
+			out = append(out, PullRequest{Number: it.Number, HeadRef: it.Head.Ref, HeadSHA: it.Head.SHA, Draft: it.Draft,
+				Title: it.Title, URL: it.HTMLURL, Author: it.User.Login})
 		}
 		if len(items) < perPage {
 			return out, nil
@@ -172,6 +178,31 @@ func (f *GitHubForge) ClosePull(ctx context.Context, repo string, number int, co
 		return nil
 	}
 	return f.rest(ctx, repo, permPullsW, http.MethodPost, fmt.Sprintf("%s/issues/%d/comments", rp, number), map[string]string{"body": comment}, nil)
+}
+
+// CreatePull implements Forge with POST /repos/{repo}/pulls (pull_requests:write).
+func (f *GitHubForge) CreatePull(ctx context.Context, repo, head, base, title, body string) (int, error) {
+	rp, err := repoPath(repo)
+	if err != nil {
+		return 0, err
+	}
+	in := map[string]string{"title": title, "head": head, "base": base, "body": body}
+	var out struct {
+		Number int `json:"number"`
+	}
+	if err := f.rest(ctx, repo, permPullsW, http.MethodPost, rp+"/pulls", in, &out); err != nil {
+		return 0, err
+	}
+	return out.Number, nil
+}
+
+// UpdatePull implements Forge with PATCH /repos/{repo}/pulls/{number} (pull_requests:write).
+func (f *GitHubForge) UpdatePull(ctx context.Context, repo string, number int, title, body string) error {
+	rp, err := repoPath(repo)
+	if err != nil {
+		return err
+	}
+	return f.rest(ctx, repo, permPullsW, http.MethodPatch, fmt.Sprintf("%s/pulls/%d", rp, number), map[string]string{"title": title, "body": body}, nil)
 }
 
 // rest performs one REST call for repo with a token limited to perms. Non-2xx responses are

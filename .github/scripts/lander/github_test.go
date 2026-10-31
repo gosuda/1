@@ -384,3 +384,59 @@ func TestGitHubForgeClosePullClosesThenCommentsWithWriteScopedToken(t *testing.T
 		t.Fatalf("calls = %v, comment = %q", calls, comment)
 	}
 }
+
+func TestGitHubForgeCreateAndUpdatePullUseWriteScopedTokensAndDecodeListings(t *testing.T) {
+	var mu sync.Mutex
+	var created, updated map[string]string
+	env := newAppEnv(t, func(f *fakeGitHub) {
+		f.routes = map[string]fakeRoute{
+			"POST /repos/gosuda/1/pulls": func(w http.ResponseWriter, r *http.Request, g grant) {
+				if !checkPerms(w, g, map[string]string{"pull_requests": "write"}) {
+					return
+				}
+				mu.Lock()
+				_ = json.NewDecoder(r.Body).Decode(&created)
+				mu.Unlock()
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"number": 41}`))
+			},
+			"PATCH /repos/gosuda/1/pulls/41": func(w http.ResponseWriter, r *http.Request, g grant) {
+				if !checkPerms(w, g, map[string]string{"pull_requests": "write"}) {
+					return
+				}
+				mu.Lock()
+				_ = json.NewDecoder(r.Body).Decode(&updated)
+				mu.Unlock()
+				_, _ = w.Write([]byte(`{}`))
+			},
+			"GET /repos/gosuda/HQQ/pulls": func(w http.ResponseWriter, r *http.Request, g grant) {
+				if !checkPerms(w, g, map[string]string{"pull_requests": "read"}) {
+					return
+				}
+				_, _ = w.Write([]byte(`[{"number": 9, "title": "Fix it", "html_url": "https://github.com/gosuda/HQQ/pull/9", "user": {"login": "bob"}, "head": {"ref": "fix", "sha": "abc"}}]`))
+			},
+		}
+	})
+	f := NewGitHubForge(env.app, "gosuda/1")
+	ctx := context.Background()
+	n, err := f.CreatePull(ctx, "gosuda/1", "review/capy-HQQ-pr-9", "base/capy-HQQ-pr-9", "[HQQ#9] Fix it", "body")
+	if err != nil || n != 41 {
+		t.Fatalf("CreatePull = %d, %v", n, err)
+	}
+	if created["head"] != "review/capy-HQQ-pr-9" || created["base"] != "base/capy-HQQ-pr-9" || created["title"] != "[HQQ#9] Fix it" || created["body"] != "body" {
+		t.Fatalf("create body = %v", created)
+	}
+	if err := f.UpdatePull(ctx, "gosuda/1", 41, "t2", "b2"); err != nil {
+		t.Fatal(err)
+	}
+	if updated["title"] != "t2" || updated["body"] != "b2" {
+		t.Fatalf("update body = %v", updated)
+	}
+	prs, err := f.OpenPulls(ctx, "gosuda/HQQ")
+	if err != nil || len(prs) != 1 {
+		t.Fatalf("OpenPulls = %v, %v", prs, err)
+	}
+	if p := prs[0]; p.Title != "Fix it" || p.Author != "bob" || p.URL != "https://github.com/gosuda/HQQ/pull/9" || p.HeadSHA != "abc" {
+		t.Fatalf("decoded pull request = %+v", p)
+	}
+}

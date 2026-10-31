@@ -135,14 +135,22 @@ Public mirror repositories (for example `gosuda/HQQ`) are exports of the trunk.
 - A change merged on a mirror's default branch by an **owner** of that project is imported by the lander
   automatically; the next export carries both sides.
 - A pull request opened on a mirror, or a push by a non-owner, is **staged** in this repository as
-  `refs/ws/capy/<project>-pr-<N>` or `refs/ws/capy/<project>-main`. It lands only when a member requests it:
+  `refs/ws/capy/<project>-pr-<N>` or `refs/ws/capy/<project>-main`.
+- Every staged mirror pull request also gets a **review pull request** in this repository, titled
+  `[<project>#<N>] <original title>`, from `review/capy-<project>-pr-<N>` into `base/capy-<project>-pr-<N>`. It
+  shows only the contributor's change, links the original and the magpie diff, and carries the landing
+  command. Review and approve it there: approvals bound to the exact tip count for `OWNERS`. The lander keeps it
+  in step with the original and closes it when the original closes or no longer applies. Do not merge it on
+  GitHub.
+
+It lands only when a member requests it:
 
 ```bash
-git fetch ws                                       # staged refs appear as refs/remotes/ws/ws/capy/...
-git push ws refs/remotes/ws/ws/capy/HQQ-pr-12:refs/heads/land/hqq-pr-12
+git fetch ws review/capy-hqq-pr-12
+git push ws FETCH_HEAD:refs/heads/land/capy-hqq-pr-12
 ```
 
-Review it like any other change. You become the requester, so `OWNERS` applies to you.
+You become the requester, so `OWNERS` applies to you.
 
 Once the change has landed and been exported, the lander closes the original pull request on the mirror with a
 comment (only if its head is exactly what landed; a pull request that got new commits stays open).

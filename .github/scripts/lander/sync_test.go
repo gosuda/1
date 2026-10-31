@@ -409,6 +409,17 @@ func TestGarbageCollectKeepsEmbargoedReferencesUntilTheirOwnTTL(t *testing.T) {
 	}
 }
 
+// closedOn returns the comments of the pull requests closed on repo, as "repo#number: comment".
+func (e *env) closedOn(repo string) []string {
+	var out []string
+	for _, c := range e.forge.closed {
+		if strings.HasPrefix(c, repo+"#") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
 	e := newEnv(t)
 	e.cycle()
@@ -429,8 +440,8 @@ func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
 	e.forge.pulls["gosuda/p"] = []PullRequest{{Number: 7, HeadRef: "f7", HeadSHA: head7}, {Number: 8, HeadRef: "f8", HeadSHA: head8}}
 	e.l.NoteWake("gosuda/p")
 	e.cycle()
-	if len(e.forge.closed) != 0 {
-		t.Fatalf("staging must not close anything: %v", e.forge.closed)
+	if len(e.closedOn("gosuda/p")) != 0 {
+		t.Fatalf("staging must not close anything: %v", e.closedOn("gosuda/p"))
 	}
 
 	// A member reviews and lands the staged change of PR 7 only.
@@ -440,18 +451,18 @@ func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
 	if !e.trunkHas("P/c7.go") || !e.mirrorHas("c7.go") {
 		t.Fatal("the staged change did not land and export")
 	}
-	if len(e.forge.closed) != 1 || !strings.HasPrefix(e.forge.closed[0], "gosuda/p#7: ") {
-		t.Fatalf("exactly PR 7 must be closed, got %v", e.forge.closed)
+	if len(e.closedOn("gosuda/p")) != 1 || !strings.HasPrefix(e.closedOn("gosuda/p")[0], "gosuda/p#7: ") {
+		t.Fatalf("exactly PR 7 must be closed, got %v", e.closedOn("gosuda/p"))
 	}
-	if c := e.forge.closed[0]; !strings.Contains(c, "landed in the monorepo") || !strings.Contains(c, "`main`") {
+	if c := e.closedOn("gosuda/p")[0]; !strings.Contains(c, "landed in the monorepo") || !strings.Contains(c, "`main`") {
 		t.Fatalf("comment text: %q", c)
 	}
-	if strings.Contains(e.forge.closed[0], "Suda-") {
+	if strings.Contains(e.closedOn("gosuda/p")[0], "Suda-") {
 		t.Fatal("internal trailers must not appear in the comment")
 	}
 	e.cycle()
-	if len(e.forge.closed) != 1 {
-		t.Fatalf("closing must not repeat: %v", e.forge.closed)
+	if len(e.closedOn("gosuda/p")) != 1 {
+		t.Fatalf("closing must not repeat: %v", e.closedOn("gosuda/p"))
 	}
 
 	// New commits on a landed pull request give it a different head: it is not closed.
@@ -459,8 +470,103 @@ func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
 	e.forge.pulls["gosuda/p"] = append(e.forge.pulls["gosuda/p"], PullRequest{Number: 7, HeadRef: "f7", HeadSHA: head7b})
 	e.l.NoteWake("gosuda/p")
 	e.cycle()
-	if len(e.forge.closed) != 1 {
-		t.Fatalf("a pull request with new commits must stay open: %v", e.forge.closed)
+	if len(e.closedOn("gosuda/p")) != 1 {
+		t.Fatalf("a pull request with new commits must stay open: %v", e.closedOn("gosuda/p"))
+	}
+}
+
+func TestStagedMirrorPullRequestsGetReviewPullRequestsOnTheUserRepository(t *testing.T) {
+	e := newEnv(t)
+	e.l.MagpieURL = "https://magpie.example/"
+	e.cycle()
+	dir := filepath.Join(e.root, "pr-dev")
+	git(t, e.root, "clone", "-q", "-b", "main", e.mirror, dir)
+	pr := func(n int, file string) string {
+		git(t, dir, "checkout", "-q", "-B", "pr", "origin/main")
+		write(t, dir, map[string]string{file: "package p\n"})
+		git(t, dir, "add", "-A")
+		git(t, dir, "commit", "-qm", "feature "+file)
+		head := git(t, dir, "rev-parse", "HEAD")
+		git(t, dir, "push", "-q", "-f", "origin", fmt.Sprintf("%s:refs/pull/%d/head", head, n))
+		return head
+	}
+	head7 := pr(7, "c7.go")
+	head8 := pr(8, "c8.go")
+	e.forge.pulls["gosuda/p"] = []PullRequest{
+		{Number: 7, HeadRef: "f7", HeadSHA: head7, Title: "Add c7\nwith a newline", Author: "ev`il", URL: "https://github.com/gosuda/p/pull/7"},
+		{Number: 8, HeadRef: "f8", HeadSHA: head8, Title: "Add c8", Author: "bob", URL: "https://github.com/gosuda/p/pull/8"},
+	}
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+
+	if len(e.forge.created) != 2 {
+		t.Fatalf("expected two review pull requests, got %+v", e.forge.created)
+	}
+	c7 := e.forge.created[0]
+	if c7.Repo != "gosuda/1" || c7.Head != "review/capy-p-pr-7" || c7.Base != "base/capy-p-pr-7" {
+		t.Fatalf("review pull request branches: %+v", c7)
+	}
+	if c7.Title != "[p#7] Add c7 with a newline" {
+		t.Fatalf("title = %q", c7.Title)
+	}
+	for _, want := range []string{
+		"gosuda/p#7", "`evil`", "https://github.com/gosuda/p/pull/7",
+		"https://magpie.example/diff/heads/base/capy-p-pr-7..heads/review/capy-p-pr-7",
+		"git fetch ws review/capy-p-pr-7", "git push ws FETCH_HEAD:refs/heads/land/capy-p-pr-7",
+	} {
+		if !strings.Contains(c7.Body, want) {
+			t.Fatalf("body lacks %q:\n%s", want, c7.Body)
+		}
+	}
+	if strings.Contains(c7.Body, "ev`il") {
+		t.Fatalf("author must not break out of its code span:\n%s", c7.Body)
+	}
+
+	// base/review hold exactly the contributor's change.
+	git(t, e.dev, "fetch", "-q", e.user, "refs/heads/base/capy-p-pr-7:refs/remotes/rv/base", "refs/heads/review/capy-p-pr-7:refs/remotes/rv/review")
+	if got := strings.TrimSpace(git(t, e.dev, "diff", "--name-status", "refs/remotes/rv/base", "refs/remotes/rv/review")); got != "A\tP/c7.go" {
+		t.Fatalf("review branch delta = %q", got)
+	}
+
+	// A quiet cycle opens nothing new.
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if len(e.forge.created) != 2 || len(e.forge.updated) != 0 {
+		t.Fatalf("idempotence: created=%d updated=%d", len(e.forge.created), len(e.forge.updated))
+	}
+
+	// New commits on the mirror pull request refresh its review pull request.
+	head7b := pr(7, "c7b.go")
+	e.forge.pulls["gosuda/p"][0].HeadSHA = head7b
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if len(e.forge.updated) != 1 || e.forge.updated[0].Number != c7.Number || !strings.Contains(e.forge.updated[0].Body, head7b[:7]) {
+		t.Fatalf("expected the review pull request to be updated for the new head: %+v", e.forge.updated)
+	}
+
+	// Landing through the review branch lands and exports, and the original is closed.
+	git(t, e.dev, "fetch", "-q", e.user, "refs/heads/review/capy-p-pr-7")
+	git(t, e.dev, "push", "-q", e.user, "FETCH_HEAD:refs/heads/land/capy-p-pr-7")
+	e.cycle()
+	if !e.trunkHas("P/c7b.go") || !e.mirrorHas("c7b.go") {
+		t.Fatal("the review branch did not land and export")
+	}
+	if got := e.closedOn("gosuda/p"); len(got) != 1 || !strings.HasPrefix(got[0], "gosuda/p#7: ") {
+		t.Fatalf("exactly mirror PR 7 must be closed: %v", got)
+	}
+	for _, p := range e.forge.created {
+		if p.Number != c7.Number && p.Head == "review/capy-p-pr-7" {
+			t.Fatalf("a landed pull request must not be opened again: %+v", e.forge.created)
+		}
+	}
+
+	// A mirror pull request that closes retires its review pull request.
+	e.forge.pulls["gosuda/p"] = nil
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	c8 := e.forge.created[1]
+	if got := e.closedOn("gosuda/1"); len(got) == 0 || !strings.Contains(strings.Join(got, "\n"), fmt.Sprintf("gosuda/1#%d:", c8.Number)) {
+		t.Fatalf("the review pull request of the closed mirror PR 8 must be retired: %v", e.forge.closed)
 	}
 }
 

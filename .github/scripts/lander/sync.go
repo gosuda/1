@@ -487,19 +487,28 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 		return fmt.Errorf("list pull requests of %s: %w", wf.DestinationRepo, err)
 	}
 	var errs []error
+	// keep holds the pull requests whose review pull request stays open: staged ones, those whose
+	// fetched state lags the API, and those that already landed (landing deletes their review branches).
+	keep := map[int]bool{}
+	var landed map[string]string
+	var userOpen []PullRequest
+	userOpenKnown := false
 	for _, pr := range prs {
 		head, ok := s.RevParse(ctx, mirrorRef(wf, fmt.Sprintf("pull/%d", pr.Number)))
 		if !ok || head != pr.HeadSHA {
+			keep[pr.Number] = true
 			continue // fetched state lags the API; next cycle
 		}
 		meta, err := s.Meta(ctx, head)
 		if err != nil {
 			errs = append(errs, err)
+			keep[pr.Number] = true
 			continue
 		}
 		xRaw, ok, err := l.replayPull(ctx, wf, base, head, pr.Number)
 		if err != nil {
 			errs = append(errs, err)
+			keep[pr.Number] = true
 			continue
 		}
 		if !ok {
@@ -508,10 +517,47 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 		imp, err := capy.ImportTree(ctx, s.Dir, bMonoTree, wf, xRaw)
 		if err != nil {
 			errs = append(errs, err)
+			keep[pr.Number] = true
 			continue
 		}
 		origin := fmt.Sprintf("%s#%d@%s", wf.DestinationRepo, pr.Number, head)
 		if err := l.publishStaged(ctx, fmt.Sprintf("%s-pr-%d", wf.Name, pr.Number), bMonoTree, imp, meta, origin, base.Mirror); err != nil {
+			errs = append(errs, err)
+			keep[pr.Number] = true
+			continue
+		}
+		keep[pr.Number] = true
+
+		if landed == nil {
+			if landed, err = l.landedInbound(ctx); err != nil {
+				errs = append(errs, err)
+				landed = map[string]string{}
+			}
+		}
+		if _, done := landed[origin]; done {
+			continue // landed through this staged change; the export closes the mirror pull request
+		}
+		if !userOpenKnown {
+			if userOpen, err = l.Forge.OpenPulls(ctx, l.User.Repo); err != nil {
+				errs = append(errs, fmt.Errorf("list pull requests of %s: %w", l.User.Repo, err))
+				continue
+			}
+			userOpenKnown = true
+		}
+		if err := l.syncReviewPull(ctx, wf, pr, &userOpen); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if !userOpenKnown {
+		// Nothing was synced: retire whatever review pull requests of this mirror are left.
+		if userOpen, err = l.Forge.OpenPulls(ctx, l.User.Repo); err == nil {
+			userOpenKnown = true
+		} else {
+			errs = append(errs, fmt.Errorf("list pull requests of %s: %w", l.User.Repo, err))
+		}
+	}
+	if userOpenKnown {
+		if err := l.closeStaleReviewPulls(ctx, wf, userOpen, keep); err != nil {
 			errs = append(errs, err)
 		}
 	}

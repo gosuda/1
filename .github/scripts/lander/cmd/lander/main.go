@@ -123,6 +123,7 @@ func main() {
 		Mirror: func(repo string) lander.Remote {
 			return lander.Remote{URL: ghURL + "/" + repo + ".git", Repo: repo}
 		},
+		MagpieURL:      env("LANDER_MAGPIE_URL", "https://magpie.gosuda.org"),
 		AckTip:         os.Getenv("LANDER_ACK_TIP"),
 		MirrorInterval: envDur("LANDER_MIRROR_INTERVAL", 30*time.Minute),
 		DryRun:         os.Getenv("LANDER_DRYRUN") != "",

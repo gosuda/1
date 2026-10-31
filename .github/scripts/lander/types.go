@@ -21,6 +21,9 @@ type PullRequest struct {
 	HeadRef string
 	HeadSHA string
 	Draft   bool
+	Title   string
+	URL     string // web address
+	Author  string // login of the opener
 }
 
 // Forge abstracts the GitHub API surface the lander needs. All identity answers come from
@@ -34,6 +37,11 @@ type Forge interface {
 	// ClosePull closes a pull request and then posts comment on it (pull_requests:write). A
 	// failed comment leaves the pull request closed; closing is never repeated.
 	ClosePull(ctx context.Context, repo string, number int, comment string) error
+	// CreatePull opens a pull request from head into base (both branches of repo) and returns its
+	// number (pull_requests:write).
+	CreatePull(ctx context.Context, repo, head, base, title, body string) (int, error)
+	// UpdatePull replaces the title and body of a pull request (pull_requests:write).
+	UpdatePull(ctx context.Context, repo string, number int, title, body string) error
 }
 
 // PresubmitInput describes a candidate landing.
@@ -81,6 +89,9 @@ type Config struct {
 	EmbargoTeam string
 	// EmbargoTTL is the age after which embargoed workspace references are pruned (default 180 days).
 	EmbargoTTL time.Duration
+	// MagpieURL (for example "https://magpie.gosuda.org") is the base of the diff links in the pull
+	// requests the lander opens for imported mirror pull requests. Empty omits those links.
+	MagpieURL string
 	// AckTip, when set, accepts that unsigned refs/suda/history tip once.
 	AckTip string
 	DryRun bool
