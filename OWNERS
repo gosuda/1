@@ -8,3 +8,7 @@
 @rabbitson87
 @metaphorics
 @metaphoric-dev
+
+# Generated files that a mirror's own workflow commits as a bot. The grant is per file and lets that bot
+# land its own push inbound; it never covers anything else in the directory.
+per-file web/gosuda/zdata/data.json.zstd=@github-actions[bot]
