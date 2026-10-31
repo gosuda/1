@@ -1,80 +1,43 @@
 #!/usr/bin/env bash
+# Imports https://github.com/<owner/repo> (branch, default main) into <prefix>/ of the current
+# workspace branch as one local commit, plus the capy.star PILOT_REPOS entry and the docs/README.md
+# explorer row. Never pushes. Run `git ws-save` and `git ws-land` afterwards.
+#
+# Usage: import-repo.sh <prefix> <owner/repo> [branch]
+#   SUDA_IMPORT_URL overrides the fetch URL (tests use a local repository).
 set -euo pipefail
 
-PREFIX="${1:?usage: import-repo.sh <monorepo-prefix> <owner/repo> [branch]}"
-REPO="${2:?usage: import-repo.sh <monorepo-prefix> <owner/repo> [branch]}"
-BRANCH="${3:-main}"
-WF_NAME="${REPO##*/}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=workspace-lib.sh
+. "$SCRIPT_DIR/workspace-lib.sh"
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
-cd "$REPO_ROOT"
-
-git fetch --filter=blob:none --no-tags origin \
-  "+refs/suda/main:refs/remotes/origin/suda/main" \
-  "+refs/suda/history:refs/remotes/origin/suda/history"
-
-OLD_MAIN=$(git rev-parse refs/remotes/origin/suda/main)
-OLD_HIST=$(git rev-parse refs/remotes/origin/suda/history)
-BASE_TREE=$(git rev-parse "${OLD_MAIN}^{tree}")
-
-EXT_URL="https://github.com/${REPO}.git"
-git fetch --no-tags --depth=1 "$EXT_URL" "refs/heads/${BRANCH}"
-EXT_SHA=$(git rev-parse FETCH_HEAD)
-EXT_TREE=$(git rev-parse "FETCH_HEAD^{tree}")
-
-TMP_IDX=$(mktemp -u "${TMPDIR:-/tmp}/suda-import-idx.XXXXXX")
-export GIT_INDEX_FILE="$TMP_IDX"
-trap 'rm -f "$TMP_IDX"' EXIT
-
-CLEAN_PREFIX="${PREFIX#/}"
-CLEAN_PREFIX="${CLEAN_PREFIX%/}"
-
-git read-tree "$BASE_TREE"
-git rm -r --cached --ignore-unmatch -- "$CLEAN_PREFIX" >/dev/null 2>&1 || true
-git read-tree --prefix="${CLEAN_PREFIX}/" "$EXT_TREE"
-NEW_TREE=$(git write-tree)
-unset GIT_INDEX_FILE
-
-if CTRL_TREE=$(git rev-parse --verify -q "HEAD^{tree}"); then
-  NEW_TREE=$("$(dirname "$0")/sync-control-plane.sh" --overlay-tree "$NEW_TREE" "$CTRL_TREE")
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+  ws_usage "usage: import-repo.sh <prefix> <owner/repo> [branch]"
 fi
+PREFIX="$1"
+REPO="$2"
+BRANCH="${3:-main}"
+ws_validate_prefix "$PREFIX"
+ws_validate_repo "$REPO"
+ws_validate_branch "$BRANCH"
+NAME="${REPO##*/}"
 
-go -C .github/scripts/capy run ./cmd/capy check-visibility -repo "$REPO_ROOT" -base-tree "$BASE_TREE" -tree "$NEW_TREE"
+ws_check_workspace
+ws_prepare_sparse "$PREFIX"
 
-MSG=$(printf "chore(%s): import %s@%s into //%s\n\nSuda-Import: %s=%s@%s\n" \
-  "$CLEAN_PREFIX" "$REPO" "${EXT_SHA:0:7}" "$CLEAN_PREFIX" "$CLEAN_PREFIX" "$REPO" "$EXT_SHA")
+URL="${SUDA_IMPORT_URL:-https://github.com/$REPO.git}"
+git fetch --quiet --no-tags --depth=1 "$URL" "refs/heads/$BRANCH"
+SRC_SHA=$(git rev-parse FETCH_HEAD)
+SRC_TREE=$(git rev-parse "FETCH_HEAD^{tree}")
 
-SNAP=$(git commit-tree "$NEW_TREE" -m "$MSG")
-HIST=$(git commit-tree "$NEW_TREE" -p "$OLD_HIST" -m "$MSG")
+ws_register "$NAME" "$PREFIX" "$REPO" "$BRANCH"
 
-git push --atomic origin \
-  --force-with-lease="refs/suda/main:${OLD_MAIN}" \
-  --force-with-lease="refs/suda/history:${OLD_HIST}" \
-  "${SNAP}:refs/suda/main" \
-  "${HIST}:refs/suda/history"
+git rm -r -q --ignore-unmatch -- "$PREFIX"
+git read-tree --prefix="$PREFIX/" -u "$SRC_TREE"
 
-python3 - "$REPO_ROOT/capy.star" "$REPO_ROOT/docs/README.md" "$WF_NAME" "$CLEAN_PREFIX" "$REPO" "$SNAP" <<'PY'
-import re, sys
+MSG=$(printf 'chore(%s): import %s@%s into //%s\n\nSuda-Import: %s=%s@%s' \
+  "$PREFIX" "$REPO" "${SRC_SHA:0:7}" "$PREFIX" "$PREFIX" "$REPO" "$SRC_SHA")
 
-capy_path, readme_path, wf_name, prefix, repo, snap = sys.argv[1:7]
-
-with open(capy_path, "r", encoding="utf-8") as f:
-    capy_src = f.read()
-
-entry = f'    ("{wf_name}", "{prefix}", "{repo}", False),\n'
-if f'"{prefix}"' not in capy_src and "PILOT_REPOS = [\n" in capy_src:
-    capy_src = capy_src.replace("PILOT_REPOS = [\n", "PILOT_REPOS = [\n" + entry, 1)
-    with open(capy_path, "w", encoding="utf-8") as f:
-        f.write(capy_src)
-
-with open(readme_path, "r", encoding="utf-8") as f:
-    readme_src = f.read()
-
-row = f"| `//{prefix}` | `{repo}` | [Browse `//{prefix}`](https://magpie.gosuda.org/tree/{prefix}) | [Commits `//{prefix}`](https://magpie.gosuda.org/history/{prefix}) |\n"
-if f"`//{prefix}`" not in readme_src and "<!-- SUDA_EXPLORER_END -->" in readme_src:
-    readme_src = readme_src.replace("<!-- SUDA_EXPLORER_END -->", row + "<!-- SUDA_EXPLORER_END -->", 1)
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(readme_src)
-PY
-
-echo "Imported ${REPO}@${EXT_SHA} into //${CLEAN_PREFIX} (refs/suda/main=${SNAP})"
+if ws_commit "$PREFIX" "$MSG"; then
+  ws_next_steps "$REPO"
+fi

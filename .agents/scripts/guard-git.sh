@@ -32,8 +32,11 @@ if [[ "$CMD" =~ (^|[[:space:]\;\&\|])git[[:space:]]+push([[:space:]]|$) ]]; then
   if [[ "$CMD" =~ git[[:space:]]+push[^\;\&\|]*(--force([[:space:]]|$)|[[:space:]]-f([[:space:]]|$)) ]] && [[ ! "$CMD" =~ --force-with-lease ]]; then
     deny "Unconditional git push --force is prohibited. Pass --force-with-lease instead."
   fi
-  if [[ "$CMD" =~ :refs/suda/(main|history) ]] && [[ ! "$CMD" =~ (import-pilot\.sh|import-repo\.sh|create-repo\.sh|land\.sh|sync-inbound\.sh|sync-control-plane\.sh) ]]; then
-    deny "Direct pushes to refs/suda/main or refs/suda/history are prohibited. Push to refs/heads/land/<id> instead."
+  if [[ "$CMD" =~ git[[:space:]]+push([[:space:]]+-[^[:space:]]+)*[[:space:]]+origin([[:space:]]|$) ]]; then
+    deny "origin (gosuda/0) is written only by the lander. Push workspaces and landing requests to the ws remote (git ws-save, git ws-land)."
+  fi
+  if [[ "$CMD" =~ :refs/suda/(main|history) ]]; then
+    deny "Direct pushes to refs/suda/main or refs/suda/history are prohibited. Push to refs/heads/land/<id> on the ws remote instead (git ws-land)."
   fi
 fi
 

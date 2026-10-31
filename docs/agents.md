@@ -1,15 +1,15 @@
 # Agent Governance and Pure-Git Operations
 
-This specification defines how autonomous coding agents operate inside `gosuda/0`. Agents execute standard Git commands guided by `AGENTS.md`, `.gitconfig` aliases, and `.agents/` skill modules. Pre-execution hooks block direct mutations to trunk references.
+This specification defines how autonomous coding agents operate inside `gosuda/0` and its user repository `gosuda/1`. Agents execute standard Git commands guided by `AGENTS.md`, `.gitconfig` aliases, and `.agents/` skill modules. A pre-execution hook blocks direct mutations of trunk references and pushes to `origin`.
 
 ## 1. Layered Instruction Architecture
 
-The repository splits agent instructions across four hierarchical layers to bound context token consumption. Figure 1 shows the discovery and loading order across these layers.
+The repository splits agent instructions across four layers to bound context consumption. Figure 1 shows the discovery and loading order across these layers.
 
 ```mermaid
 flowchart TD
-  R["Root AGENTS.md (Always loaded, <= 4 KiB)"] --> P["Domain AGENTS.md (Loaded when editing subtree)"]
-  R --> S[".agents/skills/*/SKILL.md (Loaded on demand)"]
+  R["Root AGENTS.md (always loaded)"] --> P["Domain AGENTS.md (loaded when editing subtree)"]
+  R --> S[".agents/skills/*/SKILL.md (loaded on demand)"]
   R --> HK[".agents/hooks.json (PreToolUse command enforcement)"]
 ```
 
@@ -17,98 +17,63 @@ Table 1 specifies the file path, activation trigger, and owned scope for each cu
 
 | Layer | Path | Activation Trigger | Owned Scope |
 | :--- | :--- | :--- | :--- |
-| Root Rules | `/AGENTS.md` | Always loaded at session start | Repository reference map, visibility boundaries, and the 6 standard Git commands |
+| Root Rules | `/AGENTS.md` | Always loaded at session start | Reference boundaries, `OWNERS` and visibility rules, and the workspace, review, experimental, and mirror procedures |
 | Subtree Rules | `/<domain>/<project>/AGENTS.md` | Loaded when reading or editing files in `<project>` | Project build commands, test targets, and package-specific invariants |
-| Workspace Skills | `/.agents/skills/<name>/SKILL.md` | Loaded when the agent activates `<name>` | Multi-step runbooks for conflict resolution and subtree synchronization |
-| Lifecycle Hooks | `/.agents/hooks.json` | Executed before every `run_command` tool call | Deterministic rejection of prohibited `git push` and `git pull` invocations |
+| Workspace Skills | `/.agents/skills/<name>/SKILL.md` | Loaded when the agent activates `<name>` | Runbooks for workspace submission, conflict resolution, repository creation and import, and mirror synchronization |
+| Lifecycle Hooks | `/.agents/hooks.json` | Executed before every `run_command` tool call | Deterministic rejection of prohibited `git push` and `git pull` invocations, implemented by `.agents/scripts/guard-git.sh` |
 
 ## 2. Invariants and Safety Guardrails
 
-Every coding agent operating in `gosuda/0` obeys four operational invariants. The pre-execution hook in `.agents/hooks.json` enforces these boundaries before any shell command runs.
+Every coding agent operating in `gosuda/0` obeys these operational invariants. The pre-execution hook enforces the Git-level boundaries before any shell command runs. The lander enforces the rest on every landing.
 
-1. **One Task per Workspace Reference**: Every task creates a dedicated branch named `ws/agent-<name>/<task-id>` rooted at `origin/suda/main`. Agents never reuse a workspace reference across unrelated tasks.
-2. **Prohibition of Direct Trunk Pushes**: Agents never push directly to `refs/heads/main`, `refs/suda/main`, or `refs/suda/history`. All trunk updates pass through `refs/heads/land/<task-id>`.
-3. **Import Boundary Enforcement**: Agents editing public domains (`//web/*`, `//net/*`, `//ipc/*`, `//storage/*`, `//crypto/*`, `//ai/*`, `//devtools/*`) never import packages from `//corp/*` or `//experimental/*`.
-4. **Scoped Sparse Checkout**: Agents check out only the domain directories required for the active task.
+1. **One Task per Workspace Reference**: Every task creates a dedicated branch named `ws/<actor>/<id>` rooted at `origin/suda/main`. Agents never reuse a workspace reference across unrelated tasks.
+2. **No Direct Pushes to the Trunk or to `origin`**: After `git suda-init`, `origin` (`gosuda/0`) has an invalid push URL, and the hook denies any `git push` that names `origin`, `refs/suda/main`, or `refs/suda/history`. All trunk updates pass through `refs/heads/land/<id>` on `gosuda/1`.
+3. **Import Boundary Enforcement**: Agents editing public domains (`//web/*`, `//net/*`, `//ipc/*`, `//storage/*`, `//crypto/*`, `//ai/*`, `//devtools/*`) never import packages from `//corp/*` or `//experimental/*`. The lander rejects any landing that violates this.
+4. **Scoped Sparse Checkout**: Agents check out only the domain directories required for the active task. The hook rewrites `git sparse-checkout set` so that `.agents` and `.github` stay checked out.
+5. **Fetch Control Plane and Trunk Only From `origin`**: Agents never fetch `refs/heads/main`, `refs/suda/*`, or any other trunk reference from `gosuda/1`.
 
 > [!CAUTION]
 > Never execute `git push --force` without `--force-with-lease` on any reference. Unconditional force pushes overwrite commits written by concurrent agents and cause permanent work loss.
 
 ## 3. Standard Agent Command Mapping
 
-Agents execute native `git` subcommands or the `.gitconfig` aliases tracked on `refs/heads/main`. Table 2 maps each lifecycle operation to its exact Git command and alias.
+Agents execute native `git` subcommands or the `.gitconfig` aliases tracked on `refs/heads/main`. Table 2 maps each lifecycle operation to its native Git command and its alias. `ws-*` aliases push to the `ws` remote (`gosuda/1`) and fetch from `origin` (`gosuda/0`).
 
 | Operation | Native Git Command | `.gitconfig` Alias |
 | :--- | :--- | :--- |
-| Attach trunk refspec | `git config --add remote.origin.fetch "+refs/suda/*:refs/remotes/origin/suda/*"` | `git suda-init` |
-| Set sparse directories | `git sparse-checkout set ipc/hqq web/gosuda` | `git sparse-checkout set ...` |
+| Attach trunk and `ws` remote | `git remote add ws <origin URL with /1>`, then `git fetch --filter=blob:none origin` | `git suda-init` |
+| Set sparse directories | `git sparse-checkout set ipc/hqq web/gosuda` | `git sparse-checkout set ...` or `git ws-sparse <dirs>` |
 | Create workspace | `git fetch --filter=blob:none origin && git switch -c ws/<actor>/<id> origin/suda/main` | `git ws-new <actor>/<id>` |
 | Create experimental sandbox | `git sparse-checkout add experimental/<actor>/<name> && git switch -c ws/<actor>/exp-<name> origin/suda/main` | `git ws-exp <actor> <name>` |
 | Graduate experimental package | `git mv experimental/<actor>/<name> <domain>/<name>` | `git ws-graduate <src> <dst>` |
-| Save WIP snapshot | `git push --force-with-lease origin HEAD:refs/ws/<actor>/<id>` | `git ws-save` |
-| Open ephemeral GitHub PR | `git push --force-with-lease origin ${base}:refs/heads/base/<id> HEAD:refs/heads/review/<id>` | `git ws-pr` |
-| Generate GitHub diff link | `echo "https://magpie.gosuda.org/diff/$(git symbolic-ref --short HEAD)"` | `git ws-diff` |
+| Save WIP snapshot | `git push --force-with-lease ws HEAD:refs/ws/<actor>/<id>` | `git ws-save` |
+| Open ephemeral GitHub PR | `git push --force-with-lease ws ${base}:refs/heads/base/<id> HEAD:refs/heads/review/<id>` | `git ws-pr` |
+| Generate diff link | `echo "https://magpie.gosuda.org/diff/$(git symbolic-ref --short HEAD)"` | `git ws-diff` |
 | Rebase onto latest trunk | `git fetch --filter=blob:none origin && git rebase --onto origin/suda/main $(git rev-list --max-parents=0 HEAD) HEAD` | `git ws-sync` |
-| Submit to landing queue | `git push --force-with-lease origin HEAD:refs/heads/land/<id>` | `git ws-land` |
+| Submit to landing queue | `git push --force-with-lease ws HEAD:refs/heads/land/<id>` | `git ws-land` |
 | Query commit history | `git fetch --filter=blob:none origin refs/suda/history && git log FETCH_HEAD -- <path>` | `git suda-log <path>` |
+| Fetch staged external changes | `git fetch ws` (the refspec maps `refs/ws/*` to `refs/remotes/ws/ws/*`) | none |
 
 ## 4. Control-Plane File Specifications
 
-The control plane on `refs/heads/main` ships three configuration files that configure Git aliases, agent instructions, and command hooks.
+The control plane on `refs/heads/main` ships the files that configure Git aliases, agent instructions, and the command hook.
 
 ### 4.1 Tracked `.gitconfig` Specification
 
-The `.gitconfig` file defines five aliases that wrap the `refs/suda/*`, `refs/ws/*`, and `refs/heads/land/*` reference conventions.
+The `.gitconfig` file defines the aliases that wrap the `refs/suda/*`, `refs/ws/*`, and `refs/heads/land/*` reference conventions. Its behavior:
 
-```ini
-[alias]
-  suda-init = "!git config --add remote.origin.fetch '+refs/suda/*:refs/remotes/origin/suda/*' && git fetch --filter=blob:none origin"
-  ws-new    = "!f() { git fetch --filter=blob:none origin && git switch -c \"ws/$1\" origin/suda/main; }; f"
-  ws-save   = "!f() { b=$(git symbolic-ref --short HEAD); git push --force-with-lease origin \"HEAD:refs/$b\"; }; f"
-  ws-sync   = "!f() { git fetch --filter=blob:none origin && git rebase --onto origin/suda/main $(git rev-list --max-parents=0 HEAD) HEAD; }; f"
-  ws-land   = "!f() { id=$(basename $(git symbolic-ref --short HEAD)); git push --force-with-lease origin \"HEAD:refs/heads/land/$id\"; }; f"
-  ws-diff   = "!f() { b=$(git symbolic-ref --short HEAD); echo \"https://magpie.gosuda.org/diff/$b\"; }; f"
-  suda-log  = "!f() { git fetch --filter=blob:none origin refs/suda/history && git log FETCH_HEAD -- \"$@\"; }; f"
-```
+- `suda-init` copies the tracked `.gitconfig` into the Git directory and includes it. It adds the `ws` remote derived from the origin URL, sets `remote.origin.pushurl` to an invalid `no-push://` URL, configures the `refs/suda/*` fetch refspec on `origin`, and fetches from `origin`.
+- `ws-new`, `ws-sync`, `ws-exp`, and `suda-log` fetch from `origin`.
+- `ws-save`, `ws-land`, and `ws-pr` push to `ws`. `ws-land` pushes `HEAD` to `refs/heads/land/<id>` and does not call any API. `ws-pr` opens its pull request with `gh pr create --repo gosuda/1`.
+- `ws-diff` prints the diff link for the current branch.
 
-### 4.2 Root `AGENTS.md` Specification
+### 4.2 Root `AGENTS.md`
 
-The root `AGENTS.md` file provides the normative instructions loaded into every agent session.
-
-````markdown
-# gosuda/0 Monorepo Agent Rules
-
-## 1. Reference Boundaries
-- `refs/heads/main` holds only control-plane files (`AGENTS.md`, `README.md`, `.gitconfig`, `.github/workflows/`).
-- `refs/suda/main` holds the unified `google3` source tree as a single parentless snapshot commit.
-- `refs/suda/history` holds the linear commit history for `git blame` and `git log`.
-- Do not push source code to `refs/heads/main` or directly to `refs/suda/main`.
-
-## 2. Directory Visibility Rules
-- Public domains (`//web/*`, `//net/*`, `//ipc/*`, `//storage/*`, `//crypto/*`, `//ai/*`, `//devtools/*`) sync to `github.com/gosuda/<repo>`.
-- Public domains must never import `//corp/*` or `//experimental/*`.
-- `//corp/*` holds private internal services and never leaves `gosuda/0`.
-- `//third_party/*` holds external vendored code and requires `LICENSE` and `METADATA` files.
-- Keep each project's `.github/workflows/` inside its project directory so it executes on the public mirror after export.
-
-## 3. Workspace Procedure
-
-> [!WARNING]
-> Never run `git pull` on a workspace branch. Rebase onto `origin/suda/main` using `git ws-sync` instead.
-
-1. Enable repository aliases: `git config include.path ../.gitconfig`.
-2. Fetch trunk references: `git suda-init`.
-3. Set sparse checkout paths: `git sparse-checkout set <domain>/<project>`.
-4. Create a workspace branch: `git ws-new agent-<name>/<task-id>`.
-5. Run tests in all modified packages before saving.
-6. Commit changes and push WIP: `git ws-save`.
-7. Rebase onto the latest trunk snapshot: `git ws-sync`.
-8. Enqueue for landing: `git ws-land`.
-````
+The root [AGENTS.md](../AGENTS.md) is the normative set of rules loaded into every agent session. This document does not repeat it.
 
 ### 4.3 Pre-Execution Hook Specification (`.agents/hooks.json`)
 
-The `git-guard` hook inspects every shell command before execution and rejects prohibited Git reference mutations.
+The `git-guard` hook inspects every shell command before execution and rejects prohibited Git invocations.
 
 ```json
 {
@@ -119,7 +84,7 @@ The `git-guard` hook inspects every shell command before execution and rejects p
         "hooks": [
           {
             "type": "command",
-            "command": "./.agents/scripts/guard-git.sh",
+            "command": "./scripts/guard-git.sh",
             "timeout": 5
           }
         ]
@@ -129,16 +94,30 @@ The `git-guard` hook inspects every shell command before execution and rejects p
 }
 ```
 
+`.agents/scripts/guard-git.sh` applies these rules, in order:
+
+1. Deny `git pull`. The reason names `git ws-sync` as the replacement.
+2. Deny `git push` with an unconditional `--force` or `-f` that does not also carry `--force-with-lease`.
+3. Deny `git push` that names `origin`. The reason names `git ws-save` and `git ws-land`.
+4. Deny `git push` that names `refs/suda/main` or `refs/suda/history`.
+5. Rewrite `git sparse-checkout set` so that `.agents` and `.github` are included.
+6. Allow every other command.
+
 ## 5. Verification Matrix for Agent Workflows
 
-Evaluate agent compliance against the seven behavioral scenarios in Table 3 before deploying changes to `AGENTS.md` or `.agents/hooks.json`.
+Evaluate agent compliance against the scenarios in Table 3 before deploying changes to `AGENTS.md` or `.agents/`.
 
 | Scenario | Input Condition | Expected Observable Outcome |
 | :--- | :--- | :--- |
-| Standard task landing | Agent modifies one file in `//net/portalite` and runs `git ws-land` | `land.yml` updates `refs/suda/main`, exports to `gosuda/portalite`, and deletes `refs/heads/land/<id>` |
-| Trunk advanced without conflict | `refs/suda/main` advances in `//web/gosuda` while agent edits `//net/ivnp` | `git ws-sync` rebases cleanly; `land.yml` merges in memory with exit code `0` |
-| Overlapping line conflict | Both `refs/suda/main` and agent workspace modify the same lines | `land.yml` exits `1`; agent runs `git ws-sync`, resolves markers, re-tests, and re-submits |
-| Prohibited push to `main` | Agent invokes `git push origin HEAD:main` | `guard-git.sh` denies execution and prints the `git ws-land` command |
-| Cross-boundary import violation | Public package in `//web/securl` imports `//corp/lemonsso` | `land.yml` visibility check rejects the merge and leaves `refs/suda/main` unchanged |
-| Concurrent landing race | Two agents push to `refs/heads/land/a` and `refs/heads/land/b` simultaneously | `concurrency: land-suda-main` serializes both runs; neither update is lost |
-| Credential in staged diff | Agent stages a file containing a private key token | Pre-push check aborts `git ws-save` before objects reach `origin` |
+| Standard task landing | Agent modifies one file in `//net/portalite` and runs `git ws-land` | `suda/land` status `success` on the tip in `gosuda/1`; `refs/suda/main` advances; the land ref is deleted; the mirror `gosuda/portalite` receives the export in the same or a following cycle |
+| Trunk advanced without conflict | `refs/suda/main` advances in `//web/gosuda` while the agent edits `//net/ivnp` | `git ws-sync` rebases cleanly; the lander merges in memory with `merge-tree` exit code `0` |
+| Overlapping line conflict | Both `refs/suda/main` and the workspace modify the same lines | Status `failure` with the reason `merge conflict`; the agent runs `git ws-sync`, resolves the markers, re-tests, and re-submits |
+| Prohibited push to `main` | Agent invokes `git push origin HEAD:main` | `guard-git.sh` denies execution and points to `git ws-land` |
+| Cross-boundary import violation | Public package in `//web/securl` imports a `//corp/*` package by its module path | Status `failure` with a visibility reason; `refs/suda/main` unchanged |
+| Unknown base | Workspace root is not the tree of any of the last 500 trunk commits | Status `failure` with `unknown base tree; run git ws-sync`; the agent runs `git ws-sync` and re-submits |
+| Forged approval | Commit trailers claim `Reviewed-by: @owner` and the author name matches an owner, but the GitHub requester is not an owner and no approval is bound to the tip | Status `failure` with an `OWNERS` reason; trunk unchanged |
+| Self-approving `OWNERS` | A new directory adds its own `OWNERS` and files that the same change lands | Rejected unless an ancestor `OWNERS` approves the requester: the chain is read from the base trunk tree, where the new directory has no `OWNERS` yet |
+| Experimental path by another login | Requester `alice` lands under `experimental/bob/...` | Rejected unless the `OWNERS` chain approves; `bob` may land freely |
+| Concurrent landing race | Two agents push `refs/heads/land/a` and `refs/heads/land/b` in the same interval | Both are processed in push-time order within the cycle; neither update is lost |
+| Mirror push by a non-owner | A maintainer without ownership of the prefix pushes to the mirror branch | Not landed. The import is staged as `refs/ws/capy/<wf>-main` for a member to land |
+| Break-glass push to `main` | An org owner pushes `refs/heads/main` directly | Next cycle lands an overlay-sync commit with `Suda-Break-Glass:` in the trunk history |

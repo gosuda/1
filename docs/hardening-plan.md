@@ -3,7 +3,7 @@
 This document consolidates the 2026-10-30 architecture review of `gosuda/0` into a single execution plan. It defines the target two-repository topology (`gosuda/0` as the system of record, `gosuda/1` as the user repository), the self-hosted lander that replaces `land.sh` and `sync-inbound.sh`, and a phased migration with exit criteria.
 
 > [!NOTE]
-> Status: **Phase 0 and Phase 1 code complete; cutover pending**. See [Section 15](#15-implementation-status) for what exists in the repository and what remains an operator action. Until Phase 2 completes, [architecture.md](./architecture.md), [tooling.md](./tooling.md), and [agents.md](./agents.md) describe the running system. Phase 4 rewrites them to match this plan.
+> Status: **Implemented**; see [Section 15](#15-implementation-status) for what was verified and the operator steps that remain.
 
 ## 1. Decisions
 

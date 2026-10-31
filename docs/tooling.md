@@ -1,10 +1,10 @@
-# Server-Side Tooling and Pilot Repository Specification
+# Server-Side Tooling and Operations Specification
 
-The `gosuda/0` repository requires zero custom CLI binaries on developer workstations or agent containers. All merge-queue execution, policy verification, and subtree synchronization run inside GitHub Actions workflows stored on `refs/heads/main`.
+The landing pipeline runs in one process, the lander, on a dedicated server. The lander is built from `.github/scripts/lander` and `.github/scripts/capy` on the control plane and deployed from `refs/heads/lander` of `gosuda/0`. Workstations need only Git and the aliases in `.gitconfig`. Running the `capy` checks locally needs a Go toolchain. `gosuda/0` runs no GitHub Actions workflows.
 
 ## 1. Control-Plane Directory Layout
 
-The `refs/heads/main` branch contains the agent rules, Git aliases, Starlark synchronization config, and CI workflow scripts. The entire branch occupies less than 20 KiB on disk.
+The `refs/heads/main` branch contains the agent rules, Git aliases, the Starlark synchronization config, the agent skills, and the sources of the lander and `capy`.
 
 ```text
 / (refs/heads/main)
@@ -12,163 +12,157 @@ The `refs/heads/main` branch contains the agent rules, Git aliases, Starlark syn
 ├── README.md
 ├── .gitconfig
 ├── capy.star
+├── docs/
 ├── .agents/
 │   ├── hooks.json
 │   ├── scripts/
 │   │   └── guard-git.sh
 │   └── skills/
 └── .github/
-    ├── workflows/
-    │   ├── import.yml
-    │   ├── land.yml
-    │   ├── sync-inbound.yml
-    │   └── ws-gc.yml
+    ├── OWNERS
     └── scripts/
-        ├── create-repo.sh
-        ├── import-pilot.sh
-        ├── import-repo.sh
-        ├── land.sh
-        ├── sync-inbound.sh
-        ├── ws-gc.sh
-        └── capy/
+        ├── create-repo.sh        # workspace commit for a new project
+        ├── import-repo.sh        # workspace commit importing an existing repository
+        ├── capy/                 # Starlark evaluator, visibility and OWNERS checks, export and import
+        └── lander/               # the lander service and its deployment (deploy/deploy.sh)
 ```
 
-## 2. Pilot Repository Measurements
+`refs/heads/lander` holds the deployable tree that the lander publishes from the two source directories (Section 1.1). It contains `Dockerfile` and `.dockerignore` at the root, `lander/` (the lander sources and `deploy/`), and `capy/`.
 
-The initial migration imports seven `gosuda` repositories into `refs/suda/main`. Table 1 lists the target path, Go module identifier, file count, and measured byte sizes from the GitHub Git Trees API.
+### 1.1 Image and Deployment
 
-| Upstream Repository | Target Path in `refs/suda/main` | Go Module Path | HEAD Files | Historical Disk (KB) | HEAD Uncompressed (KB) |
-| :--- | :--- | :--- | ---: | ---: | ---: |
-| `gosuda/website` | `//web/gosuda` | `gosuda.org/website` | 204 | 124,640 | 15,015 |
-| `gosuda/IVNP` | `//net/ivnp` | `gosuda.org/ivnp` | 661 | 5,485 | 5,985 |
-| `gosuda/HQQ` | `//ipc/hqq/HQQ` | `gosuda.org/hqq` | 594 | 3,095 | 6,848 |
-| `gosuda/hqq-sqlite3` | `//ipc/hqq/hqq-sqlite3` | `gosuda.org/sqlite3` | 121 | 5,612 | 9,234 |
-| `gosuda/hqq-zstd` | `//ipc/hqq/hqq-zstd` | `gosuda.org/zstd` | 54 | 3,140 | 4,750 |
-| `gosuda/securl` | `//web/securl` | `securl.click/securl` | 153 | 1,014 | 710 |
-| `gosuda/portalite` | `//net/portalite` | `gosuda.org/portalite` | 25 | 223 | 318 |
-| **Total (7 Repositories)** | **Unified root tree** | **Multi-module** | **1,812** | **143,209** | **42,860** |
+The `Dockerfile` builds the lander binary in a Go stage from `lander/` and `capy/`. The runtime stage is `debian:bookworm-slim` with `git`, `openssh-client`, `ca-certificates`, the Go toolchain (used only to download module caches for presubmit), and the Docker CLI. The container runs as UID `10001` with `/var/lib/lander` as its volume. It exposes port `8080` and starts `lander run`.
 
-Importing only the `HEAD` tree of `gosuda/website` eliminates 109,625 KB of historical `zdata/data.json.zstd` revisions. The compressed Git pack for all seven repositories combined is approximately 18 to 20 MB, and a blobless tree fetch (`--filter=blob:none`) downloads 65 KB.
+Figure 1 shows the deployment loop. `lander/deploy/deploy.sh` runs on the server, outside the container.
 
-## 3. Initial Pilot Import Procedure (`import-pilot.sh`)
+```mermaid
+flowchart LR
+  BR["refs/heads/lander (gosuda/0)"] -->|"git ls-remote, every 60 s"| D["deploy.sh"]
+  D -->|"fetch commit, docker build lander:sha"| I["image lander:sha"]
+  I -->|"lander check"| C{"check passes"}
+  C -->|"yes: start container, wait 20 s"| R["running lander container"]
+  C -->|"no"| X["keep the previous container"]
+  R -->|"not running after 20 s"| B["restart previous image"]
+```
 
-Assemble the initial `refs/suda/main` root tree from the seven upstream repositories using `git read-tree --prefix` without checking files out to the working directory.
+`deploy.sh` behaves as follows:
+
+- It deploys a commit when `refs/heads/lander` moves to it. A commit whose image fails to stay up is recorded and is not retried. The next commit is deployed normally.
+- It mounts the state directory at `/var/lib/lander` and the key directory read-only at `/etc/lander`. It binds the health port to `127.0.0.1:8080`.
+- It keeps the three newest `lander:<sha>` images.
+
+Rollback needs no GitHub write access. An operator runs a previous `lander:<sha>` image. If a broken release cannot land its own fix, an org owner pushes a previous commit to `refs/heads/lander`.
 
 > [!IMPORTANT]
-> Run `import-pilot.sh` inside a temporary index (`GIT_INDEX_FILE`) so the script does not alter the control-plane index on `refs/heads/main`.
+> The lander container never mounts the host Docker socket, because that would give the lander host root. Presubmit containers run on a dedicated sandbox daemon named by `DOCKER_HOST`.
 
-1. Allocate a temporary index file path and register an exit trap to remove it.
-2. Initialize an empty Git index using `git read-tree --empty`.
-3. Fetch each upstream repository at `--depth=1` and mount its `HEAD^{tree}` under its `google3` prefix.
-4. Write the composite index to a root tree object using `git write-tree`.
-5. Create the initial snapshot commit and push it atomically to `refs/suda/main` and `refs/suda/history`.
+## 2. GitHub App and Configuration
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+The `suda-lander` GitHub App performs every write. It is installed on `gosuda/0`, `gosuda/1`, and each repository listed in `capy.star`. Table 1 lists its permissions.
 
-TMP_IDX=$(mktemp -u "${TMPDIR:-/tmp}/suda-idx.XXXXXX")
-export GIT_INDEX_FILE="$TMP_IDX"
-trap 'rm -f "$TMP_IDX"' EXIT
-
-declare -A REPOS=(
-  ["web/gosuda"]="https://github.com/gosuda/website.git"
-  ["net/ivnp"]="https://github.com/gosuda/IVNP.git"
-  ["ipc/hqq/HQQ"]="https://github.com/gosuda/HQQ.git"
-  ["ipc/hqq/hqq-sqlite3"]="https://github.com/gosuda/hqq-sqlite3.git"
-  ["ipc/hqq/hqq-zstd"]="https://github.com/gosuda/hqq-zstd.git"
-  ["web/securl"]="https://github.com/gosuda/securl.git"
-  ["net/portalite"]="https://github.com/gosuda/portalite.git"
-)
-
-git read-tree --empty
-for prefix in "${!REPOS[@]}"; do
-  git fetch --depth=1 "${REPOS[$prefix]}" HEAD
-  tree=$(git rev-parse "FETCH_HEAD^{tree}")
-  git read-tree --prefix="${prefix}/" "$tree"
-done
-
-ROOT_TREE=$(git write-tree)
-SNAP=$(git commit-tree "$ROOT_TREE" -m "chore: initialize refs/suda/main with 7 pilot repositories")
-
-git push --atomic origin \
-  "${SNAP}:refs/suda/main" \
-  "${SNAP}:refs/suda/history"
-```
-
-## 4. GitHub Actions Workflow Specifications
-
-Three server-side workflows on `refs/heads/main` automate merging, external synchronization, and workspace garbage collection.
-
-### 4.1 Automated Landing Workflow (`land.yml`)
-
-Pushing a branch to `refs/heads/land/<id>` triggers `land.yml`. The workflow serializes merges across callers, updates `refs/suda/main` and `refs/suda/history`, exports modified public subtrees, and deletes the temporary landing branch.
-
-```yaml
-name: land
-on:
-  push:
-    branches:
-      - "land/**"
-
-concurrency:
-  group: land-suda-main
-  cancel-in-progress: false
-
-permissions:
-  contents: write
-
-jobs:
-  land:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout control plane
-        uses: actions/checkout@v4
-        with:
-          ref: refs/heads/main
-          filter: blob:none
-      - name: Merge into refs/suda/main and export mirrors
-        env:
-          LAND_REF: ${{ github.ref }}
-          MIRROR_TOKEN: ${{ secrets.SUDA_MIRROR_TOKEN }}
-        run: ./.github/scripts/land.sh "$LAND_REF"
-```
-
-### 4.2 Stale Workspace Garbage Collection (`ws-gc.yml`)
-
-The `ws-gc.yml` workflow runs once every 24 hours. It enumerates references under `refs/ws/*`, inspects the committer timestamp of each tip commit, and deletes references older than 14 days using `--force-with-lease`.
-
-## 5. `Azure-Winged Magpie` GitHub App and Bidirectional Synchronization
-
-Bidirectional synchronization between `gosuda/0` and standalone `gosuda/<repo>` mirrors authenticates through the `Azure-Winged Magpie` GitHub App. Table 2 specifies the required permissions, repository variables, and secrets.
-
-| Configuration Item | Location | Value / Permission |
+| Permission | Repositories | Purpose |
 | :--- | :--- | :--- |
-| Repository Permission: `Contents` | GitHub App settings | `Read and write` (pushes `refs/suda/*`, `refs/heads/main`, and mirror branches) |
-| Repository Permission: `Pull requests` | GitHub App settings | `Read and write` (reads inbound PR refs and updates mirror PR status) |
-| Repository Permission: `Actions` | GitHub App settings | `Write` (dispatches `capy-inbound` workflow runs on `gosuda/0`) |
-| Repository Permission: `Metadata` | GitHub App settings | `Read-only` |
-| Webhook Events | GitHub App settings | `Push`, `Pull request` (pointed at the Cloudflare Worker `/webhook` endpoint) |
-| Variable `MAGPIE_APP_ID` | `gosuda/0` Actions variables | Numeric GitHub App ID |
-| Secret `MAGPIE_APP_PRIVATE_KEY` | `gosuda/0` Actions secrets | PEM private key for `Azure-Winged Magpie` |
-| Secret `WEBHOOK_SECRET` | `gosuda/azure-magpie` Actions secrets | HMAC secret shared with the GitHub App webhook |
-| Secret `CLOUDFLARE_API_TOKEN` | `gosuda/azure-magpie` Actions secrets | Cloudflare API token with Cloudflare Pages Edit permission |
-| Variable `CLOUDFLARE_ACCOUNT_ID` | `gosuda/azure-magpie` Actions variables | Cloudflare account identifier for automated Pages deployment |
+| `contents: write` | `gosuda/0`, `gosuda/1`, mirrors | Trunk and control-plane pushes, trunk copies, staged refs, mirror exports |
+| `contents: read` | `gosuda/1`, mirrors | Activity API for the pusher of a tip |
+| `workflows: write` | Mirrors | Exporting `.github/workflows/` |
+| `pull_requests: read` | `gosuda/1`, mirrors | Approvals bound to a tip; open mirror pull requests |
+| `statuses: write` | `gosuda/1` | `suda/land` statuses on landing request tips |
+| `members: read` | Organization | Active team membership for `@org/team` owners |
 
-## 6. Cloudflare Pages Snapshot Redirector and Diff Generator (`//devtools/azure-magpie`)
+The lander mints an installation token for each operation. Every token is narrowed to one repository and to the permissions that operation needs. A fetch uses `contents: read`. A trunk push uses `contents: write`. A mirror export also requests `workflows: write`. Tokens are cached until five minutes before they expire and never enter a sandbox.
 
-The `//devtools/azure-magpie` project (`gosuda/azure-magpie`) serves the Diff Link Generator UI and resolves `refs/suda/*` and `refs/ws/*` at the edge. The `capy` synchronizer exports `//devtools/azure-magpie/.github/workflows/` to the public `gosuda/azure-magpie` mirror, where GitHub Actions executes monorepo landing, mirror synchronization, and Cloudflare Pages deployments on public runners. Table 3 lists the supported routes.
+Table 2 lists the settings an operator provides. The lander README (`.github/scripts/lander/README.md`) lists every variable.
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `LANDER_APP_ID`, `LANDER_APP_KEY_FILE` | required | App ID and PEM private key of `suda-lander` |
+| `LANDER_STORE` | `/var/lib/lander/store.git` | Bare object store shared by all remotes |
+| `LANDER_INTERVAL` | `1m` | Poll interval between cycles; a `/wake` request ends the wait early |
+| `LANDER_MIRROR_INTERVAL` | `5m` | Minimum gap between mirror reconciles; a landing that advanced the trunk reconciles on the next cycle |
+| `LANDER_DRYRUN` | unset | Decide and log, push nothing |
+| `LANDER_SIGNING_KEY`, `LANDER_ALLOWED_SIGNERS` | unset | SSH key that signs lander commits, and the allowed signers that verify the history tip. The key requires the signers file. |
+| `LANDER_ACK_TIP` | unset | Accepts one unsigned history tip after an operator reviews it |
+| `LANDER_PRESUBMIT` | `docker` | `docker` runs the sandbox; `off` skips presubmit |
+| `LANDER_WAKE_SECRET` | unset | Enables `/wake`, which accepts HMAC-SHA256 signed requests only |
+
+Mirror repositories are created by an org owner. Until a mirror exists, its reconciliation fails on every cycle and the lander skips it. The App private key is read only by the lander process. Git reads the signing key file only when it signs a commit the lander creates.
+
+## 3. Presubmit Sandbox
+
+Presubmit tests the affected projects of a candidate before it lands. Figure 2 and Table 3 show the stages. The lander process never executes repository code, so the tests run in a separate container.
+
+```mermaid
+flowchart LR
+  P["Prepare (lander process)"] -->|"git archive of affected projects, read-only caches"| R["Run (sandbox: no network, no credentials)"]
+  R -->|"exit codes"| V["Verdict (lander process)"]
+```
+
+Table 3 lists the work of each stage.
+
+| Stage | Runs in | Work |
+| :--- | :--- | :--- |
+| Prepare | Lander process | Computes the merged candidate and the affected set, writes the affected closure of project directories from the object store, and warms dependency caches with commands that run no package code: `go mod download` with `GOPROXY=https://proxy.golang.org`, `bun install --ignore-scripts --frozen-lockfile` when a lockfile exists, and `cargo fetch --locked` unless the repository carries a Cargo configuration file. Each command receives only a fixed list of host variables. |
+| Run | Sandbox container | Runs the project's test commands in a fresh container, one per project, with no network and no credentials. The source archive and the caches are mounted read-only. |
+| Verdict | Lander process | A failing project rejects the request. The `suda/land` status reads `presubmit: FAILED: <project directories>`, and the output tail stays in the lander log. A passing run with nothing to test passes with a summary of `no tests declared`. |
+
+Each sandbox container runs with these properties:
+
+- `docker run --pull=never --network none --read-only --cap-drop ALL --security-opt no-new-privileges`. The image must already exist on the sandbox daemon.
+- A non-root user (`65534:65534`), `--pids-limit 512`, and CPU and memory limits from `LANDER_PRESUBMIT_CPUS` (default `2`) and `LANDER_PRESUBMIT_MEMORY` (default `4g`). Memory swap equals memory.
+- Writable `tmpfs` mounts at `/tmp` and at the work directory. The sources are copied into the work directory, and the project's commands run there.
+- The source archive is mounted read-only at `/src`, and the dependency cache is mounted read-only at `/cache`.
+- A fixed environment (`HOME=/tmp`, `GOPROXY=off`, `GOFLAGS=-mod=readonly`, `GOWORK=off`, `GOTOOLCHAIN=local`, `CARGO_NET_OFFLINE=true`, and cache paths). The host environment never enters the container.
+- The timeout is `LANDER_PRESUBMIT_TIMEOUT` (default `15m`) per container and per prepare command. The sandbox image is `LANDER_PRESUBMIT_IMAGE` (default `golang:1.27`).
+
+The affected set starts from the changed paths. Each changed path belongs to its nearest ancestor project, which is a directory holding a `go.mod`, `Cargo.toml`, or `package.json`. The set then adds every project that transitively depends on one of them. Dependencies are read from the manifests: Go `require` directives and local `replace` targets, Cargo `path` dependencies, and `package.json` `file:`, `link:`, and `workspace:` references. Only the affected projects run tests, but the closure of their dependencies is exported and warmed so that they can build.
+
+Test commands are chosen by project kind:
+
+- **Go**: `go vet ./...` and `go test ./...`.
+- **Cargo**: `cargo test --offline --locked`, only when `Cargo.lock` exists.
+- **Node**: `bun test`, only when `package.json` declares a test script or the project has `*.test.ts` files.
+- Any other project has no commands and passes without running anything. The summary counts such projects, or reads `no tests declared` when none of the affected projects has commands.
+
+A candidate that touches no project passes with the summary `no affected projects`. The commands above are the only test configuration; `capy.star` does not list test commands.
+
+Presubmit runs inside the serialized cycle, so landing latency includes test time. Because the lander is the only writer, a passing result stays valid until the commit step. Mirror CI runs after the export and does not gate landing.
+
+## 4. `capy` Command Set
+
+`capy` is the Go module at `.github/scripts/capy`. Its CLI is `go -C .github/scripts/capy run ./cmd/capy <command>`. Table 4 lists the commands. The lander calls the same functions directly.
+
+| Command | Flags | Behavior |
+| :--- | :--- | :--- |
+| `list` | `-config capy.star`, `-json` | Prints each workflow as name, prefix, destination repository, and branch. |
+| `check-visibility` | `-repo`, `-base-tree`, `-tree` | Prints each violation and exits `1` when there is any. With `-base-tree`, it evaluates only files added or modified since the base, files whose nearest `go.mod` or `package.json` changed, and Go files that import a changed module path. |
+| `check-owners` | `-repo`, `-base-tree`, `-tree`, `-requester`, `-approvers`, `-team org/slug=login,...`, `-github-repo`, `-github-ref`, `-github-sha`, `-github-review-head` | Applies Section 2.1 of [AGENTS.md](../AGENTS.md). `OWNERS` files are read from `-base-tree`. Identity comes from `-requester` and `-approvers`, or from the GitHub API with `-github-*` (requires `GITHUB_TOKEN`). Exits `1` on violations. |
+| `export-tree` | `-config`, `-workflow`, `-tree` | Prints the export tree of a workflow for a root tree. |
+| `import-tree` | `-config`, `-workflow`, `-base-tree`, `-sub-tree` | Prints a root tree in which the workflow prefix is replaced by `-sub-tree`. This command replaces the whole prefix and does not keep excluded paths. The lander's inbound path keeps them (architecture §4.3), so do not use this command to land a mirror change. |
+| `format-msg` | `-config`, `-workflow`, `-source-rev`, `-msg` | Prints an export commit message with the configured `GitOrigin-RevId` trailer. |
+
+Starlark configuration is evaluated by the built-in modules listed in [google3-and-copybara.md](./google3-and-copybara.md) §4.3. `go -C .github/scripts/capy test ./...` runs the tests of the module.
+
+## 5. Magpie Routes and Mirror Repository
+
+The `//devtools/azure-magpie` project serves the Diff Link Generator UI and resolves `refs/suda/*` and `refs/ws/*` at the edge. The site is read-only. It accepts no landing requests; a landing is submitted only with `git ws-land`. The site sits behind Cloudflare Access, and the webhook path is the only exception. The worker reads the trunk from `gosuda/0` and workspaces from `gosuda/1`.
+
+`gosuda/azure-magpie` is an ordinary public mirror of `//devtools/azure-magpie`. It holds no landing workflow and no landing secrets.
+
+Table 5 lists the supported routes.
 
 | Request Path | Target Redirect Location or Response |
 | :--- | :--- |
-| `GET /` or `GET /<path>` | `302` to `https://github.com/gosuda/0/tree/<suda-main-sha>/<path>` |
-| `GET /blob/<path>` | `302` to `https://github.com/gosuda/0/blob/<suda-main-sha>/<path>` |
-| `GET /commit` or `GET /commit/<ref>` | `302` to `https://github.com/gosuda/0/commit/<resolved-sha>` |
-| `GET /history/<path>` | `302` to `https://github.com/gosuda/0/commits/<suda-history-sha>/<path>` |
-| `GET /blame/<path>` | `302` to `https://github.com/gosuda/0/blame/<suda-history-sha>/<path>` |
-| `GET /diff` | `200` HTML Diff Link Generator UI listing active `refs/ws/*` and `refs/heads/land/*` branches |
-| `GET /diff/ws/<actor>/<id>` | `302` to two-dot compare `https://github.com/gosuda/0/compare/<suda-main-sha>..<ws-sha>` |
-| `GET /diff/<base>..<head>` | `302` to two-dot compare `https://github.com/gosuda/0/compare/<base-sha>..<head-sha>` |
-| `GET /refs.json` or `GET /sha` | `200` JSON payload containing `suda/main` and `suda/history` commit hashes |
-| `POST /webhook` | Verifies `X-Hub-Signature-256`, clears ref cache, and dispatches `capy-inbound` on `gosuda/0` |
+| `GET /` or `GET /<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
+| `GET /blob/<path>` | `302` to `https://github.com/gosuda/1/blob/<suda-main-sha>/<path>` |
+| `GET /commit` or `GET /commit/<ref>` | `302` to `https://github.com/gosuda/1/commit/<resolved-sha>` |
+| `GET /history/<path>` | `302` to `https://github.com/gosuda/1/commits/<suda-history-sha>/<path>` |
+| `GET /blame/<path>` | `302` to `https://github.com/gosuda/1/blame/<suda-history-sha>/<path>` |
+| `GET /diff` | `200` HTML Diff Link Generator UI listing the active `refs/ws/*` and `refs/heads/land/*` references of `gosuda/1` |
+| `GET /diff/ws/<actor>/<id>` | `302` to two-dot compare `https://github.com/gosuda/1/compare/<suda-main-sha>..<ws-sha>` |
+| `GET /diff/<base>..<head>` | `302` to two-dot compare `https://github.com/gosuda/1/compare/<base-sha>..<head-sha>` |
+| `GET /refs.json` or `GET /sha` | `200` JSON payload containing the `suda/main` and `suda/history` commit hashes |
+| `POST /webhook` | Verifies `X-Hub-Signature-256` and forwards a wake request to the lander's `/wake`. It dispatches nothing. |
 
+Magpie resolves refs and builds every link on `gosuda/1` (`GITHUB_REPO`) and never contacts `gosuda/0`. The links resolve there because the lander keeps byte-identical copies of the trunk refs ([architecture.md](./architecture.md) §3.1). The copy carries no trust and lags the trunk by at most one lander cycle. The mirror project list is read from `capy.star` at `refs/suda/main` of `gosuda/1`.
+
+An organization webhook (`push`, `pull_request`) can post directly to the lander's `/wake`, which then ignores repositories it does not watch; magpie's `/webhook` forwarding is optional.
