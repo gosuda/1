@@ -247,7 +247,7 @@ The command takes `-actor <login>` and `-approver <login>` flags; `-author` and 
 `refs/suda/sync/<wf>` records the last point where the trunk and the mirror agreed:
 
 ```text
-tree <export tree at baseline>
+tree <empty tree>
 (no parents)
 
 suda: sync baseline for <wf>
@@ -257,6 +257,7 @@ Suda-Sync-Mirror: <mirror commit>
 ```
 
 - **Invariant**: `export(tree(Suda-Sync-Mono)) == tree(Suda-Sync-Mirror)`, including `.github/workflows/` (D7).
+- **Empty tree**: The baseline commit carries no files. An export tree contains the project's root `.github/workflows/`, and GitHub rejects ref updates with workflow files unless the token has `workflows` permission.
 - **Bootstrap**: Write the baseline for every workflow at cutover, after confirming zero drift (the 2026-10-30 measurement found none).
 - **Trailer change**: `GitOrigin-RevId` records the history commit instead of the snapshot commit (F12).
 

@@ -285,3 +285,25 @@ func TestNoteWakeForcesMirrorSyncOnlyForConfiguredMirrors(t *testing.T) {
 		t.Fatal("only mirror wakes force reconciliation")
 	}
 }
+
+// GitHub refuses ref updates whose tree contains a root .github/workflows unless the token has
+// the workflows permission. Baselines must therefore never carry the export tree.
+func TestBaselineWritesSurviveProjectsThatShipWorkflows(t *testing.T) {
+	e := newEnv(t)
+	hook := filepath.Join(e.trunk, "hooks", "pre-receive")
+	script := "#!/bin/sh\nwhile read old new ref; do\n  case \"$ref\" in refs/suda/sync/*)\n    if git ls-tree -r \"$new\" | grep -q '	.github/workflows/'; then echo \"refusing to update workflow files\" >&2; exit 1; fi;;\n  esac\ndone\n"
+	if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.cycle() // bootstrap the baseline
+	e.devWork("wf", map[string]string{"P/.github/workflows/ci.yml": "name: ci\n"}, "P: add CI")
+	e.cycle()
+	hist := e.trunkRef("refs/suda/history")
+	msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/sync/p")
+	if !strings.Contains(msg, "Suda-Sync-Mono: "+hist) {
+		t.Fatalf("baseline not written for a project with workflows:\n%s", msg)
+	}
+	if !e.mirrorHas(".github/workflows/ci.yml") {
+		t.Fatal("workflow file must be exported to the mirror")
+	}
+}

@@ -117,7 +117,7 @@ func (l *Lander) reconcilePass(ctx context.Context, wf capy.Workflow, remote Rem
 
 	base, haveBase := l.readBaseline(ctx, wf)
 	if M == X {
-		return true, l.writeBaseline(ctx, wf, base, haveBase, histTip, tip, M)
+		return true, l.writeBaseline(ctx, wf, base, haveBase, histTip, tip)
 	}
 	if !haveBase {
 		l.Log.Error("mirror diverged and no sync baseline exists; manual baseline required", "workflow", wf.Name)
@@ -345,7 +345,7 @@ func (l *Lander) export(ctx context.Context, wf capy.Workflow, remote Remote, ba
 	}
 	_, _ = s.Git(ctx, "update-ref", mirrorRef(wf, "head"), commit)
 	l.Log.Info("exported to mirror", "workflow", wf.Name, "commit", commit)
-	return l.writeBaseline(ctx, wf, base, haveBase, histTip, commit, M)
+	return l.writeBaseline(ctx, wf, base, haveBase, histTip, commit)
 }
 
 // exportMessage squashes the trunk commits since the baseline that touched the prefix.
@@ -403,7 +403,7 @@ func (l *Lander) readBaseline(ctx context.Context, wf capy.Workflow) (capy.SyncB
 }
 
 // writeBaseline records (histTip, mirrorCommit) as the last agreement point when it changed.
-func (l *Lander) writeBaseline(ctx context.Context, wf capy.Workflow, old capy.SyncBaseline, haveOld bool, histTip, mirrorCommit, M string) error {
+func (l *Lander) writeBaseline(ctx context.Context, wf capy.Workflow, old capy.SyncBaseline, haveOld bool, histTip, mirrorCommit string) error {
 	if haveOld && old.Mono == histTip && old.Mirror == mirrorCommit {
 		return nil
 	}
@@ -412,7 +412,14 @@ func (l *Lander) writeBaseline(ctx context.Context, wf capy.Workflow, old capy.S
 		return nil
 	}
 	s := l.Store
-	commit, err := s.CommitTree(ctx, M, nil, capy.FormatBaselineMessage(capy.SyncBaseline{Workflow: wf.Name, Mono: histTip, Mirror: mirrorCommit}), nil)
+	// The baseline lives in its message. Its tree is empty on purpose: an export tree carries the
+	// project's root .github/workflows, and GitHub refuses ref updates containing workflow files
+	// unless the token has the workflows permission.
+	empty, err := s.BuildTree(ctx, nil)
+	if err != nil {
+		return err
+	}
+	commit, err := s.CommitTree(ctx, empty, nil, capy.FormatBaselineMessage(capy.SyncBaseline{Workflow: wf.Name, Mono: histTip, Mirror: mirrorCommit}), nil)
 	if err != nil {
 		return err
 	}
