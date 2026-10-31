@@ -153,6 +153,7 @@ Table 5 lists the supported routes.
 | Request Path | Target Redirect Location or Response |
 | :--- | :--- |
 | `GET /` or `GET /<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
+| `GET /head` or `GET /head/<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-history-sha>/<path>`, the tree view at the head of `refs/suda/history` |
 | `GET /blob/<path>` | `302` to `https://github.com/gosuda/1/blob/<suda-main-sha>/<path>` |
 | `GET /commit` or `GET /commit/<ref>` | `302` to `https://github.com/gosuda/1/commit/<resolved-sha>` |
 | `GET /history/<path>` | `302` to `https://github.com/gosuda/1/commits/<suda-history-sha>/<path>` |

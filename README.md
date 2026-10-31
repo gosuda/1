@@ -1,5 +1,7 @@
 # DO NOT PUSH TO THIS REPOSITORY
 
+**Browse the current monorepo tree: [magpie.gosuda.org/head](https://magpie.gosuda.org/head)** (read-only view at the head of `refs/suda/history`)
+
 > [!CAUTION]
 > **`gosuda/0` is the internal monorepo source of truth. Members never write here.**
 > Every ref in this repository is written by the **lander** (a single automated service). A push from
@@ -28,6 +30,7 @@ Only the `suda-lander` GitHub App writes these refs. Org owners may use a docume
 
 ## Head Links
 
+- **Current Tree (head of `refs/suda/history`)**: [https://magpie.gosuda.org/head](https://magpie.gosuda.org/head)
 - **Unified Source Tree (`refs/suda/main`)**: [https://magpie.gosuda.org/tree](https://magpie.gosuda.org/tree)
 - **Linear Commit History (`refs/suda/history`)**: [https://magpie.gosuda.org/history](https://magpie.gosuda.org/history)
 - **Diff Link Generator**: [https://magpie.gosuda.org/diff](https://magpie.gosuda.org/diff)

@@ -1,5 +1,7 @@
 # gosuda/1: contribute to the gosuda monorepo
 
+**Browse the current monorepo tree: [magpie.gosuda.org/head](https://magpie.gosuda.org/head)**
+
 This is the **user repository** of the `gosuda` monorepo. Contributors and coding agents push workspaces,
 landing requests, and review branches **here**. The monorepo itself (`gosuda/0`) is internal and read-only for
 members: it is written only by the lander, the service that lands your changes.
@@ -50,5 +52,5 @@ the `suda/land` status on your commit.
 
 ## Links
 
-- Source tree: <https://magpie.gosuda.org/tree> · History: <https://magpie.gosuda.org/history> · Diff links: <https://magpie.gosuda.org/diff>
+- Current tree: <https://magpie.gosuda.org/head> · Source tree (snapshot): <https://magpie.gosuda.org/tree> · History: <https://magpie.gosuda.org/history> · Diff links: <https://magpie.gosuda.org/diff>
 - Design and rules (read access to `gosuda/0` required): [`docs/README.md`](https://github.com/gosuda/0/blob/main/docs/README.md), [`AGENTS.md`](https://github.com/gosuda/0/blob/main/AGENTS.md)
