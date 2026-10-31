@@ -47,3 +47,5 @@ bun test
 bun run build
 npx wrangler pages deploy public --project-name=azure-magpie
 ```
+
+<!-- inbound sync check -->
