@@ -4,7 +4,7 @@
 	ws-sparse = "!f() { git sparse-checkout set .agents .github \"$@\"; }; f"
 	ws-new = "!f() { if [ \"$(git config --bool core.sparseCheckout 2>/dev/null)\" = \"true\" ]; then git sparse-checkout add .agents .github 2>/dev/null || true; fi; git fetch --filter=blob:none origin && git switch -c \"ws/$1\" origin/suda/main; }; f"
 	ws-save = "!f() { b=$(git symbolic-ref --short HEAD); git push --force-with-lease ws \"HEAD:refs/$b\"; }; f"
-	ws-sync = "!f() { git fetch --filter=blob:none origin && git rebase --onto origin/suda/main $(git rev-list --max-parents=0 HEAD) HEAD; }; f"
+	ws-sync = "!f() { git fetch --filter=blob:none origin && git rebase --onto origin/suda/main $(git rev-list --max-parents=0 HEAD); }; f"
 	ws-land = "!f() { id=$(basename $(git symbolic-ref --short HEAD)); git push --force-with-lease ws \"HEAD:refs/heads/land/$id\"; }; f"
 	ws-pr = "!f() { b=$(git symbolic-ref --short HEAD); id=$(basename \"$b\"); base=$(git rev-list --max-parents=0 HEAD); t=$(git log -1 --format=%s); body=$(git log -1 --format=%b); git push --force-with-lease ws \"HEAD:refs/$b\" \"${base}:refs/heads/base/$id\" \"HEAD:refs/heads/review/$id\" && (gh pr create --repo gosuda/1 --base \"base/$id\" --head \"review/$id\" --title \"$t\" --body \"$body\" || echo \"https://github.com/gosuda/1/compare/base/$id...review/$id\"); }; f"
 	ws-exp = "!f() { actor=\"${1:?usage: git ws-exp <actor> <name>}\"; name=\"${2:?usage: git ws-exp <actor> <name>}\"; git sparse-checkout add .agents .github \"experimental/$actor/$name\" 2>/dev/null || true; git fetch --filter=blob:none origin && git switch -c \"ws/$actor/exp-$name\" origin/suda/main && mkdir -p \"experimental/$actor/$name\"; }; f"
