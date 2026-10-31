@@ -1,5 +1,6 @@
 // src/worker.ts
 var USER_AGENT = "azure-winged-magpie-worker";
+var DEFAULT_REPO = "gosuda/1";
 var STATIC_UI_PATHS = new Set(["/", "/index.html", "/styles.css", "/app.js", "/favicon.ico"]);
 var MOUNTED_PROJECTS = [
   { prefix: "web/gosuda", mirror: "gosuda/website" },
@@ -19,7 +20,7 @@ var cachedInstallationToken = null;
 var worker_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const repo = env.GITHUB_REPO || "gosuda/0";
+    const repo = env.GITHUB_REPO || DEFAULT_REPO;
     if (request.method === "POST" && url.pathname === "/webhook") {
       return handleGithubWebhook(request, env);
     }
@@ -40,7 +41,7 @@ var worker_default = {
       }
       if (url.pathname === "/api/refs") {
         const [workspaces, projects] = await Promise.all([
-          listActiveWorkspaceRefs(env),
+          listActiveWorkspaceRefs(env, repo),
           resolveMountedProjects(env, repo)
         ]);
         return jsonResponse({
@@ -57,7 +58,7 @@ var worker_default = {
       if (url.pathname.startsWith("/commit/")) {
         const refSpec = decodeURIComponent(url.pathname.slice("/commit/".length));
         const sha = await resolveRefSha(env, repo, refSpec, refs);
-        return redirectResponse(`https://github.com/${userRepoOf(env)}/commit/${sha}`);
+        return redirectResponse(`https://github.com/${repo}/commit/${sha}`);
       }
       const targetUrl = buildRedirectLocation(url.pathname, repo, refs);
       return redirectResponse(targetUrl);
@@ -140,7 +141,7 @@ async function handleDiffRequest(request, url, env, repo, refs) {
       const indexUrl = new URL("/index.html", url.origin);
       return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
     }
-    const activeRefs = await listActiveWorkspaceRefs(env);
+    const activeRefs = await listActiveWorkspaceRefs(env, repo);
     const html = renderFallbackDiffHtml(url.origin, repo, refs, activeRefs);
     return new Response(html, {
       status: 200,
@@ -152,7 +153,7 @@ async function handleDiffRequest(request, url, env, repo, refs) {
   }
   const baseSha = await resolveRefSha(env, repo, spec.baseRef, refs);
   const headSha = await resolveRefSha(env, repo, spec.headRef, refs);
-  const compareUrl = `https://github.com/${userRepoOf(env)}/compare/${baseSha}${spec.operator}${headSha}`;
+  const compareUrl = `https://github.com/${repo}/compare/${baseSha}${spec.operator}${headSha}`;
   const shortPath = spec.baseRef === "suda/main" && spec.operator === ".." ? `/diff/${spec.headRef}` : `/diff/${spec.baseRef}${spec.operator}${spec.headRef}`;
   if (url.searchParams.get("format") === "json") {
     const payload = {
@@ -180,31 +181,21 @@ async function resolveRefSha(env, repo, refSpec, refs) {
   if (/^[0-9a-f]{7,40}$/i.test(cleaned)) {
     return cleaned;
   }
-  const userRepo = userRepoOf(env);
   const candidates = [];
-  const user = (path) => candidates.push({ repo: userRepo, path });
-  const trunk = (path) => candidates.push({ repo, path });
   if (cleaned.startsWith("refs/")) {
-    const path = cleaned.slice("refs/".length);
-    (path.startsWith("suda/") ? trunk : user)(path);
-  } else if (cleaned.startsWith("suda/")) {
-    trunk(cleaned);
-  } else if (cleaned.startsWith("ws/")) {
-    user(cleaned);
+    candidates.push(cleaned.slice("refs/".length));
+  } else if (cleaned.startsWith("ws/") || cleaned.startsWith("suda/") || cleaned.startsWith("heads/")) {
+    candidates.push(cleaned);
   } else if (cleaned.startsWith("land/")) {
-    user(`heads/${cleaned}`);
-  } else if (cleaned.startsWith("heads/")) {
-    user(cleaned);
+    candidates.push(`heads/${cleaned}`);
   } else if (cleaned.startsWith("pr/")) {
-    user(`pull/${cleaned.slice("pr/".length)}/head`);
+    candidates.push(`pull/${cleaned.slice("pr/".length)}/head`);
   } else {
-    user(`ws/${cleaned}`);
-    user(`heads/land/${cleaned}`);
-    user(`heads/${cleaned}`);
+    candidates.push(`ws/${cleaned}`, `heads/land/${cleaned}`, `heads/${cleaned}`);
   }
   const headers = await buildGithubHeaders(env);
   for (const candidate of candidates) {
-    const apiUrl = `https://api.github.com/repos/${candidate.repo}/git/ref/${candidate.path}`;
+    const apiUrl = `https://api.github.com/repos/${repo}/git/ref/${candidate}`;
     const resp = await fetch(apiUrl, { headers });
     if (resp.ok) {
       const data = await resp.json();
@@ -215,11 +206,7 @@ async function resolveRefSha(env, repo, refSpec, refs) {
   }
   throw new Error(`ref '${refSpec}' not found`);
 }
-function userRepoOf(env) {
-  return env.USER_REPO || "gosuda/1";
-}
-async function listActiveWorkspaceRefs(env) {
-  const repo = userRepoOf(env);
+async function listActiveWorkspaceRefs(env, repo) {
   const headers = await buildGithubHeaders(env);
   const results = [];
   for (const prefix of ["ws/", "heads/review/", "heads/land/"]) {
@@ -247,7 +234,7 @@ async function resolveMountedProjects(env, repo) {
   try {
     const headers = await buildGithubHeaders(env);
     headers.accept = "application/vnd.github.raw+json";
-    const resp = await fetch(`https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/heads/main`, { headers });
+    const resp = await fetch(`https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/suda/main`, { headers });
     if (resp.ok) {
       const text = await resp.text();
       const parsed = [];
@@ -349,7 +336,7 @@ async function resolveGithubAuthToken(env) {
   const jwt = await signGithubAppJwt(appId, privateKey);
   let installationId = env.MAGPIE_INSTALLATION_ID || env.CAPY_INSTALLATION_ID || cachedInstallationId || "";
   if (!installationId) {
-    const repo = env.GITHUB_REPO || "gosuda/0";
+    const repo = env.GITHUB_REPO || DEFAULT_REPO;
     const jwtHeaders = {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${jwt}`,
@@ -537,6 +524,5 @@ export {
   buildRedirectLocation,
   worker_default as default,
   parseDiffSpec,
-  resolveRefSha,
-  userRepoOf
+  resolveRefSha
 };

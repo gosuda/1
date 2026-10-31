@@ -36,7 +36,7 @@ const state: {
   workspaces: WorkspaceItem[];
   projects: ProjectItem[];
 } = {
-  repo: "gosuda/0",
+  repo: "gosuda/1",
   mainSha: "",
   historySha: "",
   workspaces: [],
@@ -219,7 +219,7 @@ async function fetchTrunkAndWorkspaces(): Promise<void> {
       throw new Error(`HTTP ${resp.status}`);
     }
     const data = (await resp.json()) as ApiRefsPayload;
-    state.repo = data.repo || "gosuda/0";
+    state.repo = data.repo || "gosuda/1";
     state.mainSha = data["suda/main"] || "";
     state.historySha = data["suda/history"] || "";
     if (Array.isArray(data.workspaces)) {

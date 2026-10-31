@@ -13,7 +13,6 @@ export interface Env {
   CAPY_INSTALLATION_ID?: string;
   CAPY_APP_PRIVATE_KEY?: string;
   WEBHOOK_SECRET?: string;
-  USER_REPO?: string;
   LANDER_WAKE_URL?: string;
   LANDER_WAKE_SECRET?: string;
   CACHE_TTL_SECONDS?: string;
@@ -43,6 +42,11 @@ interface CachedAppToken {
 
 const USER_AGENT = "azure-winged-magpie-worker";
 
+// Everything magpie links to or reads lives in the user repository: it carries the workspaces and
+// landing requests and a copy of refs/suda/{main,history} (kept current by the lander), so
+// redirects never depend on read access to the trunk repository.
+const DEFAULT_REPO = "gosuda/1";
+
 const STATIC_UI_PATHS = new Set(["/", "/index.html", "/styles.css", "/app.js", "/favicon.ico"]);
 
 const MOUNTED_PROJECTS = [
@@ -65,7 +69,7 @@ let cachedInstallationToken: CachedAppToken | null = null;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const repo = env.GITHUB_REPO || "gosuda/0";
+    const repo = env.GITHUB_REPO || DEFAULT_REPO;
 
     if (request.method === "POST" && url.pathname === "/webhook") {
       return handleGithubWebhook(request, env);
@@ -92,7 +96,7 @@ export default {
 
       if (url.pathname === "/api/refs") {
         const [workspaces, projects] = await Promise.all([
-          listActiveWorkspaceRefs(env),
+          listActiveWorkspaceRefs(env, repo),
           resolveMountedProjects(env, repo),
         ]);
         return jsonResponse({
@@ -116,7 +120,7 @@ export default {
       if (url.pathname.startsWith("/commit/")) {
         const refSpec = decodeURIComponent(url.pathname.slice("/commit/".length));
         const sha = await resolveRefSha(env, repo, refSpec, refs);
-        return redirectResponse(`https://github.com/${userRepoOf(env)}/commit/${sha}`);
+        return redirectResponse(`https://github.com/${repo}/commit/${sha}`);
       }
 
       const targetUrl = buildRedirectLocation(url.pathname, repo, refs);
@@ -223,7 +227,7 @@ async function handleDiffRequest(
       const indexUrl = new URL("/index.html", url.origin);
       return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
     }
-    const activeRefs = await listActiveWorkspaceRefs(env);
+    const activeRefs = await listActiveWorkspaceRefs(env, repo);
     const html = renderFallbackDiffHtml(url.origin, repo, refs, activeRefs);
     return new Response(html, {
       status: 200,
@@ -236,7 +240,7 @@ async function handleDiffRequest(
 
   const baseSha = await resolveRefSha(env, repo, spec.baseRef, refs);
   const headSha = await resolveRefSha(env, repo, spec.headRef, refs);
-  const compareUrl = `https://github.com/${userRepoOf(env)}/compare/${baseSha}${spec.operator}${headSha}`;
+  const compareUrl = `https://github.com/${repo}/compare/${baseSha}${spec.operator}${headSha}`;
   const shortPath =
     spec.baseRef === "suda/main" && spec.operator === ".."
       ? `/diff/${spec.headRef}`
@@ -276,32 +280,22 @@ export async function resolveRefSha(
     return cleaned;
   }
 
-  const userRepo = userRepoOf(env);
-  const candidates: Array<{ repo: string; path: string }> = [];
-  const user = (path: string) => candidates.push({ repo: userRepo, path });
-  const trunk = (path: string) => candidates.push({ repo, path });
+  const candidates: string[] = [];
   if (cleaned.startsWith("refs/")) {
-    const path = cleaned.slice("refs/".length);
-    (path.startsWith("suda/") ? trunk : user)(path);
-  } else if (cleaned.startsWith("suda/")) {
-    trunk(cleaned);
-  } else if (cleaned.startsWith("ws/")) {
-    user(cleaned);
+    candidates.push(cleaned.slice("refs/".length));
+  } else if (cleaned.startsWith("ws/") || cleaned.startsWith("suda/") || cleaned.startsWith("heads/")) {
+    candidates.push(cleaned);
   } else if (cleaned.startsWith("land/")) {
-    user(`heads/${cleaned}`);
-  } else if (cleaned.startsWith("heads/")) {
-    user(cleaned);
+    candidates.push(`heads/${cleaned}`);
   } else if (cleaned.startsWith("pr/")) {
-    user(`pull/${cleaned.slice("pr/".length)}/head`);
+    candidates.push(`pull/${cleaned.slice("pr/".length)}/head`);
   } else {
-    user(`ws/${cleaned}`);
-    user(`heads/land/${cleaned}`);
-    user(`heads/${cleaned}`);
+    candidates.push(`ws/${cleaned}`, `heads/land/${cleaned}`, `heads/${cleaned}`);
   }
 
   const headers = await buildGithubHeaders(env);
   for (const candidate of candidates) {
-    const apiUrl = `https://api.github.com/repos/${candidate.repo}/git/ref/${candidate.path}`;
+    const apiUrl = `https://api.github.com/repos/${repo}/git/ref/${candidate}`;
     const resp = await fetch(apiUrl, { headers });
     if (resp.ok) {
       const data = (await resp.json()) as { object?: { sha?: string } };
@@ -314,15 +308,10 @@ export async function resolveRefSha(
   throw new Error(`ref '${refSpec}' not found`);
 }
 
-// Workspaces, landing requests, and review branches live in the user repository (gosuda/1).
-export function userRepoOf(env: Env): string {
-  return env.USER_REPO || "gosuda/1";
-}
-
 async function listActiveWorkspaceRefs(
   env: Env,
+  repo: string,
 ): Promise<Array<{ ref: string; label: string; sha: string }>> {
-  const repo = userRepoOf(env);
   const headers = await buildGithubHeaders(env);
   const results: Array<{ ref: string; label: string; sha: string }> = [];
 
@@ -356,7 +345,7 @@ async function resolveMountedProjects(
     const headers = await buildGithubHeaders(env);
     headers.accept = "application/vnd.github.raw+json";
     const resp = await fetch(
-      `https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/heads/main`,
+      `https://api.github.com/repos/${repo}/contents/capy.star?ref=refs/suda/main`,
       { headers },
     );
     if (resp.ok) {
@@ -489,7 +478,7 @@ async function resolveGithubAuthToken(env: Env): Promise<string> {
     env.MAGPIE_INSTALLATION_ID || env.CAPY_INSTALLATION_ID || cachedInstallationId || "";
 
   if (!installationId) {
-    const repo = env.GITHUB_REPO || "gosuda/0";
+    const repo = env.GITHUB_REPO || DEFAULT_REPO;
     const jwtHeaders = {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${jwt}`,

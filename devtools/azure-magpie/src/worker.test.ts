@@ -34,35 +34,35 @@ async function signedWebhookRequest(event: string, payload: unknown): Promise<Re
 
 describe("buildRedirectLocation", () => {
   test("routes root and subtree paths to refs/suda/main tree URLs", () => {
-    expect(buildRedirectLocation("/", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}`,
+    expect(buildRedirectLocation("/", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}`,
     );
-    expect(buildRedirectLocation("/ipc/hqq/HQQ", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ`,
+    expect(buildRedirectLocation("/ipc/hqq/HQQ", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ`,
     );
-    expect(buildRedirectLocation("/tree/web/gosuda", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}/web/gosuda`,
+    expect(buildRedirectLocation("/tree/web/gosuda", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/web/gosuda`,
     );
   });
 
   test("routes blob and commit paths to refs/suda/main", () => {
-    expect(buildRedirectLocation("/blob/ipc/hqq/HQQ/go.mod", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/blob/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ/go.mod`,
+    expect(buildRedirectLocation("/blob/ipc/hqq/HQQ/go.mod", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/blob/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ/go.mod`,
     );
-    expect(buildRedirectLocation("/commit", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/commit/${SAMPLE_REFS.mainSha}`,
+    expect(buildRedirectLocation("/commit", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/commit/${SAMPLE_REFS.mainSha}`,
     );
   });
 
   test("routes history and blame paths to refs/suda/history", () => {
-    expect(buildRedirectLocation("/history", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/commits/${SAMPLE_REFS.historySha}`,
+    expect(buildRedirectLocation("/history", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/commits/${SAMPLE_REFS.historySha}`,
     );
-    expect(buildRedirectLocation("/history/net/ivnp", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/commits/${SAMPLE_REFS.historySha}/net/ivnp`,
+    expect(buildRedirectLocation("/history/net/ivnp", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/commits/${SAMPLE_REFS.historySha}/net/ivnp`,
     );
-    expect(buildRedirectLocation("/blame/net/ivnp/go.mod", "gosuda/0", SAMPLE_REFS)).toBe(
-      `https://github.com/gosuda/0/blame/${SAMPLE_REFS.historySha}/net/ivnp/go.mod`,
+    expect(buildRedirectLocation("/blame/net/ivnp/go.mod", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/blame/${SAMPLE_REFS.historySha}/net/ivnp/go.mod`,
     );
   });
 });
@@ -111,7 +111,7 @@ describe("parseDiffSpec", () => {
 describe("worker.fetch", () => {
   test("serves Cloudflare Pages static assets on / and /diff when ASSETS binding is present", async () => {
     const env = {
-      GITHUB_REPO: "gosuda/0",
+      GITHUB_REPO: "gosuda/1",
       ASSETS: {
         async fetch(req: Request | string) {
           const url = typeof req === "string" ? req : req.url;
@@ -162,12 +162,12 @@ describe("worker.fetch", () => {
     }) as typeof fetch;
 
     try {
-      const env = { GITHUB_REPO: "gosuda/0", GITHUB_TOKEN: "test-token", CACHE_TTL_SECONDS: "60" };
+      const env = { GITHUB_REPO: "gosuda/1", GITHUB_TOKEN: "test-token", CACHE_TTL_SECONDS: "60" };
 
       const resRoot = await worker.fetch(new Request("https://0.gosuda.org/ipc/hqq/HQQ"), env);
       expect(resRoot.status).toBe(302);
       expect(resRoot.headers.get("location")).toBe(
-        `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ`,
+        `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ`,
       );
 
       const resApi = await worker.fetch(new Request("https://0.gosuda.org/api/refs"), env);
@@ -177,7 +177,7 @@ describe("worker.fetch", () => {
         "suda/main": string;
         workspaces: Array<{ label: string; sha: string }>;
       };
-      expect(apiBody.repo).toBe("gosuda/0");
+      expect(apiBody.repo).toBe("gosuda/1");
       expect(apiBody["suda/main"]).toBe(SAMPLE_REFS.mainSha);
       expect(apiBody.workspaces).toEqual([
         {
@@ -200,7 +200,7 @@ describe("worker.fetch", () => {
     }
   });
 
-  test("reads workspaces from the user repository and landing refs only from the user repository", async () => {
+  test("resolves trunk and workspace refs and builds every link on gosuda/1 without touching gosuda/0", async () => {
     const wsSha = "1111222233334444555566667777888899990000";
     const urls: string[] = [];
     const origFetch = globalThis.fetch;
@@ -222,17 +222,20 @@ describe("worker.fetch", () => {
       return new Response("not found", { status: 404 });
     }) as typeof fetch;
     try {
-      const res = await worker.fetch(new Request("https://0.gosuda.org/diff/land/task-9?format=json"), {
-        GITHUB_REPO: "gosuda/0",
-        USER_REPO: "gosuda/1",
-        GITHUB_TOKEN: "t",
-        CACHE_TTL_SECONDS: "0",
-      });
-      expect(res.status).toBe(200);
-      const body = (await res.json()) as { compareUrl: string };
+      const env = { GITHUB_TOKEN: "t", CACHE_TTL_SECONDS: "0" }; // no GITHUB_REPO: the default applies
+      const diff = await worker.fetch(new Request("https://0.gosuda.org/diff/land/task-9?format=json"), env);
+      expect(diff.status).toBe(200);
+      const body = (await diff.json()) as { compareUrl: string };
       expect(body.compareUrl).toBe(`https://github.com/gosuda/1/compare/${SAMPLE_REFS.mainSha}..${wsSha}`);
-      expect(urls).toContain("https://api.github.com/repos/gosuda/1/git/ref/heads/land/task-9");
-      expect(urls.some((u) => u.includes("/repos/gosuda/0/git/ref/heads/land"))).toBe(false);
+
+      const tree = await worker.fetch(new Request("https://0.gosuda.org/tree/ipc/hqq/HQQ"), env);
+      expect(tree.headers.get("location")).toBe(`https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/ipc/hqq/HQQ`);
+      const hist = await worker.fetch(new Request("https://0.gosuda.org/history/net/grt"), env);
+      expect(hist.headers.get("location")).toBe(`https://github.com/gosuda/1/commits/${SAMPLE_REFS.historySha}/net/grt`);
+
+      expect(urls.length).toBeGreaterThan(0);
+      expect(urls.filter((u) => u.includes("/repos/gosuda/0/"))).toEqual([]);
+      expect(urls.some((u) => u.includes("/repos/gosuda/1/"))).toBe(true);
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -347,11 +350,11 @@ describe("worker.fetch", () => {
     try {
       const res = await worker.fetch(
         new Request("https://0.gosuda.org/api/land?ref=refs/heads/land/task-402"),
-        { GITHUB_REPO: "gosuda/0", GITHUB_TOKEN: "test-token", CACHE_TTL_SECONDS: "60" },
+        { GITHUB_REPO: "gosuda/1", GITHUB_TOKEN: "test-token", CACHE_TTL_SECONDS: "60" },
       );
       expect(res.status).toBe(302);
       expect(res.headers.get("location")).toBe(
-        `https://github.com/gosuda/0/tree/${SAMPLE_REFS.mainSha}/api/land`,
+        `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}/api/land`,
       );
       expect(calls.filter((c) => c.includes("/dispatches") || c.startsWith("POST"))).toEqual([]);
     } finally {

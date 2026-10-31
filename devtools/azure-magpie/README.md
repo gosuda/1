@@ -1,19 +1,19 @@
 # Azure-Winged Magpie (`gosuda/azure-magpie`)
 
-`gosuda/azure-magpie` (`//devtools/azure-magpie` on `refs/suda/main`) provides the edge redirector, two-dot diff link generator, and webhook wake forwarder for the `gosuda/0` monorepo. It never lands, exports, or dispatches work: the self-hosted lander does that (`docs/hardening-plan.md`). `gosuda/azure-magpie` is an ordinary public mirror. Production traffic is served from Cloudflare Pages at [https://magpie.gosuda.org](https://magpie.gosuda.org).
+`gosuda/azure-magpie` (`//devtools/azure-magpie` on `refs/suda/main`) provides the edge redirector, two-dot diff link generator, and webhook wake forwarder for the `gosuda/0` monorepo, and links only to `gosuda/1`. It never lands, exports, or dispatches work: the self-hosted lander does that (`docs/hardening-plan.md`). `gosuda/azure-magpie` is an ordinary public mirror. Production traffic is served from Cloudflare Pages at [https://magpie.gosuda.org](https://magpie.gosuda.org).
 
 ## 1. HTTP Routes
 
-`public/_worker.js` (compiled from `src/worker.ts`) resolves trunk refs (`refs/suda/main`, `refs/suda/history`) on `gosuda/0` and workspace refs (`refs/ws/*`, `refs/heads/land/*`, `refs/heads/review/*`) on the user repository `gosuda/1` (`USER_REPO`) via the GitHub REST API and caches trunk SHA resolutions at the edge. Static assets (`index.html`, `styles.css`, `app.js`) are served from `public/`.
+`public/_worker.js` (compiled from `src/worker.ts`) resolves trunk refs (`refs/suda/main`, `refs/suda/history`, copies the lander keeps current) and workspace refs (`refs/ws/*`, `refs/heads/land/*`, `refs/heads/review/*`) on the user repository `gosuda/1` (`GITHUB_REPO`) via the GitHub REST API and caches trunk SHA resolutions at the edge. Static assets (`index.html`, `styles.css`, `app.js`) are served from `public/`.
 
 | Route | Method | Behavior |
 | :--- | :--- | :--- |
 | `/` or `/diff` | `GET` | Serves the web interface for generating comparison links, inspecting active workspaces, and browsing subtrees |
-| `/tree` or `/tree/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/0/tree/<suda-main-sha>/<path>` |
-| `/blob/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/0/blob/<suda-main-sha>/<path>` |
-| `/commit` or `/commit/<ref>` | `GET` | Resolves `<ref>` (defaults to `refs/suda/main`) and redirects (`302`) to `https://github.com/gosuda/0/commit/<sha>` |
-| `/history` or `/history/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/0/commits/<suda-history-sha>/<path>` |
-| `/blame/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/0/blame/<suda-history-sha>/<path>` |
+| `/tree` or `/tree/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
+| `/blob/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/blob/<suda-main-sha>/<path>` |
+| `/commit` or `/commit/<ref>` | `GET` | Resolves `<ref>` (defaults to `refs/suda/main`) and redirects (`302`) to `https://github.com/gosuda/1/commit/<sha>` |
+| `/history` or `/history/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/commits/<suda-history-sha>/<path>` |
+| `/blame/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/blame/<suda-history-sha>/<path>` |
 | `/diff/ws/<actor>/<id>` | `GET` | Resolves `refs/suda/main` and `refs/ws/<actor>/<id>`, then redirects (`302`) to the two-dot GitHub comparison URL on `gosuda/1` (which carries a copy of the trunk refs) |
 | `/diff/<base>..<head>` | `GET` | Resolves `<base>` and `<head>` to commit SHAs and redirects (`302`) to `https://github.com/gosuda/1/compare/<base-sha>..<head-sha>` (append `?format=json` for JSON metadata) |
 | `/api/refs` | `GET` | Returns JSON containing `suda/main`, `suda/history`, active `refs/ws/*` and `refs/heads/land/*` tips, and mounted `google3` projects |
