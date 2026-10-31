@@ -1,0 +1,105 @@
+User-agent: *
+Allow: /
+Disallow: /search/
+Disallow: /404.html
+Disallow: /404
+Disallow: /editor
+Disallow: /admin
+Disallow: /settings
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ia_archiver
+User-agent: archive.org_bot
+User-agent: ia_archiver-web.archive.org
+Disallow: /
+
+User-Agent: ImagesiftBot
+User-agent: MJ12bot
+User-agent: IonCrawl
+User-agent: DotBot
+User-agent: IAS Crawler
+User-agent: coccocbot-web
+User-agent: HaoSouSpider
+User-Agent: Verity
+User-agent: Sogou web spider
+User-agent: Sogou inst spider
+User-agent: Sogou spider2
+User-agent: Bytespider
+Disallow: /
+
+User-agent: Baiduspider
+Allow: /zh/
+Allow: /$
+Disallow: /
+
+User-agent: AwarioRssBot
+User-agent: AwarioSmartBot
+User-agent: Amazonbot
+User-agent: DataForSeoBot
+User-agent: OAI-SearchBot
+User-agent: Quora-Bot
+User-agent: Scrapy
+User-agent: TurnitinBot
+User-agent: peer39_crawler
+User-agent: peer39_crawler/1.0
+User-agent: omgilibot
+User-agent: omgili
+User-agent: Bytespider
+User-agent: CCBot
+User-agent: ChatGPT-User
+User-agent: cohere-ai
+User-agent: Diffbot
+User-agent: FacebookBot
+User-agent: ImagesiftBot
+User-agent: Meta-ExternalAgent
+User-agent: Meta-ExternalFetcher
+User-agent: magpie-crawler
+User-agent: Omgilibot
+User-agent: PerplexityBot
+User-agent: Timpibot
+Allow: /$
+Disallow: /
+
+Sitemap: https://gosuda.org/sitemap.xml
+Sitemap: https://gosuda.org/es/sitemap.xml
+Sitemap: https://gosuda.org/zh/sitemap.xml
+Sitemap: https://gosuda.org/ko/sitemap.xml
+Sitemap: https://gosuda.org/ja/sitemap.xml
+Sitemap: https://gosuda.org/de/sitemap.xml
+Sitemap: https://gosuda.org/ru/sitemap.xml
+Sitemap: https://gosuda.org/fr/sitemap.xml
+Sitemap: https://gosuda.org/nl/sitemap.xml
+Sitemap: https://gosuda.org/it/sitemap.xml
+Sitemap: https://gosuda.org/id/sitemap.xml
+Sitemap: https://gosuda.org/pt/sitemap.xml
+Sitemap: https://gosuda.org/sv/sitemap.xml
+Sitemap: https://gosuda.org/cs/sitemap.xml
+Sitemap: https://gosuda.org/sk/sitemap.xml
+Sitemap: https://gosuda.org/pl/sitemap.xml
+Sitemap: https://gosuda.org/ro/sitemap.xml
+Sitemap: https://gosuda.org/hu/sitemap.xml
+Sitemap: https://gosuda.org/fi/sitemap.xml
+Sitemap: https://gosuda.org/tr/sitemap.xml
+
+Sitemap: https://gosuda.org/feed.rss
+Sitemap: https://gosuda.org/es/feed.rss
+Sitemap: https://gosuda.org/zh/feed.rss
+Sitemap: https://gosuda.org/ko/feed.rss
+Sitemap: https://gosuda.org/ja/feed.rss
+Sitemap: https://gosuda.org/de/feed.rss
+Sitemap: https://gosuda.org/ru/feed.rss
+Sitemap: https://gosuda.org/fr/feed.rss
+Sitemap: https://gosuda.org/nl/feed.rss
+Sitemap: https://gosuda.org/it/feed.rss
+Sitemap: https://gosuda.org/id/feed.rss
+Sitemap: https://gosuda.org/pt/feed.rss
+Sitemap: https://gosuda.org/sv/feed.rss
+Sitemap: https://gosuda.org/cs/feed.rss
+Sitemap: https://gosuda.org/sk/feed.rss
+Sitemap: https://gosuda.org/pl/feed.rss
+Sitemap: https://gosuda.org/ro/feed.rss
+Sitemap: https://gosuda.org/hu/feed.rss
+Sitemap: https://gosuda.org/fi/feed.rss
+Sitemap: https://gosuda.org/tr/feed.rss

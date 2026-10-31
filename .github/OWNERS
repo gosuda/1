@@ -1,0 +1,4 @@
+# Control-plane code (landing pipeline, capy, lander, workflows) needs an owner other than the requester.
+set require-review
+@lemon-mint
+@gosunuts
