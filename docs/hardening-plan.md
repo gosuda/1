@@ -527,12 +527,13 @@ Table 13 lists what exists in the repository and how it was verified. "Tests" me
 
 ### 15.2a Imported projects and Go module convention
 
-Ten repositories were imported as unmodified copies (the lander wrote each sync baseline without an export commit): `crypto/keyless_tls`, `crypto/x402-facilitator`, `net/portal-tunnel`, `devtools/potly`, `net/autoirc2p`, `net/portal-multiplatform-sdk`, `crypto/randflake`, `ai/jimin`, `web/telemetry`, and the private `corp/rivulet`, which has no `capy.star` entry and is never exported. Excluded on purpose: `portal-flutter-sdk`, `portal-toys`, and `flats` (owner decision, and committed prebuilt binaries up to 37 MB).
+Ten repositories were imported as unmodified copies (the lander wrote each sync baseline without an export commit): `crypto/keyless_tls`, `crypto/x402-facilitator`, `net/portal-tunnel`, `devtools/potly`, `net/autoirc2p`, `net/portal-multiplatform-sdk`, `crypto/randflake`, `ai/jimin`, `web/telemetry`, and the private `corp/rivulet`, which has no `capy.star` entry and is never exported. Later imports: `storage/supersql` (mirror workflow `supersql` to the private `gosuda/supersql-alpha`, nightly cron removed) and `net/zeroproxy`. Excluded on purpose: `portal-flutter-sdk`, `portal-toys`, and `flats` (owner decision, and committed prebuilt binaries up to 37 MB).
 
 1. Committed `go.mod` files carry no local `replace` (`capy check-replaces`, run on every landing). The root `go.work` resolves sibling modules; the HQQ trio was converted (`gosuda.org/hqq v0.7.0`; `v0.1.0` never existed).
 2. The root `go.work` also carries `replace` directives for internal versions that were never published (`x402-facilitator v0.0.5` and `scheme/evm v0.0.1`). The upstream repository relied on a nested `go.work` for them; a nested `go.work` shadows the root one inside its own directory.
-3. `devtools/potly` and `net/portal-multiplatform-sdk/native/bridge` pin `portal-tunnel/v2` v2.4.1 and v2.4.3 and do not compile against the trunk's `portal-tunnel`. They stay out of `go.work` and build with `GOWORK=off` until their callers move to the current `sdk.Expose` and `identity.LoadOrCreate` signatures.
-4. `corp/rivulet` does not compile at its imported commit (`lib/record/chain_definition.go`); `jimin`, `rivulet`, and `telemetry` require the published `gosuda.org/randflake` v1 module, not the local `randflake/v2`, so the workspace does not link them to local code.
+3. `net/zeroproxy` (a Go module plus a Rust workspace) imported cleanly but stays out of `go.work`: the workspace selects `quic-go` v0.63.0 (from `net/autoirc2p`), which `webtransport-go` v0.11.1 does not compile against. It builds standalone.
+4. `devtools/potly` and `net/portal-multiplatform-sdk/native/bridge` pin `portal-tunnel/v2` v2.4.1 and v2.4.3 and do not compile against the trunk's `portal-tunnel`. They stay out of `go.work` and build with `GOWORK=off` until their callers move to the current `sdk.Expose` and `identity.LoadOrCreate` signatures.
+5. `corp/rivulet` does not compile at its imported commit (`lib/record/chain_definition.go`); `jimin`, `rivulet`, and `telemetry` require the published `gosuda.org/randflake` v1 module, not the local `randflake/v2`, so the workspace does not link them to local code.
 
 ### 15.3 Operator runbook
 
