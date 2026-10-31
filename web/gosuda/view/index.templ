@@ -1,0 +1,24 @@
+package view
+
+import (
+	"gosuda.org/website/view/home"
+	"gosuda.org/website/view/layout"
+)
+
+templ IndexPage(m *layout.Metadata, stats home.Stats, posts []*home.PostPreview) {
+	<!DOCTYPE html>
+	<html lang={ m.Language }>
+		@layout.Head(m)
+		<body>
+			@layout.Header(m)
+			<main>
+				@home.Hero(stats.GitHub)
+				@home.StatsBar(stats)
+				@home.Contribute()
+				@home.Projects(stats.GitHub)
+				@home.Posts(posts)
+			</main>
+			@layout.Footer()
+		</body>
+	</html>
+}

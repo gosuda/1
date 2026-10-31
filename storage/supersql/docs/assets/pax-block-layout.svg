@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 420" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #0f172a; rx: 14px; }
+      .section { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 8px; }
+      .cell { fill: #0f172a; stroke: #475569; stroke-width: 1; rx: 5px; }
+      .badge-header { fill: #38bdf8; }
+      .badge-desc { fill: #818cf8; }
+      .badge-mvcc { fill: #34d399; }
+      .badge-payload { fill: #f59e0b; }
+      .sec-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13.5px; font-weight: 700; fill: #f8fafc; }
+      .sec-meta { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; font-weight: 600; fill: #94a3b8; }
+      .field { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; fill: #e2e8f0; }
+      .sub { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #94a3b8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="920" height="420" />
+
+  <!-- Region 1: Block Header (64B) -->
+  <g transform="translate(24, 20)">
+    <rect class="section" x="0" y="0" width="872" height="82" />
+    <rect class="badge-header" x="0" y="0" width="6" height="82" rx="3" />
+    <text class="sec-title" x="20" y="24">1. Block Header</text>
+    <text class="sec-meta" x="740" y="24">64 Bytes (Fixed)</text>
+
+    <rect class="cell" x="20" y="36" width="110" height="32" />
+    <text class="field" x="30" y="56">Magic 'PAX2'</text>
+
+    <rect class="cell" x="138" y="36" width="96" height="32" />
+    <text class="field" x="148" y="56">Version: 2</text>
+
+    <rect class="cell" x="242" y="36" width="128" height="32" />
+    <text class="field" x="252" y="56">Rows / Cols (8B)</text>
+
+    <rect class="cell" x="378" y="36" width="136" height="32" />
+    <text class="field" x="388" y="56">Target Ref (16B)</text>
+
+    <rect class="cell" x="522" y="36" width="166" height="32" />
+    <text class="field" x="532" y="56">VisLen / BlockLen</text>
+
+    <rect class="cell" x="696" y="36" width="156" height="32" />
+    <text class="field" x="706" y="56">CRC32 (IEEE) + Rsvd</text>
+  </g>
+
+  <!-- Region 2: Column Descriptors Table (N x 64B) -->
+  <g transform="translate(24, 114)">
+    <rect class="section" x="0" y="0" width="872" height="86" />
+    <rect class="badge-desc" x="0" y="0" width="6" height="86" rx="3" />
+    <text class="sec-title" x="20" y="24">2. Column Descriptors Table</text>
+    <text class="sec-meta" x="720" y="24">N × 64 Bytes</text>
+
+    <rect class="cell" x="20" y="36" width="412" height="36" />
+    <text class="field" x="32" y="58">ColumnID (8B) · DataType (4B) · Encoding (2B) · Flags (2B)</text>
+
+    <rect class="cell" x="442" y="36" width="410" height="36" />
+    <text class="field" x="454" y="58">Rows/Nulls (8B) · Min/Max Zone Map (16B) · Payload Offset/Len</text>
+  </g>
+
+  <!-- Region 3: MVCC Visibility Region -->
+  <g transform="translate(24, 212)">
+    <rect class="section" x="0" y="0" width="872" height="90" />
+    <rect class="badge-mvcc" x="0" y="0" width="6" height="90" rx="3" />
+    <text class="sec-title" x="20" y="24">3. MVCC Visibility Region</text>
+    <text class="sec-meta" x="685" y="24">Rows × 40 Bytes + Key Arena</text>
+
+    <rect class="cell" x="20" y="36" width="520" height="40" />
+    <text class="field" x="32" y="55">Version Records: CommitTS (8B) · Ordinal (8B) · Op (1B)</text>
+    <text class="sub" x="32" y="70">KeyOffset/Length (8B) · EndKeyOffset/Length (8B)</text>
+
+    <rect class="cell" x="550" y="36" width="302" height="40" />
+    <text class="field" x="562" y="55">Contiguous Key Arena</text>
+    <text class="sub" x="562" y="70">Encoded Primary Keys &amp; Tombstone Bounds</text>
+  </g>
+
+  <!-- Region 4: Column Payloads -->
+  <g transform="translate(24, 314)">
+    <rect class="section" x="0" y="0" width="872" height="86" />
+    <rect class="badge-payload" x="0" y="0" width="6" height="86" rx="3" />
+    <text class="sec-title" x="20" y="24">4. Column Payloads (8-Byte Aligned Direct Vectors)</text>
+    <text class="sec-meta" x="710" y="24">Zero-Copy Vector Slices</text>
+
+    <rect class="cell" x="20" y="36" width="412" height="36" />
+    <text class="field" x="32" y="58">Column 0: [Null Bitmap] [Offsets] [Typed Values]</text>
+
+    <rect class="cell" x="442" y="36" width="410" height="36" />
+    <text class="field" x="454" y="58">Column 1 … Column N-1: [Null Bitmap] [Offsets] [Typed Values]</text>
+  </g>
+</svg>

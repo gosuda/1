@@ -1,0 +1,1610 @@
+// Runtime-prelude unit tests.
+// Units are extracted verbatim from the prelude source and exercised with their free variables injected;
+// stubs replace only the external boundary (rewriter and host natives).
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { preludeSource } = require('./_prelude.cjs');
+// zp-core installs globalThis.ZP so free-variable references like ZP.filterMetaCSP resolve to the real implementation.
+require('../../web/zp-core.js');
+
+const SRC = preludeSource().split('\r\n').join('\n');
+
+function slice(start, end) {
+  const a = SRC.indexOf(start);
+  assert.ok(a >= 0, `start marker missing: ${start}`);
+  const b = SRC.indexOf(end, a);
+  assert.ok(b > a, `end marker missing after ${start}: ${end}`);
+  return SRC.slice(a, b);
+}
+
+function load(code, exports, deps) {
+  // The membrane reads a window's own accessors through the getters captured at boot; a fake window is a plain object.
+  // plus the membrane's table factories (here plain built-ins: the harness has no page to patch them)
+  deps = Object.assign({
+    winGet: (w, n) => w[n], winSet: (w, n, v) => { w[n] = v; },
+    newMap: e => new Map(e), newSet: e => new Set(e), newWeakMap: () => new WeakMap(), newWeakSet: () => new WeakSet(),
+    // Trusted Types is off in these units: no document enforces it, so values pass through as before the feature.
+    ttEnforced: () => false, ttCompliant: (_kind, _sink, v) => v, ttScript: x => x, ttHTML: x => x, ttScriptURL: x => x,
+    ttFunction: (args, _evalFn, Ctor) => Reflect.construct(Ctor || Function, args), ttEvalSource: x => (typeof x === 'string' ? x : null),
+    // Nor does any target policy refuse string evaluation here.
+    cspCheckEval: () => {}, cspRefusal: () => null,
+    nameLike: (fn, name) => { if (fn.name !== name) Object.defineProperty(fn, 'name', { value: name, configurable: true }); },
+  }, deps);
+  const names = Object.keys(deps);
+  // eslint-disable-next-line no-new-func
+  const factory = new Function(...names, `${code}\nreturn { ${exports.join(', ')} };`);
+  return factory(...names.map(n => deps[n]));
+}
+
+const normalizedError = name => { const e = new Error(name); e.name = name; return e; };
+
+// Dynamic-code machinery: compileDynamic / nestedCall / dynamicEval.
+// `rewriteDynamicFunctionBody` is stubbed to identity so these tests isolate wrapper semantics (params, this, new.target, scope).
+
+const DYN_BLOCK = slice(
+  '    function stringArgs(args) {',
+  '    const dynamicFunction = function Function'
+);
+// The helper bindings every `with` starts with (00-head.js).
+const ZP_WITH_PROLOGUE = load(slice('  const ZP_WITH_HELPERS = [', '  const ZP_EVENT_CALL_HEAD = '), ['ZP_WITH_PROLOGUE'], {}).ZP_WITH_PROLOGUE;
+
+function dynEnv(overrides = {}) {
+  const SCOPE = { __scope: true };
+  const scopeVals = { location: { __vloc: true } };
+  const withScope = new Proxy(scopeVals, {
+    has() { return true; },
+    get(t, p) { return t[p]; },
+  });
+  const calls = { global: [] };
+  const toStringMap = new Map();
+  const env = load(DYN_BLOCK,
+    ['compileNested', 'nestedCall', 'compileDynamic', 'dynamicEval', 'isEvalExpressionCandidate', 'dynamicSource'],
+    Object.assign({
+      zpTrace() {},
+      rewriteDynamicFunctionBody: (_params, body) => String(body || ''),
+      Native: { FunctionCtor: Function, globalEval: code => { calls.global.push(code); return { globalResult: code }; } },
+      toStringMap,
+      scope: SCOPE,
+      withScope,
+      root: {},
+      callPageRewriter: s => s,
+      normalizedError,
+      execGlobalScript: code => { calls.global.push(code); return { globalResult: code }; },
+      // Slot read by dynamicEval to isolate eval lexical environments; injected because it is declared outside DYN_BLOCK.
+      __zp_lex_env: null,
+      ZP_WITH_PROLOGUE,
+    }, overrides));
+  return { env, SCOPE, withScope, calls, toStringMap };
+}
+
+test('compileDynamic: params, arguments object, return values', () => {
+  const { env } = dynEnv();
+  const fn = env.compileDynamic(Function, ['a', 'b', 'return a + b'], 'function');
+  assert.equal(fn(2, 3), 5);
+  const argc = env.compileDynamic(Function, ['return arguments.length'], 'function');
+  assert.equal(argc(1, 2, 3), 3);
+  const destr = env.compileDynamic(Function, ['{a}', 'return a.x'], 'function');
+  assert.equal(destr({ a: { x: 7 } }), 7);
+});
+
+test('compileDynamic: sloppy nullish `this` lands on the scope facade', () => {
+  const { env, SCOPE } = dynEnv();
+  const fn = env.compileDynamic(Function, ['return this'], 'function');
+  // Native sloppy `Function('return this').call(null)` returns the real global; the wrapper binds the scope facade instead.
+  assert.equal(fn.call(null), SCOPE);
+  assert.equal(fn.call(undefined), SCOPE);
+  const self = { s: 1 };
+  assert.equal(fn.call(self), self);
+});
+
+test('compileDynamic: strict `this` passes through uncoerced', () => {
+  const { env } = dynEnv();
+  const fn = env.compileDynamic(Function, ["'use strict'; return this"], 'function');
+  assert.equal(fn.call(null), null);
+  assert.equal(fn.call(42), 42);
+});
+
+test('compileDynamic: new.target propagates through Reflect.construct', () => {
+  const { env } = dynEnv();
+  const fn = env.compileDynamic(Function, ['return new.target'], 'function');
+  assert.equal(fn(), undefined);
+  assert.equal(new fn(), fn);
+});
+
+test('compileDynamic: free identifiers resolve through the with-scope proxy', () => {
+  const { env, withScope } = dynEnv();
+  const fn = env.compileDynamic(Function, ['return location'], 'function');
+  assert.deepEqual(fn(), { __vloc: true });
+  // `has` must return true for every name (except Symbol.unscopables) so unresolved identifiers never fall through to the real global.
+  assert.ok(SRC.includes('has(_target, prop) { return prop !== Symbol.unscopables; }'),
+    'withScope has-trap must return true for all names');
+});
+
+test('compileDynamic: async / generator kinds preserve the function species', async () => {
+  const { env } = dynEnv();
+  const afn = env.compileDynamic(Function, ['return 9'], 'async');
+  const r = afn();
+  assert.ok(r instanceof Promise, 'async dynamic function must return a Promise');
+  assert.equal(await r, 9);
+  const gfn = env.compileDynamic(Function, ['yield 1; yield 2'], 'generator');
+  assert.deepEqual([...gfn()], [1, 2]);
+});
+
+test('compileDynamic: toStringMap masks the emitted source', () => {
+  const { env, toStringMap } = dynEnv();
+  const fn = env.compileDynamic(Function, ['a', 'return a * 2'], 'function');
+  const masked = toStringMap.get(fn);
+  assert.ok(masked.includes('function anonymous(a'), masked);
+  assert.ok(masked.includes('return a * 2'), masked);
+  // The rewritten internals (__zp_*) must never appear in the masked source.
+  assert.ok(!masked.includes('__zp_'), masked);
+});
+
+test('isEvalExpressionCandidate: statement starters vs expressions', () => {
+  const { env } = dynEnv();
+  for (const expr of ['1 + 2', 'x.y', '  a()', 'new Foo()', '[1,2].map(f)', '`t${x}`']) {
+    assert.equal(env.isEvalExpressionCandidate(expr), true, expr);
+  }
+  for (const stmt of ['var q = 1', 'function f(){}', 'class A{}', 'let x = 2', 'if (x) y()', 'for (;;) {}', 'return 1', 'with(o){}', '  const c = 3']) {
+    assert.equal(env.isEvalExpressionCandidate(stmt), false, stmt);
+  }
+});
+
+test('dynamicEval: expression path evaluates in the with-scope', () => {
+  const { env } = dynEnv();
+  assert.equal(env.dynamicEval('1 + 2'), 3);
+  assert.deepEqual(env.dynamicEval('location'), { __vloc: true });
+  assert.equal(env.dynamicEval(), undefined);
+});
+
+test('dynamicEval: statement path goes through the global executor', () => {
+  const { env, calls } = dynEnv();
+  const r = env.dynamicEval('var q = 1; q');
+  assert.deepEqual(r, { globalResult: 'var q = 1; q' });
+  assert.deepEqual(calls.global, ['var q = 1; q']);
+});
+
+test('dynamicEval: rewriter failures propagate — no silent fallback', () => {
+  // NotSupportedError propagates on both paths so unrewritten code never executes.
+  const { env: envNS } = dynEnv({ callPageRewriter() { throw normalizedError('NotSupportedError'); } });
+  assert.throws(() => envNS.dynamicEval('1 + 2'), /NotSupportedError/);
+  assert.throws(() => envNS.dynamicEval('var a = 1;'), /NotSupportedError/);
+  const { env: envSyn, calls } = dynEnv({ callPageRewriter() { throw new SyntaxError('Unexpected token'); } });
+  assert.throws(() => envSyn.dynamicEval('if ('), SyntaxError);
+  assert.deepEqual(calls.global, [], 'unrewritten code reached the executor');
+});
+
+test('dynamicEval: a runtime throw propagates and the code runs exactly once', () => {
+  // Statement code that throws at runtime must not be re-executed by a fallback path.
+  let runs = 0;
+  const { env } = dynEnv({ execGlobalScript: () => { runs++; throw new Error('boom'); } });
+  assert.throws(() => env.dynamicEval('var n = 1; throw 1'), /boom/);
+  assert.equal(runs, 1, 'statement code executed more than once');
+});
+
+test('dynamicEval: non-string input is returned without evaluation (native parity)', () => {
+  const { env, calls } = dynEnv();
+  let toStringCalls = 0;
+  const o = { toString() { toStringCalls++; return '2+2'; } };
+  assert.equal(env.dynamicEval(o), o);
+  const strings = ['x'];
+  assert.equal(env.dynamicEval(strings), strings); // what eval`x` passes
+  assert.equal(env.dynamicEval(123), 123);
+  assert.equal(toStringCalls, 0, 'toString() ran — the object was evaluated as code');
+  assert.deepEqual(calls.global, []);
+});
+
+test('callPageRewriter: a parse failure is a SyntaxError built in virtual-URL-tagged code', () => {
+  const block = slice('    function parseSyntaxError(message) {', '    function rewriteDynamicFunctionBody(');
+  const parseErrors = new WeakSet();
+  const mk = rewriteScript => load(block, ['callPageRewriter'], {
+    Native: { globalEval: (0, eval) },
+    virtualURL: { href: 'https://target.example/page' },
+    proxyOrigin: 'http://proxy.example',
+    root: { ZPBundle: { ready: true, rewriteScript } },
+    normalizedError,
+    parseErrors,
+  });
+  let err;
+  try { mk(() => { throw new Error('parse failed: Unexpected token'); }).callPageRewriter('if (', 'classic'); } catch (e) { err = e; }
+  assert.ok(err instanceof SyntaxError, `expected SyntaxError, got ${err && err.name}`);
+  assert.equal(err.message, 'Unexpected token');
+  assert.ok(parseErrors.has(err), 'parse error not tagged for the timer path');
+  // Built inside the tagged eval so its stack names the virtual URL rather than the prelude URL.
+  assert.match(String(err.stack), /https:\/\/target\.example\/page/);
+  assert.throws(() => mk(() => { throw new Error('wasm trap'); }).callPageRewriter('x', 'classic'), /NotSupportedError/);
+  // Empty input validly produces empty output (`eval('')` is undefined); empty output for non-empty input is rejected.
+  assert.equal(mk(s => s).callPageRewriter('', 'classic'), '');
+  assert.throws(() => mk(() => '').callPageRewriter('x', 'classic'), /NotSupportedError/);
+});
+
+// URL scheme helpers.
+
+const SCHEME_BLOCK = slice(
+  '  function isHTTPURL(raw) {',
+  '  // Non-http(s) absolute URLs pass through unchanged.'
+) + slice(
+  '  function nonHTTPAbsoluteURL(raw) {',
+  '  // Single-parse equivalent of `isHTTPURL'
+);
+
+const NAV_BLOCK = slice(
+  '  const NAV_EXTERNAL_SCHEMES = newSet(',
+  '  function setVirtualLocation'
+);
+
+test('isHTTPURL / nonHTTPAbsoluteURL classification', () => {
+  const { isHTTPURL, nonHTTPAbsoluteURL, hasExecutableURLScheme, hasDangerousURLScheme } = load(
+    SCHEME_BLOCK,
+    ['isHTTPURL', 'nonHTTPAbsoluteURL', 'hasExecutableURLScheme', 'hasDangerousURLScheme'],
+    { baseURL: 'https://example.com/dir/' }
+  );
+  for (const v of ['https://t/x', 'http://t/', '/rel/path', '../up', 'rel', '?q=1', '#frag', '//cdn.x/y']) {
+    assert.equal(isHTTPURL(v), true, v);
+  }
+  for (const v of ['mailto:a@b', 'data:text/plain,x', 'blob:https://t/id', 'javascript:1', 'tel:+1', 'about:blank']) {
+    assert.equal(isHTTPURL(v), false, v);
+  }
+  // Empty and malformed inputs resolve against the HTTP base URL.
+  assert.equal(isHTTPURL(''), true);
+  assert.equal(isHTTPURL('::bad'), true);
+  // Non-HTTP absolute URLs come back normalized; HTTP and relative inputs return null.
+  assert.equal(nonHTTPAbsoluteURL('mailto:a@b'), 'mailto:a@b');
+  assert.equal(nonHTTPAbsoluteURL('DATA:text/plain,x'), 'data:text/plain,x');
+  assert.equal(nonHTTPAbsoluteURL('  tel:+82-1  '), 'tel:+82-1');
+  assert.equal(nonHTTPAbsoluteURL('https://t/x'), null);
+  assert.equal(nonHTTPAbsoluteURL('/rel'), null);
+  assert.equal(nonHTTPAbsoluteURL('rel'), null);
+  for (const v of ['javascript:alert(1)', '  JAVASCRIPT:x', 'data:text/html,x', 'vbscript:x']) {
+    assert.equal(hasExecutableURLScheme(v), true, v);
+  }
+  assert.equal(hasDangerousURLScheme('data:x'), false);
+  assert.equal(hasDangerousURLScheme('javascript:x'), true);
+  assert.equal(hasExecutableURLScheme('https://t'), false);
+});
+
+test('delegatableExternalScheme: mailto-family yes, executable/inline no', () => {
+  const { delegatableExternalScheme } = load(NAV_BLOCK, ['delegatableExternalScheme'], {});
+  for (const v of ['mailto:a@b', 'tel:+1', 'sms:+1', 'skype:user', 'tg://resolve', 'webcal://x']) {
+    assert.equal(delegatableExternalScheme(v), true, v);
+  }
+  // Executable and inline-content schemes stay inside the sandbox rather than delegating to the host.
+  for (const v of ['javascript:1', 'data:text/html,x', 'blob:https://t/id', 'about:blank', 'https://t/x', '/rel', 'ftp://f']) {
+    assert.equal(delegatableExternalScheme(v), false, v);
+  }
+});
+
+// Meta http-equiv policy.
+
+const CSP_META_BLOCK = slice(
+  '  const CSP_EQUIV = [',
+  '  function isIntegrityBearing'
+);
+const REFRESH_BLOCK = slice(
+  '  function proxiedRefreshContent(content) {',
+  '  // Post-write meta enforcement for paths'
+);
+const META_POLICY_BLOCK = slice(
+  '  function enforceMetaPolicy(el) {',
+  '  function transformHTML(value, opts) {'
+);
+
+function fakeEl(attrs) {
+  return { attrs, localName: 'meta' };
+}
+function fakeNative() {
+  return {
+    getAttribute: { call(el, k) { return k in el.attrs ? el.attrs[k] : null; } },
+    setAttribute: { call(el, k, v) { el.attrs[k] = String(v); } },
+    removeAttribute: { call(el, k) { delete el.attrs[k]; } },
+  };
+}
+
+test('CSP-equiv list neutralizes CSP, report-only, and origin-trial', () => {
+  const { isCSPHttpEquiv } = load(CSP_META_BLOCK, ['isCSPHttpEquiv'], { Native: fakeNative() });
+  for (const v of ['content-security-policy', 'Content-Security-Policy', ' content-security-policy-report-only ', 'origin-trial', 'ORIGIN-TRIAL']) {
+    assert.equal(isCSPHttpEquiv(v), true, v);
+  }
+  for (const v of ['refresh', 'x-ua-compatible', '', undefined]) {
+    assert.equal(isCSPHttpEquiv(v), false, String(v));
+  }
+});
+
+test('neutralizeCSPMeta removes the active equiv and keeps the original', () => {
+  const Native = fakeNative();
+  const { neutralizeCSPMeta } = load(CSP_META_BLOCK, ['neutralizeCSPMeta'], { Native, proxyOrigin: 'http://proxy.test:18080' });
+  const el = fakeEl({ 'http-equiv': 'origin-trial', content: 'TOKEN123' });
+  neutralizeCSPMeta(el, 'origin-trial');
+  assert.equal(el.attrs['http-equiv'], undefined);
+  assert.equal(el.attrs['data-zp-blocked-http-equiv'], 'origin-trial');
+  assert.equal(el.attrs.content, 'TOKEN123', 'token must stay readable for forensics');
+});
+
+test('proxiedRefreshContent rewrites only the URL part', () => {
+  const { proxiedRefreshContent } = load(REFRESH_BLOCK, ['proxiedRefreshContent'], {
+    targetURLIfHTTP: v => (/^https?:/i.test(v) ? new URL(v).href : null),
+    proxyViaURL: abs => 'VIA(' + abs + ')',
+  });
+  assert.equal(proxiedRefreshContent('5; url=https://t/x'), '5; url=VIA(https://t/x)');
+  assert.equal(proxiedRefreshContent('0;URL="https://t/y?a=1"'), '0;url=VIA(https://t/y?a=1)');
+  // Delay-only refresh (self reload) has no target URL to rewrite.
+  assert.equal(proxiedRefreshContent('5'), '');
+  assert.equal(proxiedRefreshContent('0;url=javascript:alert(1)'), '');
+  assert.equal(proxiedRefreshContent('0;url=data:text/html,x'), '');
+});
+
+test('enforceMetaPolicy handles CSP-equiv, refresh, and unrelated metas', () => {
+  const Native = fakeNative();
+  const { isCSPHttpEquiv, neutralizeCSPMeta } = load(CSP_META_BLOCK, ['isCSPHttpEquiv', 'neutralizeCSPMeta'], { Native, proxyOrigin: 'http://proxy.test:18080' });
+  const { proxiedRefreshContent } = load(REFRESH_BLOCK, ['proxiedRefreshContent'], {
+    targetURLIfHTTP: v => (/^https?:/i.test(v) ? new URL(v).href : null),
+    proxyViaURL: abs => 'VIA(' + abs + ')',
+  });
+  const { enforceMetaPolicy } = load(META_POLICY_BLOCK, ['enforceMetaPolicy'], {
+    Native, isCSPHttpEquiv, neutralizeCSPMeta, proxiedRefreshContent,
+  });
+  const cspEl = fakeEl({ 'http-equiv': 'Content-Security-Policy', content: "default-src *" });
+  enforceMetaPolicy(cspEl);
+  // When filtered directives remain, the meta element stays active with the intersected content and stashes the original in data-zp-blocked-content.
+  assert.equal(cspEl.attrs['http-equiv'], 'Content-Security-Policy');
+  assert.equal(cspEl.attrs['data-zp-blocked-http-equiv'], 'content-security-policy');
+  assert.equal(cspEl.attrs['data-zp-blocked-content'], 'default-src *');
+  assert.match(cspEl.attrs.content, /^default-src \* /, `intersected content: ${cspEl.attrs.content}`);
+  const deadEl = fakeEl({ 'http-equiv': 'Content-Security-Policy', content: "bogus-src 'none'" });
+  enforceMetaPolicy(deadEl);
+  assert.equal(deadEl.attrs['http-equiv'], undefined, 'empty intersection must neutralize');
+  assert.equal(deadEl.attrs['data-zp-blocked-http-equiv'], 'content-security-policy');
+  const refreshEl = fakeEl({ 'http-equiv': 'refresh', content: '3; url=https://t/next' });
+  enforceMetaPolicy(refreshEl);
+  assert.equal(refreshEl.attrs.content, '3; url=VIA(https://t/next)');
+  const other = fakeEl({ 'http-equiv': 'x-ua-compatible', content: 'IE=edge' });
+  enforceMetaPolicy(other);
+  assert.deepEqual(other.attrs, { 'http-equiv': 'x-ua-compatible', content: 'IE=edge' });
+});
+
+// importmap / speculationrules JSON rewriting.
+
+const JSON_REWRITE_BLOCK = slice(
+  '  function rewriteImportMapText(source) {',
+  '  // `document.write` on a CLOSED document'
+);
+
+function jsonEnv() {
+  return load(JSON_REWRITE_BLOCK, ['rewriteImportMapText', 'rewriteSpeculationRulesText'], {
+    baseURL: 'https://example.com/dir/',
+    scriptProxyPath: (u, kind) => `MOD[${kind}](${u})`,
+    subresourceProxyPath: u => `SUB(${u})`,
+    proxyViaURL: u => `VIA(${u})`,
+    ZP: { errorPath: e => `ERR(${e})` },
+  });
+}
+
+test('rewriteImportMapText rewrites imports/scopes, blocks non-http', () => {
+  const { rewriteImportMapText } = jsonEnv();
+  const out = JSON.parse(rewriteImportMapText(JSON.stringify({
+    imports: { a: '/m.js', b: './rel.js', c: 'data:text/javascript,x', d: 'https://cdn.x/lib.js' },
+    scopes: { '/pkg/': { e: '/e.js' } },
+  })));
+  assert.equal(out.imports.a, 'MOD[module](https://example.com/m.js)');
+  assert.equal(out.imports.b, 'MOD[module](https://example.com/dir/rel.js)');
+  assert.equal(out.imports.c, 'ERR(POLICY_BLOCKED)');
+  assert.equal(out.imports.d, 'MOD[module](https://cdn.x/lib.js)');
+  // Scope keys are rewritten as addresses too.
+  assert.equal(Object.keys(out.scopes)[0], 'MOD[module](https://example.com/pkg/)');
+  assert.equal(out.scopes['MOD[module](https://example.com/pkg/)'].e, 'MOD[module](https://example.com/e.js)');
+  // Invalid JSON or non-object top-level values serialize to an empty map `{}`.
+  assert.equal(rewriteImportMapText('not json'), '{}');
+  assert.equal(rewriteImportMapText('[1,2]'), '{}');
+});
+
+test('rewriteImportMapText escapes angle brackets in serialized JSON', () => {
+  const { rewriteImportMapText } = jsonEnv();
+  // Escape `<` inside specifier keys so serialized JSON can be embedded safely inside an inline <script>.
+  const raw = rewriteImportMapText(JSON.stringify({ imports: { '<x': '/m.js' } }));
+  assert.ok(!raw.includes('<'), raw);
+  assert.ok(raw.includes('\\u003c'), raw);
+});
+
+test('rewriteSpeculationRulesText routes prefetch→fetch, prerender→nav', () => {
+  const { rewriteSpeculationRulesText } = jsonEnv();
+  const out = JSON.parse(rewriteSpeculationRulesText(JSON.stringify({
+    prefetch: [{ urls: ['/a', 'https://cdn.x/b', 'data:x', 'javascript:1'] }],
+    prerender: [{ urls: ['/c'] }],
+  })));
+  assert.equal(out.prefetch[0].urls[0], 'SUB(https://example.com/a)');
+  assert.equal(out.prefetch[0].urls[1], 'SUB(https://cdn.x/b)');
+  // Non-HTTP entries pass through unchanged because they cannot trigger a network fetch.
+  assert.equal(out.prefetch[0].urls[2], 'data:x');
+  assert.equal(out.prefetch[0].urls[3], 'javascript:1');
+  assert.equal(out.prerender[0].urls[0], 'VIA(https://example.com/c)');
+  assert.equal(rewriteSpeculationRulesText('{broken'), '{}');
+});
+
+// isNativeLocation brand check against forged tags.
+
+const LOC_BLOCK = slice(
+  '    const nativeObjToString = Object.prototype.toString;',
+  '    function get(base, prop) {'
+);
+
+test('isNativeLocation: tag pre-filter + native-getter brand check', () => {
+  const realLoc = {};
+  Object.defineProperty(realLoc, Symbol.toStringTag, { value: 'Location' });
+  // Native.locationHref.get throws unless `this` is a real Location; emulate the brand check with a WeakSet.
+  const real = new WeakSet([realLoc]);
+  const { isNativeLocation } = load(LOC_BLOCK, ['isNativeLocation'], {
+    virtualLocation: { __vloc: true },
+    wrappedLocationProxies: new WeakSet(),
+    Native: {
+      locationHref: { get: { call(v) { if (!real.has(v)) throw new TypeError('brand check'); return 'https://p/'; } } },
+    },
+  });
+  assert.equal(isNativeLocation(realLoc), true);
+  // Forged Symbol.toStringTag alone is rejected by the getter brand check.
+  const forged = {};
+  Object.defineProperty(forged, Symbol.toStringTag, { value: 'Location' });
+  assert.equal(isNativeLocation(forged), false);
+  assert.equal(isNativeLocation({}), false);
+  assert.equal(isNativeLocation('https://t/x'), false);
+  assert.equal(isNativeLocation(null), false);
+  assert.equal(isNativeLocation({ __vloc: true }), false);
+  assert.equal(isNativeLocation(realLoc), true);
+});
+
+// decodeInlineEntities inline-script entity decoding.
+
+const ENTITIES_BLOCK = slice(
+  '    function decodeInlineEntities(src) {',
+  '    // Execute a classic script body with real *global* scope'
+);
+
+test('decodeInlineEntities decodes the raw-text entity set', () => {
+  const { decodeInlineEntities } = load(ENTITIES_BLOCK, ['decodeInlineEntities'], {});
+  assert.equal(decodeInlineEntities('a &lt; b && c &gt; d'), 'a < b && c > d');
+  assert.equal(decodeInlineEntities('x =&gt; y'), 'x => y');
+  assert.equal(decodeInlineEntities('&quot;q&quot; &#39;s&#39; &#x27;t&#x27;'), '"q" \'s\' \'t\'');
+  // `&nbsp;` decodes to U+00A0 (native HTML parity), not ASCII space.
+  assert.equal(decodeInlineEntities('a&nbsp;b'), 'a b');
+  assert.equal(decodeInlineEntities('plain'), 'plain');
+  assert.equal(decodeInlineEntities(''), '');
+});
+
+// Error.stack sanitizer for page (06-install.js) and worker realms.
+// Saving and restoring `Error.prepareStackTrace` (or chaining onto the previous getter value)
+// must not recurse into the internal sanitizer wrapper.
+
+const vm = require('node:vm');
+const WORKER_SRC = fs.readFileSync(require.resolve('../../web/worker-prelude.js'), 'utf8').split('\r\n').join('\n');
+
+// `hook` is the page's own view of the property (pageStackHook / the worker's stackHook): what it assigned, kept apart
+// from the sanitizer V8 reads.
+function sanitizerRealm(install) {
+  const ctx = vm.createContext({});
+  const hook = { ctor: null, exists: false, value: undefined, forget: null };
+  install(vm.runInContext('globalThis', ctx), hook);
+  const run = code => vm.runInContext(code, ctx);
+  run.hook = hook;
+  return run;
+}
+
+const STACK_SANITIZERS = {
+  page: (realm, hook) => load(
+    slice('  function installStackSanitizer() {', '  function installPhase2Membrane() {'),
+    ['installStackSanitizer'],
+    { root: realm, deproxyURL: s => s, defineMasked: (o, p, d) => Object.defineProperty(o, p, d), pageStackHook: hook },
+  ).installStackSanitizer(),
+  worker: (realm, hook) => {
+    const a = WORKER_SRC.indexOf('  (function installStackSanitizer() {');
+    const b = WORKER_SRC.indexOf('  })();', a);
+    assert.ok(a >= 0 && b > a, 'worker stack sanitizer markers missing');
+    load(WORKER_SRC.slice(a, b + '  })();'.length), [], {
+      self: realm, realProxyOrigin: 'http://proxy.localhost:18080', NativeURLCtor: URL, base: new URL('https://t.example/'), stackHook: hook,
+    });
+  },
+};
+
+for (const [name, install] of Object.entries(STACK_SANITIZERS)) {
+  test(`${name} stack sanitizer survives save/restore and chaining of prepareStackTrace`, () => {
+    const run = sanitizerRealm(install);
+    assert.match(run("const p = Error.prepareStackTrace; Error.prepareStackTrace = undefined; Error.prepareStackTrace = p; new Error('x').stack"), /^Error: x\n    at /);
+    assert.match(run("{ const prev = Error.prepareStackTrace; Error.prepareStackTrace = (e, f) => 'W:' + prev(e, f); const s = new Error('y').stack; Error.prepareStackTrace = prev; s }"), /^W:Error: y\n    at /);
+    assert.equal(run("Error.prepareStackTrace = (e, f) => 'n:' + (f.length > 0); const s2 = new Error('z').stack; Error.prepareStackTrace = undefined; s2"), 'n:true');
+    // The page's own view: what it assigned, listed like a native property; forgetting it (a page's `delete`) keeps the
+    // sanitizer in place.
+    assert.equal(run.hook.ctor, run('Error'));
+    run("globalThis.f1 = (e, f) => 'f1'; Error.prepareStackTrace = f1");
+    assert.equal(run.hook.exists, true);
+    assert.equal(run.hook.value, run('f1'));
+    assert.equal(run("Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace').enumerable"), true);
+    run.hook.forget();
+    assert.equal(run.hook.exists, false);
+    assert.equal(run("Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace').enumerable"), false);
+    assert.match(run("new Error('w').stack"), /^Error: w\n    at /);
+  });
+}
+
+// WebTransport gateway request builder (ZP.webTransportGatewayRequest).
+// Target `serverCertificateHashes` move to the gateway query string so the gateway pins its upstream dial,
+// while the native browser connection pins the gateway's own dev certificate.
+
+test('WebTransport gateway request moves target pins to the gateway', () => {
+  const hash = new Uint8Array(32).fill(7);
+  const gwPin = ZP.bytesToBase64Url(new Uint8Array(32).fill(9));
+  const { url, options } = ZP.webTransportGatewayRequest(
+    'https://proxy.localhost:18443/__zp/wt', 'https://t.example:4433/echo', 'tab1',
+    { serverCertificateHashes: [{ algorithm: 'SHA-256', value: hash.buffer }, { algorithm: 'md5', value: new Uint8Array(16) }], congestionControl: 'throughput', bogus: 1 },
+    [gwPin]);
+  const u = new URL(url);
+  assert.equal(u.searchParams.get('target'), 'https://t.example:4433/echo');
+  assert.equal(u.searchParams.get('tab'), 'tab1');
+  assert.equal(u.searchParams.get('pinned'), '1');
+  assert.deepEqual(u.searchParams.getAll('certhash'), [ZP.bytesToBase64Url(hash)]);
+  assert.equal(options.congestionControl, 'throughput');
+  assert.equal('bogus' in options, false);
+  assert.equal(options.serverCertificateHashes.length, 1);
+  assert.equal(options.serverCertificateHashes[0].algorithm, 'sha-256');
+  assert.deepEqual(Array.from(options.serverCertificateHashes[0].value), Array(32).fill(9));
+
+  // An explicit empty pin array still sets `pinned=1` so the gateway does not fall back to CA roots.
+  const empty = new URL(ZP.webTransportGatewayRequest('https://gw/w', 'https://t/x', '', { serverCertificateHashes: [] }, []).url);
+  assert.equal(empty.searchParams.get('pinned'), '1');
+  // Omitting serverCertificateHashes sets neither the pinned flag nor gateway hashes.
+  const plain = ZP.webTransportGatewayRequest('https://gw/w', 'https://t/x', '', undefined, []);
+  assert.equal(new URL(plain.url).searchParams.has('pinned'), false);
+  assert.equal('serverCertificateHashes' in plain.options, false);
+  assert.throws(() => ZP.webTransportGatewayRequest('https://gw/w', 'https://t/x', '', { serverCertificateHashes: [{ algorithm: 'sha-256', value: 'x' }] }, []), TypeError);
+});
+
+test('proxied CSP admits the WebTransport gateway only when one is configured', () => {
+  const connect = csp => csp.match(/connect-src [^;]*/)[0];
+  assert.equal(connect(ZP.fixedCSP([])).includes('18443'), false);
+  assert.equal(connect(ZP.fixedCSP([], { extraConnect: ['https://proxy.localhost:18443/__zp/wt'] })).includes(' https://proxy.localhost:18443 '), true);
+});
+
+// Proxied RTCPeerConnection configuration forces relay-only ICE transport.
+test('relay-only RTC configuration replaces the ICE servers and the policy', () => {
+  const ice = [{ urls: ['turn:192.0.2.1:3478'], username: 'u', credential: 'c' }];
+  const page = { iceServers: [{ urls: 'stun:stun.example:3478' }], iceTransportPolicy: 'all', bundlePolicy: 'max-bundle' };
+  const c = ZP.relayOnlyRTCConfiguration(page, ice);
+  assert.deepEqual(c.iceServers, ice);
+  assert.equal(c.iceTransportPolicy, 'relay');
+  assert.equal(c.bundlePolicy, 'max-bundle', 'other members pass through');
+  assert.equal(page.iceTransportPolicy, 'all', 'the page dictionary is not mutated');
+  assert.equal(ZP.relayOnlyRTCConfiguration(undefined, ice).iceTransportPolicy, 'relay');
+});
+
+// postMessage targetOrigin filtering across virtual origins.
+// Because proxied windows share one physical origin, the wrapper compares virtual origins before forwarding.
+
+const PM_BLOCK = slice('  function postMessageTargetAccepts(target, wanted) {', '  function virtualOriginForMessage(ev) {');
+
+function pmEnv(destOrigin) {
+  const sent = [];
+  const diag = [];
+  const target = { postMessage: (...a) => { sent.push(a); } };
+  const env = load(PM_BLOCK, ['postMessageWrapperFor', 'postMessageTargetAccepts', 'normalizePostMessageTargetOrigin'], {
+    proxyOrigin: 'http://proxy.test:18080',
+    siteFrameBoot: null,
+    frameRealOrigins: new WeakMap(),
+    virtualURL: new URL('http://a.test:3000/page'),
+    windowHandles: { originOf: () => destOrigin },
+    securityOrigin: () => 'http://a.test:3000',
+    displayOrigin: o => o,
+    root: { __zp_diagnostics: diag },
+    postMessageWrappers: new WeakMap(),
+    maskNativeFunction() {},
+    defineMasked() {},
+    restoreNativePostMessage() {},
+    installEarlyPostMessage() {},
+    URL,
+  });
+  return { env, target, sent, diag, wrapped: env.postMessageWrapperFor(target) };
+}
+
+test('postMessage target origin: a mismatch is dropped, a match is delivered', () => {
+  const { wrapped, sent, diag } = pmEnv('http://b.test:3000');
+  wrapped('m', 'http://b.test:3000');          // exact
+  wrapped('m', '*');                            // anything
+  assert.equal(sent.length, 2);
+  wrapped('m', 'http://example.invalid');      // wrong site
+  wrapped('m', 'http://a.test:3000');          // the sender's own origin, to another site's window
+  wrapped('m', '/');                            // "/" is the sender's origin too
+  wrapped('m');                                 // default target origin is "/"
+  assert.equal(sent.length, 2, 'every mismatch was dropped silently');
+  assert.deepEqual(diag.map(d => d.t), ['pm-drop', 'pm-drop', 'pm-drop', 'pm-drop'], 'and each one left a diagnostic');
+  assert.deepEqual({ t: diag[0].t, wanted: diag[0].wanted, dest: diag[0].dest, from: diag[0].from },
+    { t: 'pm-drop', wanted: 'http://example.invalid', dest: 'http://b.test:3000', from: 'http://a.test:3000' });
+  // The record also says which window the message was aimed at, and where it was sent from.
+  assert.match(diag[0].to, /^(self|parent|top|opener|child\d+|other)\b/, 'and names the destination by its role');
+  assert.equal(typeof diag[0].at, 'string', 'and the call site');
+  // Delivered messages carry the proxy origin the browser can match.
+  assert.deepEqual(sent.map(a => a[1]), ['http://proxy.test:18080', '*']);
+});
+
+test('postMessage target origin: "/" and the default reach a same-origin window', () => {
+  const { wrapped, sent } = pmEnv('http://a.test:3000');
+  wrapped('m', '/');
+  wrapped('m');
+  wrapped('m', 'http://a.test:3000');
+  wrapped('m', 'http://b.test:3000');
+  assert.equal(sent.length, 3);
+});
+
+test('postMessage target origin: an unknown destination is left to the browser', () => {
+  const { wrapped, sent } = pmEnv('');
+  wrapped('m', 'http://b.test:3000');
+  wrapped('m', '/');
+  assert.equal(sent.length, 2);
+});
+
+test('postMessage: the options form is honored, filtered and keeps transfer', () => {
+  const { wrapped, sent } = pmEnv('http://b.test:3000');
+  const transfer = [];
+  wrapped('m', { targetOrigin: '*' });
+  wrapped('m', { targetOrigin: 'http://b.test:3000', transfer });
+  assert.equal(sent.length, 2, 'the options form used to throw a SyntaxError (the object was stringified)');
+  assert.deepEqual(sent[0][1], { targetOrigin: '*' });
+  assert.equal(sent[1][1].targetOrigin, 'http://proxy.test:18080');
+  assert.equal(sent[1][1].transfer, transfer);
+  wrapped('m', { targetOrigin: 'http://example.invalid' });
+  wrapped('m', {});                              // targetOrigin defaults to "/" = the sender's
+  assert.equal(sent.length, 2);
+});
+
+test('postMessage wrapper looks like the native method', () => {
+  const { wrapped } = pmEnv('http://b.test:3000');
+  assert.equal(wrapped.length, 1);
+  assert.equal(wrapped.name, 'postMessage');
+});
+
+// Cross-origin window handle facade (HTML cross-origin security rules).
+
+const XORIGIN_BLOCK = slice('    const CROSS_ORIGIN_WINDOW_NAMES = [', '    function virtualWindowProperty(target, prop) {');
+
+function xoriginEnv(opts = {}) {
+  const get = () => {};
+  const scope = { __scope: true };
+  const safe = new WeakMap();
+  const ownerScope = { __ownerScope: true };
+  const root = { parent: null, opener: null, __zp_get: get };
+  root.parent = root;
+  const urlMeta = new Map();
+  const env = load(XORIGIN_BLOCK, ['windowHandleFor', 'crossOriginWindow', 'virtualOriginOfWindow'], {
+    get, root, scope,
+    virtualURL: new URL('http://a.test:3000/'),
+    siteFrameBoot: opts.siteFrameBoot || null,
+    frameRealOrigins: new WeakMap(),
+    frameWindowOrigins: new WeakMap(),
+    urlMeta,
+    securityOrigin: opts.securityOrigin || (() => 'http://a.test:3000'),
+    displayOrigin: o => (String(o).indexOf('null#') === 0 ? 'null' : o),
+    OPAQUE_FRAME_ATTR: 'data-zp-opaque',
+    OPAQUE_PENDING_ORIGIN: 'null#pending',
+    Native: { getAttribute: { call: () => null }, hasAttribute: { call: (el, name) => !!(el && el.opaque && name === 'data-zp-opaque') }, DOMException },
+    frameRouteTarget: () => '',
+    windowReachable: w => { try { void w.document; return true; } catch { return false; } },
+    isScopeProxy: v => v === scope,
+    safeCrossWindow: w => { if (!safe.has(w)) safe.set(w, { safeFor: w }); return safe.get(w); },
+    crossWindowLocation: w => ({ locationOf: w }),
+    postMessageWrapperFor: w => function postMessage() {},
+    maskNativeFunction() {},
+    toStringMap: new Map(),
+    nativeAccessorSource: () => 'function () { [native code] }',
+    maskAccessorFn() {},
+    normalizedError,
+    crossWindowTargets: new WeakMap(),
+    URL,
+  });
+  const win = (origin, extra = {}) => Object.assign({
+    length: 0, closed: false, top: null, parent: null, opener: null,
+    close() {}, focus() {}, blur() {}, postMessage() {},
+    __zp_get: origin ? (w, prop) => (prop === 'location' ? { origin } : prop === 'window' ? ownerScope : undefined) : undefined,
+  }, extra);
+  return { env, root, scope, urlMeta, win, ownerScope };
+}
+const isSecurityError = e => e && e.name === 'SecurityError';
+
+test('window handles: own window → page-facing scope, same-origin window as it is, nothing else touched', () => {
+  const { env, root, scope, win } = xoriginEnv();
+  assert.equal(env.windowHandleFor(root), scope);
+  assert.equal(env.windowHandleFor(null), null);
+  const same = win('http://a.test:3000');
+  assert.equal(env.windowHandleFor(same), same, 'a same-origin window is handed out raw');
+  assert.equal(env.windowHandleFor('str'), 'str');
+});
+
+test('window handles: a window of another origin is a stand-in, stable per window', () => {
+  const { env, win } = xoriginEnv();
+  const other = win('http://b.test:3000');
+  const handle = env.windowHandleFor(other);
+  assert.notEqual(handle, other);
+  assert.equal(env.windowHandleFor(other), handle, 'natively `iframe.contentWindow === iframe.contentWindow`');
+  assert.equal(env.windowHandleFor(handle), handle, 'a handle passed through again is itself');
+});
+
+test('cross-origin window: the allowed names answer, everything else is SecurityError', () => {
+  const { env, win, root, scope } = xoriginEnv();
+  const w = win('http://b.test:3000', { top: root, parent: root });
+  const h = env.windowHandleFor(w);
+  assert.equal(h.closed, false);
+  assert.equal(h.length, 0);
+  assert.equal(h.window, h); assert.equal(h.self, h); assert.equal(h.frames, h);
+  assert.equal(typeof h.postMessage, 'function');
+  assert.equal(h.top, scope, 'the opener chain leads back to OUR window');
+  assert.equal(h.parent, scope);
+  assert.equal(h.opener, null);
+  assert.deepEqual(h.location, { locationOf: w });
+  for (const name of ['document', 'localStorage', 'eval', 'name', 'origin', 'navigator', 'constructor', 'zpExpando', 'frameElement']) {
+    assert.throws(() => h[name], isSecurityError, `reading ${name}`);
+  }
+  assert.equal(h.then, undefined, '`then` reads undefined, so a promise resolution does not throw');
+});
+
+test('cross-origin window: every mutation throws SecurityError (not false)', () => {
+  const { env, win } = xoriginEnv();
+  const h = env.windowHandleFor(win('http://b.test:3000'));
+  assert.throws(() => { h.x = 1; }, isSecurityError);
+  assert.throws(() => { h.postMessage = 1; }, isSecurityError);
+  assert.throws(() => { delete h.x; }, isSecurityError);
+  assert.throws(() => Reflect.deleteProperty(h, 'location'), isSecurityError);
+  assert.throws(() => Reflect.defineProperty(h, 'x', { value: 1 }), isSecurityError);
+  assert.throws(() => Reflect.setPrototypeOf(h, {}), isSecurityError);
+  assert.throws(() => Reflect.preventExtensions(h), isSecurityError);
+  assert.equal(Reflect.isExtensible(h), true);
+});
+
+test('cross-origin window: reflection matches Chrome', () => {
+  const { env, win } = xoriginEnv();
+  const h = env.windowHandleFor(win('http://b.test:3000'));
+  assert.deepEqual(Object.keys(h), [], 'nothing is enumerable');
+  assert.equal(Object.getPrototypeOf(h), null);
+  assert.deepEqual(Object.getOwnPropertyNames(h), ['window', 'self', 'location', 'closed', 'frames', 'length', 'top', 'opener', 'parent', 'blur', 'close', 'focus', 'postMessage', 'then']);
+  assert.equal('location' in h, true);
+  assert.equal('postMessage' in h, true);
+  assert.throws(() => 'document' in h, isSecurityError);
+  assert.throws(() => 'then' in h, isSecurityError, '`then` is a key but not "in"');
+  assert.equal(Object.prototype.toString.call(h), '[object Object]');
+  assert.throws(() => String(h), isSecurityError);
+  assert.throws(() => JSON.stringify(h), isSecurityError);
+  assert.equal(h instanceof Object, false, 'a null prototype: no `instanceof Window` either');
+  const pm = Object.getOwnPropertyDescriptor(h, 'postMessage');
+  assert.deepEqual({ w: pm.writable, e: pm.enumerable, c: pm.configurable, t: typeof pm.value }, { w: false, e: false, c: true, t: 'function' });
+  const loc = Object.getOwnPropertyDescriptor(h, 'location');
+  assert.equal(typeof loc.get, 'function'); assert.equal(typeof loc.set, 'function'); assert.equal(loc.enumerable, false);
+  const closed = Object.getOwnPropertyDescriptor(h, 'closed');
+  assert.equal(typeof closed.get, 'function'); assert.equal(closed.set, undefined);
+  assert.throws(() => Object.getOwnPropertyDescriptor(h, 'document'), isSecurityError);
+});
+
+test('cross-origin window: child frames are reachable by index only up to length', () => {
+  const { env, win } = xoriginEnv();
+  const grandSame = win('http://a.test:3000');
+  const grandCross = win('http://c.test:3000');
+  const w = win('http://b.test:3000', { length: 2, 0: grandSame, 1: grandCross });
+  const h = env.windowHandleFor(w);
+  assert.equal(h[0], grandSame, 'a child of the SAME origin as us is ours to use');
+  assert.notEqual(h[1], grandCross);
+  assert.throws(() => h[1].document, isSecurityError);
+  assert.throws(() => h[2], isSecurityError, 'past the last child natively throws');
+  assert.deepEqual(Object.keys(h), ['0', '1']);
+});
+
+test("window handles: a frame's intended origin speaks for a window with no membrane yet", () => {
+  const { env, win, urlMeta } = xoriginEnv();
+  const blank = win('');                     // not booted: no __zp_get of its own
+  const frame = {};
+  assert.equal(env.windowHandleFor(blank, frame), blank, 'no route known: it is ours');
+  urlMeta.set(frame, 'http://b.test:3000/page');
+  const handle = env.windowHandleFor(blank, frame);
+  assert.notEqual(handle, blank, 'sent to another site: restricted from the start');
+  assert.throws(() => handle.document, isSecurityError);
+});
+
+test('window handles: a same-origin ancestor gets the ancestor stand-in, a cross-origin one the restricted one', () => {
+  const { env, win, root } = xoriginEnv();
+  const parentSame = win('http://a.test:3000');
+  parentSame.parent = parentSame;
+  root.parent = parentSame;
+  const h = env.windowHandleFor(parentSame, 'ancestor');
+  assert.deepEqual(Object.keys(h), ['safeFor']);
+  const parentCross = win('http://b.test:3000');
+  parentCross.parent = parentCross;
+  root.parent = parentCross;
+  const c = env.windowHandleFor(parentCross, 'ancestor');
+  assert.throws(() => c.document, isSecurityError);
+});
+
+// Document cookie jar synchronization: each cookie change record is applied at most once per id
+// and only when the cookie matches the document's virtual origin and path.
+
+const COOKIE_BLOCK = slice('  function initDocumentCookieRecords(cookieString) {', '  // ── virtual cookieStore');
+
+function cookieEnv(href = 'http://app.a.test:3000/dir/page') {
+  const events = [];
+  const records = [];
+  const env = load('let documentCookie = "";\n' + COOKIE_BLOCK,
+    ['applyCookieChanges', 'setDocumentCookie', 'documentCookieString'],
+    {
+      virtualURL: new URL(href),
+      documentCookieRecords: records,
+      fireCookieChange: (changed, deleted) => events.push({ changed: changed.map(c => c.name), deleted: deleted.map(c => c.name) }),
+      cookieItemFromRec: r => ({ name: r.name, value: r.value }),
+    });
+  return { env, events, records };
+}
+const change = (over = {}) => Object.assign({ id: 'e:1', name: 'tok', value: 'v1', domain: 'app.a.test', hostOnly: true, path: '/', secure: false, expires: null, deleted: false }, over);
+
+test('cookie changes: a record is applied once per id, whether it came with the response or by push', () => {
+  const { env, events } = cookieEnv();
+  env.applyCookieChanges([change()]);
+  env.applyCookieChanges([change()]);                      // the same change again (the push after the response)
+  assert.equal(env.documentCookieString(), 'tok=v1');
+  assert.equal(events.length, 1, 'one change event, not two');
+  env.applyCookieChanges([change({ id: 'e:2', value: 'v2' })]);
+  assert.equal(env.documentCookieString(), 'tok=v2', 'a new id updates');
+  assert.equal(events.length, 2);
+});
+
+test('cookie changes: only what this document could read is kept', () => {
+  const { env, records } = cookieEnv();
+  env.applyCookieChanges([
+    change({ id: 'x:1', name: 'other', domain: 'b.test' }),                                  // another site
+    change({ id: 'x:2', name: 'sibling', domain: 'www.a.test' }),                            // host-only for a sibling host
+    change({ id: 'x:3', name: 'wide', domain: 'a.test', hostOnly: false }),                  // Domain=a.test: this host reads it
+    change({ id: 'x:4', name: 'narrow', domain: 'deep.app.a.test', hostOnly: false }),       // a subdomain's
+  ]);
+  assert.deepEqual(records.map(r => r.name), ['wide']);
+  assert.equal(env.documentCookieString(), 'wide=v1');
+});
+
+test('cookie changes: a deletion removes, a session cookie never expires, a path scopes', () => {
+  const { env, events } = cookieEnv('http://app.a.test:3000/dir/page');
+  env.applyCookieChanges([change({ id: 'd:1', name: 'gone' }), change({ id: 'd:2', name: 'admin', path: '/admin' }), change({ id: 'd:3', name: 'dir', path: '/dir' })]);
+  assert.equal(env.documentCookieString(), 'dir=v1; gone=v1', 'the longer path first; /admin is not this page\'s');
+  env.applyCookieChanges([change({ id: 'd:4', name: 'gone', deleted: true, expires: 0 })]);
+  assert.equal(env.documentCookieString(), 'dir=v1');
+  assert.deepEqual(events.at(-1), { changed: [], deleted: ['gone'] }, 'cookieStore hears the deletion');
+  env.applyCookieChanges([change({ id: 'd:5', name: 'past', expires: Date.now() - 1000 })]);
+  assert.equal(env.documentCookieString(), 'dir=v1', 'an expiry in the past is not stored');
+});
+
+test('cookie changes: junk is ignored, the document\'s own write is unaffected', () => {
+  const { env } = cookieEnv();
+  env.applyCookieChanges(undefined);
+  env.applyCookieChanges([null, {}, { name: 5, domain: 'app.a.test' }, change({ id: undefined, name: 'noid' })]);
+  assert.equal(env.documentCookieString(), 'noid=v1', 'a record without an id is still applied');
+  env.setDocumentCookie('mine=1; Path=/');
+  assert.match(env.documentCookieString(), /mine=1/);
+});
+
+// Opaque-origin frames: frames sandboxed without allow-same-origin receive a unique opaque security origin
+// serialized as "null", isolating them from all other origins and denying storage access.
+
+const OPAQUE_BLOCK = slice('  const opaqueDocument = (() => {', '  // Declare opaqueDocument helpers before realm bootstrap.');
+
+function opaqueEnv(embedderAnswer) {
+  const root = embedderAnswer === undefined
+    ? { frameElement: null }
+    : { frameElement: {}, parent: { __zp_frame_opaque: embedderAnswer } };
+  return load(OPAQUE_BLOCK, ['opaqueDocument', 'securityOrigin', 'displayOrigin', 'opaqueDenied', 'OPAQUE_PENDING_ORIGIN', 'OPAQUE_FLAG_TEXT'], {
+    root, virtualURL: new URL('http://a.test:3000/page'), Native: { DOMException }, normalizedError,
+  });
+}
+
+test('opaque documents: only a frame the embedder marks is opaque, and only on a strict yes', () => {
+  assert.equal(opaqueEnv().opaqueDocument, false, 'a top-level document is not');
+  assert.equal(opaqueEnv(() => true).opaqueDocument, true);
+  for (const answer of [() => false, () => 1, () => 'yes', () => undefined, () => { throw new Error('boom'); }]) {
+    assert.equal(opaqueEnv(answer).opaqueDocument, false);
+  }
+  // A real cross-site parent cannot be asked: reading its members throws, and the frame is not ours to treat as opaque.
+  const root = { frameElement: {}, get parent() { throw normalizedError('SecurityError'); } };
+  const env = load(OPAQUE_BLOCK, ['opaqueDocument'], { root, virtualURL: new URL('http://a.test:3000/'), Native: { DOMException }, normalizedError });
+  assert.equal(env.opaqueDocument, false);
+});
+
+test('opaque documents: an own token, shown as "null"', () => {
+  const plain = opaqueEnv();
+  assert.equal(plain.securityOrigin(), 'http://a.test:3000');
+  assert.equal(plain.displayOrigin('http://x.test'), 'http://x.test');
+  const a = opaqueEnv(() => true);
+  const b = opaqueEnv(() => true);
+  assert.match(a.securityOrigin(), /^null#/);
+  assert.equal(a.securityOrigin(), a.securityOrigin(), 'stable within a document');
+  assert.notEqual(a.securityOrigin(), b.securityOrigin(), 'an opaque origin equals nothing but itself');
+  assert.equal(a.displayOrigin(a.securityOrigin()), 'null');
+  assert.equal(a.displayOrigin(a.OPAQUE_PENDING_ORIGIN), 'null', 'a frame the embedder has not heard from yet is opaque too');
+  assert.equal(a.displayOrigin('null'), 'null');
+  assert.equal(a.displayOrigin(5), 5, 'only strings are mapped');
+  assert.notEqual(a.securityOrigin(), a.OPAQUE_PENDING_ORIGIN);
+});
+
+test('opaque documents: the denial is a SecurityError saying what the browser says', () => {
+  const { opaqueDenied, OPAQUE_FLAG_TEXT } = opaqueEnv(() => true);
+  const e = opaqueDenied("Failed to read the 'localStorage' property from 'Window'");
+  assert.equal(e.name, 'SecurityError');
+  assert.equal(e.message, "Failed to read the 'localStorage' property from 'Window': " + OPAQUE_FLAG_TEXT);
+  assert.equal(OPAQUE_FLAG_TEXT, "The document is sandboxed and lacks the 'allow-same-origin' flag.");
+  assert.equal(opaqueDenied('prefix only', '').message, 'prefix only', 'an empty text: the prefix is the whole message');
+  assert.equal(opaqueDenied('p', 'own text').message, 'p: own text');
+  assert.ok(e instanceof DOMException);
+});
+
+const SANDBOX_BLOCK = slice('  function frameSandboxAllowsEscape(raw) {', '  function syncSandboxShadow(el, value) {');
+
+test('sandbox flags: opaque means no allow-same-origin; the escape combination is scripts plus same-origin', () => {
+  const { frameSandboxIsOpaque, frameSandboxAllowsEscape } = load(SANDBOX_BLOCK, ['frameSandboxIsOpaque', 'frameSandboxAllowsEscape'], {});
+  for (const raw of ['', 'allow-scripts', 'allow-scripts allow-forms allow-popups', '  allow-top-navigation ', null, undefined]) {
+    assert.equal(frameSandboxIsOpaque(raw), true, JSON.stringify(raw));
+    assert.equal(frameSandboxAllowsEscape(raw), false, JSON.stringify(raw));
+  }
+  assert.equal(frameSandboxIsOpaque('allow-same-origin'), false);
+  assert.equal(frameSandboxAllowsEscape('allow-same-origin'), false, 'without scripts the frame cannot lift its own sandbox');
+  assert.equal(frameSandboxIsOpaque('allow-scripts allow-same-origin'), false);
+  assert.equal(frameSandboxAllowsEscape('allow-scripts allow-same-origin'), true);
+  assert.equal(frameSandboxAllowsEscape('ALLOW-SCRIPTS\n\tAllow-Same-Origin'), true, 'tokens are ASCII case-insensitive, any whitespace separates them');
+  assert.equal(frameSandboxIsOpaque('allow-same-origin-ish allow-scripts'), true, 'a token is a whole word');
+});
+
+// Parked frame attributes: the HTML rewriter and DOM sanitizer park frame `src` in `data-zp-frame-src`
+// while markup is parsed or inert, and restore it once the frame enters a live document.
+
+const PARK_BLOCK = slice('  function parkFrameSrc(el) {', '  // ' + String.fromCharCode(96) + 'keepDocument' + String.fromCharCode(96) + ' is false for the mutation-observer backstop');
+const RESTORE_BLOCK = slice('  function inertFrameDocument(el) {', '  function scanNavigationBackstop(root) {');
+
+function fakeFrame(attrs = {}, live = true) {
+  return { nodeType: 1, nodeName: 'IFRAME', attrs: new Map(Object.entries(attrs)), ownerDocument: { defaultView: live ? {} : null } };
+}
+const fakeAttrs = {
+  getAttribute: { call: (el, k) => (el.attrs.has(k) ? el.attrs.get(k) : null) },
+  setAttribute: { call: (el, k, v) => { el.attrs.set(k, String(v)); } },
+  removeAttribute: { call: (el, k) => { el.attrs.delete(k); } },
+  hasAttribute: { call: (el, k) => el.attrs.has(k) },
+};
+
+test('parking: a routable src waits in data-zp-frame-src untouched, in place; blank and empty ones stay', () => {
+  const { parkFrameSrc, dropParkedFrameSrc } = load(PARK_BLOCK, ['parkFrameSrc', 'dropParkedFrameSrc'], { Native: fakeAttrs });
+  const f = fakeFrame({ name: 'm', src: ' /a/b?q=1#h ', title: 't' });
+  parkFrameSrc(f);
+  assert.equal(f.attrs.get('src'), 'about:blank', 'the browser loads nothing of the page\'s');
+  assert.deepEqual([...f.attrs.keys()], ['name', 'src', 'title', 'data-zp-frame-src'], 'src keeps its place: innerHTML lists attributes in order');
+  assert.equal(f.attrs.get('data-zp-frame-src'), ' /a/b?q=1#h ', 'the author\'s text, whitespace and all');
+  dropParkedFrameSrc(f);
+  assert.equal(f.attrs.has('data-zp-frame-src'), false, 'a src the page sets itself makes the parked text stale');
+  assert.equal(f.attrs.get('src'), 'about:blank');
+  for (const keep of ['about:blank', '  ABOUT:blank', '', '   ']) {
+    const g = fakeFrame({ src: keep });
+    parkFrameSrc(g);
+    assert.equal(g.attrs.get('src'), keep, JSON.stringify(keep));
+    assert.equal(g.attrs.has('data-zp-frame-src'), false, JSON.stringify(keep));
+  }
+  const none = fakeFrame({});
+  parkFrameSrc(none);
+  assert.equal(none.attrs.size, 0);
+});
+
+function restoreEnv() {
+  const calls = [];
+  const natives = { qsa: [], fragment: [], element: [] };
+  const mkQsa = kind => ({ call: (node, selector) => { natives[kind].push(selector); return node.found || []; } });
+  const env = load(RESTORE_BLOCK, ['inertFrameDocument', 'restoreParkedFrame', 'restoreParkedFrames', 'markupHasFrames'], {
+    restorePendingSrcdoc: el => calls.push(['srcdoc', el]),
+    restorePendingFrameSrc: el => calls.push(['src', el]),
+    Native: { querySelectorAll: mkQsa('qsa'), fragmentQuerySelectorAll: mkQsa('fragment'), elementQuerySelectorAll: mkQsa('element') },
+  });
+  return { env, calls, natives };
+}
+
+test('parking: a frame waits while its document is inert and is restored once it is live', () => {
+  const { env, calls } = restoreEnv();
+  const inert = fakeFrame({ 'data-zp-frame-src': '/x' }, false);
+  assert.equal(env.inertFrameDocument(inert), true);
+  env.restoreParkedFrame(inert);
+  assert.deepEqual(calls, [], 'nothing loads in a template or a parser copy; the insertion that activates the frame restores it');
+  const live = fakeFrame({ 'data-zp-frame-src': '/x' }, true);
+  assert.equal(env.inertFrameDocument(live), false);
+  env.restoreParkedFrame(live);
+  assert.deepEqual(calls, [['srcdoc', live], ['src', live]], 'srcdoc first, as the backstop sweep does');
+  assert.equal(env.inertFrameDocument({}), false, 'no owner document: not known to be inert');
+});
+
+test('parking: restoring a subtree asks natively for what is parked, by the node kind', () => {
+  const { env, calls, natives } = restoreEnv();
+  const a = fakeFrame({ 'data-zp-frame-src': '/a' });
+  const b = fakeFrame({ 'data-zp-srcdoc': '<p>' });
+  const host = { nodeType: 1, nodeName: 'DIV', found: [a, b] };
+  env.restoreParkedFrames(host);
+  assert.deepEqual(calls.map(c => c[1]), [a, a, b, b]);
+  assert.equal(natives.element.length, 1);
+  const selector = natives.element[0];
+  assert.deepEqual(selector.split(',').map(part => part.trim()).sort(),
+    ['frame[data-zp-frame-src]', 'frame[data-zp-srcdoc]', 'iframe[data-zp-frame-src]', 'iframe[data-zp-srcdoc]'],
+    'both tags, both parked attributes ("frame" is not a substring match of "iframe")');
+  calls.length = 0;
+  env.restoreParkedFrames({ nodeType: 11, found: [a] });   // a fragment
+  env.restoreParkedFrames({ nodeType: 9, found: [b] });    // a document
+  assert.equal(natives.fragment.length, 1);
+  assert.equal(natives.qsa.length, 1);
+  assert.deepEqual(calls.map(c => c[1]), [a, a, b, b]);
+  calls.length = 0;
+  const self = fakeFrame({ 'data-zp-frame-src': '/self' });
+  self.found = [];
+  env.restoreParkedFrames(self);
+  assert.deepEqual(calls.map(c => c[0]), ['srcdoc', 'src'], 'a frame given itself is restored too');
+  for (const nothing of [null, undefined, 'str', 5, { nodeType: 3 }]) env.restoreParkedFrames(nothing);
+  assert.equal(calls.length, 2);
+});
+
+test('parking: a failing native query never throws into the page', () => {
+  const env = load(RESTORE_BLOCK, ['restoreParkedFrames'], {
+    restorePendingSrcdoc() {}, restorePendingFrameSrc() {},
+    Native: { querySelectorAll: null, fragmentQuerySelectorAll: null, elementQuerySelectorAll: { call() { throw new Error('detached realm'); } } },
+  });
+  assert.doesNotThrow(() => env.restoreParkedFrames({ nodeType: 1, nodeName: 'DIV' }));
+  assert.doesNotThrow(() => env.restoreParkedFrames({ nodeType: 11 }));
+});
+
+test('window handles: a window whose frame is marked opaque is a stand-in from the start, whatever it shows', () => {
+  const { env, win } = xoriginEnv();
+  const blank = win('');
+  assert.equal(env.virtualOriginOfWindow(blank), '', 'unmarked and unknown');
+  const marked = win('', { frameElement: { opaque: true } });
+  assert.equal(env.virtualOriginOfWindow(marked), 'null#pending');
+  const handle = env.windowHandleFor(marked);
+  assert.notEqual(handle, marked);
+  assert.throws(() => handle.document, isSecurityError);
+});
+
+test('window handles: opaque documents are cross-origin to each other and to the site that embeds them', () => {
+  const { env, win, root } = xoriginEnv();
+  const stated = token => win('', { __zp_origin: () => token });
+  const first = stated('null#aaa');
+  assert.equal(env.virtualOriginOfWindow(first), 'null#aaa', 'a window states its own security origin');
+  assert.notEqual(env.windowHandleFor(first), first, 'an opaque frame is a stand-in to its embedder');
+  assert.notEqual(env.virtualOriginOfWindow(first), env.virtualOriginOfWindow(stated('null#bbb')), 'each has its own');
+  assert.equal(env.virtualOriginOfWindow(root), 'http://a.test:3000');
+  // The document itself opaque: only the very same origin is "same", and nothing else ever is.
+  const inside = xoriginEnv({ securityOrigin: () => 'null#me' });
+  const sibling = inside.win('', { __zp_origin: () => 'null#other' });
+  assert.notEqual(inside.env.windowHandleFor(sibling), sibling, 'a sibling opaque frame is cross-origin');
+  const embedder = inside.win('http://a.test:3000');
+  assert.notEqual(inside.env.windowHandleFor(embedder), embedder, 'so is the site that embedded us');
+  assert.equal(inside.env.virtualOriginOfWindow(inside.root), 'null#me');
+  assert.equal(inside.env.windowHandleFor(inside.root), inside.scope, 'and our own window is ours');
+});
+
+test('cookie writes: a runtime request waits for the writes still in flight, and a failed write never holds it back', async () => {
+  const sent = [];
+  const acks = [];
+  const diag = [];
+  const ctx = { bridge: { send: message => new Promise((resolve, reject) => { sent.push(message); acks.push({ resolve, reject }); }) } };
+  const env = load('let documentCookie = "";\n' + COOKIE_BLOCK, ['sendCookieSet', 'cookieWritesSettled'], {
+    virtualURL: new URL('http://app.a.test:3000/dir/page'),
+    documentCookieRecords: [], fireCookieChange() {}, cookieItemFromRec: r => r,
+    ctx, boot: { tabId: 't1' }, root: { __zp_diagnostics: diag },
+  });
+  const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(env.cookieWritesSettled(), null, 'nothing in flight: nothing to wait for');
+  env.sendCookieSet('a=1');
+  env.sendCookieSet('b=2');
+  assert.deepEqual(sent.map(m => [m.type, m.tabId, m.targetUrl, m.cookie]),
+    [[ZP.MSG.COOKIE_SET, 't1', 'http://app.a.test:3000/dir/page', 'a=1'], [ZP.MSG.COOKIE_SET, 't1', 'http://app.a.test:3000/dir/page', 'b=2']]);
+  let settled = false;
+  env.cookieWritesSettled().then(() => { settled = true; });
+  await flush();
+  assert.equal(settled, false, 'both acknowledgements are outstanding');
+  acks[0].resolve({ ok: true });
+  await flush();
+  assert.equal(settled, false, 'one is still out');
+  acks[1].reject(Object.assign(new Error('x'), { code: 'SW_NOT_READY' }));
+  await flush();
+  assert.equal(settled, true, 'a rejected write settles too: it must never hold a request back');
+  assert.equal(env.cookieWritesSettled(), null, 'and nothing is left to wait for');
+  assert.deepEqual(diag.map(d => [d.t, d.code, d.ck]), [['cookie-set-failed', 'SW_NOT_READY', 'b=2']]);
+});
+
+test('parking: only markup with a frame in it is swept for parked frames', () => {
+  const { env } = restoreEnv();
+  for (const yes of ['<iframe src=x></iframe>', '<IFRAME>', '<div><frame src=x>', 'a<iframe', '<p></p><iframe\n src=x>']) assert.equal(env.markupHasFrames(yes), true, yes);
+  for (const no of ['', '<i>x</i>', '<iframes>', '<frameset>', 'iframe', '<div data-x="iframe">', null, undefined]) assert.equal(env.markupHasFrames(no), false, String(no));
+});
+
+test('cookie writes: a request that cannot wait carries what is unacknowledged, and the writer ignores the push of its own write', async () => {
+  const sent = [];
+  const acks = [];
+  const ctx = { bridge: { send: message => new Promise((resolve, reject) => { sent.push(message); acks.push({ resolve, reject }); }) } };
+  const env = load('let documentCookie = "";\n' + COOKIE_BLOCK, ['sendCookieSet', 'pendingCookieWrites', 'applyCookieChanges', 'documentCookieString'], {
+    virtualURL: new URL('http://app.a.test:3000/dir/page'),
+    documentCookieRecords: [], fireCookieChange() {}, cookieItemFromRec: r => r,
+    ctx, boot: { tabId: 't1' }, root: { __zp_diagnostics: [] },
+  });
+  const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(env.pendingCookieWrites(), [], 'nothing written: nothing carried');
+  env.sendCookieSet('a=1; Path=/');
+  env.sendCookieSet('b=2');
+  const pending = env.pendingCookieWrites();
+  assert.deepEqual(pending.map(w => w[1]), ['a=1; Path=/', 'b=2']);
+  assert.equal(pending[0][0], sent[0].wid, 'the request names the write by the id the message carries');
+  assert.equal(pending[1][0], sent[1].wid);
+  assert.notEqual(pending[0][0], pending[1][0]);
+  acks[0].resolve({ ok: true });
+  await flush();
+  assert.deepEqual(env.pendingCookieWrites().map(w => w[1]), ['b=2'], 'an acknowledged write is no longer carried');
+  // The worker broadcasts cookie changes to every matching document, including the writer.
+  env.applyCookieChanges([change({ id: 'p:1', name: 'a', wid: sent[0].wid }), change({ id: 'p:2', name: 'other', wid: 'w-someone-else' })]);
+  assert.equal(env.documentCookieString(), 'other=v1', 'the writer already has its cookie; another document\'s write is applied');
+});
+
+test('cookie writes: only the newest unacknowledged writes ride a request, in order', () => {
+  const ctx = { bridge: { send: () => new Promise(() => {}) } };
+  const env = load('let documentCookie = "";\n' + COOKIE_BLOCK, ['sendCookieSet', 'pendingCookieWrites'], {
+    virtualURL: new URL('http://app.a.test:3000/dir/page'),
+    documentCookieRecords: [], fireCookieChange() {}, cookieItemFromRec: r => r,
+    ctx, boot: { tabId: 't1' }, root: { __zp_diagnostics: [] },
+  });
+  for (let i = 0; i < 100; i++) env.sendCookieSet('c' + i + '=' + i);
+  const carried = env.pendingCookieWrites().map(w => w[1]);
+  assert.equal(carried.length, 32);
+  assert.equal(carried[0], 'c68=68', 'the oldest of the newest 32');
+  assert.equal(carried[31], 'c99=99', 'the write just made is always carried');
+});
+
+// fastDataBase / fastSet guards for inline member access.
+
+test('fastDataBase: plain data objects are fast; windows, facades, instances and Dates are not', () => {
+  const crossWindowTargets = new WeakMap();
+  const { fastDataBase, fastSet, fastDataKey } = load(slice(
+    '    const nativeIsArray = Array.isArray, nativeIsView = ArrayBuffer.isView;',
+    '    function get(base, prop) {'
+  ), ['fastDataBase', 'fastSet', 'fastDataKey'], { crossWindowTargets });
+  // a literal, a dictionary, a namespace, an array, a typed array, a string, a function
+  for (const v of [{}, { a: 1 }, Object.create(null), Reflect, Math, JSON, [], new Uint8Array(2), 'abc', () => 1]) {
+    assert.equal(fastDataBase(v), true, String(Object.prototype.toString.call(v)));
+  }
+  // not plain: a class instance, a Date, a Map, an element-like prototype chain, null and undefined
+  class Widget {}
+  for (const v of [new Widget(), new Date(), new Map(), Object.create({ inherited: 1 }), null, undefined, 5, true]) {
+    assert.equal(fastDataBase(v), false, String(Object.prototype.toString.call(v)));
+  }
+  // an object the membrane keeps as the stand-in for another window (a Proxy over `{}`) keeps the long path
+  const facade = new Proxy({}, {});
+  crossWindowTargets.set(facade, {});
+  assert.equal(fastDataBase(facade), false);
+  // a Proxy whose prototype trap throws is not asked twice: the long path decides
+  assert.equal(fastDataBase(new Proxy({}, { getPrototypeOf() { throw new Error('trap'); } })), false);
+  // writes: the same objects, never the names the long path answers for
+  assert.equal(fastSet({}, 'x'), true);
+  assert.equal(fastSet({}, 'location'), false);
+  assert.equal(fastSet({}, 'name'), false);
+  assert.equal(fastSet(new Date(), 'x'), false);
+  assert.equal(fastSet(facade, 'x'), false);
+  assert.equal(fastSet(null, 'x'), false);
+  // the names `get` answers for any base keep the long path
+  for (const k of ['constructor', 'prepareStackTrace', 'postMessage', 'location']) assert.equal(fastDataKey(k), false, k);
+  assert.equal(fastDataKey('document'), true);
+});
+
+test('sealRegExp: ZP_HIDDEN_RE and ZP_RESERVED_NAME_RE ignore patched RegExp.prototype.test and exec', () => {
+  const { ZP_HIDDEN_RE, ZP_RESERVED_NAME_RE } = load(
+    slice('  const nativeApply = Reflect.apply;', '  const WINDOW_ACCESSORS = Object.create(null);') + '\n' +
+    slice('  const ZP_HIDDEN_RE = ', '  const ZP_WITH_HELPERS = '),
+    ['ZP_HIDDEN_RE', 'ZP_RESERVED_NAME_RE'],
+    {}
+  );
+  const origTest = RegExp.prototype.test;
+  const origExec = RegExp.prototype.exec;
+  try {
+    RegExp.prototype.test = () => { throw new Error('patched test'); };
+    RegExp.prototype.exec = () => { throw new Error('patched exec'); };
+    assert.equal(ZP_HIDDEN_RE.test('__zp_get'), true);
+    assert.equal(ZP_HIDDEN_RE.test('normalVar'), false);
+    assert.equal(ZP_RESERVED_NAME_RE.test('__zp_get'), true);
+    assert.equal(ZP_RESERVED_NAME_RE.test('__zp_t_1'), false);
+  } finally {
+    RegExp.prototype.test = origTest;
+    RegExp.prototype.exec = origExec;
+  }
+});
+
+test('window handles: a child window captured while same-origin transitions to cross-origin once its frame navigates', () => {
+  const { env, win, urlMeta } = xoriginEnv();
+  const frame = {};
+  const child = win('', { frameElement: frame });
+  assert.equal(env.windowHandleFor(child), child, 'initially about:blank: same-origin');
+  urlMeta.set(frame, 'http://b.test:3000/other');
+  const after = env.windowHandleFor(child);
+  assert.notEqual(after, child, 'after frame navigates cross-origin, windowHandleFor returns the cross-origin facade');
+  assert.throws(() => after.document, isSecurityError);
+});
+
+test('SW non-UTF-8 decoding: EUC-KR bytes and meta charset tags normalize to UTF-8', () => {
+  const swSrc = fs.readFileSync(require('node:path').join(__dirname, '../../web/sw.js'), 'utf8').split('\r\n').join('\n');
+  const a = swSrc.indexOf('function extractCharsetFromContentType(');
+  const b = swSrc.indexOf('async function rewriteScriptResponse(', a);
+  assert.ok(a >= 0 && b > a);
+  // eslint-disable-next-line no-new-func
+  const { decodeTextBytes, rewriteMetaCharsetToUtf8 } = new Function(
+    swSrc.slice(a, b) + '\nreturn { decodeTextBytes, rewriteMetaCharsetToUtf8 };'
+  )();
+  // '<meta charset="euc-kr"><p>\uC548\uB155</p>' in EUC-KR ('\uC548\uB155' = 0xbe 0xc8 0xb3 0xe7)
+  const prefix = Buffer.from('<meta charset="euc-kr"><p>', 'latin1');
+  const kor = Buffer.from([0xbe, 0xc8, 0xb3, 0xe7]);
+  const suffix = Buffer.from('</p>', 'latin1');
+  const raw = new Uint8Array(Buffer.concat([prefix, kor, suffix]));
+  const decoded = decodeTextBytes(raw, 'text/html', true);
+  assert.equal(decoded.nonUtf8, true);
+  assert.equal(decoded.charset.toLowerCase(), 'euc-kr');
+  assert.match(decoded.text, /<p>\uC548\uB155<\/p>/);
+  const rewrittenMeta = rewriteMetaCharsetToUtf8(decoded.text);
+  assert.match(rewrittenMeta, /<meta charset="utf-8"><p>\uC548\uB155<\/p>/);
+});
+
+test('embedding bridge API: ZP.configureBridge, ctx.setBridge, and ctx.dispose manage bridge and realm lifecycle', () => {
+  const root = {};
+  const initialSent = [];
+  let initialDisposed = 0;
+  let inboundListener = null;
+  globalThis.ZP.configureBridge(root, {
+    send(msg) { initialSent.push(msg); return Promise.resolve({ ok: true }); },
+    onMessage(fn) { inboundListener = fn; },
+    dispose() { initialDisposed++; },
+  });
+  assert.equal(typeof root.__zp_bridge_factory, 'function');
+  assert.throws(() => globalThis.ZP.configureBridge(null, { send() {} }), TypeError);
+  assert.throws(() => globalThis.ZP.configureBridge(root, {}), TypeError);
+
+  const ctx = {};
+  const clearedIntervals = [];
+  const disconnected = [];
+  const activeObservers = new Set([
+    { disconnect() { disconnected.push('obs1'); } },
+    { disconnect() { disconnected.push('obs2'); } },
+  ]);
+  const appliedCookies = [];
+  const block = slice(
+    '  const bridge = (() => {',
+    '  // Register this client with the service worker\'s tab context so'
+  );
+  const env = load(
+    'let realmDisposed = false; let __zpHeartbeatTimer = 99;\n' + block,
+    ['ctx'],
+    {
+      root,
+      ctx,
+      postMessageToSW: () => Promise.resolve({ ok: false }),
+      Native: {
+        clearInterval: (id) => { clearedIntervals.push(id); },
+      },
+      setInterval: () => 42,
+      clearInterval: (id) => { clearedIntervals.push(id); },
+      applyCookieChanges: (c) => { appliedCookies.push(c); },
+      activeObservers,
+    }
+  );
+
+  assert.equal(typeof env.ctx.bridge.send, 'function');
+  assert.equal(typeof inboundListener, 'function');
+  inboundListener({ type: globalThis.ZP.MSG.COOKIE_CHANGE, changes: ['c=1'] });
+  assert.deepEqual(appliedCookies, [['c=1']]);
+
+  let nextInbound = null;
+  let nextDisposed = 0;
+  const nextBridge = {
+    send(msg) { return Promise.resolve({ ok: true, echo: msg }); },
+    onMessage(fn) { nextInbound = fn; },
+    dispose() { nextDisposed++; },
+  };
+  assert.throws(() => env.ctx.setBridge({}), TypeError);
+  env.ctx.setBridge(nextBridge);
+  assert.equal(env.ctx.bridge, nextBridge);
+  assert.equal(typeof nextInbound, 'function');
+
+  env.ctx.dispose();
+  assert.deepEqual(clearedIntervals, [42, 99]);
+  assert.deepEqual(disconnected, ['obs1', 'obs2']);
+  assert.equal(activeObservers.size, 0);
+  assert.equal(nextDisposed, 1);
+  assert.equal(initialDisposed, 0);
+
+  // Second dispose call is a no-op.
+  env.ctx.dispose();
+  assert.equal(nextDisposed, 1);
+});
+
+
+// Site frames live at real origins of their own, so a message is addressed to the origin the browser holds for the window, not to the
+// proxy origin every other frame shares.
+function siteMsgEnv({ siteFrameBoot = null, frameRealOrigins = new WeakMap(), parent = null, top = null } = {}) {
+  const sent = [];
+  const target = { postMessage: (...a) => { sent.push(a); } };
+  const root = { parent, top };
+  const env = load(PM_BLOCK, ['postMessageWrapperFor', 'realOriginOfWindow'], {
+    proxyOrigin: 'http://proxy.test:18080',
+    siteFrameBoot,
+    frameRealOrigins,
+    virtualURL: new URL('http://a.test:3000/page'),
+    windowHandles: { originOf: () => 'http://b.test:3000' },
+    securityOrigin: () => 'http://a.test:3000',
+    displayOrigin: o => o,
+    root,
+    winGet: (w, n) => w[n],
+    postMessageWrappers: new WeakMap(),
+    maskNativeFunction() {},
+    defineMasked() {},
+    restoreNativePostMessage() {},
+    installEarlyPostMessage() {},
+    URL,
+  });
+  return { env, target, sent, root };
+}
+
+test('site frames: a message to an embedded site frame is addressed to the frame\'s own real origin', () => {
+  const frameRealOrigins = new WeakMap();
+  const { env, target, sent } = siteMsgEnv({ frameRealOrigins });
+  assert.equal(env.realOriginOfWindow(target), 'http://proxy.test:18080', 'an ordinary frame shares the proxy origin');
+  frameRealOrigins.set(target, 'http://s-b-test-1234.localhost:18080');
+  assert.equal(env.realOriginOfWindow(target), 'http://s-b-test-1234.localhost:18080');
+  const wrapped = env.postMessageWrapperFor(target);
+  wrapped('m', 'http://b.test:3000');
+  wrapped('m', '*');
+  wrapped('m', { targetOrigin: 'http://b.test:3000' });
+  assert.deepEqual(sent.map(a => a[1]), ['http://s-b-test-1234.localhost:18080', '*', { targetOrigin: 'http://s-b-test-1234.localhost:18080' }]);
+});
+
+test('site frames: the embedding page and the top document are addressed at the origins the boot configuration names', () => {
+  const embedder = { postMessage() {} }, top = { postMessage() {} }, stranger = { postMessage() {} };
+  const { env } = siteMsgEnv({
+    siteFrameBoot: { parentOrigin: 'http://s-p-test-aaaaaaaa.localhost:18080', mainOrigin: 'http://proxy.localhost:18080', parentUrl: 'https://p.test/', topUrl: 'https://t.test/' },
+    parent: embedder, top,
+  });
+  assert.equal(env.realOriginOfWindow(embedder), 'http://s-p-test-aaaaaaaa.localhost:18080');
+  assert.equal(env.realOriginOfWindow(top), 'http://proxy.localhost:18080', 'the top document lives at the main origin');
+  assert.equal(env.realOriginOfWindow(stranger), 'http://proxy.test:18080', 'any other window is ours');
+});
+
+// Trusted Types (02-trusted-types.js), run against a small stand-in for the engine's factory.
+const TT_BLOCK = slice('  const TT_KINDS = {', '  // The source text `eval` runs for its argument');
+const TT_EVAL = slice('  function ttEvalSource(x, sink, tt) {', '\n  }\n') + '\n  }\n';
+
+function ttEnv({ enforce = true, names = null, metas = [] } = {}) {
+  class TrustedHTML { constructor(s) { this.s = s; } }
+  class TrustedScript { constructor(s) { this.s = s; } }
+  class TrustedScriptURL { constructor(s) { this.s = s; } }
+  const wrap = (Ctor, fn) => function (...a) { const r = fn(...a); return r === null || r === undefined ? r : new Ctor(r); };
+  const mkPolicy = (name, opts) => ({
+    name,
+    createHTML: wrap(TrustedHTML, opts.createHTML), createScript: wrap(TrustedScript, opts.createScript), createScriptURL: wrap(TrustedScriptURL, opts.createScriptURL),
+  });
+  const factory = {
+    defaultPolicy: null, created: [],
+    createPolicy(name, opts) {
+      if (names && !names.includes(name)) throw new TypeError(`Policy "${name}" disallowed.`);
+      const p = mkPolicy(name, opts); this.created.push(name);
+      if (name === 'default') this.defaultPolicy = p;
+      return p;
+    },
+  };
+  const Native = {
+    trustedTypes: factory,
+    ttCreatePolicy: factory.createPolicy,
+    ttCreateHTML() { return this.createHTML(...arguments); },
+    ttCreateScript() { return this.createScript(...arguments); },
+    ttCreateScriptURL() { return this.createScriptURL(...arguments); },
+    ttIsHTML: v => v instanceof TrustedHTML, ttIsScript: v => v instanceof TrustedScript, ttIsScriptURL: v => v instanceof TrustedScriptURL,
+    ttHTMLText() { return this.s; }, ttScriptText() { return this.s; }, ttScriptURLText() { return this.s; },
+    ttDefaultPolicy() { return factory.defaultPolicy; },
+    documentGetElementsByTagName: () => metas,
+    getAttribute(name) { return this[name] === undefined ? null : this[name]; },
+    FunctionCtor: Function,
+    globalEval: code => code,
+  };
+  const boot = { trustedTypes: enforce };
+  // This file defines ttEnforced, ttCompliant and the rest itself, so the harness's default stubs for them are switched off.
+  const env = load(TT_BLOCK + TT_EVAL, ['ttViolation', 'ttPolicy', 'ttHTML', 'ttScript', 'ttScriptURL', 'ttEnforced', 'ttIsTrusted', 'ttCompliant', 'ttFunction', 'ttAttributeSink', 'ttAttributeValue', 'ttWrapNatives', 'ttEvalSource'], {
+    Native, boot, root: { document: {} }, nativeApply: Reflect.apply,
+  });
+  return { env, Native, boot, factory, TrustedHTML, TrustedScript, TrustedScriptURL };
+}
+
+test('trusted types: refusals are worded as the engine words them', () => {
+  const { env } = ttEnv();
+  assert.equal(env.ttViolation('HTML', 'Element innerHTML').message, "Failed to set the 'innerHTML' property on 'Element': This document requires 'TrustedHTML' assignment.");
+  assert.equal(env.ttViolation('HTML', 'Element insertAdjacentHTML').message, "Failed to execute 'insertAdjacentHTML' on 'Element': This document requires 'TrustedHTML' assignment.");
+  assert.equal(env.ttViolation('ScriptURL', 'Worker constructor').message, "Failed to construct 'Worker': This document requires 'TrustedScriptURL' assignment.");
+  assert.equal(env.ttViolation('Script', 'Window setTimeout').message, "Failed to execute 'setTimeout' on 'Window': This document requires 'TrustedScript' assignment.");
+  assert.equal(env.ttViolation('Script', 'Element onclick', 'setAttribute').message, "Failed to execute 'setAttribute' on 'Element': This document requires 'TrustedScript' assignment.");
+  assert.equal(env.ttViolation('Script', 'Element onclick').message, "Failed to set the 'onclick' property on 'Element': This document requires 'TrustedScript' assignment.");
+  assert.ok(env.ttViolation('Script', 'eval') instanceof EvalError, 'a string for eval is an EvalError');
+  assert.ok(env.ttViolation('Script', 'Function') instanceof EvalError);
+  assert.ok(env.ttViolation('HTML', 'Element innerHTML') instanceof TypeError);
+});
+
+test('trusted types: the membrane policy is created once, and is absent where the document does not admit its name', () => {
+  const a = ttEnv();
+  const p = a.env.ttPolicy();
+  assert.equal(p.name, ZP.TT_POLICY_NAME);
+  assert.equal(a.env.ttPolicy(), p, 'one policy for the realm');
+  assert.deepEqual(a.factory.created, [ZP.TT_POLICY_NAME]);
+  assert.ok(a.env.ttHTML('<b>') instanceof a.TrustedHTML);
+  assert.ok(a.env.ttScript('1') instanceof a.TrustedScript);
+  assert.ok(a.env.ttScriptURL('/x') instanceof a.TrustedScriptURL);
+  const b = ttEnv({ names: ['only-this'] });
+  assert.equal(b.env.ttPolicy(), null, 'a refused name leaves no policy');
+  assert.equal(b.env.ttHTML('<b>'), '<b>', 'the membrane then hands strings to the native sinks');
+  const c = ttEnv(); c.Native.trustedTypes = undefined;
+  assert.equal(c.env.ttPolicy(), null, 'a browser without Trusted Types has nothing to create');
+});
+
+test('trusted types: what a sink receives from the page', () => {
+  const on = ttEnv();
+  // a Trusted value gives its string, whether or not the document enforces
+  assert.equal(on.env.ttCompliant('HTML', 'Element innerHTML', new on.TrustedHTML('<i>')), '<i>');
+  const off = ttEnv({ enforce: false });
+  assert.equal(off.env.ttCompliant('HTML', 'Element innerHTML', new off.TrustedHTML('<i>')), '<i>');
+  assert.equal(off.env.ttCompliant('HTML', 'Element innerHTML', '<s>'), '<s>', 'no enforcement: a string is left alone');
+  // enforcement without a default policy refuses a string
+  assert.throws(() => on.env.ttCompliant('HTML', 'Element innerHTML', '<s>'), /requires 'TrustedHTML' assignment/);
+  assert.throws(() => on.env.ttCompliant('Script', 'eval', '1'), EvalError);
+  // enforcement with a default policy: called the way the engine calls it, and its answer is what the sink gets
+  const calls = [];
+  on.factory.createPolicy('default', {
+    createHTML: (s, ...rest) => { calls.push(['H', s, ...rest]); return s.toUpperCase(); },
+    createScript: (s, ...rest) => { calls.push(['S', s, ...rest]); return null; },
+    createScriptURL: s => s,
+  });
+  assert.equal(on.env.ttCompliant('HTML', 'Element innerHTML', '<s>'), '<S>');
+  assert.deepEqual(calls[0], ['H', '<s>', 'TrustedHTML', 'Element innerHTML']);
+  assert.throws(() => on.env.ttCompliant('Script', 'Window setTimeout', 'x'), /requires 'TrustedScript' assignment/, 'a default policy that answers null is a refusal');
+  assert.equal(on.env.ttCompliant('ScriptURL', 'HTMLScriptElement src', 123), '123', 'the value reaches the policy as a string');
+});
+
+test('trusted types: enforcement is read from the response header and from a <meta> policy', () => {
+  assert.equal(ttEnv({ enforce: true }).env.ttEnforced(), true);
+  assert.equal(ttEnv({ enforce: false }).env.ttEnforced(), false);
+  const meta = { 'http-equiv': 'Content-Security-Policy', content: "require-trusted-types-for 'script'" };
+  const metas = [{ 'http-equiv': 'x-ua-compatible', content: 'IE=Edge' }];
+  const late = ttEnv({ enforce: false, metas });
+  assert.equal(late.env.ttEnforced(), false);
+  metas.push(meta);
+  assert.equal(late.env.ttEnforced(), true, 'a <meta> policy added after the first read counts');
+  metas.length = 0;
+  assert.equal(late.env.ttEnforced(), true, 'and enforcement does not end');
+  const plain = ttEnv({ enforce: false, metas: [{ 'http-equiv': 'Content-Security-Policy', content: "default-src 'self'" }] });
+  assert.equal(plain.env.ttEnforced(), false, 'a policy that does not require Trusted Types changes nothing');
+});
+
+test('trusted types: Function is made by evaluating the source it would have compiled, as a TrustedScript', () => {
+  const off = ttEnv({ enforce: false });
+  const fn = off.env.ttFunction(['a', 'b', 'return a + b'], null, Function);
+  assert.equal(fn(1, 2), 3, 'no enforcement: the plain constructor');
+  const on = ttEnv();
+  const seen = [];
+  const result = on.env.ttFunction(['a', 'b', 'return a + b'], function (script) { seen.push(script); return 'made'; }, Function);
+  assert.equal(result, 'made');
+  assert.ok(seen[0] instanceof on.TrustedScript, 'the evaluator receives a Trusted value');
+  assert.equal(seen[0].s, '(function anonymous(a,b\n) {\nreturn a + b\n})');
+  const bare = ttEnv(); const s2 = [];
+  bare.env.ttFunction([], f => { s2.push(f); return 1; }, Function);
+  assert.equal(s2[0].s, '(function anonymous(\n) {\n\n})');
+});
+
+test('trusted types: which attributes are sinks, and what setAttribute gives them', () => {
+  const { env } = ttEnv();
+  const button = { localName: 'button', onclick: null };
+  assert.deepEqual(env.ttAttributeSink(button, 'onclick'), ['Script', 'Element onclick']);
+  assert.equal(env.ttAttributeSink(button, 'on'), null, 'a bare "on" is no handler');
+  assert.equal(env.ttAttributeSink(button, 'onmadeup'), null, 'a handler the element does not have is no sink');
+  assert.deepEqual(env.ttAttributeSink({ localName: 'iframe' }, 'srcdoc'), ['HTML', 'HTMLIFrameElement srcdoc']);
+  assert.equal(env.ttAttributeSink({ localName: 'div' }, 'srcdoc'), null);
+  assert.deepEqual(env.ttAttributeSink({ localName: 'script' }, 'src'), ['ScriptURL', 'HTMLScriptElement src']);
+  assert.equal(env.ttAttributeSink({ localName: 'img' }, 'src'), null);
+  assert.equal(env.ttAttributeValue({ localName: 'img' }, 'src', '/a.png'), '/a.png', 'other attributes are the page\'s own');
+  assert.throws(() => env.ttAttributeValue({ localName: 'script' }, 'src', '/a.js', 'setAttribute'), /Failed to execute 'setAttribute' on 'Element'/);
+});
+
+test('trusted types: the natives the membrane calls take Trusted values for the strings it builds', () => {
+  const { env, Native, TrustedScript, TrustedHTML } = ttEnv();
+  const got = [];
+  Native.setAttribute = function (name, value) { got.push(['setAttribute', name, value]); };
+  Native.insertAdjacentHTML = function (where, html) { got.push(['insertAdjacentHTML', where, html]); };
+  let stored;
+  Native.elementInnerHTML = { get() { return stored; }, set(v) { stored = v; }, enumerable: true, configurable: true };
+  env.ttWrapNatives(Native);
+  const button = { localName: 'button', onclick: null };
+  Native.setAttribute.call(button, 'onclick', 'go()');
+  assert.ok(got[0][2] instanceof TrustedScript, 'an event handler built by the membrane is TrustedScript');
+  Native.setAttribute.call(button, 'title', 'plain');
+  assert.equal(got[1][2], 'plain', 'other attributes stay strings');
+  Native.insertAdjacentHTML.call({}, 'beforeend', '<b>');
+  assert.ok(got[2][2] instanceof TrustedHTML);
+  Native.elementInnerHTML.set.call({}, '<i>');
+  assert.ok(stored instanceof TrustedHTML, 'innerHTML takes TrustedHTML');
+  const already = stored;
+  Native.elementInnerHTML.set.call({}, already);
+  assert.equal(stored, already, 'a value that is already Trusted passes unchanged');
+});
+
+test('trusted types: eval source is the Trusted value\'s string, a string after the default policy, or nothing', () => {
+  const on = ttEnv();
+  assert.equal(on.env.ttEvalSource(new on.TrustedScript('1 + 1')), '1 + 1');
+  assert.equal(on.env.ttEvalSource({}), null, 'a non-string, non-Trusted argument is returned by eval as it is');
+  assert.throws(() => on.env.ttEvalSource('1 + 1'), EvalError);
+  const off = ttEnv({ enforce: false });
+  assert.equal(off.env.ttEvalSource('2 + 2'), '2 + 2');
+});
+
+test('trusted types: a default policy that changes a compilation is refused, and every other sink takes the policy\'s text', () => {
+  const t = ttEnv();
+  t.factory.createPolicy('default', {
+    createHTML: s => s + '<!--p-->',
+    createScript: (s, _type, sink) => (sink === 'eval' || sink === 'Function' ? s + ' ' : sink === 'Window setTimeout' ? 'later()' : s),
+    createScriptURL: s => s,
+  });
+  assert.throws(() => t.env.ttCompliant('Script', 'eval', '1 + 2'), EvalError, 'eval whose text the policy changed');
+  assert.throws(() => t.env.ttCompliant('Script', 'Function', '(function anonymous(\n) {\n\n})'), EvalError, 'Function whose source the policy changed');
+  assert.equal(t.env.ttCompliant('Script', 'Window setTimeout', 'now()'), 'later()', 'a timer runs the text the policy returned');
+  assert.equal(t.env.ttCompliant('HTML', 'Element innerHTML', '<i>'), '<i><!--p-->', 'markup is what the policy returned');
+  const same = ttEnv();
+  same.factory.createPolicy('default', { createHTML: s => s, createScript: s => s, createScriptURL: s => s });
+  assert.equal(same.env.ttCompliant('Script', 'eval', '1 + 2'), '1 + 2', 'a policy that returns the text unchanged lets the compilation through');
+  assert.equal(same.env.ttCompliant('Script', 'Function', '(function anonymous(\n) {\n\n})'), '(function anonymous(\n) {\n\n})');
+});
+
+// Attribute selectors on URL-bearing attributes (14-dom.js `translateAttributeSelectors`, `pageSelectorArgs`): the translation is lexical, so it is pinned by its output.
+const SELECTOR_BLOCK = slice('  const litSelectorCache = newMap();', '  function filterSelectorOne(');
+const LIT_ATTRS = load(slice('  const LIT_SELECTOR_ATTRS = ', '  function litSet('), ['LIT_SELECTOR_ATTRS'], {}).LIT_SELECTOR_ATTRS;
+function selectorEnv() {
+  return load(SELECTOR_BLOCK, ['translateAttributeSelectors', 'pageSelectorArgs'], { LIT_SELECTOR_ATTRS: LIT_ATTRS, litAttrName: k => 'data-zp-lit-' + String(k).toLowerCase() });
+}
+const lit = (name, rest) => `:is([data-zp-lit-${name}${rest}],[${name}${rest}]:where(:not([data-zp-lit-${name}])))`;
+
+test('url attribute selectors: every operator, flag and quote style is carried over to the stash and the attribute', () => {
+  const { translateAttributeSelectors: t } = selectorEnv();
+  assert.equal(t('a[href="/x"]'), 'a' + lit('href', '="/x"'));
+  for (const op of ['=', '~=', '|=', '^=', '$=', '*=']) assert.equal(t(`script[src${op}"/a.js"]`), 'script' + lit('src', `${op}"/a.js"`), op);
+  assert.equal(t("a[ HREF  *= 'x'  i ]"), 'a' + lit('href', "*= 'x'  i "), 'case, spaces, single quotes and the flag are kept as written');
+  assert.equal(t('form[action$=post]'), 'form' + lit('action', '$=post'), 'an unquoted value');
+  for (const name of ['href', 'src', 'action', 'formaction', 'poster', 'background', 'srcset', 'imagesrcset', 'data']) assert.equal(t(`[${name}^="x"]`), lit(name, '^="x"'), name);
+});
+
+test('url attribute selectors: what needs no translation is returned as it came', () => {
+  const { translateAttributeSelectors: t } = selectorEnv();
+  for (const sel of ['div.a > p', 'a[href]', '[title^="a"]', '[data-src="x"]', '[data-href$="y"]', '[xlink|href="x"]', '[*|href="x"]', '[|href="x"]', 'a:not([target])', '[id="r8"]', String.raw`.a\[href\=x\]`, 'a:is(:hover, :focus)']) {
+    assert.strictEqual(t(sel), sel, sel);
+  }
+  assert.equal(t(':contains("[href=x]")'), ':contains("[href=x]")', 'a bracket inside a string outside any attribute selector is text');
+});
+
+test('url attribute selectors: nesting, grouping and the characters that end a naive scan', () => {
+  const { translateAttributeSelectors: t } = selectorEnv();
+  assert.equal(t('a:not([href^="http"])'), 'a:not(' + lit('href', '^="http"') + ')');
+  assert.equal(t(':is(a,link)[href$=".css"]'), ':is(a,link)' + lit('href', '$=".css"'));
+  assert.equal(t('link[rel="stylesheet"][href*="a"], script[src$=".js"]'), 'link[rel="stylesheet"]' + lit('href', '*="a"') + ', script' + lit('src', '$=".js"'));
+  assert.equal(t('a[href="/x]y"]'), 'a' + lit('href', '="/x]y"'), 'a ] inside the value does not end the attribute selector');
+  assert.equal(t('a[href="a\\"b"]'), 'a' + lit('href', '="a\\"b"'), 'an escaped quote does not end the value');
+  assert.equal(t(String.raw`a[href='it\'s']`), 'a' + lit('href', String.raw`='it\'s'`));
+  assert.equal(t('a[title="[href=x]"]'), 'a[title="[href=x]"]', 'a URL attribute named inside another attribute\'s value is text');
+  assert.equal(t('a[href="x"'), 'a[href="x"', 'an unterminated attribute selector is left for the engine to refuse');
+  assert.equal(t('a[href="x"][href'), 'a' + lit('href', '="x"') + '[href');
+});
+
+test('url attribute selectors: the translation is kept per selector, and one the engine refuses is not translated', () => {
+  const { pageSelectorArgs } = selectorEnv();
+  let checks = 0;
+  const ok = () => { checks++; };
+  const args = ['a[href="/x"]'];
+  const out = pageSelectorArgs(args, ok);
+  assert.deepEqual(out, ['a' + lit('href', '="/x"')]);
+  pageSelectorArgs(['a[href="/x"]'], ok);
+  assert.equal(checks, 1, 'the check runs once per selector');
+  const same = ['div > a'];
+  assert.strictEqual(pageSelectorArgs(same, ok), same, 'a selector without brackets passes through as the same arguments');
+  const noArgs = [];
+  assert.strictEqual(pageSelectorArgs(noArgs, ok), noArgs, 'no argument is left for the engine to refuse');
+  const obj = [{ toString() { return 'a[href="x"]'; } }];
+  assert.strictEqual(pageSelectorArgs(obj, ok), obj, 'a non-string selector is left as it is');
+  const bad = ['a[href=]'];
+  assert.strictEqual(pageSelectorArgs(bad, () => { throw new SyntaxError('invalid'); }), bad, 'a selector the engine refuses stays as written, so the page gets the engine\'s own error');
+  assert.strictEqual(pageSelectorArgs(['a[href=]'], ok)[0], 'a[href=]', 'and that decision is remembered');
+});
