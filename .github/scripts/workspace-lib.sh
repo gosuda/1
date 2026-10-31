@@ -109,6 +109,13 @@ ws_write_new() {
 # docs/README.md explorer row. Idempotent: existing entries are left alone and files are written only
 # when their content changes. Nothing is written unless every edit validates.
 ws_register() {
+  case "${2%%/*}" in
+    corp | experimental)
+      # corp is never exported and experimental is a sandbox: no mirror workflow, no explorer row.
+      echo "capy.star, docs/README.md: //$2 is never exported; not registered"
+      return 0
+      ;;
+  esac
   python3 - "$REPO_ROOT/capy.star" "$REPO_ROOT/docs/README.md" "$1" "$2" "$3" "$4" <<'PY'
 import re
 import sys
