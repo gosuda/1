@@ -9,12 +9,13 @@
 #
 # Fresh run  : clones gosuda/0 read-only (blob-less, sparse), registers the aliases, adds the `ws`
 #              remote (gosuda/1), disables pushes to `origin`, and selects the sparse directories.
+#              Uses SSH when GitHub accepts your key, otherwise HTTPS with the GitHub CLI's login (`-p` forces one).
 # Re-run     : in an existing clone that is on a clean `main`, refreshes the aliases from the current
 #              control plane. Workspace branches are never touched.
 set -euo pipefail
 
 DIR="gosuda-0"
-PROTO="ssh"
+PROTO=""
 REPO="${SUDA_REMOTE_URL:-}"   # override for tests: full clone URL of gosuda/0
 SPARSE=()
 
@@ -32,12 +33,27 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-case "$PROTO" in
+# Without -p, use SSH when GitHub accepts this machine's SSH key, otherwise HTTPS through the
+# GitHub CLI's credentials.
+if [ -z "$PROTO" ] && [ -z "$REPO" ]; then
+  if ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+    PROTO=ssh
+  else
+    PROTO=https
+  fi
+fi
+case "${PROTO:-ssh}" in
   ssh) URL_DEFAULT="git@github.com:gosuda/0.git" ;;
   https) URL_DEFAULT="https://github.com/gosuda/0.git" ;;
   *) die "protocol must be ssh or https" ;;
 esac
 REPO="${REPO:-$URL_DEFAULT}"
+USE_GH_CREDENTIALS=0
+if [ "${PROTO:-}" = "https" ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  USE_GH_CREDENTIALS=1
+fi
+clone_cfg=()
+[ "$USE_GH_CREDENTIALS" = 1 ] && clone_cfg=(-c "credential.helper=!gh auth git-credential")
 
 for p in "${SPARSE[@]+"${SPARSE[@]}"}"; do
   case "$p" in
@@ -71,12 +87,13 @@ if [ -d "$DIR/.git" ] || [ -f "$DIR/.git" ]; then
   echo "onboard: refreshed the control plane in $DIR"
 else
   [ ! -e "$DIR" ] || die "$DIR exists and is not a git clone"
-  git clone -q --filter=blob:none --sparse "$REPO" "$DIR"
+  git clone -q "${clone_cfg[@]+"${clone_cfg[@]}"}" --filter=blob:none --sparse "$REPO" "$DIR"
   cd "$DIR"
   echo "onboard: cloned gosuda/0 (read-only) into $DIR"
 fi
 
 git config include.path ../.gitconfig
+[ "$USE_GH_CREDENTIALS" = 1 ] && git config credential.helper '!gh auth git-credential'
 git suda-init
 if [ "${#SPARSE[@]}" -gt 0 ]; then
   git sparse-checkout set .agents .github "${SPARSE[@]}"
