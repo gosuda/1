@@ -30,6 +30,7 @@ func (l *Lander) Cycle(ctx context.Context) error {
 	step("drain", l.DrainLandRequests)
 	step("publish-lander", l.PublishLanderBranch)
 	step("copy-trunk", l.CopyTrunkToUser)
+	step("publish-user-main", l.PublishUserMain)
 	step("mirrors", l.maybeReconcileMirrors)
 	step("gc", l.maybeGC)
 	if l.halted != nil {

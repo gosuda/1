@@ -39,6 +39,8 @@ The topology partitions control metadata, trunk snapshots, commit history, and a
 
 ## 3. Quickstart Procedure
 
+Contributors: the step-by-step guide lives in `gosuda/1` ([README](https://github.com/gosuda/1#readme), [onboarding guide](https://github.com/gosuda/1/blob/main/docs/onboarding.md)); it is generated from `docs/user-repo/` in this repository. The summary follows.
+
 Clone the control plane from `gosuda/0`, attach the trunk namespace and the `ws` remote, and check out the domain directories required for your task.
 
 > [!IMPORTANT]

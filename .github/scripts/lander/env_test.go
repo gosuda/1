@@ -131,6 +131,8 @@ func newEnv(t *testing.T) *env {
 	// Trunk: control plane overlay + sources, as one parentless snapshot.
 	write(t, e.dev, map[string]string{
 		"README.md":                         "control plane\n",
+		"docs/user-repo/README.md":          "front page\n",
+		"docs/user-repo/docs/onboarding.md": "onboarding\n",
 		"capy.star":                         testCapyStar,
 		".github/scripts/lander/Dockerfile": "FROM scratch\n",
 		".github/scripts/lander/main.go":    "package main\n",

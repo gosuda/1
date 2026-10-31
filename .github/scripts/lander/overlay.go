@@ -187,3 +187,56 @@ func (l *Lander) PublishLanderBranch(ctx context.Context) error {
 	l.Log.Info("published lander branch", "commit", commit)
 	return nil
 }
+
+// userFrontDir holds, in the control plane, the files published as the root of the user
+// repository's main branch (README and onboarding guide). Executable code is deliberately not
+// part of it: members can write the user repository, so nothing they would run belongs there.
+const userFrontDir = "docs/user-repo"
+
+// PublishUserMain renders docs/user-repo of the control plane as refs/heads/main of the user
+// repository. A member pushing over it is undone on the next cycle.
+func (l *Lander) PublishUserMain(ctx context.Context) error {
+	s := l.Store
+	ctrl, ok := s.RevParse(ctx, trunkHeads+"main")
+	if !ok {
+		return nil
+	}
+	dir, ok := s.RevParse(ctx, ctrl+":"+userFrontDir)
+	if !ok {
+		return nil
+	}
+	entries, err := s.ListTree(ctx, dir, true)
+	if err != nil {
+		return err
+	}
+	tree, err := s.BuildTree(ctx, entries)
+	if err != nil {
+		return err
+	}
+	old, haveOld := s.RevParse(ctx, userMain)
+	if haveOld {
+		if oldTree, err := s.Tree(ctx, old); err == nil && oldTree == tree {
+			return nil
+		}
+	}
+	if l.DryRun {
+		l.Log.Info("dry-run: would publish the user repository front page", "tree", tree)
+		return nil
+	}
+	var parents []string
+	lease := "refs/heads/main:"
+	if haveOld {
+		parents = []string{old}
+		lease += old
+		l.Log.Info("user repository main differs from the control plane; restoring", "tip", old)
+	}
+	commit, err := s.CommitTree(ctx, tree, parents, fmt.Sprintf("front page: publish control-plane %s\n", ctrl), nil)
+	if err != nil {
+		return err
+	}
+	if err := s.Push(ctx, l.User, Write, false, []string{lease}, commit+":refs/heads/main"); err != nil {
+		return fmt.Errorf("publish user repository main: %w", err)
+	}
+	_, _ = s.Git(ctx, "update-ref", userMain, commit)
+	return nil
+}

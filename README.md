@@ -1,44 +1,40 @@
-# gosuda/0
+# DO NOT PUSH TO THIS REPOSITORY
 
-`gosuda/0` is the private system of record for the `gosuda` monorepo. `refs/heads/main` holds the control plane, and the unified `google3` source tree lives on `refs/suda/main`. Only the `suda-lander` GitHub App writes to this repository. Members do their work in `gosuda/1`, a second private repository, and submit landing requests there. A self-hosted lander, a single process on a dedicated server, lands those requests into `gosuda/0` and keeps the public mirrors in sync with the trunk.
+> [!CAUTION]
+> **`gosuda/0` is the internal monorepo source of truth. Members never write here.**
+> Every ref in this repository is written by the **lander** (a single automated service). A push from
+> anyone else is either rejected or detected, and an unexpected `refs/suda/*` update **halts the landing
+> queue for the whole organization** until an org owner investigates.
 
-Table 1 lists the repositories and their write authority.
+| Do | Do not |
+| :--- | :--- |
+| Read and clone this repository (`--filter=blob:none --sparse`) | Push **anything** to `gosuda/0`: branches, tags, `refs/suda/*`, `refs/ws/*` |
+| Push workspaces and landing requests to **[`gosuda/1`](https://github.com/gosuda/1)** | Force-push, delete refs, or open pull requests here |
+| Follow the onboarding guide in **[`gosuda/1`](https://github.com/gosuda/1#readme)** | Run `git pull` or `git push origin` from a workspace |
 
-| Repository | Visibility | Content | Writers |
-| :--- | :--- | :--- | :--- |
-| `gosuda/0` | Private | Control plane, trunk, sync baselines, lander deployment branch | `suda-lander` App; org owners for break-glass only |
-| `gosuda/1` | Private | Workspaces, landing requests, review pull requests, staged external changes, trunk copy | Organization members; `suda-lander` App |
-| `gosuda/<mirror>` | Public | Standalone exports of the projects listed in `capy.star` | `suda-lander` App; mirror maintainers for external pull requests |
+**Want to contribute?** Go to **[`gosuda/1`](https://github.com/gosuda/1)**. Everything a contributor needs (setup, workspace flow, review, landing, new projects) is documented there.
 
-Clients fetch the control plane and the trunk from `gosuda/0`, which is `origin` and is read-only for members. They push workspaces and landing requests to `gosuda/1`, which is the `ws` remote. Never fetch the control plane or the trunk from `gosuda/1`.
+## What this repository is
+
+`gosuda/0` is the system of record for the `gosuda` monorepo:
+
+- `refs/heads/main`: the control plane (`AGENTS.md`, `.gitconfig`, `capy.star`, `.agents/`, `.github/`, `docs/`).
+- `refs/suda/main` and `refs/suda/history`: the unified source tree (a parentless snapshot) and its linear history.
+- `refs/suda/sync/<workflow>`: per-mirror synchronization baselines.
+- `refs/heads/lander`: the deployable lander (Dockerfile, `lander/`, `capy/`), published by the lander itself.
+
+Only the `suda-lander` GitHub App writes these refs. Org owners may use a documented break-glass push to
+`refs/heads/main`; the lander detects it and synchronizes the trunk overlay.
 
 ## Head Links
 
 - **Unified Source Tree (`refs/suda/main`)**: [https://magpie.gosuda.org/tree](https://magpie.gosuda.org/tree)
 - **Linear Commit History (`refs/suda/history`)**: [https://magpie.gosuda.org/history](https://magpie.gosuda.org/history)
-- **Diff Link Generator & Workspace Studio**: [https://magpie.gosuda.org/diff](https://magpie.gosuda.org/diff)
-
-## Quickstart
-
-```bash
-git clone --filter=blob:none --sparse ssh://github-lmmt.com/gosuda/0
-cd 0
-git config include.path ../.gitconfig
-git suda-init
-git sparse-checkout set ipc/hqq web/gosuda
-git ws-new engineer/fix-header
-```
-
-`git suda-init` adds the `ws` remote, disables pushes to `origin`, and fetches `refs/suda/*` from `origin`. [docs/README.md](./docs/README.md) describes the full procedure.
-
-## Contribution & Review Process
-
-- **Direct Workspace (`refs/ws/<actor>/<id>` on `gosuda/1`)**: Create a workspace with `git ws-new`, save work-in-progress with `git ws-save`, inspect the two-dot diff at [`magpie.gosuda.org/diff`](https://magpie.gosuda.org/diff), and submit it with `git ws-land`. The lander lands or rejects the request and reports the result as a `suda/land` commit status on the tip in `gosuda/1`.
-- **GitHub Pull Request Review (`git ws-pr`)**: `git ws-pr` pushes `refs/heads/base/<id>` and `refs/heads/review/<id>` to `gosuda/1` and opens a pull request there for discussion and approval. Merging that pull request lands nothing. Run `git ws-land` to land, and the lander deletes the pair after the change lands.
-- **Hierarchical `OWNERS` & Experimental Sandbox (`git ws-exp`, `git ws-graduate`)**: The lander evaluates `OWNERS` files read from the trunk and resolves every import to enforce import visibility. A path under `experimental/<actor>/` is approved for the requester whose GitHub login equals `<actor>`.
-- **External Mirror Pull Requests and Pushes (`gosuda/<repo>`)**: The lander stages each open mirror pull request as `refs/ws/capy/<wf>-pr-<N>` on `gosuda/1`. An inbound push to a mirror branch lands automatically only when the pusher owns the prefix; otherwise it is staged as `refs/ws/capy/<wf>-main`. A member lands a staged change with `git ws-land`.
+- **Diff Link Generator**: [https://magpie.gosuda.org/diff](https://magpie.gosuda.org/diff)
 
 ## Documentation
 
-- [Design Specification, Mounted Projects, and Quickstart (`docs/README.md`)](./docs/README.md)
+- [Design Specification and Mounted Projects (`docs/README.md`)](./docs/README.md)
+- [Hardening plan and lander migration (`docs/hardening-plan.md`)](./docs/hardening-plan.md)
 - [Agent Operating Rules (`AGENTS.md`)](./AGENTS.md)
+- Lander service: [`.github/scripts/lander/README.md`](./.github/scripts/lander/README.md)

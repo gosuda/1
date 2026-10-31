@@ -88,11 +88,18 @@ func (l *Lander) fetchTrunk(ctx context.Context) error {
 
 // fetchUser refreshes the user-repository namespaces the lander reads.
 func (l *Lander) fetchUser(ctx context.Context) error {
-	return l.Store.Fetch(ctx, l.User,
+	if err := l.Store.Fetch(ctx, l.User,
 		"+refs/heads/land/*:"+userLand+"*",
 		"+refs/heads/review/*:"+userReview+"*",
 		"+refs/heads/base/*:"+userBase+"*",
-		"+refs/suda/*:"+userSuda+"*")
+		"+refs/suda/*:"+userSuda+"*"); err != nil {
+		return err
+	}
+	// An explicit refspec fails when the branch does not exist yet (fresh repository).
+	if err := l.Store.FetchNoPrune(ctx, l.User, "+refs/heads/main:"+userMain); err != nil && !strings.Contains(err.Error(), "couldn't find remote ref") {
+		return err
+	}
+	return nil
 }
 
 // DrainLandRequests processes every pending landing ref in activity order.
