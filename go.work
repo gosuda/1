@@ -15,6 +15,7 @@ use (
 	./net/ivnp
 	./net/portal-tunnel
 	./net/portalite
+	./storage/supersql
 	./web/gosuda
 	./web/securl
 	./web/telemetry

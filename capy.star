@@ -19,6 +19,7 @@ PILOT_REPOS = [
     ("randflake", "crypto/randflake", "gosuda/randflake", False),
     ("jimin", "ai/jimin", "gosuda/jimin", False),
     ("telemetry.gosuda.org", "web/telemetry", "gosuda/telemetry.gosuda.org", False),
+    ("supersql-alpha", "storage/supersql", "gosuda/supersql-alpha", False),
 ]
 
 # Entries are (name, monorepo prefix, mirror repo, strip_replaces[, branch]); branch defaults to "main".

@@ -28,6 +28,7 @@ The unified source tree on `refs/suda/main` and the linear commit chain on `refs
 | `//crypto/randflake` | `gosuda/randflake` | [Browse `//crypto/randflake`](https://magpie.gosuda.org/tree/crypto/randflake) | [Commits `//crypto/randflake`](https://magpie.gosuda.org/history/crypto/randflake) |
 | `//ai/jimin` | `gosuda/jimin` | [Browse `//ai/jimin`](https://magpie.gosuda.org/tree/ai/jimin) | [Commits `//ai/jimin`](https://magpie.gosuda.org/history/ai/jimin) |
 | `//web/telemetry` | `gosuda/telemetry.gosuda.org` | [Browse `//web/telemetry`](https://magpie.gosuda.org/tree/web/telemetry) | [Commits `//web/telemetry`](https://magpie.gosuda.org/history/web/telemetry) |
+| `//storage/supersql` | `gosuda/supersql-alpha` | [Browse `//storage/supersql`](https://magpie.gosuda.org/tree/storage/supersql) | [Commits `//storage/supersql`](https://magpie.gosuda.org/history/storage/supersql) |
 <!-- SUDA_EXPLORER_END -->
 
 ## 2. Reference Namespace Map
