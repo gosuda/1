@@ -35,6 +35,7 @@ var (
 	permContents = map[string]string{"contents": "read"}
 	permPulls    = map[string]string{"pull_requests": "read"}
 	permStatuses = map[string]string{"statuses": "write"}
+	permPullsW   = map[string]string{"pull_requests": "write"}
 	permMembers  = map[string]string{"members": "read"}
 )
 
@@ -155,6 +156,22 @@ func (f *GitHubForge) OpenPulls(ctx context.Context, repo string) ([]PullRequest
 			return out, nil
 		}
 	}
+}
+
+// ClosePull implements Forge: it closes the pull request, then comments. The order avoids a
+// duplicate comment when a retry follows a failure between the two calls.
+func (f *GitHubForge) ClosePull(ctx context.Context, repo string, number int, comment string) error {
+	rp, err := repoPath(repo)
+	if err != nil {
+		return err
+	}
+	if err := f.rest(ctx, repo, permPullsW, http.MethodPatch, fmt.Sprintf("%s/pulls/%d", rp, number), map[string]string{"state": "closed"}, nil); err != nil {
+		return err
+	}
+	if comment == "" {
+		return nil
+	}
+	return f.rest(ctx, repo, permPullsW, http.MethodPost, fmt.Sprintf("%s/issues/%d/comments", rp, number), map[string]string{"body": comment}, nil)
 }
 
 // rest performs one REST call for repo with a token limited to perms. Non-2xx responses are

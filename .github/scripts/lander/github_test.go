@@ -336,3 +336,51 @@ func TestGitHubStaticForgeSendsStaticToken(t *testing.T) {
 		t.Fatalf("push = %+v, err = %v; want alice", push, err)
 	}
 }
+
+func TestGitHubForgeClosePullClosesThenCommentsWithWriteScopedToken(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	var comment string
+	rec := func(name string, want map[string]string, decode func(*http.Request)) fakeRoute {
+		return func(w http.ResponseWriter, r *http.Request, g grant) {
+			if !checkPerms(w, g, want) {
+				return
+			}
+			mu.Lock()
+			calls = append(calls, name)
+			mu.Unlock()
+			if decode != nil {
+				decode(r)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}
+	env := newAppEnv(t, func(f *fakeGitHub) {
+		f.routes = map[string]fakeRoute{
+			"PATCH /repos/gosuda/HQQ/pulls/12": rec("close", map[string]string{"pull_requests": "write"}, func(r *http.Request) {
+				var in map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&in)
+				if in["state"] != "closed" {
+					t.Errorf("close body = %v", in)
+				}
+			}),
+			"POST /repos/gosuda/HQQ/issues/12/comments": rec("comment", map[string]string{"pull_requests": "write"}, func(r *http.Request) {
+				var in map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&in)
+				mu.Lock()
+				comment = in["body"]
+				mu.Unlock()
+			}),
+		}
+	})
+	f := NewGitHubForge(env.app, "gosuda/1")
+	if err := f.ClosePull(context.Background(), "gosuda/HQQ", 12, "landed, thanks"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(calls, ",") != "close,comment" || comment != "landed, thanks" {
+		t.Fatalf("calls = %v, comment = %q", calls, comment)
+	}
+}

@@ -65,7 +65,8 @@ The `suda-lander` GitHub App performs every write. It is installed on `gosuda/0`
 | `contents: write` | `gosuda/0`, `gosuda/1`, mirrors | Trunk and control-plane pushes, trunk copies, staged refs, mirror exports |
 | `contents: read` | `gosuda/1`, mirrors | Activity API for the pusher of a tip |
 | `workflows: write` | Mirrors | Exporting `.github/workflows/` |
-| `pull_requests: read` | `gosuda/1`, mirrors | Approvals bound to a tip; open mirror pull requests |
+| `pull_requests: read` | `gosuda/1` | Approvals bound to a tip |
+| `pull_requests: write` | Mirrors | Open mirror pull requests; close a landed mirror pull request and comment on it |
 | `statuses: write` | `gosuda/1` | `suda/land` statuses on landing request tips |
 | `members: read` | Organization | Active team membership for `@org/team` owners |
 

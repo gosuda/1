@@ -91,6 +91,7 @@ type fakeForge struct {
 	teams     map[string]map[string]bool
 	statuses  []string
 	pulls     map[string][]PullRequest
+	closed    []string // "repo#number: comment"
 }
 
 func (f *fakeForge) PushForTip(_ context.Context, repo, ref, sha string) (capy.Push, error) {
@@ -120,6 +121,20 @@ func (f *fakeForge) SetStatus(_ context.Context, repo, sha string, st Status) er
 }
 func (f *fakeForge) OpenPulls(_ context.Context, repo string) ([]PullRequest, error) {
 	return f.pulls[repo], nil
+}
+
+func (f *fakeForge) ClosePull(_ context.Context, repo string, number int, comment string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, fmt.Sprintf("%s#%d: %s", repo, number, comment))
+	var rest []PullRequest
+	for _, p := range f.pulls[repo] {
+		if p.Number != number {
+			rest = append(rest, p)
+		}
+	}
+	f.pulls[repo] = rest
+	return nil
 }
 
 func newEnv(t *testing.T) *env {

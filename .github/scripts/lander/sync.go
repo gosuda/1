@@ -242,6 +242,11 @@ func (l *Lander) reconcile(ctx context.Context, wf capy.Workflow) (settled bool,
 		done, ok, err := l.reconcilePass(ctx, wf, remote)
 		if err != nil || done {
 			settled = ok
+			if err == nil && settled {
+				if cerr := l.closeLandedPulls(ctx, wf); cerr != nil {
+					l.Log.Warn("closing landed mirror pull requests failed", "workflow", wf.Name, "err", cerr)
+				}
+			}
 			if err == nil {
 				err = l.stagePulls(ctx, wf)
 			}
@@ -614,4 +619,68 @@ func (l *Lander) writeBaseline(ctx context.Context, wf capy.Workflow, old capy.S
 	}
 	_, _ = s.Git(ctx, "update-ref", trunkSync+wf.Name, commit)
 	return nil
+}
+
+var inboundTrailerRe = regexp.MustCompile(`(?m)^Suda-Inbound-From: (\S+)#(\d+)@([0-9a-f]{7,40})\s*$`)
+
+// landedInbound returns, for the most recent trunk commits, the pull requests that landed through
+// a staged reference: key "<repo>#<number>@<head sha>" -> history commit. The trailer comes from the
+// staged commit, so it records exactly which head was reviewed and landed.
+func (l *Lander) landedInbound(ctx context.Context) (map[string]string, error) {
+	out, err := l.Store.Git(ctx, "log", "-n", itoa(l.HistoryDepth), "--format=%H%x00%B%x01", trunkHistory)
+	if err != nil {
+		return nil, err
+	}
+	res := map[string]string{}
+	for _, rec := range strings.Split(out, "\x01") {
+		hash, msg, ok := strings.Cut(strings.TrimLeft(rec, "\n"), "\x00")
+		if !ok {
+			continue
+		}
+		for _, m := range inboundTrailerRe.FindAllStringSubmatch(msg, -1) {
+			res[fmt.Sprintf("%s#%s@%s", m[1], m[2], m[3])] = hash
+		}
+	}
+	return res, nil
+}
+
+// closeLandedPulls closes the open pull requests of a settled mirror whose exact head was landed
+// in the trunk, and tells the contributor. Settled means the mirror's default branch already holds
+// the content, so the comment is true when it is posted. A pull request that received new commits
+// after the landing has a different head and stays open.
+func (l *Lander) closeLandedPulls(ctx context.Context, wf capy.Workflow) error {
+	if l.DryRun {
+		return nil
+	}
+	prs, err := l.Forge.OpenPulls(ctx, wf.DestinationRepo)
+	if err != nil || len(prs) == 0 {
+		return err
+	}
+	landed, err := l.landedInbound(ctx)
+	if err != nil {
+		return err
+	}
+	mirrorTip, _ := l.Store.RevParse(ctx, mirrorRef(wf, "head"))
+	var errs []error
+	for _, pr := range prs {
+		hist, ok := landed[fmt.Sprintf("%s#%d@%s", wf.DestinationRepo, pr.Number, pr.HeadSHA)]
+		if !ok {
+			continue
+		}
+		body := fmt.Sprintf("This pull request was reviewed and its changes landed in the monorepo (`%s`). They are now on `%s` of this repository (`%s`), so it is closed as completed. Thank you for the contribution!\n",
+			shortSHA(hist), wf.Branch, shortSHA(mirrorTip))
+		if err := l.Forge.ClosePull(ctx, wf.DestinationRepo, pr.Number, body); err != nil {
+			errs = append(errs, fmt.Errorf("%s#%d: %w", wf.DestinationRepo, pr.Number, err))
+			continue
+		}
+		l.Log.Info("closed landed mirror pull request", "repo", wf.DestinationRepo, "number", pr.Number, "history", shortSHA(hist))
+	}
+	return errors.Join(errs...)
+}
+
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }

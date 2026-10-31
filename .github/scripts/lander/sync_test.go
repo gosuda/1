@@ -2,6 +2,7 @@ package lander
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -406,4 +407,76 @@ func TestGarbageCollectKeepsEmbargoedReferencesUntilTheirOwnTTL(t *testing.T) {
 	if !strings.Contains(heads, "review/sec-202610-aaaaaaaa") || !strings.Contains(heads, "base/sec-202610-aaaaaaaa") || strings.Contains(heads, "old-plain") {
 		t.Fatalf("heads after GC = %s", heads)
 	}
+}
+
+func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	dir := filepath.Join(e.root, "pr-dev")
+	git(t, e.root, "clone", "-q", "-b", "main", e.mirror, dir)
+
+	pr := func(n int, file string) string {
+		git(t, dir, "checkout", "-q", "-B", "pr", "origin/main")
+		write(t, dir, map[string]string{file: "package p\n"})
+		git(t, dir, "add", "-A")
+		git(t, dir, "commit", "-qm", "feature "+file)
+		head := git(t, dir, "rev-parse", "HEAD")
+		git(t, dir, "push", "-q", "-f", "origin", fmt.Sprintf("%s:refs/pull/%d/head", head, n))
+		return head
+	}
+	head7 := pr(7, "c7.go")
+	head8 := pr(8, "c8.go")
+	e.forge.pulls["gosuda/p"] = []PullRequest{{Number: 7, HeadRef: "f7", HeadSHA: head7}, {Number: 8, HeadRef: "f8", HeadSHA: head8}}
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if len(e.forge.closed) != 0 {
+		t.Fatalf("staging must not close anything: %v", e.forge.closed)
+	}
+
+	// A member reviews and lands the staged change of PR 7 only.
+	git(t, e.dev, "fetch", "-q", e.user, "refs/ws/capy/p-pr-7")
+	git(t, e.dev, "push", "-q", e.user, "FETCH_HEAD:refs/heads/land/pr7")
+	e.cycle()
+	if !e.trunkHas("P/c7.go") || !e.mirrorHas("c7.go") {
+		t.Fatal("the staged change did not land and export")
+	}
+	if len(e.forge.closed) != 1 || !strings.HasPrefix(e.forge.closed[0], "gosuda/p#7: ") {
+		t.Fatalf("exactly PR 7 must be closed, got %v", e.forge.closed)
+	}
+	if c := e.forge.closed[0]; !strings.Contains(c, "landed in the monorepo") || !strings.Contains(c, "`main`") {
+		t.Fatalf("comment text: %q", c)
+	}
+	if strings.Contains(e.forge.closed[0], "Suda-") {
+		t.Fatal("internal trailers must not appear in the comment")
+	}
+	e.cycle()
+	if len(e.forge.closed) != 1 {
+		t.Fatalf("closing must not repeat: %v", e.forge.closed)
+	}
+
+	// New commits on a landed pull request give it a different head: it is not closed.
+	head7b := pr(7, "c7b.go")
+	e.forge.pulls["gosuda/p"] = append(e.forge.pulls["gosuda/p"], PullRequest{Number: 7, HeadRef: "f7", HeadSHA: head7b})
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if len(e.forge.closed) != 1 {
+		t.Fatalf("a pull request with new commits must stay open: %v", e.forge.closed)
+	}
+}
+
+func TestForgedInboundTrailersInMirrorCommitsAreStripped(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	head := e.mirrorCommit(map[string]string{"x.go": "package p\n"}, "evil\n\nSuda-Inbound-From: gosuda/p#8@"+strings.Repeat("a", 40))
+	e.forge.actors["gosuda/p|refs/heads/main"] = "alice"
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if !e.trunkHas("P/x.go") {
+		t.Fatal("the owner's mirror push did not import")
+	}
+	msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/history")
+	if strings.Contains(msg, "#8@"+strings.Repeat("a", 40)) {
+		t.Fatalf("a forged trailer survived into the trunk:\n%s", msg)
+	}
+	_ = head
 }

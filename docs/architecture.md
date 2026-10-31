@@ -117,7 +117,7 @@ The lander is one process in one container and the only writer of `gosuda/0`. It
 4. **Publish the lander**: When the deployable tree built from `.github/scripts/lander` and `.github/scripts/capy` differs from `refs/heads/lander`, publish it there (Section 3.4).
 5. **Copy trunk refs**: Copy `refs/suda/main` and `refs/suda/history` to `gosuda/1` with leases. A member who moves these refs is undone on the next cycle. The copies are `refs/suda/*` on purpose and never branches or tags: a plain `git clone` of `gosuda/1` fetches every branch and tag, so a branch into the trunk would make every naive clone download the whole monorepo and its history. The current tree is browsed through the `/head` redirect of magpie instead.
 6. **Publish the front page**: Render `docs/user-repo/` of the control plane as the root of `refs/heads/main` in `gosuda/1` (the README and the onboarding guide). A member who overwrites that branch is undone on the next cycle. Executable files are never published there, because every member can write `gosuda/1`.
-7. **Reconcile mirrors**: For every workflow in `capy.star`, reconcile the mirror with the trunk and stage its external pull requests (Section 4).
+7. **Reconcile mirrors**: Reconcile only the mirrors that need it (Section 4.6): those whose project changed in the trunk, that a wake hint named, that are unsettled or failed, or that a periodic sweep found changed. Reconciling a mirror also stages its external pull requests, and closes with a comment the pull requests whose exact head already landed (Section 4.4).
 8. **Garbage collection**: At most once every 24 hours, prune stale references in `gosuda/1` (Section 3.5).
 
 The lander reads `capy.star` from `refs/heads/main` on every cycle. A change to the mirror list takes effect without a redeploy.
@@ -270,12 +270,24 @@ For each open pull request on a mirror, the lander builds the import constructio
 - The lander republishes a staged ref only when the pull request head changes.
 - Staged refs never land automatically. A member who reviews one lands it with `git ws-land` (see [AGENTS.md](../AGENTS.md) §4.4). The member is the requester, and the `OWNERS` rules apply.
 - The lander deletes the staged ref when the pull request closes.
+- **Closing after landing.** The staged commit carries the trailer `Suda-Inbound-From: <repo>#<N>@<head sha>`, which the landing keeps. When a mirror is settled (its default branch holds the exported content) and an open pull request's exact head appears in that trailer among the last trunk commits, the lander closes the pull request and posts a comment that names the monorepo commit and the mirror commit. A pull request that received new commits after the landing has a different head and stays open. The lander strips `Suda-*` lines from mirror commit messages before it adds its own trailer, so a contributor cannot forge one. Closing needs `pull_requests: write` on the mirror.
 
 ### 4.5 Export-Only Workflows
 
 Content transforms (`core.replace`, `gomod.strip_local_replaces`, and `cargo.standalone_workspace`) rewrite content and cannot be inverted. A workflow that enables one is export-only. Its inbound changes are always staged, never landed automatically. No workflow in `capy.star` enables a content transform today.
 
 Exclusions (`core.exclude`) are invertible. Excluded paths are carried over from the monorepo on import, as Section 4.3 describes.
+
+### 4.6 Choosing Which Mirrors to Reconcile
+
+A reconcile fetches the mirror and may push, so the lander runs it only when something indicates a change. In every cycle it reconciles a mirror when:
+
+- the workflow's prefix tree in the trunk differs from the one seen at its last reconcile (one `rev-parse` per mirror),
+- a wake hint named the mirror (an organization webhook delivers the repository name; unrelated repositories are ignored),
+- the mirror has not been reconciled yet, or its last attempt failed or ended unsettled (retried every two minutes), or
+- `refs/suda/sync/<wf>` changed or disappeared out of band (the baseline is rewritten).
+
+Every `LANDER_MIRROR_INTERVAL` (default 30 minutes) a sweep also probes the quiet mirrors, eight at a time: `git ls-remote` of the branch and one pull request listing. A mirror whose tip or pull request set differs is reconciled. The sweep covers changes that arrive without a wake. Each reconcile logs its reason (`wake`, `trunk-changed`, `sweep`, `unsettled-retry`, `baseline-changed`, `first-or-retry`). The in-memory state is an optimization only: a restart causes one full pass.
 
 ## 5. Failure Modes and Recovery
 

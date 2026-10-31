@@ -170,7 +170,8 @@ A new App, `suda-lander`, replaces `azure-winged-magpie` for every write path. I
 | :--- | :--- | :--- |
 | `contents: write` | `gosuda/0`, `gosuda/1`, mirrors | Ref updates |
 | `workflows: write` | Mirrors | Exporting `.github/workflows/` (D7) |
-| `pull_requests: read` | `gosuda/1`, mirrors | Review approvals; external PR staging |
+| `pull_requests: read` | `gosuda/1` | Review approvals |
+| `pull_requests: write` | Mirrors | External PR staging and closing a mirror pull request with a comment after its change landed |
 | `statuses: write` | `gosuda/1` | `suda/land` and `suda/presubmit` statuses |
 | `members: read` | Organization | Resolving `@gosuda/<team>` entries in `OWNERS` |
 
@@ -541,7 +542,7 @@ Everything below changes systems outside this repository or lands code through t
 **Phase 1 (build and shadow run).**
 
 1. `gh repo create gosuda/1 --private`.
-2. Create the `suda-lander` GitHub App, installed on `gosuda/0`, `gosuda/1`, and the mirrors in `capy.star`. Permissions: Contents write, Workflows write (mirrors), Pull requests read, Commit statuses write, Members read (organization). Verify that `lander check` can mint a token for each repository; the `members` narrowing against a repository-scoped token has not been verified against live GitHub, so check team lookups with a real `@gosuda/<team>` entry.
+2. Create the `suda-lander` GitHub App, installed on `gosuda/0`, `gosuda/1`, and the mirrors in `capy.star`. Permissions: Contents write, Workflows write (mirrors), Pull requests write, Commit statuses write, Members read (organization). Verify that `lander check` can mint a token for each repository; the `members` narrowing against a repository-scoped token has not been verified against live GitHub, so check team lookups with a real `@gosuda/<team>` entry.
 3. Generate an SSH signing key and an allowed-signers file. On first start set `LANDER_ACK_TIP` to the current `refs/suda/history` tip.
 4. Provision the server with Docker, a separate sandbox daemon (`DOCKER_HOST`), and `deploy/deploy.sh`. The first image is built from `refs/heads/lander`, which the lander publishes on its first cycle; for the very first start build from the control-plane sources: `docker build` with a context containing `capy/` and `lander/` copied from `.github/scripts`.
 5. Run `LANDER_DRYRUN=1 lander once` and read the log: reconcile decisions must show no export or inbound action for the nine mirrors, and no baseline is written in dry-run.

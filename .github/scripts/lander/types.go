@@ -31,6 +31,9 @@ type Forge interface {
 	TeamResolver(ctx context.Context) capy.TeamResolver
 	SetStatus(ctx context.Context, repo, sha string, st Status) error
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
+	// ClosePull closes a pull request and then posts comment on it (pull_requests:write). A
+	// failed comment leaves the pull request closed; closing is never repeated.
+	ClosePull(ctx context.Context, repo string, number int, comment string) error
 }
 
 // PresubmitInput describes a candidate landing.
