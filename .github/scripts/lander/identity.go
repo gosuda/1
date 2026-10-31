@@ -28,7 +28,8 @@ func (a *App) BotIdentity(ctx context.Context) (Identity, error) {
 	var user struct {
 		ID int64 `json:"id"`
 	}
-	if err := a.call(ctx, "GET", "/users/"+url.PathEscape(login), jwt, nil, &user); err != nil {
+	// Public endpoint: an App JWT is rejected outside /app routes, so no credentials are sent.
+	if err := a.call(ctx, "GET", "/users/"+url.PathEscape(login), "", nil, &user); err != nil {
 		return Identity{}, fmt.Errorf("read bot user %s: %w", login, err)
 	}
 	if user.ID == 0 {

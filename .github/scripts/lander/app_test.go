@@ -106,6 +106,15 @@ type fakeGitHub struct {
 
 func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if r.Method == http.MethodGet && r.URL.Path == "/users/suda-lander[bot]" {
+		// Public endpoint, like GitHub: it answers anonymous callers and rejects an App JWT.
+		if bearer != "" {
+			http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"id":350558086,"login":"suda-lander[bot]","type":"Bot"}`)
+		return
+	}
 	if strings.HasPrefix(bearer, "ghs_") {
 		f.mu.Lock()
 		g, granted := f.grants[bearer]
@@ -133,8 +142,6 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/app":
 		_, _ = fmt.Fprint(w, `{"id":123,"slug":"suda-lander"}`)
-	case r.Method == http.MethodGet && r.URL.Path == "/users/suda-lander[bot]":
-		_, _ = fmt.Fprint(w, `{"id":350558086,"login":"suda-lander[bot]","type":"Bot"}`)
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/installation"):
 		f.mu.Lock()
 		f.installs++
