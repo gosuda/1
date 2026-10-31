@@ -249,7 +249,7 @@ Export rules:
 An inbound change is a mirror tip whose tree differs from the baseline export. The import is built so that only the mirror's changes reach the trunk:
 
 - The request's root commit is a new parentless commit of `B`, the baseline monorepo tree.
-- Its tip tree is `B` with the prefix replaced by the mirror tree, plus every export-excluded path from the baseline prefix. Excluded paths (for example `internal_notes/**`) therefore survive an import.
+- Its tip tree is `B` with the prefix replaced by the mirror tree, plus every export-excluded path from the baseline prefix. Excluded paths (for example `internal_notes/**`, and every `OWNERS` file: ownership is declared in the monorepo and never exported) therefore survive an import. A mirror that carries an excluded path while agreeing with the trunk otherwise gets one cleanup commit that removes it; the trunk is not changed.
 - The 3-way merge of Section 3.2 then keeps monorepo-only changes made since the baseline.
 
 The lander applies the request through the normal landing checks, with the mirror pusher as the requester. The pusher is the activity-API actor of the mirror branch tip. The change lands automatically only when that login owns the prefix under the `OWNERS` rules. Otherwise the import is staged. A staged change never lands automatically.

@@ -287,6 +287,14 @@ func (l *Lander) reconcilePass(ctx context.Context, wf capy.Workflow, remote Rem
 
 	base, haveBase := l.readBaseline(ctx, wf)
 	if M == X {
+		if haveBase && xRaw != X {
+			// The trunk and the mirror agree, but the mirror carries paths the export never produces
+			// (excluded patterns, for example OWNERS files). Remove them with one export commit.
+			if l.DryRun {
+				return true, false, l.exportCleanup(ctx, wf, remote, base, haveBase, histTip, tip, M)
+			}
+			return true, true, l.exportCleanup(ctx, wf, remote, base, haveBase, histTip, tip, M)
+		}
 		return true, true, l.writeBaseline(ctx, wf, base, haveBase, histTip, tip)
 	}
 	if !haveBase {
@@ -619,6 +627,32 @@ func (l *Lander) replayPull(ctx context.Context, wf capy.Workflow, base capy.Syn
 	}
 	tree, _, _ = strings.Cut(out, "\n")
 	return tree, true, nil
+}
+
+// exportCleanup pushes the export tree on top of a mirror whose content already matches it except for
+// paths the export excludes, so that the mirror loses them. The trunk is not changed.
+func (l *Lander) exportCleanup(ctx context.Context, wf capy.Workflow, remote Remote, base capy.SyncBaseline, haveBase bool, histTip, tip, M string) error {
+	s := l.Store
+	if l.DryRun {
+		l.Log.Info("dry-run: would remove excluded paths from the mirror", "workflow", wf.Name)
+		return nil
+	}
+	meta, err := s.Meta(ctx, histTip)
+	if err != nil {
+		return err
+	}
+	msg := capy.FormatCommitMessage("Remove paths that are excluded from the export\n\nThe monorepo keeps these files; the mirror never carries them.", wf, histTip)
+	commit, err := s.CommitTree(ctx, M, []string{tip}, msg, &meta)
+	if err != nil {
+		return err
+	}
+	ref := "refs/heads/" + wf.Branch
+	if err := s.Push(ctx, remote, WriteWorkflows, false, []string{ref + ":" + tip}, commit+":"+ref); err != nil {
+		return fmt.Errorf("clean up %s: %w", wf.DestinationRepo, err)
+	}
+	_, _ = s.Git(ctx, "update-ref", mirrorRef(wf, "head"), commit)
+	l.Log.Info("removed excluded paths from the mirror", "workflow", wf.Name, "commit", commit)
+	return l.writeBaseline(ctx, wf, base, haveBase, histTip, commit)
 }
 
 // export pushes the trunk's export tree on top of the mirror tip, guarded by a lease on that tip.

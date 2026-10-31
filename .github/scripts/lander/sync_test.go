@@ -41,6 +41,35 @@ func TestReconcileBootstrapsBaselineWhenMirrorMatchesExport(t *testing.T) {
 
 func (e *env) trunkRefMirror() string { return git(e.t, e.mirror, "rev-parse", "refs/heads/main") }
 
+func TestMirrorThatCarriesExcludedPathsIsCleanedWithoutTouchingTheTrunk(t *testing.T) {
+	e := newEnv(t)
+	e.cycle() // baseline
+	trunkBefore := e.trunkRef("refs/suda/main")
+
+	e.mirrorCommit(map[string]string{"internal_notes/leaked.md": "x\n", "sub/dev.local.toml": "k=1\n"}, "add excluded paths")
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if e.mirrorHas("internal_notes/leaked.md") || e.mirrorHas("sub/dev.local.toml") {
+		t.Fatal("the mirror still carries excluded paths")
+	}
+	if got := e.trunkRef("refs/suda/main"); got != trunkBefore {
+		t.Fatal("cleaning the mirror must not change the trunk")
+	}
+	if msg := git(t, e.mirror, "log", "-1", "--format=%B", "refs/heads/main"); !strings.Contains(msg, "Remove paths that are excluded from the export") {
+		t.Fatalf("cleanup commit message:\n%s", msg)
+	}
+	// Settled: another cycle adds no commit.
+	tip := e.trunkRefMirror()
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if e.trunkRefMirror() != tip {
+		t.Fatal("a cleaned mirror must not be touched again")
+	}
+	if !e.trunkHas("P/internal_notes/n.md") || !e.trunkHas("P/a.go") {
+		t.Fatal("trunk content must be intact")
+	}
+}
+
 func TestLandingExportsToMirrorWithoutExcludedFilesAndRecordsHistoryRev(t *testing.T) {
 	e := newEnv(t)
 	e.cycle() // baseline

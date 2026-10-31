@@ -28,7 +28,7 @@ for entry in PILOT_REPOS:
     name, prefix, repo, strip_replaces = entry[0], entry[1], entry[2], entry[3]
     branch = entry[4] if len(entry) > 4 else "main"
     transforms = [
-        core.exclude(["internal_notes/**", "**.local.toml"]),
+        core.exclude(["internal_notes/**", "**.local.toml", "OWNERS", "**/OWNERS"]),
         metadata.expose_label("GitOrigin-RevId"),
     ]
     if strip_replaces:
