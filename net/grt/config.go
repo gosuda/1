@@ -206,9 +206,13 @@ type Config struct {
 	// Domain is the listener's stable 32-byte token domain separating
 	// tenants that may share address validation. Nil uses AppID.
 	Domain []byte
-	// TicketKey seals issued resumption tickets; required to issue.
+	// TicketKey is the 32-byte master key from which per-period and
+	// per-2^24-issuance ticket-envelope keys are derived (spec section 9.1);
+	// required to issue resumption tickets.
 	TicketKey [32]byte
-	// TicketKeyID identifies the ticket key to clients.
+	// TicketKeyID is the master-key generation mixed into derived ticket
+	// keys; bump it when rotating TicketKey so tickets minted under an old
+	// master are rejected cleanly.
 	TicketKeyID uint32
 	// TicketIssuer returns a ticket-ID prefix and counter per issue.
 	TicketIssuer func() (prefix [16]byte, counter uint64)

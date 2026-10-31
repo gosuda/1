@@ -58,7 +58,7 @@ func (c *Conn) startValidation(p *pathRec, pi int, now uint64, localInit bool) {
 	p.validUntilUS = now + vmax
 	p.nextProbeUS = now // first probe immediate when the gates permit
 	if p.pstate != psActive {
-		p.pstate = psValidating
+		fsmPathSet(&p.pstate, psValidating)
 	}
 	core.arm(tkPathValid, now)
 }
@@ -165,9 +165,9 @@ func (c *Conn) applyPathResponse(tok [16]byte, pi int, dgramLen int) {
 			p.rttSample(now, p.challengeSentUS, 0, 0)
 		}
 		if p.role == pathActive {
-			p.pstate = psActive
+			fsmPathSet(&p.pstate, psActive)
 		} else {
-			p.pstate = psReady
+			fsmPathSet(&p.pstate, psReady)
 		}
 		p.validated = true
 		p.stale = false // fresh proof: no longer a stale parked route
@@ -181,7 +181,7 @@ func (c *Conn) applyPathResponse(tok [16]byte, pi int, dgramLen int) {
 		}
 		return
 	}
-	p.pstate = psReachable
+	fsmPathSet(&p.pstate, psReachable)
 	// Send another full-sized challenge after budget becomes available
 	// (section 17.2): open a fresh transaction whose first probe is
 	// paced by nextProbeUS so retries accrue amplification credit
@@ -248,18 +248,18 @@ func (c *Conn) onPathDeadline(now uint64) {
 			// path is unaffected (section 17.3).
 			p.validating = false
 			if p.role == pathCandidate {
-				p.pstate = psFailed
-				p.role = pathFree
+				fsmPathSet(&p.pstate, psFailed)
+				fsmPathRoleSet(&p.role, pathFree)
 				if core.localIntentPath == i {
 					core.localIntentPath = -1
 					core.localIntentDone = true
 					c.dropIntentItems(i)
 				}
 			} else if p.role == pathActive {
-				p.pstate = psActive // revalidation failed: keep route, stay stale
+				fsmPathSet(&p.pstate, psActive) // revalidation failed: keep route, stay stale
 				p.stale = true
 			} else if p.role == pathOld {
-				p.pstate = psOld // retained path revalidation expired
+				fsmPathSet(&p.pstate, psOld) // retained path revalidation expired
 			}
 			continue
 		}
@@ -517,13 +517,13 @@ func (c *Conn) promotePath(pi int) {
 	oldP := &core.paths[old]
 	oldPTO := oldP.basePTO(uint64(core.peer.MaxAckDelayUS))
 	if oldP.role == pathActive {
-		oldP.role = pathOld
-		oldP.pstate = psOld
+		fsmPathRoleSet(&oldP.role, pathOld)
+		fsmPathSet(&oldP.pstate, psOld)
 		oldP.cutoverPN = core.lastPeerPN
 		oldP.validating = false
 	}
-	p.role = pathActive
-	p.pstate = psActive
+	fsmPathRoleSet(&p.role, pathActive)
+	fsmPathSet(&p.pstate, psActive)
 	p.validated = true
 	p.promotedUS = now
 	p.migSampled = false
@@ -582,7 +582,7 @@ func (c *Conn) onRetentionDeadline(now uint64) {
 			c.declareAbandoned(sp)
 			sp = next
 		}
-		p.role = pathFree
-		p.pstate = psFree
+		fsmPathRoleSet(&p.role, pathFree)
+		fsmPathSet(&p.pstate, psFree)
 	}
 }

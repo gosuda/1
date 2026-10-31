@@ -6,12 +6,28 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
+	"runtime"
+	"slices"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+	"weak"
+
+	"gosuda.org/grt/internal/engine"
 )
 
 func testPair(t *testing.T, datagrams bool) (*Listener, *Config) {
+	t.Helper()
+	return testPairOver(t, datagrams, func(s *UDPSocket) PacketSocket { return s })
+}
+
+// testPairOver binds a loopback listener whose socket is wrapped by wrap
+// and returns it with a matching client config. The socket is closed in
+// test cleanup.
+func testPairOver(t *testing.T, datagrams bool, wrap func(*UDPSocket) PacketSocket) (*Listener, *Config) {
 	t.Helper()
 	// The service identity binds the authority string (host:port), so
 	// bind the socket first, then mint the identity for the real port.
@@ -19,6 +35,7 @@ func testPair(t *testing.T, datagrams bool) (*Listener, *Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = sock.Close() })
 	authority := sock.LocalAddr().String()
 	id, err := GenerateServerIdentity(authority, [16]byte{7})
 	if err != nil {
@@ -37,7 +54,7 @@ func testPair(t *testing.T, datagrams bool) (*Listener, *Config) {
 		NowUnix:        func() int64 { return time.Now().Unix() },
 		MaxLiveSent:    4096,
 	}
-	l := ListenOver(sock, scfg)
+	l := ListenOver(wrap(sock), scfg)
 	ccfg := &Config{
 		ServerName:  authority,
 		AppID:       [16]byte{7},
@@ -192,6 +209,9 @@ func TestUDPUniAndDatagram(t *testing.T) {
 	if !bytes.Equal(dg, []byte("dgram-s2c")) {
 		t.Fatalf("client datagram %q", dg)
 	}
+	if cap(dg) > 64 {
+		t.Fatalf("ReceiveDatagram buffer cap = %d, want right-sized copy (<= 64)", cap(dg))
+	}
 }
 
 func TestStreamDeadlinesAndListenerStats(t *testing.T) {
@@ -272,4 +292,187 @@ func TestStreamDeadlinesAndListenerStats(t *testing.T) {
 	if rerr := <-readDone; !errors.Is(rerr, os.ErrDeadlineExceeded) {
 		t.Fatalf("expected concurrent SetReadDeadline to unblock with os.ErrDeadlineExceeded, got %v", rerr)
 	}
+}
+
+// scriptedSocket is a PacketSocket whose Recv results come from recv,
+// called with the 1-based call number.
+type scriptedSocket struct {
+	recv  func(call int, buf []byte) (int, error)
+	calls int
+}
+
+func (s *scriptedSocket) Send([]byte, netip.AddrPort, uint8) error { return nil }
+
+func (s *scriptedSocket) LocalAddr() netip.AddrPort { return netip.AddrPort{} }
+
+func (s *scriptedSocket) Recv(buf []byte) (int, netip.AddrPort, netip.AddrPort, uint8, error) {
+	s.calls++
+	n, err := s.recv(s.calls, buf)
+	return n, netip.AddrPort{}, netip.AddrPort{}, 0, err
+}
+
+var errClosedSocket = &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed}
+
+func TestReadPumpDeliversAcrossTransientErrors(t *testing.T) {
+	script := []struct {
+		data string
+		err  error
+	}{
+		{err: syscall.ECONNREFUSED},
+		{data: "a"},
+		{err: syscall.ENOBUFS},
+		{err: syscall.ENOBUFS},
+		{err: os.ErrDeadlineExceeded},
+		{data: "b"},
+	}
+	ps := &scriptedSocket{recv: func(call int, buf []byte) (int, error) {
+		if call > len(script) {
+			return 0, errClosedSocket
+		}
+		step := script[call-1]
+		return copy(buf, step.data), step.err
+	}}
+	var got []string
+	err := readPump(ps, nil, func(pkt []byte, _, _ netip.AddrPort, _ uint8) {
+		got = append(got, string(pkt))
+		engine.PutPacketBuf(pkt)
+	})
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("readPump returned %v, want net.ErrClosed", err)
+	}
+	if want := []string{"a", "b"}; !slices.Equal(got, want) {
+		t.Fatalf("delivered %q, want %q", got, want)
+	}
+	if ps.calls != len(script)+1 {
+		t.Fatalf("Recv calls = %d, want %d", ps.calls, len(script)+1)
+	}
+}
+
+func TestReadPumpStopsDuringErrorBackoff(t *testing.T) {
+	const stopAfter = 5
+	stop := make(chan struct{})
+	ps := &scriptedSocket{recv: func(call int, _ []byte) (int, error) {
+		if call == stopAfter {
+			close(stop)
+		}
+		return 0, os.ErrDeadlineExceeded
+	}}
+	err := readPump(ps, stop, func([]byte, netip.AddrPort, netip.AddrPort, uint8) {
+		t.Error("deliver called for a failed Recv")
+	})
+	if err != nil {
+		t.Fatalf("readPump returned %v, want nil after stop", err)
+	}
+	if ps.calls != stopAfter {
+		t.Fatalf("Recv calls = %d, want %d (no Recv after stop)", ps.calls, stopAfter)
+	}
+}
+
+// flakySocket fails its first failures Recv calls with a transient error
+// before forwarding to the underlying UDPSocket.
+type flakySocket struct {
+	*UDPSocket
+	failures int32
+	calls    atomic.Int32
+}
+
+func (f *flakySocket) Recv(buf []byte) (int, netip.AddrPort, netip.AddrPort, uint8, error) {
+	if n := f.calls.Add(1); n <= f.failures {
+		return 0, netip.AddrPort{}, netip.AddrPort{}, 0, syscall.ECONNRESET
+	}
+	return f.UDPSocket.Recv(buf)
+}
+
+func TestListenerSurvivesTransientRecvErrors(t *testing.T) {
+	var flaky *flakySocket
+	l, ccfg := testPairOver(t, false, func(s *UDPSocket) PacketSocket {
+		flaky = &flakySocket{UDPSocket: s, failures: 6}
+		return flaky
+	})
+	defer l.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	cli, err := Dial(ctx, l.Addr().String(), ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	if err := cli.WaitConfirmed(ctx); err != nil {
+		t.Fatalf("client confirm through flaky listener socket: %v", err)
+	}
+	srv, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatalf("accept after transient Recv errors: %v", err)
+	}
+	defer srv.Close()
+	if got := flaky.calls.Load(); got <= flaky.failures {
+		t.Fatalf("listener Recv calls = %d; handshake finished before all %d injected errors", got, flaky.failures)
+	}
+}
+
+func TestDialOverSurvivesTransientRecvErrors(t *testing.T) {
+	l, ccfg := testPair(t, false)
+	defer l.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	sock, err := DialUDPSocket(l.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sock.Close() })
+	flaky := &flakySocket{UDPSocket: sock, failures: 4}
+	cli, err := DialOver(flaky, l.Addr(), ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	if err := cli.WaitConfirmed(ctx); err != nil {
+		t.Fatalf("client confirm through flaky socket: %v", err)
+	}
+	if got := flaky.calls.Load(); got <= flaky.failures {
+		t.Fatalf("client Recv calls = %d; handshake finished before all %d injected errors", got, flaky.failures)
+	}
+}
+
+func TestStreamEndReleasesDeadlineTimers(t *testing.T) {
+	l, ccfg := testPair(t, false)
+	defer l.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	cli, err := Dial(ctx, l.Addr().String(), ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	if err := cli.WaitConfirmed(ctx); err != nil {
+		t.Fatalf("client confirm: %v", err)
+	}
+	s, err := cli.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CancelRead(1); err != nil {
+		t.Fatalf("CancelRead: %v", err)
+	}
+	if err := s.CancelWrite(1); err != nil {
+		t.Fatalf("CancelWrite: %v", err)
+	}
+
+	// A pending deadline timer references its Stream; once both halves
+	// end, nothing else does and the Stream must become collectable.
+	wp := weak.Make(s)
+	s = nil
+	for range 10 {
+		runtime.GC()
+		if wp.Value() == nil {
+			return
+		}
+	}
+	t.Fatal("Stream still reachable after CancelRead and CancelWrite: a deadline timer retains it")
 }

@@ -154,7 +154,7 @@ func (l *sentLedger) set(pn uint64, s sentStatus) {
 	if int64(pn) > l.largest || pn < l.floor() {
 		return
 	}
-	l.hist[pn%compactHistory] = s
+	fsmSentSet(&l.hist[pn%compactHistory], s)
 }
 
 // status returns the recorded status of an allocated PN, or sentUnused when

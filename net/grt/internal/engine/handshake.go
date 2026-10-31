@@ -16,12 +16,12 @@ import (
 func (c *Conn) startClient(remote netip.AddrPort, id *ClientIdentity) {
 	core := c.core
 	core.role = roleClient
-	core.state = stCBuild
+	c.mustFireConn(fsmConn_EV_CLIENT_START)
 	core.arm(tkHandshake, nowUS()+wire.HandshakeDeadlineUS)
 	// Path 0 = active route.
 	p := &core.paths[0]
-	p.role = pathActive
-	p.pstate = psActive
+	fsmPathRoleSet(&p.role, pathActive)
+	fsmPathSet(&p.pstate, psActive)
 	p.remote = remote
 	p.local = core.sock.LocalAddr()
 	p.validated = true // client destination is locally authorized
@@ -55,7 +55,7 @@ func (c *Conn) startClient(remote netip.AddrPort, id *ClientIdentity) {
 		c.quiesce(err)
 		return
 	}
-	core.state = stCWaitReply
+	c.mustFireConn(fsmConn_EV_CLIENT_HELLO_BUILT)
 }
 
 // ClientIdentity is an optional stable client identity for PQXDH.
@@ -132,12 +132,8 @@ func (c *Conn) buildClientFlight() error {
 	// and rides the first client bidi stream's generation-zero batch.
 	if t := core.cfg.Ticket; t != nil {
 		meta := gc.DecodeTicketMeta(t.Meta[:])
-		var nowS uint64
-		if core.cfg.NowUnix != nil {
-			nowS = uint64(core.cfg.NowUnix())
-		}
-		if (core.cfg.NowUnix == nil || nowS <= meta.ExpiresUnixS) &&
-			meta.ServiceHash == c.serviceHash() {
+		nowS := uint64(core.cfg.nowUnix())
+		if nowS <= meta.ExpiresUnixS && meta.ServiceHash == c.serviceHash() {
 			m.Ticket = t.Ticket[:]
 			m.TicketMetadata = t.Meta
 			core.hs.ticketPSK = t.PSK
@@ -232,7 +228,7 @@ func (c *Conn) buildEarlyPlain() ([]byte, wire.StreamID, error) {
 	// Install the send half under the cached peer limits so rejection
 	// needs no requeue: the bytes are already the stream's unsent range.
 	s := core.slots.ensureSlot(classIdx(false, c.ourInitiator()), 0)
-	s.state = slotActive
+	fsmSlotSet(&s.state, slotActive)
 	s.gen = 0
 	s.uni = false
 	initCap := 256 * 1024
@@ -475,6 +471,14 @@ func (c *Conn) verifyServerFlight(msg []byte) {
 	if core.state != stCWaitReply {
 		return
 	}
+	// Verification runs inline: C_WAIT_REPLY -> C_VERIFY, then either
+	// C_FINISHING on commit or back to C_WAIT_REPLY on any rejection.
+	c.mustFireConn(fsmConn_EV_SERVER_HELLO_REASSEMBLED)
+	defer func() {
+		if core.state == stCVerify {
+			c.mustFireConn(fsmConn_EV_SERVER_AUTH_FAILED)
+		}
+	}()
 	sm, err := wire.ParseServerPrefix(msg)
 	if err != nil {
 		return
@@ -533,7 +537,10 @@ func (c *Conn) verifyServerFlight(msg []byte) {
 	if err != nil {
 		return
 	}
-	ss := gc.MLKEM768Decaps(core.hs.pqpkC.Seed, sm.CTS[:])
+	ss, err := gc.MLKEM768Decaps(core.hs.pqpkC.Seed, sm.CTS[:])
+	if err != nil {
+		return
+	}
 	sk := gc.PQXDHKDF(dh1, dh2, dh3, ss)
 	for _, d := range []*[32]byte{&dh1, &dh2, &dh3, &ss} {
 		for i := range d {
@@ -581,7 +588,7 @@ func (c *Conn) verifyServerFlight(msg []byte) {
 	gc.DeriveEstablished(&hs, core.hs.clientMsg, msg, sm.SelectedCipher)
 	// --- Commit: install epoch zero and transition ---
 	core.cipher = sm.SelectedCipher
-	core.cipherSt = cipherLocked
+	fsmCipherSet(&core.cipherSt, cipherLocked)
 	core.peer = sm.Params
 	core.t1 = hs.T1
 	core.hs.t0, core.hs.t1 = hs.T0, hs.T1
@@ -632,7 +639,7 @@ func (c *Conn) verifyServerFlight(msg []byte) {
 	core.hs.pqpkC.Zeroize()
 	// Queue FINISH (reliable until acked) and transition.
 	c.queueCtrl(ctrlFinish, 0, 0, 0, 0, [16]byte{})
-	core.state = stCFinishing
+	c.mustFireConn(fsmConn_EV_SERVER_AUTH_VERIFIED)
 	core.disarm(tkFlight) // client flight emission stops at reply
 	c.signalSecureReady()
 	// Apply flow limits from peer params.
@@ -675,12 +682,8 @@ func (c *Conn) checkServerIdentity(sm *wire.ServerMessage) bool {
 	case 0: // PINNED
 		return subtle.ConstantTimeCompare(sm.IKS[:], core.cfg.ExpectedKey[:]) == 1
 	case 1: // CHAIN
-		var nowS int64 = -1
-		if core.cfg.NowUnix != nil {
-			nowS = core.cfg.NowUnix()
-		}
 		return gc.VerifyCredentialChain(sm.Credentials, sm.IKS,
-			core.cfg.TrustAnchors, c.serviceHash(), nowS)
+			core.cfg.TrustAnchors, c.serviceHash(), core.cfg.nowUnix())
 	}
 	return false
 }

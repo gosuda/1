@@ -2698,3 +2698,38 @@ Because GRT/1.1 decomposes protocol behavior into orthogonal finite-state machin
 The normative architecture, IR schema, verification obligations, and code generation rules are specified in `spec/FORMAL_CODEGEN_ARCH.md`.
 
 
+## Appendix C. Test vectors
+
+The reference implementation pins regression vectors in `internal/crypto/testdata/kat.json` and checks them in `internal/crypto/kat_test.go`. They were generated from that implementation, not derived independently; an independent implementation that reproduces them byte for byte agrees with it on the covered derivations (Section 27.1). Byte strings are lowercase hex; integers are decimal. The file covers:
+
+- `kdf_label`: `L(secret, label, context, n)` (Section 4.3) for n = 32, 24, 12 and an empty context.
+- `epoch_keys`: directional key and IV from an epoch root for both ciphers and both directions (Sections 5.1, 8.4).
+- `ticket_psk`: `L(resumption_master, "ticket psk", ticket_id, 32)` (Section 9.1).
+- `ticket_seal`: complete 224-byte ticket envelopes (Section 9.1).
+- `token_retry`: a complete 64-byte kind-0 address token (Section 6.2).
+- `aead_packet`: one DATA payload sealed under each cipher with the Section 5.1 nonce.
+- `pqxdh_kdf`: the PQXDH-shaped KDF (Section 4.3).
+
+`seq(b, n)` denotes the n bytes `b, b+1, …, b+n-1`.
+
+**C.1 Ticket PSK.** `resumption_master = seq(0x80, 32)`, `ticket_id = seq(0xa0, 16)`:
+
+```
+psk = bcdaae06ac4bcbb957d7e7515b1c7eaa32e822a3188da24e73d7e6b68ca4c4e2
+```
+
+**C.2 Epoch-1 client-to-server keys, XChaCha20-Poly1305.** `root = seq(0x40, 32)`, `T1 = seq(0x60, 32)`, `cs = 0x0001`, `e = 1`, so `KCTX = T1 || 0001 || 00000001`:
+
+```
+key = a465b6a2b6535a496cf5df34d1e525d1bd0723903b4d737b47313eaabf245b2d
+iv  = 72ae1cf5934c6babeb611220ad7798c1d236a071060b310a
+```
+
+**C.3 DATA payload, AES-256-GCM.** `key = seq(0x30, 32)`, `iv = seq(0x50, 12)`, `pn = 305419896` (`0x12345678`), `AAD = seq(0x70, 32)`, plaintext = ASCII `GRT/1.1 test vector packet payload`:
+
+```
+ciphertext||tag = 57120d978e2a4f7d83898613e300091cbdbb66d2f47ff0420e3d7579df640f0b
+                  1c3f46c5e51e546d7beb3dd617fc2f08345d
+```
+
+The `ticket_seal` vectors also fix this implementation's server-private ticket-key rotation, which does not affect interoperability because only the issuing server opens its tickets. Envelope keys are `L(master, "ticket key", u32(generation) || u64(period) || u16(sub), 32)` with `period = floor(now_unix_s / 86400)` and `sub = (issuance_counter >> 24) mod 4096`, and the envelope `key_id` is `u32((period mod 2^20) << 12 | sub)`. Each derived key therefore seals at most 2^24 envelopes within one 24-hour period. The server accepts only the current and previous period.

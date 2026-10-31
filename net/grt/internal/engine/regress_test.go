@@ -88,6 +88,7 @@ func unitConn(t *testing.T, sock Socket) *Conn {
 	c.core.peer = wire.DefaultParams() // peer advertised all features
 	c.core.paths[0] = pathRec{
 		role:      pathActive,
+		pstate:    psActive,
 		validated: true,
 		remote:    netip.MustParseAddrPort("10.0.0.1:4433"),
 		local:     sock.LocalAddr(),
@@ -1879,7 +1880,7 @@ func TestTicketPolicyAndDomain(t *testing.T) {
 		t.Fatalf("no NEW_TICKET queued (body %d bytes)", len(body))
 	}
 	meta := gc.DecodeTicketMeta(body[:wire.TicketMetaBytes])
-	tp, err := gc.OpenTicket(core.cfg.TicketKey, body[wire.TicketMetaBytes:])
+	tp, err := c.openTicket(body[wire.TicketMetaBytes:])
 	if err != nil {
 		t.Fatal(err)
 	}

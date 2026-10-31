@@ -24,19 +24,38 @@ func Extract(salt, ikm []byte) [32]byte {
 //	    u16(n) || u8(len("GRT11 "+label)) || "GRT11 "+label ||
 //	    u16(len(context)) || context, n)
 //
-// All callers use n <= 32, so expansion is exactly one HMAC block
-// (HKDF-Expand T(1)). Labels are <=64 bytes, contexts <=65535 bytes. The
-// concatenated "GRT11 "+label prefix is streamed into the HMAC without
+// Expansion is exactly one HMAC block (HKDF-Expand T(1)), so n is limited
+// to 1..32. The "GRT11 "+label prefix is streamed into the HMAC without
 // materializing it.
+//
+// Labels and lengths are package constants, never peer input, so an
+// out-of-range argument is a programmer error and panics rather than
+// silently truncating the output or wrapping a length field.
 func L(secret []byte, label string, context []byte, n int) []byte {
 	out := make([]byte, n)
 	LInto(out, secret, label, context)
 	return out
 }
 
-// LInto is L with a caller-provided output buffer of len <= 32.
+const (
+	maxLOutput  = 32 // one SHA-256 block
+	maxLLabel   = 64 // spec section 4.3
+	maxLContext = 0xffff
+)
+
+// LInto is L with a caller-provided output buffer of 1..32 bytes. It panics
+// on an out-of-range output, label, or context length (see L).
 func LInto(out []byte, secret []byte, label string, context []byte) {
 	n := len(out)
+	if n < 1 || n > maxLOutput {
+		panic("grt/crypto: L output length out of range 1..32")
+	}
+	if len(label) > maxLLabel {
+		panic("grt/crypto: L label longer than 64 bytes")
+	}
+	if len(context) > maxLContext {
+		panic("grt/crypto: L context longer than 65535 bytes")
+	}
 	m := hmac.New(sha256.New, secret)
 	var tmp [8]byte
 	binary.BigEndian.PutUint16(tmp[0:], uint16(n))
@@ -61,8 +80,13 @@ func L32(secret []byte, label string, context []byte) [32]byte {
 }
 
 // ExpandRaw is HKDF-Expand-SHA256 with a caller-supplied exact info string
-// (used for the fixed PQXDH KDF info of spec section 4.3).
+// (used for the fixed PQXDH KDF info of spec section 4.3). It panics when n
+// exceeds the RFC 5869 limit of 255 blocks, where the counter byte would
+// wrap.
 func ExpandRaw(secret []byte, info string, n int) []byte {
+	if n < 0 || n > 255*sha256.Size {
+		panic("grt/crypto: HKDF-Expand length out of range")
+	}
 	m := hmac.New(sha256.New, secret)
 	out := make([]byte, 0, n)
 	var prev []byte

@@ -108,7 +108,7 @@ func (c *Conn) appPark(cmd *appCmd) error {
 	}
 	core.parkReqUS = now
 	core.ctrlPTO = c.leasePTO()
-	core.parkSt = parkReqWait
+	fsmParkSet(&core.parkSt, parkReqWait)
 	core.parked = true // freeze application admission at request
 	core.parkSends = 1
 	core.parkBaseUS = now
@@ -148,7 +148,7 @@ func (c *Conn) beginWake() {
 		core.wakeSeq = 1
 	}
 	core.wakeSends = 1
-	core.parkSt = parkWaking
+	fsmParkSet(&core.parkSt, parkWaking)
 	// The attempt snapshots the same pto formula and anchors a fresh
 	// 0/pto/3pto resend grid (section 35.8).
 	core.ctrlPTO = c.leasePTO()
@@ -191,7 +191,7 @@ func (c *Conn) applyParkGrant(reqID uint64, durMS uint32, status uint16) {
 	if status != 0 || durMS == 0 {
 		// REFUSED/BUSY are final for this request ID; retain ordinary
 		// idle semantics and reopen the gate.
-		core.parkSt = parkIdle
+		fsmParkSet(&core.parkSt, parkIdle)
 		core.parked = false
 		core.disarm(tkParkCtrl)
 		notify(c.writeWake)
@@ -201,7 +201,7 @@ func (c *Conn) applyParkGrant(reqID uint64, durMS uint32, status uint16) {
 		c.closeWith(codeMobileState, wire.FrameParkGrant)
 		return
 	}
-	core.parkSt = parkLive
+	fsmParkSet(&core.parkSt, parkLive)
 	// Conservative expiry from first request handoff, never the later
 	// grant-arrival time (section 35.5).
 	core.parkLeaseUS = core.parkReqUS + uint64(durMS)*1000
@@ -229,7 +229,7 @@ func (c *Conn) applyParkAwake(reqID, wakeSeq uint64) {
 	}
 	core.awakeSeen = false
 	core.parked = false
-	core.parkSt = parkIdle
+	fsmParkSet(&core.parkSt, parkIdle)
 	core.parkLeaseUS = 0
 	core.disarm(tkParkCtrl)
 	core.disarm(tkIdle)
@@ -297,7 +297,7 @@ func (c *Conn) applyParkRequest(reqID uint64, durMS uint32) {
 		// PARK_AWAKE waits for a fresh routability proof (section 35.6).
 		status, grant = 0, durMS
 		core.parked = true
-		core.parkSt = parkLive
+		fsmParkSet(&core.parkSt, parkLive)
 		core.parkID = reqID
 		core.parkDurMS = durMS
 		core.parkLeaseUS = nowUS() + uint64(durMS)*1000
@@ -348,7 +348,7 @@ func (c *Conn) applyParkWake(reqID, wakeSeq uint64, pi int) {
 		}
 		core.peerWakeSeq = wakeSeq
 		if core.parkSt != parkAwakePend {
-			core.parkSt = parkWaking
+			fsmParkSet(&core.parkSt, parkWaking)
 		}
 		core.wakePath = pi
 		// Revalidate the wake ingress tuple before emitting AWAKE; the
@@ -371,7 +371,7 @@ func (c *Conn) applyParkWake(reqID, wakeSeq uint64, pi int) {
 		}
 		core.parkID = reqID
 		core.peerWakeSeq = wakeSeq
-		core.parkSt = parkWaking
+		fsmParkSet(&core.parkSt, parkWaking)
 		core.parked = true
 		core.wakePath = pi
 		p := &core.paths[pi]
@@ -396,7 +396,7 @@ func (c *Conn) wakeAdvance(now uint64) {
 	}
 	// Receive gate opens before the result is emitted; the send gate stays
 	// closed until an awake-carrying packet is acknowledged.
-	core.parkSt = parkAwakePend
+	fsmParkSet(&core.parkSt, parkAwakePend)
 	core.awakePend = true
 	core.parkSends = 1
 	core.parkBaseUS = now
@@ -413,7 +413,7 @@ func (c *Conn) parkAwakeAcked() {
 	if core.parkSt != parkAwakePend {
 		return
 	}
-	core.parkSt = parkIdle
+	fsmParkSet(&core.parkSt, parkIdle)
 	core.parked = false
 	core.parkLeaseUS = 0
 	core.awakePend = false
@@ -452,7 +452,7 @@ func (c *Conn) onParkCtrl(now uint64) {
 			if dl != 0 && now >= dl {
 				// Wake failed: gates stay closed; lease expiry or a new
 				// authorized attempt decides. No timeout return to online.
-				core.parkSt = parkLive
+				fsmParkSet(&core.parkSt, parkLive)
 				return
 			}
 			if *sends < 3 && now >= core.parkNextUS {

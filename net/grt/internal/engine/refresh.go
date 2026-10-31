@@ -454,7 +454,11 @@ func (c *Conn) clientAcceptAnswer(ans []byte) {
 		c.closeWith(codeKeyUpdate, wire.FrameCryptoFragment)
 		return
 	}
-	ssR := gc.MLKEM768Decaps(rt.qC.Seed, ap[88:1176])
+	ssR, err := gc.MLKEM768Decaps(rt.qC.Seed, ap[88:1176])
+	if err != nil {
+		c.closeWith(codeKeyUpdate, wire.FrameCryptoFragment)
+		return
+	}
 	rs := gc.DeriveRefresh(core.t1, rt.offer, ap,
 		gc.DeriveRefreshSecret(core.keys.rootFor(rt.epoch-1), core.t1, core.cipher, rt.epoch-1),
 		dR, ssR)
@@ -552,7 +556,7 @@ func (c *Conn) promoteStaged() {
 			continue
 		}
 		if s.state == epochSlotInstalled && s.epoch == rt.epoch-1 {
-			s.state = epochSlotGrace
+			fsmEpochSlotSet(&s.state, epochSlotGrace)
 			s.graceUntilUS = nowUS() + 3*c.ptoUS()
 			core.arm(tkGrace, s.graceUntilUS)
 		}
@@ -574,7 +578,7 @@ func (c *Conn) onGraceDeadline(now uint64) {
 			old := s.epoch
 			s.tx.Zeroize()
 			s.rx.Zeroize()
-			s.state = epochSlotEmpty
+			fsmEpochSlotSet(&s.state, epochSlotEmpty)
 			core.keys.root[i] = [32]byte{}
 			// Transmissions stranded under the erased epoch detach
 			// administratively: items requeue under the current epoch,

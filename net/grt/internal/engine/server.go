@@ -25,12 +25,16 @@ type Listener struct {
 	// dies, so token validation can never open unlimited expensive
 	// PQXDH/signature work.
 	attemptsInFlight int
-	attemptsBound    int
-	gen              uint32
-	closed           bool
-	accept           chan *Conn
+	// tokenlessInFlight counts admitted attempts that carried no token;
+	// ALLOW_TOKENLESS may hold at most 1/tokenlessPoolDivisor of the pool.
+	tokenlessInFlight int
+	attemptsBound     int
+	gen               uint32
+	closed            bool
+	accept            chan *Conn
 
-	tokens *gc.TokenService
+	tokens    *gc.TokenService
+	tokenRotS int64
 
 	// bounded per-attempt reassembly slots; tokenless counts the live
 	// ALLOW_TOKENLESS spool entries (section 6)
@@ -42,8 +46,8 @@ type Listener struct {
 	// spoofed fragment-zero floods cannot turn the listener into an
 	// unbounded Retry emitter.
 	retryGlobal tokenBucket
-	retrySrc    map[netip.Addr]*tokenBucket
-	attemptSrc  map[netip.Addr]*tokenBucket
+	retrySrc    srcTable
+	attemptSrc  srcTable
 
 	// Section 37.7 abuse & admission metrics (guarded by mu).
 	retriesSent      uint64
@@ -104,6 +108,55 @@ func (b *tokenBucket) take(now uint64, pktRate, pktBurst, cost float64) bool {
 	return true
 }
 
+// srcTable is a bounded per-source bucket map. A bucket idle long enough
+// to refill to burst is indistinguishable from a fresh one, so dropping it
+// loses no throttling state; sweeping such buckets keeps spoofed sources
+// from pinning the table full and locking out every new client.
+type srcTable struct {
+	m       map[netip.Addr]*tokenBucket
+	idleUS  uint64 // empty-to-burst refill time
+	sweptUS uint64
+}
+
+const (
+	srcSweepFullIntervalUS = 1_000_000  // min spacing of sweeps while full
+	srcSweepIdleIntervalUS = 10_000_000 // background sweep spacing
+)
+
+func newSrcTable(rate, burst float64) srcTable {
+	return srcTable{
+		m:      make(map[netip.Addr]*tokenBucket),
+		idleUS: uint64(burst / rate * 1e6),
+	}
+}
+
+// bucket returns the source's bucket, creating it when capacity allows;
+// nil means the table is saturated by sources still being throttled.
+func (t *srcTable) bucket(a netip.Addr, now uint64) *tokenBucket {
+	if b := t.m[a]; b != nil {
+		return b
+	}
+	since := now - t.sweptUS
+	if since >= srcSweepIdleIntervalUS || len(t.m) >= retrySrcMax && since >= srcSweepFullIntervalUS {
+		t.sweep(now)
+	}
+	if len(t.m) >= retrySrcMax {
+		return nil
+	}
+	b := &tokenBucket{}
+	t.m[a] = b
+	return b
+}
+
+func (t *srcTable) sweep(now uint64) {
+	t.sweptUS = now
+	for a, b := range t.m {
+		if now-b.lastUS >= t.idleUS {
+			delete(t.m, a)
+		}
+	}
+}
+
 // Retry emission limits are local policy (spec section 6.3 requires the
 // buckets; their rates are deployment-tunable). A legitimate client
 // retransmits a fragment zero at most a handful of times per attempt.
@@ -118,6 +171,11 @@ const (
 	// under ALLOW_TOKENLESS (section 6.3): each is a real allocation the
 	// listener carries without any validated token.
 	maxTokenlessSlots = 16
+
+	// tokenlessPoolDivisor caps tokenless attempts at 1/4 of the attempt
+	// pool: spoofed tokenless flights cost a full PQXDH each, so they may
+	// never crowd out address-validated attempts (section 6.4).
+	tokenlessPoolDivisor = 4
 
 	// defaultMaxAttempts is the manifest admission bound applied when
 	// Config.MaxAttempts is unset (spec sections 20.1/37.6).
@@ -163,13 +221,18 @@ type reasmSlot struct {
 
 // NewListener creates a listener on the given socket.
 func NewListener(cfg *Config, sock PacketSocket, domain []byte) *Listener {
-	var nowf func() uint64
-	if cfg.NowUnix != nil {
-		nowf = func() uint64 { return uint64(cfg.NowUnix()) }
-	}
+	nowf := func() uint64 { return uint64(cfg.nowUnix()) }
 	bound := cfg.MaxAttempts
 	if bound <= 0 {
 		bound = defaultMaxAttempts
+	}
+	srcRate := cfg.SourceAttemptRate
+	if srcRate <= 0 {
+		srcRate = defaultAttemptSrcRate
+	}
+	srcBurst := cfg.SourceAttemptBurst
+	if srcBurst <= 0 {
+		srcBurst = defaultAttemptSrcBurst
 	}
 	return &Listener{
 		cfg:           cfg,
@@ -177,11 +240,12 @@ func NewListener(cfg *Config, sock PacketSocket, domain []byte) *Listener {
 		conns:         make(map[uint64]*Conn),
 		attempts:      make(map[[16]byte]*Conn),
 		attemptsBound: bound,
-		accept:        make(chan *Conn, 64),
+		accept:        make(chan *Conn, max(bound, 256)),
 		reasm:         make(map[reasmKey]*reasmSlot),
-		retrySrc:      make(map[netip.Addr]*tokenBucket),
-		attemptSrc:    make(map[netip.Addr]*tokenBucket),
+		retrySrc:      newSrcTable(retrySrcPktRate, retrySrcPktBurst),
+		attemptSrc:    newSrcTable(srcRate, srcBurst),
 		tokens:        gc.NewTokenService(nowf, domain),
+		tokenRotS:     cfg.nowUnix(),
 	}
 }
 
@@ -354,6 +418,7 @@ func (l *Listener) onClientFlight(pkt []byte, h wire.Header, src, dst netip.Addr
 		// past the handshake deadline so stalled attempts cannot hold
 		// memory forever.
 		now := nowUS()
+		l.rotateTokensLocked()
 		for k, s := range l.reasm {
 			if now-s.createdUS > wire.HandshakeDeadlineUS {
 				if s.token == ([wire.TokenBytes]byte{}) {
@@ -368,42 +433,26 @@ func (l *Listener) onClientFlight(pkt []byte, h wire.Header, src, dst netip.Addr
 			return // SHEDDING: every new attempt is silently dropped
 		}
 		zeroTok := f.Token == ([wire.TokenBytes]byte{})
-		if zeroTok && l.cfg.AdmissionMode != AdmissionTokenless {
+		// ALLOW_TOKENLESS is a capacity-bounded latency policy: once its
+		// reassembly or attempt share is used up, fragment zero falls back
+		// to a stateless RETRY instead of being dropped (section 6.4), so
+		// a spoofed tokenless flood degrades legitimate clients to 2-RTT
+		// rather than locking them out.
+		if zeroTok && (l.cfg.AdmissionMode != AdmissionTokenless || !l.tokenlessCapacityLocked()) {
 			l.mu.Unlock()
 			if f.Index == 0 {
 				l.sendRetry(&f, h, src, dst)
 			}
 			return
 		}
-		if !zeroTok {
-			// Token-bearing: validate before any per-attempt allocation.
-			// Kind-1 (REUSE) validates from this fragment alone; kind-0
-			// binds flight hash + outer retry DCID now and original DCID
-			// at frag 0.
-			tok, tokOK := wire.DecodeToken(f.Token[:])
-			if !tokOK {
-				l.tokenFailures++
-				l.mu.Unlock()
-				return
+		if !zeroTok && !l.admitClientTokenLocked(&f, h, src, dst) {
+			l.mu.Unlock()
+			if f.Index == 0 {
+				l.sendRetry(&f, h, src, dst)
 			}
-			if tok.Kind == wire.TokenKindRetry {
-				if !l.tokens.ValidateToken(f.Token, src, dst, f.MessageHash, h.DestCID, tok.Binding) {
-					l.tokenFailures++
-					l.mu.Unlock()
-					return
-				}
-			} else if !l.tokens.ValidateToken(f.Token, src, dst, [32]byte{}, 0, 0) {
-				// An invalid REUSE token is not a drop: the safe fallback
-				// is a stateless RETRY on fragment zero (section 6.3).
-				l.tokenFailures++
-				l.mu.Unlock()
-				if f.Index == 0 {
-					l.sendRetry(&f, h, src, dst)
-				}
-				return
-			}
+			return
 		}
-		if len(l.reasm) >= 64 || (zeroTok && l.tokenless >= maxTokenlessSlots) {
+		if len(l.reasm) >= 64 {
 			l.reassemblyDrops++
 			l.mu.Unlock()
 			return
@@ -461,6 +510,34 @@ func (l *Listener) onClientFlight(pkt []byte, h wire.Header, src, dst netip.Addr
 	l.startServerAttempt(msg, &f, slot, src, dst)
 }
 
+// admitClientTokenLocked validates a non-zero address token on a new
+// client flight before any per-attempt allocation. Returns false when the
+// token is malformed or fails HMAC/expiry verification (caller holds mu).
+func (l *Listener) admitClientTokenLocked(f *wire.Fragment, h wire.Header, src, dst netip.AddrPort) bool {
+	tok, tokOK := wire.DecodeToken(f.Token[:])
+	if !tokOK {
+		l.tokenFailures++
+		return false
+	}
+	valid := false
+	if tok.Kind == wire.TokenKindRetry {
+		valid = l.tokens.ValidateToken(f.Token, src, dst, f.MessageHash, h.DestCID, tok.Binding)
+	} else {
+		valid = l.tokens.ValidateToken(f.Token, src, dst, [32]byte{}, 0, 0)
+	}
+	if !valid {
+		l.tokenFailures++
+	}
+	return valid
+}
+
+// tokenlessCapacityLocked reports whether ALLOW_TOKENLESS may take one
+// more reassembly slot and, on completion, one more attempt. Caller holds mu.
+func (l *Listener) tokenlessCapacityLocked() bool {
+	limit := max(l.attemptsBound/tokenlessPoolDivisor, 1)
+	return l.tokenless < maxTokenlessSlots && l.tokenlessInFlight+l.tokenless < limit
+}
+
 // sendRetry emits one stateless RETRY for a tokenless fragment zero
 // (section 7.1 fixed-prefix checks; no crypto beyond the token HMAC).
 func (l *Listener) sendRetry(f *wire.Fragment, h wire.Header, src, dst netip.AddrPort) {
@@ -488,24 +565,21 @@ func (l *Listener) emitRetry(attemptID [wire.AttemptIDBytes]byte,
 	hash [32]byte, origDCID, clientCID uint64, src, dst netip.AddrPort) {
 	l.mu.Lock()
 	now := nowUS()
+	l.rotateTokensLocked()
 	if !l.retryGlobal.take(now, retryGlobalPktRate, retryGlobalPktBurst,
 		float64(wire.RetryUDPBytes)) {
 		l.retryRateLimited++
 		l.mu.Unlock()
 		return
 	}
-	sb := l.retrySrc[src.Addr()]
+	sb := l.retrySrc.bucket(src.Addr(), now)
 	if sb == nil {
-		if len(l.retrySrc) >= retrySrcMax {
-			// Spoofed-source flood: the table is bounded and the global
-			// bucket still limits emission — refuse the new source rather
-			// than resetting buckets that are throttling known sources.
-			l.retryRateLimited++
-			l.mu.Unlock()
-			return
-		}
-		sb = &tokenBucket{}
-		l.retrySrc[src.Addr()] = sb
+		// Saturated by sources still being throttled: refuse the new
+		// source rather than resetting live buckets; the global bucket
+		// still bounds emission and idle entries age out.
+		l.retryRateLimited++
+		l.mu.Unlock()
+		return
 	}
 	ok := sb.take(now, retrySrcPktRate, retrySrcPktBurst,
 		float64(wire.RetryUDPBytes))
@@ -561,18 +635,19 @@ func (l *Listener) startServerAttempt(msg []byte, f *wire.Fragment, slot *reasmS
 	if srcBurst <= 0 {
 		srcBurst = defaultAttemptSrcBurst
 	}
-	ab := l.attemptSrc[src.Addr()]
-	if ab == nil && len(l.attemptSrc) < retrySrcMax {
-		ab = &tokenBucket{}
-		l.attemptSrc[src.Addr()] = ab
-	}
-	if ab == nil || !ab.take(nowUS(), srcRate, srcBurst, 1) {
+	now := nowUS()
+	ab := l.attemptSrc.bucket(src.Addr(), now)
+	if ab == nil || !ab.take(now, srcRate, srcBurst, 1) {
 		l.admissionDrops++
 		l.mu.Unlock()
 		return
 	}
 	l.attemptsAdmitted++
 	l.attemptsInFlight++
+	tokenless := slot.token == ([wire.TokenBytes]byte{})
+	if tokenless {
+		l.tokenlessInFlight++
+	}
 	l.gen++
 	gen := l.gen
 	l.attempts[f.AttemptID] = nil // placeholder; set after conn build
@@ -581,8 +656,12 @@ func (l *Listener) startServerAttempt(msg []byte, f *wire.Fragment, slot *reasmS
 	sock := &routeSocket{ps: l.sock, local: dst}
 	cn := newConn(l.cfg, sock, gen)
 	cn.core.attemptHeld = true
+	cn.core.attemptTokenless = tokenless
 	cn.core.role = roleServer
-	cn.core.state = stSBuild
+	// The listener reassembled and hash-checked the flight before
+	// creating the conn, so NEW -> S_COLLECT -> S_BUILD happen together.
+	cn.mustFireConn(fsmConn_EV_SERVER_ACCEPT)
+	cn.mustFireConn(fsmConn_EV_CLIENT_AUTH_REASSEMBLED)
 	cn.core.hs.cliMsg = msg
 	cn.core.hs.attemptID = f.AttemptID
 	cn.core.hs.flightHash = f.MessageHash
@@ -592,8 +671,8 @@ func (l *Listener) startServerAttempt(msg []byte, f *wire.Fragment, slot *reasmS
 	cn.core.listener = l
 	cn.core.paths[0].remote = src
 	cn.core.paths[0].local = dst
-	cn.core.paths[0].role = pathActive
-	cn.core.paths[0].pstate = psActive
+	fsmPathRoleSet(&cn.core.paths[0].role, pathActive)
+	fsmPathSet(&cn.core.paths[0].pstate, psActive)
 	// The admission budget is the datagrams actually received on this
 	// attempt/source; a validated token marks the route proven while a
 	// tokenless attempt remains amplification-capped (section 6).
@@ -613,10 +692,54 @@ func (l *Listener) startServerAttempt(msg []byte, f *wire.Fragment, slot *reasmS
 		res: make(chan appResult, 1)}})
 }
 
+// rotateTokensLocked rotates the address-token HMAC key once per REUSE
+// token lifetime so retired keys age out within two lifetimes (section 6.2).
+// Caller holds mu.
+func (l *Listener) rotateTokensLocked() {
+	nowS := l.cfg.nowUnix()
+	if nowS-l.tokenRotS >= wire.ReuseTokenLifetimeS {
+		l.tokens.Rotate()
+		l.tokenRotS = nowS
+	}
+}
+
+// issueReuseToken mints a kind-1 REUSE token after applying any due key
+// rotation.
+func (l *Listener) issueReuseToken(src, dst netip.AddrPort) ([wire.TokenBytes]byte, bool) {
+	l.mu.Lock()
+	l.rotateTokensLocked()
+	l.mu.Unlock()
+	return l.tokens.IssueReuse(src, dst)
+}
+
+// admitAccepted registers an S_BUILD-complete connection for DATA demux and
+// enqueues it on the accept channel. If the listener is closed or the accept
+// queue is full, it returns false without registering the connection so
+// unaccepted zombie connections cannot accumulate in l.conns.
+func (l *Listener) admitAccepted(cn *Conn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return false
+	}
+	select {
+	case l.accept <- cn:
+	default:
+		l.admissionDrops++
+		return false
+	}
+	l.registerConnLocked(cn)
+	return true
+}
+
 // registerConn installs a conn under its local CIDs for DATA demux.
 func (l *Listener) registerConn(cn *Conn) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.registerConnLocked(cn)
+}
+
+func (l *Listener) registerConnLocked(cn *Conn) {
 	if cn.core.localCID.valid {
 		l.conns[cn.core.localCID.cid] = cn
 	}

@@ -283,7 +283,7 @@ func (c *Conn) commitData(e *connEvent, h wire.Header, frames []wire.Frame, elic
 		c.checkImplicitPromotion(pi)
 	}
 	if core.state == stSFinishing && pf.finishOK {
-		core.state = stEstablished
+		c.mustFireConn(fsmConn_EV_FINISH_VERIFIED)
 		c.releaseAttempt()
 		// A valid FINISH proves the client received our flight: the
 		// cached response and the client's flight/reassembly buffers are
@@ -298,7 +298,7 @@ func (c *Conn) commitData(e *connEvent, h wire.Header, frames []wire.Frame, elic
 		c.postEstablish()
 	}
 	if core.state == stCFinishing && pf.handshakeDoneOK {
-		core.state = stEstablished
+		c.mustFireConn(fsmConn_EV_HANDSHAKE_DONE_RX)
 		// Same confirmation fence: the client flight and its emitter
 		// state are no longer needed once the handshake is done.
 		core.hs.clientMsg = nil
@@ -634,6 +634,13 @@ func (c *Conn) preflightFrame(f *wire.Frame, pf *rxPreflight) closeCode {
 		if !classOurs(class, core.role) {
 			return codeStreamState
 		}
+		cap_ := uint32(core.peer.MaximumBidiSlots)
+		if class&2 != 0 {
+			cap_ = uint32(core.peer.MaximumUniSlots)
+		}
+		if lim > cap_ {
+			return codeFlowControl
+		}
 	case wire.FrameStreamRetire:
 		sid64, ok := wire.ParseU64(f.Body)
 		if !ok || !wire.StreamID(sid64).Valid() {
@@ -647,12 +654,16 @@ func (c *Conn) preflightFrame(f *wire.Frame, pf *rxPreflight) closeCode {
 		}
 		return c.preflightRetireAck(wire.StreamID(sid64))
 	case wire.FrameDatagram:
-		ctx, _, ok := wire.ParseDatagram(f.Body)
+		ctx, data, ok := wire.ParseDatagram(f.Body)
 		if !ok || ctx != 0 {
 			return codeFrameEncoding
 		}
-		if core.peer.FeatureFlags&wire.FeatureDatagram == 0 {
+		if core.peer.FeatureFlags&wire.FeatureDatagram == 0 ||
+			core.local.FeatureFlags&wire.FeatureDatagram == 0 {
 			return codeProtocolViolation
+		}
+		if uint32(len(data)) > core.local.MaxDatagramData {
+			return codeFrameEncoding
 		}
 	case wire.FrameNewCID:
 		seq, _, cid, _, ok := wire.ParseNewCID(f.Body)

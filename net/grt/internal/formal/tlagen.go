@@ -44,19 +44,7 @@ func GenerateTLA() (tlaSpec string, tlaCfg string, err error) {
 		fmt.Fprintf(&b, "%sStates == {0..%d}\n", m.Name, len(m.States)-1)
 		fmt.Fprintf(&b, "%sEvents == {0..%d}\n", m.Name, len(m.Events)-1)
 		for _, p := range m.Predicates {
-			mask := cm.PredicateMasks[p.Name]
-			fmt.Fprintf(&b, "%s_%s == {", m.Name, p.Name)
-			first := true
-			for s := range m.States {
-				if mask&(uint16(1)<<uint(s)) != 0 {
-					if !first {
-						b.WriteString(", ")
-					}
-					fmt.Fprintf(&b, "%d", s)
-					first = false
-				}
-			}
-			b.WriteString("}\n")
+			writeTLAPredicateSet(&b, m, p.Name, cm.PredicateMasks[p.Name])
 		}
 
 		// Emit total transition function.
@@ -147,11 +135,33 @@ func GenerateTLA() (tlaSpec string, tlaCfg string, err error) {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("QuietTerminalNoClose ==\n")
+	b.WriteString("    \\A s \\in (ConnLifecycle_Terminating \\cup ConnLifecycle_Terminal) :\n")
+	b.WriteString("        ConnLifecycleStep(s, 9) = s \\* EV_LOCAL_CLOSE cannot re-enter CLOSING from terminal/terminating\n\n")
+
+	b.WriteString("CipherImmutabilityOK ==\n")
+	b.WriteString("    \\A s \\in CipherSelection_Locked, ev \\in CipherSelectionEvents :\n")
+	b.WriteString("        CipherSelectionStep(s, ev) = s \\* I01: locked cipher never mutates\n\n")
+
+	b.WriteString("LiveKeyedDisjointTerminating ==\n")
+	b.WriteString("    /\\ ConnLifecycle_LiveKeyed \\subseteq ConnLifecycle_KeyBearing\n")
+	b.WriteString("    /\\ (ConnLifecycle_LiveKeyed \\cap ConnLifecycle_Terminating) = {}\n\n")
+
+	b.WriteString("SentAckVerifiableExact ==\n")
+	b.WriteString("    /\\ 0 \\notin SentPacket_AckVerifiable \\* UNISSUED never ACK-verifiable\n")
+	b.WriteString("    /\\ 3 \\notin SentPacket_AckVerifiable \\* BURNED never ACK-verifiable\n\n")
+
 	b.WriteString("\\* Normative Invariant Catalog (verified by explicit-state models):\n")
 	for _, inv := range invariants {
 		fmt.Fprintf(&b, "\\* [%s] (%s, Section %s): %s\n", inv.ID, inv.Category, inv.SpecSection, inv.Summary)
 	}
-	b.WriteString("\nSafetyInvariants == TypeOK /\\ TerminalAbsorptionOK\n")
+	b.WriteString("\nSafetyInvariants ==\n")
+	b.WriteString("    /\\ TypeOK\n")
+	b.WriteString("    /\\ TerminalAbsorptionOK\n")
+	b.WriteString("    /\\ QuietTerminalNoClose\n")
+	b.WriteString("    /\\ CipherImmutabilityOK\n")
+	b.WriteString("    /\\ LiveKeyedDisjointTerminating\n")
+	b.WriteString("    /\\ SentAckVerifiableExact\n")
 	b.WriteString("Spec == Init /\\ [][Next]_vars\n")
 	b.WriteString("=============================================================================\n")
 
@@ -160,7 +170,27 @@ func GenerateTLA() (tlaSpec string, tlaCfg string, err error) {
 	cfg.WriteString("SPECIFICATION Spec\n")
 	cfg.WriteString("INVARIANT TypeOK\n")
 	cfg.WriteString("INVARIANT TerminalAbsorptionOK\n")
+	cfg.WriteString("INVARIANT QuietTerminalNoClose\n")
+	cfg.WriteString("INVARIANT CipherImmutabilityOK\n")
+	cfg.WriteString("INVARIANT LiveKeyedDisjointTerminating\n")
+	cfg.WriteString("INVARIANT SentAckVerifiableExact\n")
 	cfg.WriteString("INVARIANT SafetyInvariants\n")
 
 	return b.String(), cfg.String(), nil
+}
+
+func writeTLAPredicateSet(b *bytes.Buffer, m MachineSpec, predName string, mask uint16) {
+	fmt.Fprintf(b, "%s_%s == {", m.Name, predName)
+	first := true
+	for s := range m.States {
+		if mask&(uint16(1)<<uint(s)) == 0 {
+			continue
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%d", s)
+		first = false
+	}
+	b.WriteString("}\n")
 }

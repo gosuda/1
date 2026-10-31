@@ -246,7 +246,7 @@ func (c *Conn) ackCtrlItem(li *lossItem) {
 		s := core.slots.slotOf(sid.Class(), sid.Slot())
 		if s != nil && s.send != nil && s.gen == it.gen &&
 			s.send.state == sendReset {
-			s.send.state = sendDone
+			fsmSendSet(&s.send.state, sendDone)
 			c.maybeRetire(s, sid)
 			notify(c.writeWake)
 		}

@@ -11,6 +11,7 @@ var (
 	ErrNonCanonicalKey = errors.New("grt: noncanonical X25519 public key")
 	ErrAllZeroDH       = errors.New("grt: all-zero X25519 shared secret")
 	ErrKEMKey          = errors.New("grt: ML-KEM key check failed")
+	ErrKEMCiphertext   = errors.New("grt: malformed ML-KEM ciphertext")
 )
 
 // x25519FieldP is p = 2^255-19, little-endian, for the canonical-encoding
@@ -147,23 +148,24 @@ func MLKEM768Encaps(ek []byte) ([1088]byte, [32]byte, error) {
 	return ct, ss, nil
 }
 
-// MLKEM768Decaps decapsulates under the 64-byte seed. Implicit rejection
-// stays internal per spec section 4.2 — callers must not expose a
-// decapsulation-error oracle.
-func MLKEM768Decaps(seed [64]byte, ct []byte) [32]byte {
+// MLKEM768Decaps decapsulates ct under the 64-byte seed. A well-sized but
+// tampered ciphertext is not an error: FIPS 203 implicit rejection yields
+// a pseudorandom secret, so no decapsulation oracle exists (spec section
+// 4.2). An error means a malformed seed or a ciphertext that is not 1088
+// bytes, both of which depend only on public lengths.
+func MLKEM768Decaps(seed [64]byte, ct []byte) ([32]byte, error) {
 	var ss [32]byte
 	dk, err := mlkem.NewDecapsulationKey768(seed[:])
 	if err != nil {
-		return ss
+		return ss, ErrKEMKey
 	}
 	sh, err := dk.Decapsulate(ct)
 	if err != nil {
-		// Keep implicit rejection semantics: return a stable dummy value
-		// rather than an error the caller could leak as an oracle.
-		return ss
+		return ss, ErrKEMCiphertext
 	}
 	copy(ss[:], sh)
-	return ss
+	Zeroize(sh)
+	return ss, nil
 }
 
 // EncodeEC builds EncodeEC(pk) = 0x01 || pk32 (spec section 4.3).

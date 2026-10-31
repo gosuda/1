@@ -19,39 +19,60 @@ vars == <<st_ConnLifecycle, st_CipherSelection, st_StreamSlot, st_StreamSend, st
 
 \* --- ConnLifecycle (Section 20.1-20.3) ---
 ConnLifecycleStates == {0..12}
-ConnLifecycleEvents == {0..14}
+ConnLifecycleEvents == {0..16}
 ConnLifecycle_KeyBearing == {4, 7, 8, 9, 10, 11}
+ConnLifecycle_LiveKeyed == {4, 7, 8}
 ConnLifecycle_Terminating == {9, 10, 11, 12}
 ConnLifecycle_AppSendEligible == {4, 8}
 ConnLifecycle_HandshakePhase == {0, 1, 2, 3, 5, 6, 7}
 ConnLifecycle_QuietTerminal == {10, 11, 12}
 ConnLifecycleStep(s, ev) ==
-    CASE (s = 0 /\ ev = 0) -> 1 \* NEW + EV_CLIENT_START -> C_BUILD (20.1)
-      [] (s = 0 /\ ev = 6) -> 5 \* NEW + EV_SERVER_ACCEPT -> S_COLLECT (20.1)
-      [] (s = 1 /\ ev = 1) -> 2 \* C_BUILD + EV_CLIENT_HELLO_BUILT -> C_WAIT_REPLY (20.1)
-      [] (s = 2 /\ ev = 2) -> 1 \* C_WAIT_REPLY + EV_RETRY_RECEIVED -> C_BUILD (6.3)
-      [] (s = 2 /\ ev = 3) -> 3 \* C_WAIT_REPLY + EV_SERVER_HELLO_REASSEMBLED -> C_VERIFY (20.1)
-      [] (s = 3 /\ ev = 4) -> 4 \* C_VERIFY + EV_SERVER_AUTH_VERIFIED -> C_FINISHING (7.5)
-      [] (s = 4 /\ ev = 5) -> 8 \* C_FINISHING + EV_HANDSHAKE_DONE_RX -> ESTABLISHED (7.6)
-      [] (s = 5 /\ ev = 7) -> 6 \* S_COLLECT + EV_CLIENT_AUTH_REASSEMBLED -> S_BUILD (20.1)
-      [] (s = 6 /\ ev = 8) -> 7 \* S_BUILD + EV_SERVER_HELLO_BUILT -> S_FINISHING (7.5)
-      [] (s = 7 /\ ev = 9) -> 8 \* S_FINISHING + EV_FINISH_VERIFIED -> ESTABLISHED (7.6)
-      [] (s = 0 /\ ev = 14) -> 11 \* NEW + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 1 /\ ev = 14) -> 11 \* C_BUILD + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 2 /\ ev = 14) -> 11 \* C_WAIT_REPLY + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 3 /\ ev = 14) -> 11 \* C_VERIFY + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 5 /\ ev = 14) -> 11 \* S_COLLECT + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 6 /\ ev = 14) -> 11 \* S_BUILD + EV_ABORT_UNKEYED -> QUIESCING (20.3)
-      [] (s = 4 /\ ev = 10) -> 9 \* C_FINISHING + EV_LOCAL_CLOSE -> CLOSING (20.3)
-      [] (s = 7 /\ ev = 10) -> 9 \* S_FINISHING + EV_LOCAL_CLOSE -> CLOSING (20.3)
-      [] (s = 8 /\ ev = 10) -> 9 \* ESTABLISHED + EV_LOCAL_CLOSE -> CLOSING (20.3)
-      [] (s = 4 /\ ev = 11) -> 10 \* C_FINISHING + EV_REMOTE_CLOSE -> DRAINING (20.3)
-      [] (s = 7 /\ ev = 11) -> 10 \* S_FINISHING + EV_REMOTE_CLOSE -> DRAINING (20.3)
-      [] (s = 8 /\ ev = 11) -> 10 \* ESTABLISHED + EV_REMOTE_CLOSE -> DRAINING (20.3)
-      [] (s = 9 /\ ev = 11) -> 10 \* CLOSING + EV_REMOTE_CLOSE -> DRAINING (20.3)
+    CASE (s = 0 /\ ev = 0) -> 1 \* NEW + EV_CLIENT_START -> C_BUILD (20.3)
+      [] (s = 0 /\ ev = 6) -> 5 \* NEW + EV_SERVER_ACCEPT -> S_COLLECT (20.3)
+      [] (s = 1 /\ ev = 1) -> 2 \* C_BUILD + EV_CLIENT_HELLO_BUILT -> C_WAIT_REPLY (20.3)
+      [] (s = 2 /\ ev = 2) -> 2 \* C_WAIT_REPLY + EV_RETRY_RECEIVED -> C_WAIT_REPLY (6.3, 20.3)
+      [] (s = 2 /\ ev = 3) -> 3 \* C_WAIT_REPLY + EV_SERVER_HELLO_REASSEMBLED -> C_VERIFY (20.3)
+      [] (s = 3 /\ ev = 4) -> 4 \* C_VERIFY + EV_SERVER_AUTH_VERIFIED -> C_FINISHING (20.3)
+      [] (s = 3 /\ ev = 16) -> 2 \* C_VERIFY + EV_SERVER_AUTH_FAILED -> C_WAIT_REPLY (20.3)
+      [] (s = 4 /\ ev = 5) -> 8 \* C_FINISHING + EV_HANDSHAKE_DONE_RX -> ESTABLISHED (20.3)
+      [] (s = 5 /\ ev = 7) -> 6 \* S_COLLECT + EV_CLIENT_AUTH_REASSEMBLED -> S_BUILD (20.3)
+      [] (s = 6 /\ ev = 8) -> 7 \* S_BUILD + EV_SERVER_HELLO_BUILT -> S_FINISHING (20.3)
+      [] (s = 7 /\ ev = 9) -> 8 \* S_FINISHING + EV_FINISH_VERIFIED -> ESTABLISHED (20.3)
       [] (s = 9 /\ ev = 12) -> 11 \* CLOSING + EV_CLOSE_TIMEOUT -> QUIESCING (20.3)
       [] (s = 10 /\ ev = 12) -> 11 \* DRAINING + EV_CLOSE_TIMEOUT -> QUIESCING (20.3)
       [] (s = 11 /\ ev = 13) -> 12 \* QUIESCING + EV_IO_PINS_DRAINED -> DEAD (20.3)
+      [] (s = 4 /\ ev = 10) -> 9 \* C_FINISHING + EV_LOCAL_CLOSE -> CLOSING (20.2)
+      [] (s = 4 /\ ev = 15) -> 9 \* C_FINISHING + EV_PROTOCOL_ERROR -> CLOSING (20.2)
+      [] (s = 4 /\ ev = 11) -> 10 \* C_FINISHING + EV_REMOTE_CLOSE -> DRAINING (20.2)
+      [] (s = 7 /\ ev = 10) -> 9 \* S_FINISHING + EV_LOCAL_CLOSE -> CLOSING (20.2)
+      [] (s = 7 /\ ev = 15) -> 9 \* S_FINISHING + EV_PROTOCOL_ERROR -> CLOSING (20.2)
+      [] (s = 7 /\ ev = 11) -> 10 \* S_FINISHING + EV_REMOTE_CLOSE -> DRAINING (20.2)
+      [] (s = 8 /\ ev = 10) -> 9 \* ESTABLISHED + EV_LOCAL_CLOSE -> CLOSING (20.2)
+      [] (s = 8 /\ ev = 15) -> 9 \* ESTABLISHED + EV_PROTOCOL_ERROR -> CLOSING (20.2)
+      [] (s = 8 /\ ev = 11) -> 10 \* ESTABLISHED + EV_REMOTE_CLOSE -> DRAINING (20.2)
+      [] (s = 0 /\ ev = 10) -> 11 \* NEW + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 0 /\ ev = 15) -> 11 \* NEW + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 1 /\ ev = 10) -> 11 \* C_BUILD + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 1 /\ ev = 15) -> 11 \* C_BUILD + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 2 /\ ev = 10) -> 11 \* C_WAIT_REPLY + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 2 /\ ev = 15) -> 11 \* C_WAIT_REPLY + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 3 /\ ev = 10) -> 11 \* C_VERIFY + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 3 /\ ev = 15) -> 11 \* C_VERIFY + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 5 /\ ev = 10) -> 11 \* S_COLLECT + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 5 /\ ev = 15) -> 11 \* S_COLLECT + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 6 /\ ev = 10) -> 11 \* S_BUILD + EV_LOCAL_CLOSE -> QUIESCING (20.2)
+      [] (s = 6 /\ ev = 15) -> 11 \* S_BUILD + EV_PROTOCOL_ERROR -> QUIESCING (20.2)
+      [] (s = 0 /\ ev = 14) -> 11 \* NEW + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 1 /\ ev = 14) -> 11 \* C_BUILD + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 2 /\ ev = 14) -> 11 \* C_WAIT_REPLY + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 3 /\ ev = 14) -> 11 \* C_VERIFY + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 4 /\ ev = 14) -> 11 \* C_FINISHING + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 5 /\ ev = 14) -> 11 \* S_COLLECT + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 6 /\ ev = 14) -> 11 \* S_BUILD + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 7 /\ ev = 14) -> 11 \* S_FINISHING + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 8 /\ ev = 14) -> 11 \* ESTABLISHED + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 9 /\ ev = 14) -> 11 \* CLOSING + EV_LOCAL_FATAL -> QUIESCING (20.2)
+      [] (s = 10 /\ ev = 14) -> 11 \* DRAINING + EV_LOCAL_FATAL -> QUIESCING (20.2)
       [] OTHER -> s
 
 \* --- CipherSelection (Section 4.6) ---
@@ -98,6 +119,7 @@ StreamSendStep(s, ev) ==
       [] (s = 0 /\ ev = 3) -> 2 \* OPEN + EV_RESET_OR_STOP_SENDING -> RESET (12.5)
       [] (s = 1 /\ ev = 2) -> 3 \* FIN + EV_ALL_BYTES_AND_FIN_ACKED -> DONE (12.5)
       [] (s = 1 /\ ev = 3) -> 2 \* FIN + EV_RESET_OR_STOP_SENDING -> RESET (12.5)
+      [] (s = 2 /\ ev = 2) -> 3 \* RESET + EV_ALL_BYTES_AND_FIN_ACKED -> DONE (12.5)
       [] OTHER -> s
 
 \* --- StreamRecv (Section 12.6, 21.1) ---
@@ -130,7 +152,7 @@ EpochSlotStep(s, ev) ==
 
 \* --- PathValidation (Section 17.1-17.7, 21.3) ---
 PathValidationStates == {0..6}
-PathValidationEvents == {0..7}
+PathValidationEvents == {0..10}
 PathValidation_ControlSendEligible == {1, 2, 3, 4, 5}
 PathValidation_BulkDataEligible == {4}
 PathValidation_ReturnRoutable == {2, 3, 4, 5}
@@ -151,11 +173,16 @@ PathValidationStep(s, ev) ==
       [] (s = 5 /\ ev = 6) -> 6 \* OLD + EV_VALIDATION_OR_PATH_FAIL -> FAILED (17.5)
       [] (s = 5 /\ ev = 7) -> 0 \* OLD + EV_RELEASE_SLOT -> FREE (17.5)
       [] (s = 6 /\ ev = 7) -> 0 \* FAILED + EV_RELEASE_SLOT -> FREE (17.5)
+      [] (s = 4 /\ ev = 8) -> 1 \* ACTIVE + EV_REVALIDATE -> VALIDATING (17.7)
+      [] (s = 5 /\ ev = 8) -> 1 \* OLD + EV_REVALIDATE -> VALIDATING (17.7)
+      [] (s = 1 /\ ev = 9) -> 5 \* VALIDATING + EV_RETAINED_REVALIDATION_EXPIRED -> OLD (17.5)
+      [] (s = 2 /\ ev = 9) -> 5 \* REACHABLE + EV_RETAINED_REVALIDATION_EXPIRED -> OLD (17.5)
+      [] (s = 5 /\ ev = 10) -> 4 \* OLD + EV_FALLBACK_TO_RETAINED -> ACTIVE (17.5)
       [] OTHER -> s
 
 \* --- PathRole (Section 17.1) ---
 PathRoleStates == {0..3}
-PathRoleEvents == {0..4}
+PathRoleEvents == {0..5}
 PathRole_Allocated == {1, 2, 3}
 PathRole_Primary == {2}
 PathRoleStep(s, ev) ==
@@ -165,6 +192,7 @@ PathRoleStep(s, ev) ==
       [] (s = 1 /\ ev = 4) -> 0 \* CANDIDATE + EV_RECLAIM -> FREE (17.3)
       [] (s = 2 /\ ev = 3) -> 3 \* ACTIVE + EV_DEMOTE_ACTIVE -> OLD (17.5)
       [] (s = 3 /\ ev = 4) -> 0 \* OLD + EV_RECLAIM -> FREE (17.5)
+      [] (s = 3 /\ ev = 5) -> 2 \* OLD + EV_FALLBACK_TO_RETAINED -> ACTIVE (17.5)
       [] OTHER -> s
 
 \* --- SentPacket (Section 13.3, 22.1, 29.5) ---
@@ -182,9 +210,11 @@ SentPacketStep(s, ev) ==
       [] (s = 0 /\ ev = 4) -> 3 \* RESERVED + EV_ABORT_OR_IO_REJECTED -> BURNED (13.3)
       [] (s = 1 /\ ev = 3) -> 2 \* SUBMITTED + EV_IO_ACCEPTED -> EMITTED (29.5)
       [] (s = 1 /\ ev = 4) -> 3 \* SUBMITTED + EV_ABORT_OR_IO_REJECTED -> BURNED (29.5)
+      [] (s = 1 /\ ev = 5) -> 1 \* SUBMITTED + EV_RX_VALID_ACK -> SUBMITTED (29.5)
       [] (s = 2 /\ ev = 5) -> 4 \* EMITTED + EV_RX_VALID_ACK -> ACKED (13.3)
       [] (s = 2 /\ ev = 6) -> 5 \* EMITTED + EV_LOSS_DETECTED -> LOST (14.3)
       [] (s = 2 /\ ev = 7) -> 6 \* EMITTED + EV_ABANDON_EPOCH_OR_PATH -> ABANDONED (17.5)
+      [] (s = 2 /\ ev = 4) -> 3 \* EMITTED + EV_ABORT_OR_IO_REJECTED -> BURNED (29.5)
       [] (s = 4 /\ ev = 5) -> 4 \* ACKED + EV_RX_VALID_ACK -> ACKED (13.3)
       [] (s = 5 /\ ev = 5) -> 4 \* LOST + EV_RX_VALID_ACK -> ACKED (13.3)
       [] (s = 6 /\ ev = 5) -> 6 \* ABANDONED + EV_RX_VALID_ACK -> ABANDONED (13.3)
@@ -331,11 +361,26 @@ TerminalAbsorptionOK ==
     /\ \A ev \in ConnLifecycleEvents : ConnLifecycleStep(12, ev) = 12 \* ConnLifecycle.DEAD
     /\ \A ev \in CipherSelectionEvents : CipherSelectionStep(2, ev) = 2 \* CipherSelection.FAILED
     /\ \A ev \in StreamSlotEvents : StreamSlotStep(5, ev) = 5 \* StreamSlot.EXHAUSTED
-    /\ \A ev \in StreamSendEvents : StreamSendStep(2, ev) = 2 \* StreamSend.RESET
     /\ \A ev \in StreamSendEvents : StreamSendStep(3, ev) = 3 \* StreamSend.DONE
     /\ \A ev \in StreamRecvEvents : StreamRecvStep(2, ev) = 2 \* StreamRecv.RESET
     /\ \A ev \in StreamRecvEvents : StreamRecvStep(3, ev) = 3 \* StreamRecv.DONE
     /\ \A ev \in ECNValidationEvents : ECNValidationStep(2, ev) = 2 \* ECNValidation.BROKEN
+
+QuietTerminalNoClose ==
+    \A s \in (ConnLifecycle_Terminating \cup ConnLifecycle_Terminal) :
+        ConnLifecycleStep(s, 9) = s \* EV_LOCAL_CLOSE cannot re-enter CLOSING from terminal/terminating
+
+CipherImmutabilityOK ==
+    \A s \in CipherSelection_Locked, ev \in CipherSelectionEvents :
+        CipherSelectionStep(s, ev) = s \* I01: locked cipher never mutates
+
+LiveKeyedDisjointTerminating ==
+    /\ ConnLifecycle_LiveKeyed \subseteq ConnLifecycle_KeyBearing
+    /\ (ConnLifecycle_LiveKeyed \cap ConnLifecycle_Terminating) = {}
+
+SentAckVerifiableExact ==
+    /\ 0 \notin SentPacket_AckVerifiable \* UNISSUED never ACK-verifiable
+    /\ 3 \notin SentPacket_AckVerifiable \* BURNED never ACK-verifiable
 
 \* Normative Invariant Catalog (verified by explicit-state models):
 \* [I01] (Crypto, Section 4.6, 27.1): Cipher suite is selected at most once and never mutates across migration, resumption, or rekey.
@@ -375,6 +420,12 @@ TerminalAbsorptionOK ==
 \* [M17] (Parking, Section 35.8, 38.1): Waking never resumes bulk application TX before path readiness and credit backing are confirmed.
 \* [M21] (Memory, Section 12.2, 38.1): Frames carrying stale or future stream generations never allocate state or mutate the active generation.
 
-SafetyInvariants == TypeOK /\ TerminalAbsorptionOK
+SafetyInvariants ==
+    /\ TypeOK
+    /\ TerminalAbsorptionOK
+    /\ QuietTerminalNoClose
+    /\ CipherImmutabilityOK
+    /\ LiveKeyedDisjointTerminating
+    /\ SentAckVerifiableExact
 Spec == Init /\ [][Next]_vars
 =============================================================================

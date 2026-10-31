@@ -32,11 +32,11 @@ func connLifecycleMachine() MachineSpec {
 			{ID: 1, Name: "C_BUILD", EngineConst: "stCBuild", Predicates: []string{"HandshakePhase"}},
 			{ID: 2, Name: "C_WAIT_REPLY", EngineConst: "stCWaitReply", Predicates: []string{"HandshakePhase"}},
 			{ID: 3, Name: "C_VERIFY", EngineConst: "stCVerify", Predicates: []string{"HandshakePhase"}},
-			{ID: 4, Name: "C_FINISHING", EngineConst: "stCFinishing", Predicates: []string{"KeyBearing", "AppSendEligible"}},
+			{ID: 4, Name: "C_FINISHING", EngineConst: "stCFinishing", Predicates: []string{"KeyBearing", "LiveKeyed", "AppSendEligible"}},
 			{ID: 5, Name: "S_COLLECT", EngineConst: "stSCollect", Predicates: []string{"HandshakePhase"}},
 			{ID: 6, Name: "S_BUILD", EngineConst: "stSBuild", Predicates: []string{"HandshakePhase"}},
-			{ID: 7, Name: "S_FINISHING", EngineConst: "stSFinishing", Predicates: []string{"KeyBearing", "HandshakePhase"}},
-			{ID: 8, Name: "ESTABLISHED", EngineConst: "stEstablished", Predicates: []string{"KeyBearing", "AppSendEligible"}},
+			{ID: 7, Name: "S_FINISHING", EngineConst: "stSFinishing", Predicates: []string{"KeyBearing", "LiveKeyed", "HandshakePhase"}},
+			{ID: 8, Name: "ESTABLISHED", EngineConst: "stEstablished", Predicates: []string{"KeyBearing", "LiveKeyed", "AppSendEligible"}},
 			{ID: 9, Name: "CLOSING", EngineConst: "stClosing", Predicates: []string{"KeyBearing", "Terminating"}},
 			{ID: 10, Name: "DRAINING", EngineConst: "stDraining", Predicates: []string{"KeyBearing", "Terminating", "QuietTerminal"}},
 			{ID: 11, Name: "QUIESCING", EngineConst: "stQuiescing", Predicates: []string{"KeyBearing", "Terminating", "QuietTerminal"}},
@@ -57,10 +57,13 @@ func connLifecycleMachine() MachineSpec {
 			{ID: 11, Name: "EV_REMOTE_CLOSE"},
 			{ID: 12, Name: "EV_CLOSE_TIMEOUT"},
 			{ID: 13, Name: "EV_IO_PINS_DRAINED"},
-			{ID: 14, Name: "EV_ABORT_UNKEYED"},
+			{ID: 14, Name: "EV_LOCAL_FATAL"},
+			{ID: 15, Name: "EV_PROTOCOL_ERROR"},
+			{ID: 16, Name: "EV_SERVER_AUTH_FAILED"},
 		},
 		Predicates: []PredicateSpec{
 			{Name: "KeyBearing", GoFunc: "fsmConnIsKeyBearing", Doc: "reports whether the connection state holds installed epoch keys (Section 20.1)."},
+			{Name: "LiveKeyed", GoFunc: "fsmConnIsLiveKeyed", Doc: "reports whether the state is key-bearing and not terminating: APP_CLOSE and authenticated protocol errors enter CLOSING only from here (Section 20.2 rules 4-5)."},
 			{Name: "Terminating", GoFunc: "fsmConnIsTerminating", Doc: "reports whether the connection is in CLOSING, DRAINING, QUIESCING, or DEAD."},
 			{Name: "AppSendEligible", GoFunc: "fsmConnIsAppSendEligible", Doc: "reports whether application STREAM/DATAGRAM frames may be emitted."},
 			{Name: "HandshakePhase", GoFunc: "fsmConnIsHandshakePhase", Doc: "reports whether the connection is still in pre-established handshake progression."},
@@ -73,40 +76,66 @@ func connLifecycleMachine() MachineSpec {
 			{Name: "ActZeroizeSecrets", Bit: 1 << 3},
 			{Name: "ActWakeApp", Bit: 1 << 4},
 		},
-		Transitions: []TransitionSpec{
-			{From: 0, Event: 0, To: 1, Disp: DispTransition, SpecRef: "20.1"},
-			{From: 0, Event: 6, To: 5, Disp: DispTransition, SpecRef: "20.1"},
-			{From: 1, Event: 1, To: 2, Disp: DispTransition, SpecRef: "20.1"},
-			{From: 2, Event: 2, To: 1, Disp: DispTransition, SpecRef: "6.3"},
-			{From: 2, Event: 3, To: 3, Disp: DispTransition, SpecRef: "20.1"},
-			{From: 3, Event: 4, To: 4, Disp: DispTransition, Actions: []string{"ActInstallEpoch1", "ActWakeApp"}, SpecRef: "7.5"},
-			{From: 4, Event: 5, To: 8, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "7.6"},
-			{From: 5, Event: 7, To: 6, Disp: DispTransition, SpecRef: "20.1"},
-			{From: 6, Event: 8, To: 7, Disp: DispTransition, Actions: []string{"ActInstallEpoch1"}, SpecRef: "7.5"},
-			{From: 7, Event: 9, To: 8, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "7.6"},
-			// Unkeyed abort transitions directly to QUIESCING/DEAD
-			{From: 0, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			{From: 1, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			{From: 2, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			{From: 3, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			{From: 5, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			{From: 6, Event: 14, To: 11, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
-			// Key-bearing local close -> CLOSING
-			{From: 4, Event: 10, To: 9, Disp: DispTransition, Actions: []string{"ActEmitClose", "ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			{From: 7, Event: 10, To: 9, Disp: DispTransition, Actions: []string{"ActEmitClose", "ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			{From: 8, Event: 10, To: 9, Disp: DispTransition, Actions: []string{"ActEmitClose", "ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			// Key-bearing remote close -> DRAINING
-			{From: 4, Event: 11, To: 10, Disp: DispTransition, Actions: []string{"ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			{From: 7, Event: 11, To: 10, Disp: DispTransition, Actions: []string{"ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			{From: 8, Event: 11, To: 10, Disp: DispTransition, Actions: []string{"ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.3"},
-			{From: 9, Event: 11, To: 10, Disp: DispTransition, SpecRef: "20.3"},
-			// Close/drain timer expiry -> QUIESCING
-			{From: 9, Event: 12, To: 11, Disp: DispTransition, SpecRef: "20.3"},
-			{From: 10, Event: 12, To: 11, Disp: DispTransition, SpecRef: "20.3"},
-			// Quiescing completion -> DEAD
-			{From: 11, Event: 13, To: 12, Disp: DispTransition, Actions: []string{"ActZeroizeSecrets", "ActWakeApp"}, SpecRef: "20.3"},
-		},
+		Transitions: connLifecycleTransitions(),
 	}
+}
+
+// connLifecycleTransitions is the Section 20.3 table plus the Section 20.2
+// global rules that apply uniformly across state classes.
+func connLifecycleTransitions() []TransitionSpec {
+	const (
+		stNew, stCBuild, stCWaitReply, stCVerify, stCFinishing = 0, 1, 2, 3, 4
+		stSCollect, stSBuild, stSFinishing, stEstablished      = 5, 6, 7, 8
+		stClosing, stDraining, stQuiescing, stDead             = 9, 10, 11, 12
+	)
+	const (
+		evClientStart, evHelloBuilt, evRetry, evServerHello, evAuthOK = 0, 1, 2, 3, 4
+		evHandshakeDone, evAccept, evClientFlight, evServerBuilt      = 5, 6, 7, 8
+		evFinish, evLocalClose, evRemoteClose, evCloseTimeout         = 9, 10, 11, 12
+		evPinsDrained, evLocalFatal, evProtocolError, evAuthFail      = 13, 14, 15, 16
+	)
+	t := []TransitionSpec{
+		{From: stNew, Event: evClientStart, To: stCBuild, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stNew, Event: evAccept, To: stSCollect, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stCBuild, Event: evHelloBuilt, To: stCWaitReply, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stCWaitReply, Event: evRetry, To: stCWaitReply, Disp: DispStay, SpecRef: "6.3, 20.3"},
+		{From: stCWaitReply, Event: evServerHello, To: stCVerify, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stCVerify, Event: evAuthOK, To: stCFinishing, Disp: DispTransition, Actions: []string{"ActInstallEpoch1", "ActWakeApp"}, SpecRef: "20.3"},
+		{From: stCVerify, Event: evAuthFail, To: stCWaitReply, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stCFinishing, Event: evHandshakeDone, To: stEstablished, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
+		{From: stSCollect, Event: evClientFlight, To: stSBuild, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stSBuild, Event: evServerBuilt, To: stSFinishing, Disp: DispTransition, Actions: []string{"ActInstallEpoch1"}, SpecRef: "20.3"},
+		{From: stSFinishing, Event: evFinish, To: stEstablished, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.3"},
+		{From: stClosing, Event: evCloseTimeout, To: stQuiescing, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stDraining, Event: evCloseTimeout, To: stQuiescing, Disp: DispTransition, SpecRef: "20.3"},
+		{From: stQuiescing, Event: evPinsDrained, To: stDead, Disp: DispTransition, Actions: []string{"ActZeroizeSecrets", "ActWakeApp"}, SpecRef: "20.3"},
+	}
+	// Rules 4-5: in a live key-bearing state APP_CLOSE and authenticated
+	// protocol errors enter CLOSING, a valid peer CLOSE enters DRAINING.
+	// CLOSING/DRAINING/QUIESCING ignore all three (default disposition):
+	// a draining endpoint never re-enters CLOSING and its deadline never
+	// extends.
+	for _, s := range []uint8{stCFinishing, stSFinishing, stEstablished} {
+		t = append(t,
+			TransitionSpec{From: s, Event: evLocalClose, To: stClosing, Disp: DispTransition, Actions: []string{"ActEmitClose", "ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.2"},
+			TransitionSpec{From: s, Event: evProtocolError, To: stClosing, Disp: DispTransition, Actions: []string{"ActEmitClose", "ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.2"},
+			TransitionSpec{From: s, Event: evRemoteClose, To: stDraining, Disp: DispTransition, Actions: []string{"ActArmCloseTimer", "ActWakeApp"}, SpecRef: "20.2"},
+		)
+	}
+	// Without a safe sending key the same events enter QUIESCING silently.
+	for _, s := range []uint8{stNew, stCBuild, stCWaitReply, stCVerify, stSCollect, stSBuild} {
+		t = append(t,
+			TransitionSpec{From: s, Event: evLocalClose, To: stQuiescing, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.2"},
+			TransitionSpec{From: s, Event: evProtocolError, To: stQuiescing, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.2"},
+		)
+	}
+	// Rules 3 and 5: local faults, establishment/idle/lease expiry, AEAD
+	// and invalid-authentication limits stop emission from any state that
+	// is not already quiescing.
+	for s := uint8(stNew); s <= stDraining; s++ {
+		t = append(t, TransitionSpec{From: s, Event: evLocalFatal, To: stQuiescing, Disp: DispTransition, Actions: []string{"ActWakeApp"}, SpecRef: "20.2"})
+	}
+	return t
 }
 
 func cipherSelectionMachine() MachineSpec {
@@ -206,7 +235,7 @@ func streamSendMachine() MachineSpec {
 		States: []StateSpec{
 			{ID: 0, Name: "OPEN", EngineConst: "sendOpen", Predicates: []string{"Writable", "Retransmittable"}},
 			{ID: 1, Name: "FIN", EngineConst: "sendFin", Predicates: []string{"FinalSizeBound", "Retransmittable"}},
-			{ID: 2, Name: "RESET", EngineConst: "sendReset", Terminal: true, Predicates: []string{"FinalSizeBound", "Terminal"}},
+			{ID: 2, Name: "RESET", EngineConst: "sendReset", Predicates: []string{"FinalSizeBound", "Terminal"}},
 			{ID: 3, Name: "DONE", EngineConst: "sendDone", Terminal: true, Predicates: []string{"FinalSizeBound", "Terminal"}},
 		},
 		Events: []EventSpec{
@@ -232,6 +261,7 @@ func streamSendMachine() MachineSpec {
 			{From: 0, Event: 3, To: 2, Disp: DispTransition, Actions: []string{"ActFreezeFinalSize", "ActQueueReset", "ActCheckSlotRetire"}, SpecRef: "12.5"},
 			{From: 1, Event: 2, To: 3, Disp: DispTransition, Actions: []string{"ActCheckSlotRetire"}, SpecRef: "12.5"},
 			{From: 1, Event: 3, To: 2, Disp: DispTransition, Actions: []string{"ActQueueReset", "ActCheckSlotRetire"}, SpecRef: "12.5"},
+			{From: 2, Event: 2, To: 3, Disp: DispTransition, Actions: []string{"ActCheckSlotRetire"}, SpecRef: "12.5"},
 		},
 	}
 }
@@ -340,6 +370,9 @@ func pathValidationMachine() MachineSpec {
 			{ID: 5, Name: "EV_DEMOTE_TO_OLD"},
 			{ID: 6, Name: "EV_VALIDATION_OR_PATH_FAIL"},
 			{ID: 7, Name: "EV_RELEASE_SLOT"},
+			{ID: 8, Name: "EV_REVALIDATE"},
+			{ID: 9, Name: "EV_RETAINED_REVALIDATION_EXPIRED"},
+			{ID: 10, Name: "EV_FALLBACK_TO_RETAINED"},
 		},
 		Predicates: []PredicateSpec{
 			{Name: "ControlSendEligible", GoFunc: "fsmPathIsControlSendEligible", Doc: "reports whether validation/control frames may be emitted on the path."},
@@ -370,6 +403,15 @@ func pathValidationMachine() MachineSpec {
 			{From: 5, Event: 6, To: 6, Disp: DispTransition, Actions: []string{"ActAbandonInFlight"}, SpecRef: "17.5"},
 			{From: 5, Event: 7, To: 0, Disp: DispTransition, Actions: []string{"ActAbandonInFlight"}, SpecRef: "17.5"},
 			{From: 6, Event: 7, To: 0, Disp: DispTransition, SpecRef: "17.5"},
+			// Parked-path wake / resume needs fresh proof (17.7 ACTIVE/OLD row).
+			{From: 4, Event: 8, To: 1, Disp: DispTransition, Actions: []string{"ActIssueChallenge"}, SpecRef: "17.7"},
+			{From: 5, Event: 8, To: 1, Disp: DispTransition, Actions: []string{"ActIssueChallenge"}, SpecRef: "17.7"},
+			// An expired revalidation of a retained path returns it to OLD;
+			// its retention deadline still bounds its lifetime.
+			{From: 1, Event: 9, To: 5, Disp: DispTransition, SpecRef: "17.5"},
+			{From: 2, Event: 9, To: 5, Disp: DispTransition, SpecRef: "17.5"},
+			// Controlled fallback to a still-authorized retained path.
+			{From: 5, Event: 10, To: 4, Disp: DispTransition, Actions: []string{"ActInstallActive"}, SpecRef: "17.5"},
 		},
 	}
 }
@@ -394,6 +436,7 @@ func pathRoleMachine() MachineSpec {
 			{ID: 2, Name: "EV_PROMOTE_CANDIDATE"},
 			{ID: 3, Name: "EV_DEMOTE_ACTIVE"},
 			{ID: 4, Name: "EV_RECLAIM"},
+			{ID: 5, Name: "EV_FALLBACK_TO_RETAINED"},
 		},
 		Predicates: []PredicateSpec{
 			{Name: "Allocated", GoFunc: "fsmPathRoleIsAllocated", Doc: "reports whether the path table slot holds a live role."},
@@ -409,6 +452,7 @@ func pathRoleMachine() MachineSpec {
 			{From: 1, Event: 4, To: 0, Disp: DispTransition, Actions: []string{"ActResetPathState"}, SpecRef: "17.3"},
 			{From: 2, Event: 3, To: 3, Disp: DispTransition, SpecRef: "17.5"},
 			{From: 3, Event: 4, To: 0, Disp: DispTransition, Actions: []string{"ActResetPathState"}, SpecRef: "17.5"},
+			{From: 3, Event: 5, To: 2, Disp: DispTransition, SpecRef: "17.5"},
 		},
 	}
 }
@@ -462,9 +506,15 @@ func sentPacketMachine() MachineSpec {
 			{From: 0, Event: 4, To: 3, Disp: DispTransition, SpecRef: "13.3"},
 			{From: 1, Event: 3, To: 2, Disp: DispTransition, Actions: []string{"ActChargeInFlight"}, SpecRef: "29.5"},
 			{From: 1, Event: 4, To: 3, Disp: DispTransition, Actions: []string{"ActRequeueItems"}, SpecRef: "29.5"},
+			// An ACK can overtake the I/O completion of a SUBMITTED packet; it
+			// waits for acceptance instead of raising ACK_RANGE_ERROR (A01).
+			{From: 1, Event: 5, To: 1, Disp: DispIgnore, SpecRef: "29.5"},
 			{From: 2, Event: 5, To: 4, Disp: DispTransition, Actions: []string{"ActReleaseInFlight", "ActRetireItems"}, SpecRef: "13.3"},
 			{From: 2, Event: 6, To: 5, Disp: DispTransition, Actions: []string{"ActReleaseInFlight", "ActRequeueItems"}, SpecRef: "14.3"},
 			{From: 2, Event: 7, To: 6, Disp: DispTransition, Actions: []string{"ActReleaseInFlight", "ActRequeueItems"}, SpecRef: "17.5"},
+			// A queued socket adapter commits emission optimistically and
+			// reports rejection later; the PN burns and its items requeue.
+			{From: 2, Event: 4, To: 3, Disp: DispTransition, Actions: []string{"ActReleaseInFlight", "ActRequeueItems"}, SpecRef: "29.5"},
 			// Late ACK on already-resolved packets is idempotent (never double-releases in-flight)
 			{From: 4, Event: 5, To: 4, Disp: DispStay, SpecRef: "13.3"},
 			{From: 5, Event: 5, To: 4, Disp: DispTransition, Actions: []string{"ActRetireItems"}, SpecRef: "13.3"},

@@ -72,7 +72,7 @@ type Config struct {
 	ExpectedKey  [32]byte
 	ServerCert   *ServerIdentity // server: signing identity
 	TrustAnchors [][32]byte      // client: CHAIN anchors
-	NowUnix      func() int64    // credential/ticket time source
+	NowUnix      func() int64    // credential/ticket time source; nil = system clock
 	// ReplayLedger consumes (domain,ticketID) durably before early exposure.
 	ReplayLedger ReplayLedger
 	// TicketStore issues/opens resumption tickets (server side).
@@ -124,6 +124,15 @@ type Config struct {
 	DisableAES bool
 	// NowUS overrides the monotonic microsecond clock source (for deterministic simulation).
 	NowUS func() uint64
+}
+
+// nowUnix is the wall clock for ticket and credential expiry. A nil
+// NowUnix must not freeze time at zero: that makes tickets immortal.
+func (c *Config) nowUnix() int64 {
+	if c.NowUnix != nil {
+		return c.NowUnix()
+	}
+	return time.Now().Unix()
 }
 
 // Listener admission modes for new attempts (spec sections 6 and 20.1).
@@ -570,6 +579,9 @@ type connCore struct {
 	// bounded attempt pool (spec sections 20.1/37.6); released exactly
 	// once at handshake confirmation or death.
 	attemptHeld bool
+	// attemptTokenless marks an attempt admitted without an address token,
+	// charged against the listener's tokenless share until release.
+	attemptTokenless bool
 
 	// durable local reset secret (client: random per conn; server: config)
 	resetSecret [32]byte
@@ -846,7 +858,15 @@ func (c *Conn) postWait(cmd *appCmd) appResult {
 	case r := <-cmd.res:
 		return r
 	case <-c.done:
-		return appResult{err: errClosed}
+		// The owner may have answered and then died in the same loop
+		// iteration; leaving that result buffered would hand it to the
+		// next pooled user of cmd, possibly on another connection.
+		select {
+		case r := <-cmd.res:
+			return r
+		default:
+			return appResult{err: errClosed}
+		}
 	}
 }
 

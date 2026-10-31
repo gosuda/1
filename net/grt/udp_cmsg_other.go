@@ -1,13 +1,23 @@
-//go:build !linux && !darwin && !freebsd && !netbsd && !openbsd
+//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd
 
 package grt
 
-import "net/netip"
+import (
+	"net"
+	"net/netip"
+)
 
-func parseRecvOOB(oob []byte) (dst netip.Addr, ecn uint8) {
+// Platforms without a control-message implementation (Windows, Plan 9,
+// js/wasip1, ...) send without source selection or ECN marking, leave
+// the kernel's default fragmentation policy in place, and report the
+// bound address as the datagram destination.
+
+func configureSocket(*net.UDPConn, bool) {}
+
+func parseRecvOOB([]byte) (dst netip.Addr, ecn uint8) {
 	return netip.Addr{}, 0
 }
 
-func buildSendOOB(oob []byte, src netip.Addr, dst netip.AddrPort, ecn uint8) int {
+func buildSendOOB([]byte, netip.Addr, netip.AddrPort, uint8) int {
 	return 0
 }

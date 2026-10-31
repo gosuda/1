@@ -38,9 +38,22 @@ func GenerateEngineGo() ([]byte, error) {
 	b.WriteString("\tfsmDispInvalidState  uint8 = 4\n")
 	b.WriteString(")\n\n")
 
+	b.WriteString("// Machine identifiers passed to fsmViolation.\n")
+	b.WriteString("const (\n")
+	for i, cm := range machines {
+		fmt.Fprintf(&b, "\tfsmMachine%s uint8 = %d\n", cm.Spec.Name, i)
+	}
+	b.WriteString(")\n\n")
+	b.WriteString("var fsmMachineNames = [...]string{\n")
+	for _, cm := range machines {
+		fmt.Fprintf(&b, "\t%q,\n", cm.Spec.Name)
+	}
+	b.WriteString("}\n\n")
+
 	for _, cm := range machines {
 		emitMachineGo(&b, cm)
 	}
+	emitEngineConstAssertions(&b, machines)
 
 	for _, g := range gates {
 		emitGateGo(&b, g)
@@ -109,6 +122,15 @@ func emitMachineGo(b *bytes.Buffer, cm *CompiledMachine) {
 	fmt.Fprintf(b, "\treturn uint(from) < %d && (uint16(1)<<uint(to))&%sValidNext[from] != 0\n", numStates, m.GoPrefix)
 	fmt.Fprintf(b, "}\n\n")
 
+	fmt.Fprintf(b, "// %sSet assigns *p = to and reports a transition outside the verified %s\n", m.GoPrefix, m.Name)
+	fmt.Fprintf(b, "// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.\n")
+	fmt.Fprintf(b, "func %sSet(p *%s, to %s) {\n", m.GoPrefix, m.StateType, m.StateType)
+	fmt.Fprintf(b, "\tif !%sCanTransition(*p, to) {\n", m.GoPrefix)
+	fmt.Fprintf(b, "\t\tfsmViolation(fsmMachine%s, uint8(*p), uint8(to))\n", m.Name)
+	fmt.Fprintf(b, "\t}\n")
+	fmt.Fprintf(b, "\t*p = to\n")
+	fmt.Fprintf(b, "}\n\n")
+
 	// Total [State][Event] transition lookup table
 	fmt.Fprintf(b, "var %sTable = [%d][%d]fsmStepResult{\n", m.GoPrefix, numStates, numEvents)
 	for s := range numStates {
@@ -129,6 +151,23 @@ func emitMachineGo(b *bytes.Buffer, cm *CompiledMachine) {
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn %sTable[s][ev]\n", m.GoPrefix)
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// emitEngineConstAssertions pins every IR state ID to its engine constant
+// at compile time (stringer idiom): reordering either side breaks the build
+// instead of silently corrupting the bitmask predicates.
+func emitEngineConstAssertions(b *bytes.Buffer, machines []*CompiledMachine) {
+	b.WriteString("func _() {\n")
+	b.WriteString("\tvar x [1]struct{}\n")
+	for _, cm := range machines {
+		for _, st := range cm.Spec.States {
+			if st.EngineConst == "" {
+				continue
+			}
+			fmt.Fprintf(b, "\t_ = x[%s-%d]\n", st.EngineConst, st.ID)
+		}
+	}
+	b.WriteString("}\n\n")
 }
 
 func emitGateGo(b *bytes.Buffer, g GateSpec) {

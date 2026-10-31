@@ -21,9 +21,13 @@ func (c *Conn) applyReset(sid wire.StreamID, final uint64, code uint32) {
 		c.core.connRxUsed += final - r.high
 		r.high = final
 	}
-	r.state = recvReset
+	fsmRecvSet(&r.state, recvReset)
 	r.resetCode = code
 	s.readTerm, s.readTermGen = termReset, s.gen
+	if r.high > r.base {
+		c.core.connRxAdv += r.high - r.base
+		r.base = r.high
+	}
 	r.releaseAll() // discard incomplete retained data
 	c.retireCheck(s, sid)
 	notify(c.readWake)
@@ -62,7 +66,7 @@ func (c *Conn) queueStreamReset(s *streamSlot, sid wire.StreamID) {
 	if sh.resetCode == 0 {
 		sh.resetCode = wire.ErrApplicationAbort
 	}
-	sh.state = sendReset
+	fsmSendSet(&sh.state, sendReset)
 	sh.unsent = rangeSet{} // abandon unsent/retransmittable bytes
 	sh.retx = rangeSet{}
 	sh.unacked = rangeSet{}
@@ -85,7 +89,7 @@ func (c *Conn) applyRetire(sid wire.StreamID) {
 		if sid.Generation() != s.gen {
 			return
 		}
-		s.state = slotRetirePending
+		fsmSlotSet(&s.state, slotRetirePending)
 		c.maybeRetireAck(s, sid)
 	case slotRetirePending:
 		// The ACK obligation is already queued; it emits once local
@@ -109,7 +113,7 @@ func (c *Conn) maybeRetireAck(s *streamSlot, sid wire.StreamID) {
 	if !slotLocalDone(s) {
 		return
 	}
-	s.state = slotRetiredWaitOpen
+	fsmSlotSet(&s.state, slotRetiredWaitOpen)
 	c.queueCtrl(ctrlRetireAck, sid.Slot(), uint64(sid), s.gen, 0, [16]byte{})
 	core := c.core
 	class := sid.Class()
@@ -171,11 +175,11 @@ func (c *Conn) applyRetireAck(sid wire.StreamID) {
 	}
 	s.send, s.recv = nil, nil
 	if s.gen >= wire.MaxGeneration {
-		s.state = slotExhausted
+		fsmSlotSet(&s.state, slotExhausted)
 		return
 	}
 	s.gen++
-	s.state = slotEmpty
+	fsmSlotSet(&s.state, slotEmpty)
 	s.openAcked = false
 	notify(c.writeWake)
 }
@@ -200,7 +204,9 @@ func (c *Conn) ackStreamRange(sid wire.StreamID, lo, hi uint64, flags uint16) {
 	sh.advanceBase()
 	notify(c.writeWake)
 	if sh.state == sendFin && !sh.finPending && sh.unacked.empty() {
-		sh.state = sendDone
+		fsmSendSet(&sh.state, sendDone)
+		sh.buf = nil
+		sh.head = 0
 		c.retireCheck(s, sid)
 	}
 }
@@ -233,6 +239,6 @@ func (c *Conn) maybeRetire(s *streamSlot, sid wire.StreamID) {
 	if !slotLocalDone(s) {
 		return
 	}
-	s.state = slotRetireSent
+	fsmSlotSet(&s.state, slotRetireSent)
 	c.queueCtrl(ctrlRetire, sid.Slot(), uint64(sid), s.gen, 0, [16]byte{})
 }

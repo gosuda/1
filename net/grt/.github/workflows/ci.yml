@@ -8,7 +8,7 @@ on:
 
 jobs:
   lint:
-    name: Lint & Format Check
+    name: Lint, Format & Cross-OS Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -29,11 +29,25 @@ jobs:
             exit 1
           fi
 
+      - name: Verify Formal Codegen Up-To-Date
+        run: |
+          go run ./cmd/grtgen
+          git diff --exit-code
+
       - name: Static Analysis (go vet)
         run: go vet ./...
 
+      - name: Vulnerability Check (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Cross-OS Compile Check
+        run: |
+          for goos in linux darwin windows freebsd openbsd; do
+            GOOS=$goos GOARCH=amd64 go build ./...
+          done
+
   unit-test:
-    name: Unit Tests (${{ matrix.os }})
+    name: Unit & Fuzz Smoke Tests (${{ matrix.os }})
     needs: lint
     strategy:
       fail-fast: false
@@ -52,6 +66,11 @@ jobs:
 
       - name: Run Unit Tests (with Race Detector)
         run: go test -v -race -timeout 5m ./internal/formal/... ./internal/wire/... ./internal/crypto/... ./internal/engine/... .
+
+      - name: Run Wire Parser Fuzz Smoke Tests
+        run: |
+          go test -fuzz=^FuzzParseFrames$ -fuzztime=5s ./internal/wire
+          go test -fuzz=^FuzzParseFragment$ -fuzztime=5s ./internal/wire
 
   dst-matrix:
     name: DST Seed ${{ matrix.seed }} (${{ matrix.os }})

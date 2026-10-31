@@ -24,7 +24,7 @@ func (c *Conn) serverBuild() {
 	// needs: quiesce scrubs handshake residue before we get here.
 	msg := core.hs.cliMsg
 	c.serverFlight()
-	if core.state != stDead || core.hs.hasToken || core.listener == nil {
+	if core.state != stDead || core.termErr == errClosed || core.hs.hasToken || core.listener == nil {
 		return
 	}
 	// Tokenless admission fallback: a failed bootstrap earns at most one
@@ -211,7 +211,7 @@ func (c *Conn) serverFlight() {
 	gc.DeriveEstablished(&hs, core.hs.cliMsg, serverMsg, cipher)
 	// Commit state.
 	core.cipher = cipher
-	core.cipherSt = cipherLocked
+	fsmCipherSet(&core.cipherSt, cipherLocked)
 	p, ok := wire.DecodeParams(cm.Params[:])
 	if !ok {
 		c.quiesce(fmt.Errorf("grt: serverhs L171: %w", errHandshakeFailed))
@@ -291,17 +291,14 @@ func (c *Conn) serverFlight() {
 	core.slots.peerLimit[classIdx(true, c.ourInitiator())] = uint32(core.peer.InitialUniSlots)
 	core.slots.localLimit[classIdx(false, c.peerInitiator())] = uint32(core.local.InitialBidiSlots)
 	core.slots.localLimit[classIdx(true, c.peerInitiator())] = uint32(core.local.InitialUniSlots)
+	if core.listener != nil && !core.listener.admitAccepted(c) {
+		c.quiesce(errClosed)
+		return
+	}
 	if earlyStatus == 1 {
 		c.commitEarly(earlyFrames)
 	}
-	if core.listener != nil {
-		core.listener.registerConn(c)
-		select {
-		case core.listener.accept <- c:
-		default:
-		}
-	}
-	core.state = stSFinishing
+	c.mustFireConn(fsmConn_EV_SERVER_HELLO_BUILT)
 }
 
 // checkTicket validates a presented resumption ticket: envelope, service,
@@ -309,7 +306,7 @@ func (c *Conn) serverFlight() {
 // On success it writes the ticket PSK into pskOut.
 func (c *Conn) checkTicket(cm *wire.ClientMessage, ch0End, noBinder int, pskOut *[32]byte) bool {
 	core := c.core
-	tp, err := gc.OpenTicket(core.cfg.TicketKey, cm.Ticket)
+	tp, err := c.openTicket(cm.Ticket)
 	if err != nil {
 		return false
 	}
@@ -317,10 +314,7 @@ func (c *Conn) checkTicket(cm *wire.ClientMessage, ch0End, noBinder int, pskOut 
 	meta := gc.DecodeTicketMeta(cm.TicketMetadata[:])
 	svc := c.serviceHash()
 	mh := sha256.Sum256(cm.TicketMetadata[:])
-	var nowS uint64
-	if core.cfg.NowUnix != nil {
-		nowS = uint64(core.cfg.NowUnix())
-	}
+	nowS := uint64(core.cfg.nowUnix())
 	serviceOK := tp.ServiceHash == svc && meta.ServiceHash == svc
 	metaOK := tp.TicketID == meta.TicketID && tp.MetadataHash == mh &&
 		tp.ExpiresUnixS == meta.ExpiresUnixS
@@ -465,7 +459,7 @@ func (c *Conn) tryEarlyData(cm *wire.ClientMessage, psk [32]byte, ch0End, noBind
 		}
 	}
 	// Replay ledger: durable consume before any exposure.
-	tp, terr := gc.OpenTicket(core.cfg.TicketKey, cm.Ticket)
+	tp, terr := c.openTicket(cm.Ticket)
 	if terr != nil {
 		return nil, zero
 	}

@@ -37,7 +37,6 @@ func (c *Conn) issueTicket() {
 		return
 	}
 	prefix, counter := core.cfg.TicketIssuer()
-	nonce := gc.TicketNonceIssue(prefix, counter)
 	// Ticket ID binds the unique issuer nonce material so distinct
 	// issuances never share a replay-ledger identity.
 	var ib [24]byte
@@ -49,10 +48,11 @@ func (c *Conn) issueTicket() {
 	var tp gc.TicketPlain
 	tp.PSK = gc.TicketPSK(core.resumptionMaster, id)
 	tp.TicketID = id
-	var nowS uint64
-	if core.cfg.NowUnix != nil {
-		nowS = uint64(core.cfg.NowUnix())
+	now := core.cfg.nowUnix()
+	if now < 0 {
+		return
 	}
+	nowS := uint64(now)
 	tp.IssuedUnixS = nowS
 	tp.ExpiresUnixS = nowS + gc.TicketMaxLifetimeS
 	tp.ServiceHash = c.serviceHash()
@@ -69,13 +69,32 @@ func (c *Conn) issueTicket() {
 	mb := gc.EncodeTicketMeta(&meta)
 	tp.MetadataHash = sha256.Sum256(mb[:])
 	plain := gc.EncodeTicketPlain(&tp)
-	ticket := gc.SealTicket(core.cfg.TicketKey, core.cfg.TicketKeyID, nonce, plain)
+	tm := c.ticketMaster()
+	ticket, err := tm.Seal(now, prefix, counter, &plain)
+	tm.Zeroize()
 	tp.PSK = [32]byte{}
 	gc.Zeroize(plain[:])
+	if err != nil {
+		return
+	}
 	body := make([]byte, wire.TicketMetaBytes+wire.TicketBytes)
 	copy(body[:], mb[:])
 	copy(body[wire.TicketMetaBytes:], ticket[:])
 	c.queueCtrlBody(ctrlNewTicket, body)
+}
+
+// ticketMaster wraps the configured master; envelope keys rotate per
+// period and 2^24-issuance block beneath it (spec section 9.1).
+func (c *Conn) ticketMaster() gc.TicketMaster {
+	return gc.TicketMaster{Key: c.core.cfg.TicketKey, Generation: c.core.cfg.TicketKeyID}
+}
+
+// openTicket opens a presented ticket under the current or previous
+// period key.
+func (c *Conn) openTicket(ticket []byte) (gc.TicketPlain, error) {
+	tm := c.ticketMaster()
+	defer tm.Zeroize()
+	return tm.Open(c.core.cfg.nowUnix(), ticket)
 }
 
 // queueCtrlBody queues a control item whose full body travels in it.body.
@@ -103,7 +122,7 @@ func (c *Conn) issueReuseToken() {
 		return
 	}
 	p := &core.paths[core.activePth]
-	tok, ok := core.listener.tokens.IssueReuse(p.remote, p.local)
+	tok, ok := core.listener.issueReuseToken(p.remote, p.local)
 	if !ok {
 		return
 	}

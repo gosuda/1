@@ -34,13 +34,7 @@ func (c *Conn) appCommand(cmd *appCmd) {
 	case acDatagram:
 		r.err = c.appDatagram(cmd.data)
 	case acClose:
-		core.closeCode = closeCode(cmd.code)
-		if core.state.keyBearing() {
-			core.state = stClosing
-			core.arm(tkClose, nowUS()+3*c.ptoUS())
-		} else {
-			c.quiesce(nil)
-		}
+		c.localClose(closeCode(cmd.code))
 	case acMigrate:
 		r.err = c.appMigrate(cmd)
 	case acPark:
@@ -135,7 +129,7 @@ func (c *Conn) openStream(uni bool) (uint64, error) {
 		return 0, errWouldBlock
 	}
 	s := core.slots.ensureSlot(class, slot)
-	s.state = slotActive
+	fsmSlotSet(&s.state, slotActive)
 	s.readTerm = termNone // a new generation retires the old terminal
 	// s.gen already holds the expected generation: zero for a fresh slot,
 	// one past the retired generation after a confirmed RETIRE_ACK.
@@ -192,7 +186,8 @@ func (c *Conn) appWrite(sid64 uint64, data []byte) (int, error) {
 		sh.head = 0
 	}
 	if cap(sh.buf) == 0 {
-		sh.buf = make([]byte, 0, 256*1024)
+		initCap := min(max(256*1024, int(core.peer.InitialStreamWindow)), 1024*1024)
+		sh.buf = make([]byte, 0, initCap)
 	}
 	sh.buf = append(sh.buf, data...)
 	sh.unsent.add(sh.end, sh.end+uint64(len(data)))
@@ -215,7 +210,7 @@ func (c *Conn) appFin(sid64 uint64) error {
 	if s.state != slotActive || !sh.live() {
 		return errClosed
 	}
-	sh.state = sendFin
+	fsmSendSet(&sh.state, sendFin)
 	sh.final = sh.end
 	sh.finPending = true
 	return nil
@@ -289,7 +284,7 @@ func (c *Conn) appConsume(sid64 uint64, dst []byte) (int, error) {
 		}
 	}
 	if r.state == recvFin && r.finalKnown && r.base >= r.final && r.allConsumed() {
-		r.state = recvDone
+		fsmRecvSet(&r.state, recvDone)
 		s.readTerm, s.readTermGen = termEOF, s.gen
 		// Retirement may have been waiting on these unread bytes;
 		// re-check now that the half is terminal (section 21.1).

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"testing"
 
 	"filippo.io/edwards25519"
@@ -214,15 +215,46 @@ func TestMLKEMRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss2 := MLKEM768Decaps(kp.Seed, ct[:])
+	ss2, err := MLKEM768Decaps(kp.Seed, ct[:])
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ss != ss2 {
 		t.Fatal("ML-KEM shared secrets differ")
 	}
 	// Corrupted ciphertext must give a different (implicit-rejection) secret.
 	ct[0] ^= 1
-	ss3 := MLKEM768Decaps(kp.Seed, ct[:])
+	ss3, err := MLKEM768Decaps(kp.Seed, ct[:])
+	if err != nil {
+		t.Fatalf("tampered full-length ciphertext returned %v; implicit rejection must not error", err)
+	}
 	if ss3 == ss {
 		t.Fatal("corrupted CT produced same secret")
+	}
+}
+
+func TestMLKEMDecapsRejectsShortCiphertext(t *testing.T) {
+	kp, err := GenerateMLKEM768()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss, err := MLKEM768Decaps(kp.Seed, make([]byte, 1087))
+	if !errors.Is(err, ErrKEMCiphertext) {
+		t.Fatalf("1087-byte ciphertext: err = %v, want ErrKEMCiphertext", err)
+	}
+	if ss != ([32]byte{}) {
+		t.Fatal("failed decapsulation returned a non-zero secret")
+	}
+}
+
+func TestMLKEMEncapsRejectsMalformedKey(t *testing.T) {
+	if _, _, err := MLKEM768Encaps(make([]byte, 1183)); !errors.Is(err, ErrKEMKey) {
+		t.Fatalf("1183-byte key: err = %v, want ErrKEMKey", err)
+	}
+	// A coefficient >= q = 3329 fails the FIPS 203 modulus check.
+	ek := bytes.Repeat([]byte{0xff}, 1184)
+	if _, _, err := MLKEM768Encaps(ek); !errors.Is(err, ErrKEMKey) {
+		t.Fatalf("out-of-range coefficients: err = %v, want ErrKEMKey", err)
 	}
 }
 

@@ -13,18 +13,28 @@ import (
 	"gosuda.org/grt/internal/engine"
 )
 
+// sendOOBSize bounds the ancillary data of one send: a source-address
+// message, an ECN message, and (Linux GSO) a UDP_SEGMENT message.
+const sendOOBSize = 128
+
 // UDPSocket is the portable socket-profile adapter (spec section 29.1).
 // It wraps a UDP socket with per-packet destination-address delivery
-// (IP_PKTINFO / IPV6_PKTINFO) so the engine always sees the canonical
-// local endpoint of section 6.2 — the actual destination address and
-// port, not the wildcard bind address.
+// (IP_PKTINFO / IP_RECVDSTADDR / IPV6_PKTINFO) so the engine always sees
+// the canonical local endpoint of section 6.2 — the actual destination
+// address and port, not the wildcard bind address.
 //
-// ECN: inbound markings are read from IPV6_TCLASS where the platform
-// supplies them; outbound marking is applied per packet on IPv6 via
-// IPV6_TCLASS. The IPv4 control path carries no portable per-packet TOS
-// through this interface, so IPv4 sends leave ECN unmarked — safe
-// because ECT marking starts only after negotiated capability probing
-// (spec section 15.4).
+// Fragmentation (spec section 17.2): IPv4 sends set Don't Fragment where
+// the platform offers a socket option (Linux IP_PMTUDISC_PROBE, darwin
+// and FreeBSD IP_DONTFRAG) and IPv6 sends never fragment locally (Linux
+// IPV6_PMTUDISC_PROBE, BSD IPV6_DONTFRAG). A datagram larger than the
+// local interface MTU then fails its send with EMSGSIZE; that rejection
+// is per datagram and leaves the socket usable.
+//
+// ECN: outbound codepoints use IP_TOS for IPv4 and IPv4-mapped
+// destinations (Linux, darwin, FreeBSD) and IPV6_TCLASS for IPv6.
+// Inbound codepoints come from IP_RECVTOS and IPV6_RECVTCLASS. Platforms
+// without these interfaces send unmarked and report Not-ECT, which the
+// ECN validation of spec section 15.4 detects and disables.
 type UDPSocket struct {
 	conn        *net.UDPConn
 	p4          *ipv4.PacketConn // non-nil when bound to an IPv4 endpoint
@@ -35,9 +45,8 @@ type UDPSocket struct {
 
 // ListenUDP binds a UDP socket for the transport. A nil or wildcard
 // addr binds an ephemeral port; an IPv6 wildcard gets dual-stack where
-// the platform permits. The returned socket implements
-// engine.PacketSocket; callers normally use Listen or Dial instead of
-// driving it directly.
+// the platform permits. The returned socket implements PacketSocket;
+// callers normally use Listen or Dial instead of driving it directly.
 func ListenUDP(addr *net.UDPAddr) (*UDPSocket, error) {
 	return listenUDP("udp", addr)
 }
@@ -56,10 +65,12 @@ func listenUDP(network string, addr *net.UDPAddr) (*UDPSocket, error) {
 		// bound address which is still canonical for non-wildcard binds.
 		_ = p4.SetControlMessage(ipv4.FlagDst, true)
 		s.p4 = p4
+		configureSocket(conn, true)
 	} else {
 		p6 := ipv6.NewPacketConn(conn)
 		_ = p6.SetControlMessage(ipv6.FlagDst|ipv6.FlagTrafficClass, true)
 		s.p6 = p6
+		configureSocket(conn, false)
 	}
 	return s, nil
 }
@@ -76,12 +87,13 @@ func DialUDPSocket(remote netip.AddrPort) (*UDPSocket, error) {
 }
 
 // Send publishes one datagram to dst with ECN codepoint ecn (0–3).
-// A nil return commits the packet to EMITTED (spec section 29.3).
+// A nil return commits the packet to EMITTED (spec section 29.3); an
+// error, including EMSGSIZE for a datagram above the local MTU, means
+// the datagram was definitely not accepted (IO_REJECT, section 29.5).
 func (s *UDPSocket) Send(payload []byte, dst netip.AddrPort, ecn uint8) error {
-	if ecn != 0 && dst.Addr().Is6() && !dst.Addr().Is4In6() {
-		var oob [64]byte
-		n := buildSendOOB(oob[:], netip.Addr{}, dst, ecn)
-		if n > 0 {
+	if ecn != 0 {
+		var oob [sendOOBSize]byte
+		if n := buildSendOOB(oob[:], netip.Addr{}, dst, ecn); n > 0 {
 			_, _, err := s.conn.WriteMsgUDPAddrPort(payload, oob[:n], dst)
 			return err
 		}
@@ -98,7 +110,7 @@ func (s *UDPSocket) Send(payload []byte, dst netip.AddrPort, ecn uint8) error {
 func (s *UDPSocket) SendFrom(payload []byte, src, dst netip.AddrPort, ecn uint8) error {
 	ip := src.Addr().Unmap()
 	if src != s.addr && ip.IsValid() && !ip.IsUnspecified() && ip != s.addr.Addr().Unmap() {
-		var oob [64]byte
+		var oob [sendOOBSize]byte
 		n := buildSendOOB(oob[:], ip, dst, ecn)
 		if n > 0 {
 			_, _, err := s.conn.WriteMsgUDPAddrPort(payload, oob[:n], dst)

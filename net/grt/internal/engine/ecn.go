@@ -47,7 +47,7 @@ func (c *Conn) applyECN(a *wire.AckFrame, pi int, now uint64) {
 		e0+ce > p.sentECT0 ||
 		e0+ce-(p.lastAckECT0+p.lastAckCE) < newAckE0
 	if bad {
-		p.ecn = ecnBroken
+		fsmECNSet(&p.ecn, ecnBroken)
 		p.ecnDisabled = true
 		return
 	}
@@ -57,7 +57,7 @@ func (c *Conn) applyECN(a *wire.AckFrame, pi int, now uint64) {
 	core.ackLargestPN, core.ackLargestOK = largest, true
 
 	if p.ecn == ecnUnknown && p.ackedECT0 >= 3 {
-		p.ecn = ecnCapable // three consistent marked acknowledgments
+		fsmECNSet(&p.ecn, ecnCapable) // three consistent marked acknowledgments
 	}
 	if ceNew {
 		// Congestion event once per recovery boundary.

@@ -21,7 +21,7 @@ func TestGeneratedFSMAlignmentAndZeroAlloc(t *testing.T) {
 	}
 
 	// Verify DEAD is absorbing across all events.
-	for ev := uint8(0); ev <= fsmConn_EV_ABORT_UNKEYED; ev++ {
+	for ev := uint8(0); ev <= fsmConn_EV_SERVER_AUTH_FAILED; ev++ {
 		res := fsmConnStep(stDead, ev)
 		if connState(res.next) != stDead || res.actions != 0 {
 			t.Fatalf("stDead not absorbing on ev=%d: %+v", ev, res)

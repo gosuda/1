@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha512"
 	"errors"
@@ -96,25 +97,30 @@ func XEdDSASign(priv []byte, msg, random []byte) ([64]byte, error) {
 	// -a (mod q) encoding when the point had to be negated — matching
 	// the reference crypto_sign_modified.
 	var aKey [32]byte
+	defer Zeroize(aKey[:])
 	copy(aKey[:], priv)
 	aKey[0] &= 0xf8
 	aKey[31] &= 0x7f
 	aKey[31] |= 0x40
 	if encA[31]&0x80 != 0 {
-		a = new(edwards25519.Scalar).Negate(a)
+		a.Negate(a)
 		copy(aKey[:], a.Bytes())
 		encA[31] &= 0x7f
 	}
+	defer a.Set(edwards25519.NewScalar())
 	// r = hash1(a || M || Z) mod q
 	h := sha512.New()
 	h.Write(xeddsaHash1Prefix[:])
 	h.Write(aKey[:])
 	h.Write(msg)
 	h.Write(random)
-	r, err := new(edwards25519.Scalar).SetUniformBytes(h.Sum(nil))
+	digest := h.Sum(nil)
+	defer Zeroize(digest)
+	r, err := new(edwards25519.Scalar).SetUniformBytes(digest)
 	if err != nil {
 		return sig, err
 	}
+	defer r.Set(edwards25519.NewScalar())
 	encR := new(edwards25519.Point).ScalarBaseMult(r).Bytes()
 	// h = SHA512(R || A || M) mod q
 	h.Reset()
@@ -143,7 +149,9 @@ func XEdDSASignRand(priv []byte, msg []byte) ([64]byte, error) {
 
 // XEdDSAVerify verifies an XEd25519 signature against the Montgomery public
 // key u (the peer's X25519 public key bytes). It enforces canonical u, the
-// full point/curve checks, and the group equation s·B = R + h·A'.
+// full point/curve checks, canonical R and s < q encodings, and the group
+// equation s·B = R + h·A'. The canonical-encoding checks make signatures
+// non-malleable: each valid (R, s) has exactly one accepted byte form.
 func XEdDSAVerify(u []byte, msg, sig []byte) bool {
 	if len(sig) != 64 || len(u) != 32 {
 		return false
@@ -152,10 +160,13 @@ func XEdDSAVerify(u []byte, msg, sig []byte) bool {
 	if err != nil {
 		return false
 	}
+	// SetBytes accepts y >= p and an x sign bit on x = 0; re-encoding
+	// rejects both non-canonical forms.
 	R, err := edwards25519.NewIdentityPoint().SetBytes(sig[:32])
-	if err != nil {
+	if err != nil || !bytes.Equal(R.Bytes(), sig[:32]) {
 		return false
 	}
+	// SetCanonicalBytes rejects s >= q.
 	s, err := edwards25519.NewScalar().SetCanonicalBytes(sig[32:])
 	if err != nil {
 		return false

@@ -279,3 +279,60 @@ func TestBodyParserStrict(t *testing.T) {
 		t.Fatal("short CLOSE accepted")
 	}
 }
+
+func TestPaddingBodyMustBeZero(t *testing.T) {
+	var buf [32]byte
+	fb := NewFrameBuilder(buf[:0])
+	if !fb.Pad(24) {
+		t.Fatal("Pad failed")
+	}
+	var out [MaxFrames]Frame
+	if _, _, err := ParseFrames(fb.Bytes(), out[:0]); err != nil {
+		t.Fatalf("valid PADDING rejected: %v", err)
+	}
+	bad := append([]byte(nil), fb.Bytes()...)
+	bad[FrameHeaderBytes] = 1
+	if _, _, err := ParseFrames(bad, out[:0]); err != ErrFramePadding {
+		t.Fatalf("nonzero PADDING body got %v, want ErrFramePadding", err)
+	}
+}
+
+func FuzzParseFrames(f *testing.F) {
+	var buf [64]byte
+	fb := NewFrameBuilder(buf[:0])
+	fb.Add(FramePing, 0, 0, nil)
+	fb.Pad(32)
+	f.Add(fb.Bytes())
+	f.Fuzz(func(t *testing.T, pt []byte) {
+		var out [MaxFrames]Frame
+		frames, _, err := ParseFrames(pt, out[:0])
+		if err != nil {
+			return
+		}
+		for i := range frames {
+			fr := &frames[i]
+			switch fr.Type {
+			case FrameStream:
+				_, _, _, _ = ParseStreamBody(fr.Body)
+			case FrameAck:
+				_, _ = ParseAckBody(fr.Body)
+			case FrameResetStream:
+				_, _, _, _ = ParseResetStream(fr.Body)
+			case FrameClose:
+				_, _, _, _ = ParseClose(fr.Body)
+			case FrameCryptoFragment:
+				_, _ = ParseCryptoFrag(fr.Body)
+			}
+		}
+	})
+}
+
+func FuzzParseFragment(f *testing.F) {
+	frags := BuildFragments(make([]byte, 128), ClassClientFlight, 1, [AttemptIDBytes]byte{1}, [TokenBytes]byte{})
+	if len(frags) > 0 && len(frags[0]) > HeaderBytes {
+		f.Add(frags[0][HeaderBytes:])
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _ = ParseFragment(b)
+	})
+}

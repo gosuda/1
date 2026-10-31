@@ -75,6 +75,7 @@ func LowLatencyParams() Params {
 	p.InitialUniSlots = 4
 	p.ReceivePacketHistory = 16384
 	p.MaxAckDelayUS = 500
+	p.MaxDatagramData = 1136
 	return p
 }
 
@@ -89,6 +90,7 @@ func Standard1RTTParams() Params {
 	p.InitialBidiSlots = 64
 	p.InitialUniSlots = 16
 	p.ReceivePacketHistory = 16384
+	p.MaxDatagramData = 1136
 	return p
 }
 
@@ -108,6 +110,7 @@ func HighThroughputParams() Params {
 	p.CandidatePathLimit = 1
 	p.RetainedOldPathLimit = 1
 	p.InitialAckRatio = 8
+	p.MaxDatagramData = 4032
 	return p
 }
 

@@ -100,6 +100,13 @@ func ParseFrames(plaintext []byte, out []Frame) (frames []Frame, eliciting bool,
 		if !frameFlagsValid(typ, flags) {
 			return nil, false, ErrFrameFlags
 		}
+		if typ == FramePadding {
+			for i := bodyStart; i < bodyEnd; i++ {
+				if plaintext[i] != 0 {
+					return nil, false, ErrFramePadding
+				}
+			}
+		}
 		out = out[:n+1]
 		out[n] = Frame{Type: typ, Flags: flags, Body: plaintext[bodyStart:bodyEnd]}
 		n++

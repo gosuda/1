@@ -14,8 +14,9 @@ import (
 )
 
 // TokenService issues and validates the 64-byte address tokens
-// (spec section 6.2). It holds a small key set indexed by key_id; retired
-// keys remain verify-only for the admitted maximum lifetime.
+// (spec section 6.2). It holds the issuing key and at most one retired
+// verify-only key: a token validates only while its key_id is current or
+// exactly one rotation old.
 type TokenService struct {
 	mu     sync.RWMutex
 	now    func() uint64 // unix seconds
@@ -26,15 +27,19 @@ type TokenService struct {
 	dead  bool
 	curID uint32
 	cur   [32]byte
-	old   map[uint32][32]byte // verify-only
-	oldAt map[uint32]uint64   // when each retired key stopped issuing
+	// hasPrev guards prev: an absent slot must never verify under its
+	// zero bytes.
+	hasPrev bool
+	prevID  uint32
+	prev    [32]byte
+	// zeroized is terminal: Rotate cannot reseed after Zeroize.
+	zeroized bool
 }
 
 // NewTokenService creates a service with a fresh random key. now may be nil
 // (uses system time).
 func NewTokenService(now func() uint64, domain []byte) *TokenService {
-	s := &TokenService{now: now, domain: append([]byte(nil), domain...),
-		old: make(map[uint32][32]byte), oldAt: make(map[uint32]uint64)}
+	s := &TokenService{now: now, domain: append([]byte(nil), domain...)}
 	if s.now == nil {
 		s.now = func() uint64 { return uint64(time.Now().Unix()) }
 	}
@@ -45,17 +50,32 @@ func NewTokenService(now func() uint64, domain []byte) *TokenService {
 }
 
 // Zeroize erases the issuing and retired verification keys. Issuing and
-// verification both refuse afterwards.
+// verification refuse permanently afterwards; later Rotate calls are
+// no-ops.
 func (s *TokenService) Zeroize() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.cur {
-		s.cur[i] = 0
-	}
-	for id := range s.old {
-		s.old[id] = [32]byte{}
-	}
+	Zeroize(s.cur[:])
+	s.dropPrev()
 	s.dead = true
+	s.zeroized = true
+}
+
+func (s *TokenService) dropPrev() {
+	Zeroize(s.prev[:])
+	s.hasPrev = false
+}
+
+// verifyKey returns the HMAC key for keyID, or false when the id is
+// unknown, retired more than one rotation ago, or unseeded.
+func (s *TokenService) verifyKey(keyID uint32) ([32]byte, bool) {
+	switch {
+	case keyID == s.curID && !s.dead:
+		return s.cur, true
+	case s.hasPrev && keyID == s.prevID:
+		return s.prev, true
+	}
+	return [32]byte{}, false
 }
 
 func (s *TokenService) common(t *wire.Token, source, localDest netip.AddrPort) []byte {
@@ -142,20 +162,11 @@ func (s *TokenService) ValidateToken(tb [wire.TokenBytes]byte, source, localDest
 	if t.ExpiresUnixS-t.IssuedUnixS > maxLife || now < t.IssuedUnixS || now > t.ExpiresUnixS {
 		return false
 	}
-	var key [32]byte
-	switch {
-	case t.KeyID == s.curID:
-		if s.dead {
-			return false // current key was never seeded: it would verify forgeries
-		}
-		key = s.cur
-	default:
-		k, ok := s.old[t.KeyID]
-		if !ok {
-			return false
-		}
-		key = k
+	key, ok := s.verifyKey(t.KeyID)
+	if !ok {
+		return false
 	}
+	defer Zeroize(key[:])
 	in := s.common(&t, source, localDest)
 	if in == nil {
 		return false
@@ -175,32 +186,30 @@ func (s *TokenService) ValidateToken(tb [wire.TokenBytes]byte, source, localDest
 	return subtle.ConstantTimeCompare(want, t.Tag[:]) == 1
 }
 
-// Rotate installs a fresh issuing key; the old key stays verify-only
-// until every token it could have issued has passed its admitted maximum
-// lifetime, after which it is pruned.
+// Rotate installs a fresh issuing key under key_id+1 and demotes the
+// current key to the single verify-only slot, erasing the key it
+// replaces. A token stays valid until the second Rotate after its
+// issuance, so a periodic caller needs an interval of at least
+// wire.ReuseTokenLifetimeS for REUSE tokens to live out their lifetime.
+// Safe for concurrent use with issuing and validation; a no-op after
+// Zeroize.
 func (s *TokenService) Rotate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.zeroized {
+		return
+	}
+	s.dropPrev()
 	// A dead key was never seeded: it must not enter the verify-only
-	// set, where it would keep validating forgeries under its key_id.
+	// slot, where it would keep validating forgeries under its key_id.
 	if !s.dead {
-		s.old[s.curID] = s.cur
-		s.oldAt[s.curID] = s.now()
+		s.prev, s.prevID, s.hasPrev = s.cur, s.curID, true
 	}
 	s.curID++
 	if _, err := rand.Read(s.cur[:]); err != nil {
+		Zeroize(s.cur[:])
 		s.dead = true
 		return
 	}
 	s.dead = false
-	// A token issued under a retired key lives at most
-	// ReuseTokenLifetimeS past retirement; keys beyond that horizon can
-	// no longer validate anything.
-	maxLife := uint64(wire.ReuseTokenLifetimeS)
-	for id, at := range s.oldAt {
-		if s.now() > at+maxLife {
-			delete(s.old, id)
-			delete(s.oldAt, id)
-		}
-	}
 }

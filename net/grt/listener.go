@@ -41,11 +41,11 @@ func Listen(addr string, cfg *Config) (*Listener, error) {
 // must remain open for the listener's life. Close stops admission but
 // does NOT close the socket — the caller releases it, which also ends
 // the read pump.
-func ListenOver(ps engine.PacketSocket, cfg *Config) *Listener {
+func ListenOver(ps PacketSocket, cfg *Config) *Listener {
 	return listenOver(ps, nil, cfg)
 }
 
-func listenOver(ps engine.PacketSocket, owned *UDPSocket, cfg *Config) *Listener {
+func listenOver(ps PacketSocket, owned *UDPSocket, cfg *Config) *Listener {
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -56,20 +56,11 @@ func listenOver(ps engine.PacketSocket, owned *UDPSocket, cfg *Config) *Listener
 	}
 	el := engine.NewListener(cfg.engineConfig(), ps, domain)
 	l := &Listener{l: el, sock: owned, done: make(chan struct{})}
+	// The pump outlives Close for a caller-owned socket: established
+	// connections still receive through it until the socket is closed.
 	go func() {
-		for {
-			pktBuf := engine.GetPacketBuf()
-			n, src, dst, ecn, err := ps.Recv(pktBuf[:cap(pktBuf)])
-			if err != nil {
-				engine.PutPacketBuf(pktBuf)
-				l.Close()
-				return
-			}
-			if n == 0 {
-				engine.PutPacketBuf(pktBuf)
-				continue
-			}
-			el.OnDatagram(pktBuf[:n], src, dst, ecn)
+		if readPump(ps, nil, el.OnDatagram) != nil {
+			_ = l.Close()
 		}
 	}()
 	return l
@@ -102,8 +93,10 @@ func (l *Listener) Addr() netip.AddrPort { return l.l.Addr() }
 // abuse/admission telemetry counters.
 func (l *Listener) Stats() ListenerStats { return l.l.Stats() }
 
-// Close stops admission and releases an owned socket. Established
-// connections are unaffected.
+// Close stops admission and zeroizes token keys. For a Listener created by
+// Listen, Close also closes the owned UDP socket (terminating any connections
+// sharing it); for ListenOver, the caller-supplied socket remains open so
+// established connections continue operating until the caller closes it.
 func (l *Listener) Close() error {
 	var err error
 	l.once.Do(func() {

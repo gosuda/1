@@ -32,6 +32,9 @@ type MachineReport struct {
 	Total                bool
 	AbsorbingTerminals   bool
 	TerminationReachable bool
+	// Recurrent reports R02 for machines without terminal states: every
+	// state can return to Initial, so no slot is stranded in a dead end.
+	Recurrent bool
 }
 
 // CompileAndVerifyMachine compiles a MachineSpec into a total transition matrix
@@ -41,6 +44,8 @@ type MachineReport struct {
 //   - R01: Full state reachability from Initial via BFS
 //   - A01: Terminal state absorption (Section 20.1)
 //   - L01: Absence of non-terminating livelock traps when terminal states exist
+//   - R02: Recurrence to Initial for machines without terminal states
+//   - S01: Dispositions consistent with targets (STAY/IGNORE/errors never move)
 func CompileAndVerifyMachine(m MachineSpec) (*CompiledMachine, *MachineReport, error) {
 	numStates := len(m.States)
 	numEvents := len(m.Events)
@@ -133,6 +138,12 @@ func CompileAndVerifyMachine(m MachineSpec) (*CompiledMachine, *MachineReport, e
 				m.Name, m.States[tr.From].Name, m.Events[tr.Event].Name)
 		}
 		defined[tr.From][tr.Event] = true
+		moves := tr.To != tr.From
+		illegalActions := len(tr.Actions) > 0 && tr.Disp != DispStay
+		if tr.Disp != DispTransition && (moves || illegalActions) {
+			return nil, nil, fmt.Errorf("%s: (%s, %s) has disposition %s but moves to %s or carries actions",
+				m.Name, m.States[tr.From].Name, m.Events[tr.Event].Name, tr.Disp, m.States[tr.To].Name)
+		}
 
 		var actMask uint16
 		for _, aName := range tr.Actions {
@@ -195,35 +206,19 @@ func CompileAndVerifyMachine(m MachineSpec) (*CompiledMachine, *MachineReport, e
 	// to reach at least one terminal state (absence of inescapable livelock traps).
 	termReachable := true
 	if terminalCount > 0 {
-		canTerminate := make([]bool, numStates)
-		bQueue := make([]uint8, 0, numStates)
-		for s, st := range m.States {
-			if st.Terminal {
-				canTerminate[s] = true
-				bQueue = append(bQueue, uint8(s))
-			}
+		if err := verifyCanTerminate(m, table); err != nil {
+			return nil, nil, err
 		}
-		for head := 0; head < len(bQueue); head++ {
-			target := bQueue[head]
-			for s := range numStates {
-				if canTerminate[s] {
-					continue
-				}
-				for e := range numEvents {
-					if table[s][e].Next == target {
-						canTerminate[s] = true
-						bQueue = append(bQueue, uint8(s))
-						break
-					}
-				}
-			}
+	}
+
+	// Verify R02: without terminal states every state must be able to
+	// return to Initial (a reusable slot can never wedge).
+	recurrent := terminalCount > 0
+	if terminalCount == 0 {
+		if err := verifyRecurrent(m, table); err != nil {
+			return nil, nil, err
 		}
-		for s, ok := range canTerminate {
-			if !ok {
-				return nil, nil, fmt.Errorf("%s: state %s has no path to any terminal state (livelock trap)",
-					m.Name, m.States[s].Name)
-			}
-		}
+		recurrent = true
 	}
 
 	cm := &CompiledMachine{
@@ -245,12 +240,90 @@ func CompileAndVerifyMachine(m MachineSpec) (*CompiledMachine, *MachineReport, e
 		Total:                true,
 		AbsorbingTerminals:   true,
 		TerminationReachable: termReachable,
+		Recurrent:            recurrent,
 	}
 	return cm, rep, nil
 }
 
+func verifyCanTerminate(m MachineSpec, table [][]CompiledCell) error {
+	numStates := len(m.States)
+	canTerminate := make([]bool, numStates)
+	for s, st := range m.States {
+		canTerminate[s] = st.Terminal
+	}
+	markBackwardReachable(table, canTerminate)
+	for s, ok := range canTerminate {
+		if !ok {
+			return fmt.Errorf("%s: state %s has no path to any terminal state (livelock trap)",
+				m.Name, m.States[s].Name)
+		}
+	}
+	return nil
+}
+
+func verifyRecurrent(m MachineSpec, table [][]CompiledCell) error {
+	back := make([]bool, len(m.States))
+	back[m.Initial] = true
+	markBackwardReachable(table, back)
+	for s, ok := range back {
+		if !ok {
+			return fmt.Errorf("%s: state %s cannot return to initial state %s (R02)",
+				m.Name, m.States[s].Name, m.States[m.Initial].Name)
+		}
+	}
+	return nil
+}
+
+func markBackwardReachable(table [][]CompiledCell, reached []bool) {
+	for changed := true; changed; {
+		changed = false
+		for s := range table {
+			if reached[s] {
+				continue
+			}
+			if reachesAny(table[s], reached) {
+				reached[s] = true
+				changed = true
+			}
+		}
+	}
+}
+
+func reachesAny(row []CompiledCell, reached []bool) bool {
+	for _, cell := range row {
+		if reached[cell.Next] {
+			return true
+		}
+	}
+	return false
+}
+
+// VerifyGate checks that every term owns a distinct single bit, so the
+// generated `flags&mask == mask` test is exactly the conjunction of terms.
+func VerifyGate(g GateSpec) error {
+	if len(g.Terms) == 0 || len(g.Terms) > 16 {
+		return fmt.Errorf("gate %s: %d terms, want 1..16", g.Name, len(g.Terms))
+	}
+	var used uint16
+	for _, t := range g.Terms {
+		if t.Bit == 0 || t.Bit&(t.Bit-1) != 0 {
+			return fmt.Errorf("gate %s: term %s bit 0x%x is not a single power-of-two bit", g.Name, t.Name, t.Bit)
+		}
+		if used&t.Bit != 0 {
+			return fmt.Errorf("gate %s: term %s reuses bit 0x%x", g.Name, t.Name, t.Bit)
+		}
+		used |= t.Bit
+	}
+	return nil
+}
+
 // CompileAndVerifyAll compiles and formally verifies all 11 GRT/1.1 machines.
 func CompileAndVerifyAll() ([]*CompiledMachine, []*MachineReport, error) {
+	for _, g := range AllGates() {
+		if err := VerifyGate(g); err != nil {
+			return nil, nil, err
+		}
+	}
 	specs := AllMachines()
 	compiled := make([]*CompiledMachine, 0, len(specs))
 	reports := make([]*MachineReport, 0, len(specs))

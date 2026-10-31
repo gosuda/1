@@ -18,23 +18,45 @@ func (c *Conn) closeWith(code closeCode, offending uint16) {
 	core.termErr = &TransportError{Code: code}
 	diag := sha256.Sum256([]byte(codeName(code)))
 	copy(core.termErr.(*TransportError).Diag[:], diag[:])
-	if core.state.keyBearing() {
-		core.state = stClosing
-		core.closeCode = code
+	r := c.mustFireConn(fsmConn_EV_PROTOCOL_ERROR)
+	c.enterClosing(r, code)
+}
+
+// localClose handles APP_CLOSE. CLOSING, DRAINING and QUIESCING ignore it
+// by table: re-entering CLOSING would emit from DRAINING and extend the
+// close deadline (section 20.2 rule 5, 20.3).
+func (c *Conn) localClose(code closeCode) {
+	r := c.fireConn(fsmConn_EV_LOCAL_CLOSE)
+	if r.disp != fsmDispTransition {
+		return
+	}
+	c.enterClosing(r, code)
+}
+
+// enterClosing runs the actions of a step into CLOSING, or completes the
+// silent QUIESCING branch taken when no safe sending key exists.
+func (c *Conn) enterClosing(r fsmStepResult, code closeCode) {
+	core := c.core
+	if core.state == stQuiescing {
+		c.completeQuiesce()
+		return
+	}
+	core.closeCode = code
+	if r.actions&fsmConn_ActArmCloseTimer != 0 {
 		core.arm(tkClose, nowUS()+3*c.ptoUS())
-	} else {
-		c.quiesce(core.termErr)
 	}
 }
 
 // enterDraining follows a valid peer CLOSE or stateless reset.
 func (c *Conn) enterDraining() {
 	core := c.core
-	if core.state.terminating() {
+	r := c.fireConn(fsmConn_EV_REMOTE_CLOSE)
+	if r.disp != fsmDispTransition {
 		return
 	}
-	core.state = stDraining
-	core.arm(tkClose, nowUS()+3*c.ptoUS())
+	if r.actions&fsmConn_ActArmCloseTimer != 0 {
+		core.arm(tkClose, nowUS()+3*c.ptoUS())
+	}
 	notify(c.readWake)
 	notify(c.writeWake)
 	notify(c.dgWake)
@@ -49,13 +71,19 @@ func (c *Conn) quiesce(err error) {
 	if err != nil && core.termErr == nil {
 		core.termErr = err
 	}
-	core.state = stQuiescing
-	// The portable profile has no outstanding I/O fences: the synchronous
-	// socket adapter completes publication inside the owner call. Zeroize
-	// secrets, release the admission-pool slot, and die.
-	c.zeroize()
+	c.fireConn(fsmConn_EV_LOCAL_FATAL) // already QUIESCING: ignored
+	c.completeQuiesce()
+}
+
+// completeQuiesce finishes QUIESCING → DEAD. The portable profile has no
+// outstanding I/O fences: the synchronous socket adapter completes
+// publication inside the owner call.
+func (c *Conn) completeQuiesce() {
 	c.releaseAttempt()
-	core.state = stDead
+	r := c.mustFireConn(fsmConn_EV_IO_PINS_DRAINED)
+	if r.actions&fsmConn_ActZeroizeSecrets != 0 {
+		c.zeroize()
+	}
 }
 
 // releaseAttempt returns the conn's admission-pool slot to the listener
@@ -73,6 +101,9 @@ func (c *Conn) releaseAttempt() {
 	l := core.listener
 	l.mu.Lock()
 	l.attemptsInFlight--
+	if core.attemptTokenless {
+		l.tokenlessInFlight--
+	}
 	l.mu.Unlock()
 }
 
@@ -92,7 +123,7 @@ func (c *Conn) zeroize() {
 		}
 		s.tx.Zeroize()
 		s.rx.Zeroize()
-		s.state = epochSlotEmpty
+		fsmEpochSlotSet(&s.state, epochSlotEmpty)
 	}
 	for i := range core.keys.root {
 		for j := range core.keys.root[i] {
@@ -341,6 +372,7 @@ func (c *Conn) onHandshakeDeadline(now uint64) {
 
 // onCloseDeadline: CLOSING/DRAINING deadline → QUIESCING.
 func (c *Conn) onCloseDeadline() {
+	c.fireConn(fsmConn_EV_CLOSE_TIMEOUT)
 	c.quiesce(nil)
 }
 

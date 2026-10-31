@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,10 +55,49 @@ func Dial(ctx context.Context, remote string, cfg *Config) (*Conn, error) {
 	return &Conn{c: ec}, nil
 }
 
+// PacketSocket is the datagram transport a Conn or Listener runs over.
+// UDPSocket is the standard implementation; DialOver and ListenOver
+// accept any other, such as a wrapped socket for tests or tunnelling.
+//
+// Send transmits payload as one datagram to dst marked with ECN codepoint
+// ecn (0 Not-ECT, 1 ECT(1), 2 ECT(0), 3 CE). A nil error means the local
+// send path accepted the datagram; an error means it definitely did not,
+// and the engine re-queues the packet's frames under a fresh packet
+// number. Send must not retain payload after returning and must be safe
+// for concurrent use: every connection sharing a listener socket sends
+// from its own goroutine, concurrently with Recv.
+//
+// LocalAddr reports the bound endpoint.
+//
+// Recv blocks until one datagram arrives, copies it into buf, and reports
+// its length, the remote source, the local destination endpoint (the
+// address it actually arrived on, not a wildcard bind address), and the
+// received ECN codepoint. Only one goroutine calls Recv. Recv errors
+// other than net.ErrClosed are treated as transient and retried after a
+// short backoff; an error wrapping net.ErrClosed stops the read loop.
+//
+// Optional capabilities are detected by type assertion on the value:
+// SendFrom(payload, src, dst, ecn) selects the source address for
+// multi-homed paths; SendGSO and SendFromGSO send equal-size segments in
+// one call (see UDPSocket); SetReadDeadline(time.Time) error lets
+// DialOver unblock its reader when the connection ends.
+type PacketSocket interface {
+	Send(payload []byte, dst netip.AddrPort, ecn uint8) error
+	LocalAddr() netip.AddrPort
+	Recv(buf []byte) (n int, src, dst netip.AddrPort, ecn uint8, err error)
+}
+
+// PacketSocket and the engine's socket contract must stay identical.
+var (
+	_ engine.PacketSocket = PacketSocket(nil)
+	_ PacketSocket        = engine.PacketSocket(nil)
+)
+
 // DialOver starts a client connection on a caller-supplied socket,
 // which must remain open for the connection's life and is NOT closed
-// by Conn.Close.
-func DialOver(ps engine.PacketSocket, remote netip.AddrPort, cfg *Config) (*Conn, error) {
+// by Conn.Close. Once the connection ends, its reader stops at the next
+// Recv return; a socket with SetReadDeadline is unblocked immediately.
+func DialOver(ps PacketSocket, remote netip.AddrPort, cfg *Config) (*Conn, error) {
 	if cfg == nil || cfg.ServerName == "" {
 		return nil, errNeedServerName
 	}
@@ -100,20 +140,69 @@ func resolveAddr(ctx context.Context, remote string) (netip.AddrPort, error) {
 }
 
 // pumpDatagrams forwards socket datagrams into the connection until the
-// socket errors (closed) or the connection dies.
-func pumpDatagrams(ps engine.PacketSocket, c *engine.Conn) {
+// socket is closed or the connection dies.
+func pumpDatagrams(ps PacketSocket, c *engine.Conn) {
+	_ = readPump(ps, c.Done(), c.OnDatagram)
+}
+
+// Bounds of the pause between consecutive failed Recv calls.
+const (
+	recvBackoffMin = time.Millisecond
+	recvBackoffMax = 100 * time.Millisecond
+)
+
+// readPump hands each received datagram, in a pooled packet buffer whose
+// ownership passes to deliver, until Recv reports net.ErrClosed (returned)
+// or stop closes (nil returned). Any other Recv error is transient on an
+// unconnected UDP socket — Windows WSAECONNRESET or WSAENETRESET after an
+// ICMP error, ENOBUFS or ENOMEM under memory pressure, an expired read
+// deadline — so the pump retries: immediately after one failure, then
+// with a backoff that doubles from recvBackoffMin to recvBackoffMax and
+// resets on success.
+func readPump(ps PacketSocket, stop <-chan struct{}, deliver func(pkt []byte, src, dst netip.AddrPort, ecn uint8)) error {
+	var backoff time.Duration
+	failed := false
 	for {
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
 		pktBuf := engine.GetPacketBuf()
 		n, src, dst, ecn, err := ps.Recv(pktBuf[:cap(pktBuf)])
-		if err != nil {
-			engine.PutPacketBuf(pktBuf)
-			return
-		}
-		if n == 0 {
-			engine.PutPacketBuf(pktBuf)
+		if err == nil {
+			failed, backoff = false, 0
+			if n == 0 {
+				engine.PutPacketBuf(pktBuf)
+				continue
+			}
+			deliver(pktBuf[:n], src, dst, ecn)
 			continue
 		}
-		c.OnDatagram(pktBuf[:n], src, dst, ecn)
+		engine.PutPacketBuf(pktBuf)
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		if !failed {
+			failed = true
+			continue
+		}
+		backoff = min(max(2*backoff, recvBackoffMin), recvBackoffMax)
+		if !sleepUnlessStopped(stop, backoff) {
+			return nil
+		}
+	}
+}
+
+// sleepUnlessStopped waits for d and reports false when stop closes first.
+func sleepUnlessStopped(stop <-chan struct{}, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -205,16 +294,21 @@ func (c *Conn) AcceptUniStream(ctx context.Context) (*Stream, error) {
 // limit.
 func (c *Conn) SendDatagram(b []byte) error { return c.c.SendDatagram(b) }
 
-// ReceiveDatagram waits for the next inbound datagram.
+// ReceiveDatagram waits for the next inbound datagram and returns a copy
+// sized to its payload.
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	buf := make([]byte, 64*1024)
+	// A DATAGRAM frame travels inside one packet, so a packet buffer
+	// always holds the whole payload.
+	buf := engine.GetPacketBuf()
+	defer engine.PutPacketBuf(buf)
+	buf = buf[:cap(buf)]
 	for {
 		n, err := c.c.ReadDatagram(buf)
 		if err != engine.ErrWouldBlock {
 			if err != nil {
 				return nil, err
 			}
-			return buf[:n], nil
+			return slices.Clone(buf[:n]), nil
 		}
 		c.c.WaitDatagram(ctx)
 		if err := ctx.Err(); err != nil {
@@ -341,16 +435,79 @@ func (c *Conn) Exporter(label, ctx string) ([32]byte, error) {
 // returns received bytes; Write appends to the send buffer; Close sends
 // FIN. CancelRead/CancelWrite map to STOP_RECV/RESET.
 type Stream struct {
-	c             *engine.Conn
-	id            uint64
-	hasDeadline   atomic.Bool
-	mu            sync.Mutex
-	readDeadline  time.Time
-	writeDeadline time.Time
-	readCancel    chan struct{}
-	writeCancel   chan struct{}
-	readTimer     *time.Timer
-	writeTimer    *time.Timer
+	c           *engine.Conn
+	id          uint64
+	hasDeadline atomic.Bool
+	mu          sync.Mutex // guards read and write
+	read        deadline
+	write       deadline
+}
+
+// deadline is one stream half's deadline state, guarded by Stream.mu.
+// cancel is closed to wake blocked callers when the deadline expires or
+// changes. timer is armed only while a deadline is pending; it is
+// stopped when the half ends so a long deadline cannot pin the Stream.
+type deadline struct {
+	at     time.Time
+	cancel chan struct{}
+	timer  *time.Timer
+}
+
+// set replaces the deadline and wakes current waiters so they observe it.
+func (d *deadline) set(mu *sync.Mutex, t time.Time) {
+	d.release()
+	d.at = t
+	if t.IsZero() || !time.Now().Before(t) {
+		return
+	}
+	d.cancel = make(chan struct{})
+	d.arm(mu)
+}
+
+// arm schedules closing the current cancel channel at the deadline.
+func (d *deadline) arm(mu *sync.Mutex) {
+	ch := d.cancel
+	d.timer = time.AfterFunc(time.Until(d.at), func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if d.cancel == ch {
+			close(ch)
+			d.cancel = nil
+			d.timer = nil
+		}
+	})
+}
+
+// release stops the timer and wakes waiters while keeping the recorded
+// deadline, so a later wait still honours it by re-arming lazily.
+func (d *deadline) release() {
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	if d.cancel != nil {
+		close(d.cancel)
+		d.cancel = nil
+	}
+}
+
+func (d *deadline) expired(now time.Time) bool {
+	return !d.at.IsZero() && !now.Before(d.at)
+}
+
+// prepareWait returns the channel a blocked caller waits on, arming the
+// timer when a pending deadline has none.
+func (d *deadline) prepareWait(mu *sync.Mutex) (expired bool, ch <-chan struct{}) {
+	if d.expired(time.Now()) {
+		return true, nil
+	}
+	if d.cancel == nil {
+		d.cancel = make(chan struct{})
+	}
+	if !d.at.IsZero() && d.timer == nil {
+		d.arm(mu)
+	}
+	return false, d.cancel
 }
 
 // ID returns the wire stream identifier (generation-tagged handle).
@@ -370,33 +527,7 @@ func (s *Stream) SetReadDeadline(t time.Time) error {
 	s.hasDeadline.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.readDeadline = t
-	if s.readTimer != nil {
-		s.readTimer.Stop()
-		s.readTimer = nil
-	}
-	if s.readCancel != nil {
-		close(s.readCancel)
-		s.readCancel = nil
-	}
-	if !t.IsZero() {
-		ch := make(chan struct{})
-		s.readCancel = ch
-		d := time.Until(t)
-		if d <= 0 {
-			close(ch)
-			s.readCancel = nil
-			return nil
-		}
-		s.readTimer = time.AfterFunc(d, func() {
-			s.mu.Lock()
-			if s.readCancel == ch {
-				close(ch)
-				s.readCancel = nil
-			}
-			s.mu.Unlock()
-		})
-	}
+	s.read.set(&s.mu, t)
 	return nil
 }
 
@@ -405,78 +536,33 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.hasDeadline.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.writeDeadline = t
-	if s.writeTimer != nil {
-		s.writeTimer.Stop()
-		s.writeTimer = nil
-	}
-	if s.writeCancel != nil {
-		close(s.writeCancel)
-		s.writeCancel = nil
-	}
-	if !t.IsZero() {
-		ch := make(chan struct{})
-		s.writeCancel = ch
-		d := time.Until(t)
-		if d <= 0 {
-			close(ch)
-			s.writeCancel = nil
-			return nil
-		}
-		s.writeTimer = time.AfterFunc(d, func() {
-			s.mu.Lock()
-			if s.writeCancel == ch {
-				close(ch)
-				s.writeCancel = nil
-			}
-			s.mu.Unlock()
-		})
-	}
+	s.write.set(&s.mu, t)
 	return nil
 }
 
-func (s *Stream) readExpired() bool {
+func (s *Stream) expired(d *deadline) bool {
 	if !s.hasDeadline.Load() {
 		return false
 	}
 	s.mu.Lock()
-	dl := s.readDeadline
-	s.mu.Unlock()
-	return !dl.IsZero() && !time.Now().Before(dl)
+	defer s.mu.Unlock()
+	return d.expired(time.Now())
 }
 
-func (s *Stream) prepareReadWait() (expired bool, ch <-chan struct{}) {
+func (s *Stream) prepareWait(d *deadline) (expired bool, ch <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.readDeadline.IsZero() && !time.Now().Before(s.readDeadline) {
-		return true, nil
-	}
-	if s.readCancel == nil {
-		s.readCancel = make(chan struct{})
-	}
-	return false, s.readCancel
+	return d.prepareWait(&s.mu)
 }
 
-func (s *Stream) writeExpired() bool {
+// releaseDeadline stops a half's deadline timer once that half has ended.
+func (s *Stream) releaseDeadline(d *deadline) {
 	if !s.hasDeadline.Load() {
-		return false
+		return
 	}
-	s.mu.Lock()
-	dl := s.writeDeadline
-	s.mu.Unlock()
-	return !dl.IsZero() && !time.Now().Before(dl)
-}
-
-func (s *Stream) prepareWriteWait() (expired bool, ch <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.writeDeadline.IsZero() && !time.Now().Before(s.writeDeadline) {
-		return true, nil
-	}
-	if s.writeCancel == nil {
-		s.writeCancel = make(chan struct{})
-	}
-	return false, s.writeCancel
+	d.release()
 }
 
 // Read consumes ordered stream bytes, blocking until data, FIN (io.EOF),
@@ -487,23 +573,28 @@ func (s *Stream) Read(b []byte) (int, error) {
 }
 
 // ReadContext consumes ordered stream bytes, honoring both ctx and any
-// deadline configured via SetReadDeadline / SetDeadline.
+// deadline configured via SetReadDeadline / SetDeadline. A terminal
+// result (FIN, reset, connection death) releases the read deadline timer.
 func (s *Stream) ReadContext(ctx context.Context, b []byte) (int, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		if s.readExpired() {
+		if s.expired(&s.read) {
 			return 0, os.ErrDeadlineExceeded
 		}
 		n, err := s.c.Read(s.id, b)
-		if n > 0 || err != nil {
+		if err != nil {
+			s.releaseDeadline(&s.read)
 			if errors.Is(err, engine.ErrStreamEOF) {
 				err = io.EOF
 			}
 			return n, err
 		}
-		expired, waitCh := s.prepareReadWait()
+		if n > 0 {
+			return n, nil
+		}
+		expired, waitCh := s.prepareWait(&s.read)
 		if expired {
 			return 0, os.ErrDeadlineExceeded
 		}
@@ -511,11 +602,12 @@ func (s *Stream) ReadContext(ctx context.Context, b []byte) (int, error) {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		if s.readExpired() {
+		if s.expired(&s.read) {
 			return 0, os.ErrDeadlineExceeded
 		}
 		select {
 		case <-s.c.Done():
+			s.releaseDeadline(&s.read)
 			return 0, s.c.TermError()
 		default:
 		}
@@ -530,22 +622,27 @@ func (s *Stream) Write(b []byte) (int, error) {
 }
 
 // WriteContext appends bytes to the send buffer, honoring both ctx and
-// any deadline configured via SetWriteDeadline / SetDeadline.
+// any deadline configured via SetWriteDeadline / SetDeadline. A terminal
+// error (peer STOP_SENDING, connection death) releases the write
+// deadline timer.
 func (s *Stream) WriteContext(ctx context.Context, b []byte) (int, error) {
 	total := 0
 	for total < len(b) {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		if s.writeExpired() {
+		if s.expired(&s.write) {
 			return total, os.ErrDeadlineExceeded
 		}
 		n, err := s.c.Write(s.id, b[total:])
 		total += n
 		if err != engine.ErrWouldBlock {
+			if err != nil {
+				s.releaseDeadline(&s.write)
+			}
 			return total, err
 		}
-		expired, waitCh := s.prepareWriteWait()
+		expired, waitCh := s.prepareWait(&s.write)
 		if expired {
 			return total, os.ErrDeadlineExceeded
 		}
@@ -553,11 +650,12 @@ func (s *Stream) WriteContext(ctx context.Context, b []byte) (int, error) {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		if s.writeExpired() {
+		if s.expired(&s.write) {
 			return total, os.ErrDeadlineExceeded
 		}
 		select {
 		case <-s.c.Done():
+			s.releaseDeadline(&s.write)
 			return total, s.c.TermError()
 		default:
 		}
@@ -568,12 +666,23 @@ func (s *Stream) WriteContext(ctx context.Context, b []byte) (int, error) {
 // TryWrite appends without blocking; ErrWouldBlock means no capacity.
 func (s *Stream) TryWrite(b []byte) (int, error) { return s.c.Write(s.id, b) }
 
-// Close sends FIN, freezing the send half's final size (spec FIN).
-// The receive half stays open.
-func (s *Stream) Close() error { return s.c.Fin(s.id) }
+// Close sends FIN, freezing the send half's final size (spec FIN), and
+// releases the write deadline timer. The receive half stays open.
+func (s *Stream) Close() error {
+	defer s.releaseDeadline(&s.write)
+	return s.c.Fin(s.id)
+}
 
-// CancelWrite abandons the send half with an application code (RESET).
-func (s *Stream) CancelWrite(code uint32) error { return s.c.Reset(s.id, code) }
+// CancelWrite abandons the send half with an application code (RESET)
+// and releases the write deadline timer.
+func (s *Stream) CancelWrite(code uint32) error {
+	defer s.releaseDeadline(&s.write)
+	return s.c.Reset(s.id, code)
+}
 
-// CancelRead asks the peer to stop sending (STOP_RECV).
-func (s *Stream) CancelRead(code uint32) error { return s.c.Stop(s.id, code) }
+// CancelRead asks the peer to stop sending (STOP_RECV) and releases the
+// read deadline timer.
+func (s *Stream) CancelRead(code uint32) error {
+	defer s.releaseDeadline(&s.read)
+	return s.c.Stop(s.id, code)
+}

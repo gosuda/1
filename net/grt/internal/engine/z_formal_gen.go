@@ -18,6 +18,35 @@ const (
 	fsmDispInvalidState  uint8 = 4
 )
 
+// Machine identifiers passed to fsmViolation.
+const (
+	fsmMachineConnLifecycle   uint8 = 0
+	fsmMachineCipherSelection uint8 = 1
+	fsmMachineStreamSlot      uint8 = 2
+	fsmMachineStreamSend      uint8 = 3
+	fsmMachineStreamRecv      uint8 = 4
+	fsmMachineEpochSlot       uint8 = 5
+	fsmMachinePathValidation  uint8 = 6
+	fsmMachinePathRole        uint8 = 7
+	fsmMachineSentPacket      uint8 = 8
+	fsmMachineParkLease       uint8 = 9
+	fsmMachineECNValidation   uint8 = 10
+)
+
+var fsmMachineNames = [...]string{
+	"ConnLifecycle",
+	"CipherSelection",
+	"StreamSlot",
+	"StreamSend",
+	"StreamRecv",
+	"EpochSlot",
+	"PathValidation",
+	"PathRole",
+	"SentPacket",
+	"ParkLease",
+	"ECNValidation",
+}
+
 // ---------------------------------------------------------------------------
 // ConnLifecycle FSM (GRT/1.1 Section 20.1-20.3)
 // ---------------------------------------------------------------------------
@@ -37,7 +66,9 @@ const (
 	fsmConn_EV_REMOTE_CLOSE             uint8 = 11
 	fsmConn_EV_CLOSE_TIMEOUT            uint8 = 12
 	fsmConn_EV_IO_PINS_DRAINED          uint8 = 13
-	fsmConn_EV_ABORT_UNKEYED            uint8 = 14
+	fsmConn_EV_LOCAL_FATAL              uint8 = 14
+	fsmConn_EV_PROTOCOL_ERROR           uint8 = 15
+	fsmConn_EV_SERVER_AUTH_FAILED       uint8 = 16
 )
 
 const (
@@ -50,6 +81,7 @@ const (
 
 const (
 	fsmConnMaskKeyBearing      uint16 = 0x0f90
+	fsmConnMaskLiveKeyed       uint16 = 0x0190
 	fsmConnMaskTerminating     uint16 = 0x1e00
 	fsmConnMaskAppSendEligible uint16 = 0x0110
 	fsmConnMaskHandshakePhase  uint16 = 0x00ef
@@ -59,6 +91,11 @@ const (
 // fsmConnIsKeyBearing reports whether the connection state holds installed epoch keys (Section 20.1).
 func fsmConnIsKeyBearing(s connState) bool {
 	return (uint16(1)<<uint(s))&fsmConnMaskKeyBearing != 0
+}
+
+// fsmConnIsLiveKeyed reports whether the state is key-bearing and not terminating: APP_CLOSE and authenticated protocol errors enter CLOSING only from here (Section 20.2 rules 4-5).
+func fsmConnIsLiveKeyed(s connState) bool {
+	return (uint16(1)<<uint(s))&fsmConnMaskLiveKeyed != 0
 }
 
 // fsmConnIsTerminating reports whether the connection is in CLOSING, DRAINING, QUIESCING, or DEAD.
@@ -84,14 +121,14 @@ func fsmConnIsQuietTerminal(s connState) bool {
 var fsmConnValidNext = [13]uint16{
 	0:  0x0823, // NEW
 	1:  0x0806, // C_BUILD
-	2:  0x080e, // C_WAIT_REPLY
-	3:  0x0818, // C_VERIFY
-	4:  0x0710, // C_FINISHING
+	2:  0x080c, // C_WAIT_REPLY
+	3:  0x081c, // C_VERIFY
+	4:  0x0f10, // C_FINISHING
 	5:  0x0860, // S_COLLECT
 	6:  0x08c0, // S_BUILD
-	7:  0x0780, // S_FINISHING
-	8:  0x0700, // ESTABLISHED
-	9:  0x0e00, // CLOSING
+	7:  0x0f80, // S_FINISHING
+	8:  0x0f00, // ESTABLISHED
+	9:  0x0a00, // CLOSING
 	10: 0x0c00, // DRAINING
 	11: 0x1800, // QUIESCING
 	12: 0x1000, // DEAD
@@ -102,7 +139,16 @@ func fsmConnCanTransition(from, to connState) bool {
 	return uint(from) < 13 && (uint16(1)<<uint(to))&fsmConnValidNext[from] != 0
 }
 
-var fsmConnTable = [13][15]fsmStepResult{
+// fsmConnSet assigns *p = to and reports a transition outside the verified ConnLifecycle
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmConnSet(p *connState, to connState) {
+	if !fsmConnCanTransition(*p, to) {
+		fsmViolation(fsmMachineConnLifecycle, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
+var fsmConnTable = [13][17]fsmStepResult{
 	0: { // NEW
 		0:  {next: 1, disp: 0, actions: 0x0000},
 		1:  {next: 0, disp: 2, actions: 0x0000},
@@ -114,11 +160,13 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 0, disp: 2, actions: 0x0000},
 		8:  {next: 0, disp: 2, actions: 0x0000},
 		9:  {next: 0, disp: 2, actions: 0x0000},
-		10: {next: 0, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 0, disp: 2, actions: 0x0000},
 		12: {next: 0, disp: 2, actions: 0x0000},
 		13: {next: 0, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 0, disp: 2, actions: 0x0000},
 	},
 	1: { // C_BUILD
 		0:  {next: 1, disp: 2, actions: 0x0000},
@@ -131,16 +179,18 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 1, disp: 2, actions: 0x0000},
 		8:  {next: 1, disp: 2, actions: 0x0000},
 		9:  {next: 1, disp: 2, actions: 0x0000},
-		10: {next: 1, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 1, disp: 2, actions: 0x0000},
 		12: {next: 1, disp: 2, actions: 0x0000},
 		13: {next: 1, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 1, disp: 2, actions: 0x0000},
 	},
 	2: { // C_WAIT_REPLY
 		0:  {next: 2, disp: 2, actions: 0x0000},
 		1:  {next: 2, disp: 2, actions: 0x0000},
-		2:  {next: 1, disp: 0, actions: 0x0000},
+		2:  {next: 2, disp: 1, actions: 0x0000},
 		3:  {next: 3, disp: 0, actions: 0x0000},
 		4:  {next: 2, disp: 2, actions: 0x0000},
 		5:  {next: 2, disp: 2, actions: 0x0000},
@@ -148,11 +198,13 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 2, disp: 2, actions: 0x0000},
 		8:  {next: 2, disp: 2, actions: 0x0000},
 		9:  {next: 2, disp: 2, actions: 0x0000},
-		10: {next: 2, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 2, disp: 2, actions: 0x0000},
 		12: {next: 2, disp: 2, actions: 0x0000},
 		13: {next: 2, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 2, disp: 2, actions: 0x0000},
 	},
 	3: { // C_VERIFY
 		0:  {next: 3, disp: 2, actions: 0x0000},
@@ -165,11 +217,13 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 3, disp: 2, actions: 0x0000},
 		8:  {next: 3, disp: 2, actions: 0x0000},
 		9:  {next: 3, disp: 2, actions: 0x0000},
-		10: {next: 3, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 3, disp: 2, actions: 0x0000},
 		12: {next: 3, disp: 2, actions: 0x0000},
 		13: {next: 3, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 2, disp: 0, actions: 0x0000},
 	},
 	4: { // C_FINISHING
 		0:  {next: 4, disp: 2, actions: 0x0000},
@@ -186,7 +240,9 @@ var fsmConnTable = [13][15]fsmStepResult{
 		11: {next: 10, disp: 0, actions: 0x0014},
 		12: {next: 4, disp: 2, actions: 0x0000},
 		13: {next: 4, disp: 2, actions: 0x0000},
-		14: {next: 4, disp: 2, actions: 0x0000},
+		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 9, disp: 0, actions: 0x0016},
+		16: {next: 4, disp: 2, actions: 0x0000},
 	},
 	5: { // S_COLLECT
 		0:  {next: 5, disp: 2, actions: 0x0000},
@@ -199,11 +255,13 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 6, disp: 0, actions: 0x0000},
 		8:  {next: 5, disp: 2, actions: 0x0000},
 		9:  {next: 5, disp: 2, actions: 0x0000},
-		10: {next: 5, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 5, disp: 2, actions: 0x0000},
 		12: {next: 5, disp: 2, actions: 0x0000},
 		13: {next: 5, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 5, disp: 2, actions: 0x0000},
 	},
 	6: { // S_BUILD
 		0:  {next: 6, disp: 2, actions: 0x0000},
@@ -216,11 +274,13 @@ var fsmConnTable = [13][15]fsmStepResult{
 		7:  {next: 6, disp: 2, actions: 0x0000},
 		8:  {next: 7, disp: 0, actions: 0x0001},
 		9:  {next: 6, disp: 2, actions: 0x0000},
-		10: {next: 6, disp: 2, actions: 0x0000},
+		10: {next: 11, disp: 0, actions: 0x0010},
 		11: {next: 6, disp: 2, actions: 0x0000},
 		12: {next: 6, disp: 2, actions: 0x0000},
 		13: {next: 6, disp: 2, actions: 0x0000},
 		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 11, disp: 0, actions: 0x0010},
+		16: {next: 6, disp: 2, actions: 0x0000},
 	},
 	7: { // S_FINISHING
 		0:  {next: 7, disp: 2, actions: 0x0000},
@@ -237,7 +297,9 @@ var fsmConnTable = [13][15]fsmStepResult{
 		11: {next: 10, disp: 0, actions: 0x0014},
 		12: {next: 7, disp: 2, actions: 0x0000},
 		13: {next: 7, disp: 2, actions: 0x0000},
-		14: {next: 7, disp: 2, actions: 0x0000},
+		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 9, disp: 0, actions: 0x0016},
+		16: {next: 7, disp: 2, actions: 0x0000},
 	},
 	8: { // ESTABLISHED
 		0:  {next: 8, disp: 2, actions: 0x0000},
@@ -254,7 +316,9 @@ var fsmConnTable = [13][15]fsmStepResult{
 		11: {next: 10, disp: 0, actions: 0x0014},
 		12: {next: 8, disp: 2, actions: 0x0000},
 		13: {next: 8, disp: 2, actions: 0x0000},
-		14: {next: 8, disp: 2, actions: 0x0000},
+		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 9, disp: 0, actions: 0x0016},
+		16: {next: 8, disp: 2, actions: 0x0000},
 	},
 	9: { // CLOSING
 		0:  {next: 9, disp: 2, actions: 0x0000},
@@ -268,10 +332,12 @@ var fsmConnTable = [13][15]fsmStepResult{
 		8:  {next: 9, disp: 2, actions: 0x0000},
 		9:  {next: 9, disp: 2, actions: 0x0000},
 		10: {next: 9, disp: 2, actions: 0x0000},
-		11: {next: 10, disp: 0, actions: 0x0000},
+		11: {next: 9, disp: 2, actions: 0x0000},
 		12: {next: 11, disp: 0, actions: 0x0000},
 		13: {next: 9, disp: 2, actions: 0x0000},
-		14: {next: 9, disp: 2, actions: 0x0000},
+		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 9, disp: 2, actions: 0x0000},
+		16: {next: 9, disp: 2, actions: 0x0000},
 	},
 	10: { // DRAINING
 		0:  {next: 10, disp: 2, actions: 0x0000},
@@ -288,7 +354,9 @@ var fsmConnTable = [13][15]fsmStepResult{
 		11: {next: 10, disp: 2, actions: 0x0000},
 		12: {next: 11, disp: 0, actions: 0x0000},
 		13: {next: 10, disp: 2, actions: 0x0000},
-		14: {next: 10, disp: 2, actions: 0x0000},
+		14: {next: 11, disp: 0, actions: 0x0010},
+		15: {next: 10, disp: 2, actions: 0x0000},
+		16: {next: 10, disp: 2, actions: 0x0000},
 	},
 	11: { // QUIESCING
 		0:  {next: 11, disp: 2, actions: 0x0000},
@@ -306,6 +374,8 @@ var fsmConnTable = [13][15]fsmStepResult{
 		12: {next: 11, disp: 2, actions: 0x0000},
 		13: {next: 12, disp: 0, actions: 0x0018},
 		14: {next: 11, disp: 2, actions: 0x0000},
+		15: {next: 11, disp: 2, actions: 0x0000},
+		16: {next: 11, disp: 2, actions: 0x0000},
 	},
 	12: { // DEAD
 		0:  {next: 12, disp: 2, actions: 0x0000},
@@ -323,12 +393,14 @@ var fsmConnTable = [13][15]fsmStepResult{
 		12: {next: 12, disp: 2, actions: 0x0000},
 		13: {next: 12, disp: 2, actions: 0x0000},
 		14: {next: 12, disp: 2, actions: 0x0000},
+		15: {next: 12, disp: 2, actions: 0x0000},
+		16: {next: 12, disp: 2, actions: 0x0000},
 	},
 }
 
 // fsmConnStep evaluates the total transition table for (connState, event) in O(1) with zero allocations.
 func fsmConnStep(s connState, ev uint8) fsmStepResult {
-	if uint(s) >= 13 || uint(ev) >= 15 {
+	if uint(s) >= 13 || uint(ev) >= 17 {
 		return fsmStepResult{next: uint8(s), disp: fsmDispInvalidState}
 	}
 	return fsmConnTable[s][ev]
@@ -373,6 +445,15 @@ var fsmCipherValidNext = [3]uint16{
 // fsmCipherCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified CipherSelection FSM.
 func fsmCipherCanTransition(from, to uint8) bool {
 	return uint(from) < 3 && (uint16(1)<<uint(to))&fsmCipherValidNext[from] != 0
+}
+
+// fsmCipherSet assigns *p = to and reports a transition outside the verified CipherSelection
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmCipherSet(p *uint8, to uint8) {
+	if !fsmCipherCanTransition(*p, to) {
+		fsmViolation(fsmMachineCipherSelection, uint8(*p), uint8(to))
+	}
+	*p = to
 }
 
 var fsmCipherTable = [3][3]fsmStepResult{
@@ -467,6 +548,15 @@ var fsmSlotValidNext = [6]uint16{
 // fsmSlotCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified StreamSlot FSM.
 func fsmSlotCanTransition(from, to slotState) bool {
 	return uint(from) < 6 && (uint16(1)<<uint(to))&fsmSlotValidNext[from] != 0
+}
+
+// fsmSlotSet assigns *p = to and reports a transition outside the verified StreamSlot
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmSlotSet(p *slotState, to slotState) {
+	if !fsmSlotCanTransition(*p, to) {
+		fsmViolation(fsmMachineStreamSlot, uint8(*p), uint8(to))
+	}
+	*p = to
 }
 
 var fsmSlotTable = [6][7]fsmStepResult{
@@ -581,13 +671,22 @@ func fsmSendIsTerminal(s sendState) bool {
 var fsmSendValidNext = [4]uint16{
 	0: 0x0007, // OPEN
 	1: 0x000e, // FIN
-	2: 0x0004, // RESET
+	2: 0x000c, // RESET
 	3: 0x0008, // DONE
 }
 
 // fsmSendCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified StreamSend FSM.
 func fsmSendCanTransition(from, to sendState) bool {
 	return uint(from) < 4 && (uint16(1)<<uint(to))&fsmSendValidNext[from] != 0
+}
+
+// fsmSendSet assigns *p = to and reports a transition outside the verified StreamSend
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmSendSet(p *sendState, to sendState) {
+	if !fsmSendCanTransition(*p, to) {
+		fsmViolation(fsmMachineStreamSend, uint8(*p), uint8(to))
+	}
+	*p = to
 }
 
 var fsmSendTable = [4][4]fsmStepResult{
@@ -606,7 +705,7 @@ var fsmSendTable = [4][4]fsmStepResult{
 	2: { // RESET
 		0: {next: 2, disp: 2, actions: 0x0000},
 		1: {next: 2, disp: 2, actions: 0x0000},
-		2: {next: 2, disp: 2, actions: 0x0000},
+		2: {next: 3, disp: 0, actions: 0x0004},
 		3: {next: 2, disp: 2, actions: 0x0000},
 	},
 	3: { // DONE
@@ -673,6 +772,15 @@ var fsmRecvValidNext = [4]uint16{
 // fsmRecvCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified StreamRecv FSM.
 func fsmRecvCanTransition(from, to recvState) bool {
 	return uint(from) < 4 && (uint16(1)<<uint(to))&fsmRecvValidNext[from] != 0
+}
+
+// fsmRecvSet assigns *p = to and reports a transition outside the verified StreamRecv
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmRecvSet(p *recvState, to recvState) {
+	if !fsmRecvCanTransition(*p, to) {
+		fsmViolation(fsmMachineStreamRecv, uint8(*p), uint8(to))
+	}
+	*p = to
 }
 
 var fsmRecvTable = [4][4]fsmStepResult{
@@ -752,6 +860,15 @@ func fsmEpochSlotCanTransition(from, to epochSlotState) bool {
 	return uint(from) < 3 && (uint16(1)<<uint(to))&fsmEpochSlotValidNext[from] != 0
 }
 
+// fsmEpochSlotSet assigns *p = to and reports a transition outside the verified EpochSlot
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmEpochSlotSet(p *epochSlotState, to epochSlotState) {
+	if !fsmEpochSlotCanTransition(*p, to) {
+		fsmViolation(fsmMachineEpochSlot, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
 var fsmEpochSlotTable = [3][3]fsmStepResult{
 	0: { // EMPTY
 		0: {next: 1, disp: 0, actions: 0x0001},
@@ -783,14 +900,17 @@ func fsmEpochSlotStep(s epochSlotState, ev uint8) fsmStepResult {
 // ---------------------------------------------------------------------------
 
 const (
-	fsmPath_EV_ALLOCATE_CANDIDATE      uint8 = 0
-	fsmPath_EV_BOOTSTRAP_ACTIVE        uint8 = 1
-	fsmPath_EV_RX_SMALL_RESPONSE       uint8 = 2
-	fsmPath_EV_RX_1200B_RESPONSE       uint8 = 3
-	fsmPath_EV_PROMOTE_TO_ACTIVE       uint8 = 4
-	fsmPath_EV_DEMOTE_TO_OLD           uint8 = 5
-	fsmPath_EV_VALIDATION_OR_PATH_FAIL uint8 = 6
-	fsmPath_EV_RELEASE_SLOT            uint8 = 7
+	fsmPath_EV_ALLOCATE_CANDIDATE            uint8 = 0
+	fsmPath_EV_BOOTSTRAP_ACTIVE              uint8 = 1
+	fsmPath_EV_RX_SMALL_RESPONSE             uint8 = 2
+	fsmPath_EV_RX_1200B_RESPONSE             uint8 = 3
+	fsmPath_EV_PROMOTE_TO_ACTIVE             uint8 = 4
+	fsmPath_EV_DEMOTE_TO_OLD                 uint8 = 5
+	fsmPath_EV_VALIDATION_OR_PATH_FAIL       uint8 = 6
+	fsmPath_EV_RELEASE_SLOT                  uint8 = 7
+	fsmPath_EV_REVALIDATE                    uint8 = 8
+	fsmPath_EV_RETAINED_REVALIDATION_EXPIRED uint8 = 9
+	fsmPath_EV_FALLBACK_TO_RETAINED          uint8 = 10
 )
 
 const (
@@ -842,11 +962,11 @@ func fsmPathIsFailedOrFree(s pathSt) bool {
 
 var fsmPathValidNext = [7]uint16{
 	0: 0x0013, // FREE
-	1: 0x004e, // VALIDATING
-	2: 0x004c, // REACHABLE
+	1: 0x006e, // VALIDATING
+	2: 0x006c, // REACHABLE
 	3: 0x0058, // READY
-	4: 0x0030, // ACTIVE
-	5: 0x0061, // OLD
+	4: 0x0032, // ACTIVE
+	5: 0x0073, // OLD
 	6: 0x0041, // FAILED
 }
 
@@ -855,82 +975,112 @@ func fsmPathCanTransition(from, to pathSt) bool {
 	return uint(from) < 7 && (uint16(1)<<uint(to))&fsmPathValidNext[from] != 0
 }
 
-var fsmPathTable = [7][8]fsmStepResult{
+// fsmPathSet assigns *p = to and reports a transition outside the verified PathValidation
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmPathSet(p *pathSt, to pathSt) {
+	if !fsmPathCanTransition(*p, to) {
+		fsmViolation(fsmMachinePathValidation, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
+var fsmPathTable = [7][11]fsmStepResult{
 	0: { // FREE
-		0: {next: 1, disp: 0, actions: 0x0001},
-		1: {next: 4, disp: 0, actions: 0x000e},
-		2: {next: 0, disp: 2, actions: 0x0000},
-		3: {next: 0, disp: 2, actions: 0x0000},
-		4: {next: 0, disp: 2, actions: 0x0000},
-		5: {next: 0, disp: 2, actions: 0x0000},
-		6: {next: 0, disp: 2, actions: 0x0000},
-		7: {next: 0, disp: 2, actions: 0x0000},
+		0:  {next: 1, disp: 0, actions: 0x0001},
+		1:  {next: 4, disp: 0, actions: 0x000e},
+		2:  {next: 0, disp: 2, actions: 0x0000},
+		3:  {next: 0, disp: 2, actions: 0x0000},
+		4:  {next: 0, disp: 2, actions: 0x0000},
+		5:  {next: 0, disp: 2, actions: 0x0000},
+		6:  {next: 0, disp: 2, actions: 0x0000},
+		7:  {next: 0, disp: 2, actions: 0x0000},
+		8:  {next: 0, disp: 2, actions: 0x0000},
+		9:  {next: 0, disp: 2, actions: 0x0000},
+		10: {next: 0, disp: 2, actions: 0x0000},
 	},
 	1: { // VALIDATING
-		0: {next: 1, disp: 2, actions: 0x0000},
-		1: {next: 1, disp: 2, actions: 0x0000},
-		2: {next: 2, disp: 0, actions: 0x0003},
-		3: {next: 3, disp: 0, actions: 0x0006},
-		4: {next: 1, disp: 2, actions: 0x0000},
-		5: {next: 1, disp: 2, actions: 0x0000},
-		6: {next: 6, disp: 0, actions: 0x0010},
-		7: {next: 1, disp: 2, actions: 0x0000},
+		0:  {next: 1, disp: 2, actions: 0x0000},
+		1:  {next: 1, disp: 2, actions: 0x0000},
+		2:  {next: 2, disp: 0, actions: 0x0003},
+		3:  {next: 3, disp: 0, actions: 0x0006},
+		4:  {next: 1, disp: 2, actions: 0x0000},
+		5:  {next: 1, disp: 2, actions: 0x0000},
+		6:  {next: 6, disp: 0, actions: 0x0010},
+		7:  {next: 1, disp: 2, actions: 0x0000},
+		8:  {next: 1, disp: 2, actions: 0x0000},
+		9:  {next: 5, disp: 0, actions: 0x0000},
+		10: {next: 1, disp: 2, actions: 0x0000},
 	},
 	2: { // REACHABLE
-		0: {next: 2, disp: 2, actions: 0x0000},
-		1: {next: 2, disp: 2, actions: 0x0000},
-		2: {next: 2, disp: 2, actions: 0x0000},
-		3: {next: 3, disp: 0, actions: 0x0004},
-		4: {next: 2, disp: 2, actions: 0x0000},
-		5: {next: 2, disp: 2, actions: 0x0000},
-		6: {next: 6, disp: 0, actions: 0x0010},
-		7: {next: 2, disp: 2, actions: 0x0000},
+		0:  {next: 2, disp: 2, actions: 0x0000},
+		1:  {next: 2, disp: 2, actions: 0x0000},
+		2:  {next: 2, disp: 2, actions: 0x0000},
+		3:  {next: 3, disp: 0, actions: 0x0004},
+		4:  {next: 2, disp: 2, actions: 0x0000},
+		5:  {next: 2, disp: 2, actions: 0x0000},
+		6:  {next: 6, disp: 0, actions: 0x0010},
+		7:  {next: 2, disp: 2, actions: 0x0000},
+		8:  {next: 2, disp: 2, actions: 0x0000},
+		9:  {next: 5, disp: 0, actions: 0x0000},
+		10: {next: 2, disp: 2, actions: 0x0000},
 	},
 	3: { // READY
-		0: {next: 3, disp: 2, actions: 0x0000},
-		1: {next: 3, disp: 2, actions: 0x0000},
-		2: {next: 3, disp: 2, actions: 0x0000},
-		3: {next: 3, disp: 2, actions: 0x0000},
-		4: {next: 4, disp: 0, actions: 0x0008},
-		5: {next: 3, disp: 2, actions: 0x0000},
-		6: {next: 6, disp: 0, actions: 0x0010},
-		7: {next: 3, disp: 2, actions: 0x0000},
+		0:  {next: 3, disp: 2, actions: 0x0000},
+		1:  {next: 3, disp: 2, actions: 0x0000},
+		2:  {next: 3, disp: 2, actions: 0x0000},
+		3:  {next: 3, disp: 2, actions: 0x0000},
+		4:  {next: 4, disp: 0, actions: 0x0008},
+		5:  {next: 3, disp: 2, actions: 0x0000},
+		6:  {next: 6, disp: 0, actions: 0x0010},
+		7:  {next: 3, disp: 2, actions: 0x0000},
+		8:  {next: 3, disp: 2, actions: 0x0000},
+		9:  {next: 3, disp: 2, actions: 0x0000},
+		10: {next: 3, disp: 2, actions: 0x0000},
 	},
 	4: { // ACTIVE
-		0: {next: 4, disp: 2, actions: 0x0000},
-		1: {next: 4, disp: 2, actions: 0x0000},
-		2: {next: 4, disp: 2, actions: 0x0000},
-		3: {next: 4, disp: 2, actions: 0x0000},
-		4: {next: 4, disp: 2, actions: 0x0000},
-		5: {next: 5, disp: 0, actions: 0x0000},
-		6: {next: 4, disp: 2, actions: 0x0000},
-		7: {next: 4, disp: 2, actions: 0x0000},
+		0:  {next: 4, disp: 2, actions: 0x0000},
+		1:  {next: 4, disp: 2, actions: 0x0000},
+		2:  {next: 4, disp: 2, actions: 0x0000},
+		3:  {next: 4, disp: 2, actions: 0x0000},
+		4:  {next: 4, disp: 2, actions: 0x0000},
+		5:  {next: 5, disp: 0, actions: 0x0000},
+		6:  {next: 4, disp: 2, actions: 0x0000},
+		7:  {next: 4, disp: 2, actions: 0x0000},
+		8:  {next: 1, disp: 0, actions: 0x0001},
+		9:  {next: 4, disp: 2, actions: 0x0000},
+		10: {next: 4, disp: 2, actions: 0x0000},
 	},
 	5: { // OLD
-		0: {next: 5, disp: 2, actions: 0x0000},
-		1: {next: 5, disp: 2, actions: 0x0000},
-		2: {next: 5, disp: 2, actions: 0x0000},
-		3: {next: 5, disp: 2, actions: 0x0000},
-		4: {next: 5, disp: 2, actions: 0x0000},
-		5: {next: 5, disp: 2, actions: 0x0000},
-		6: {next: 6, disp: 0, actions: 0x0010},
-		7: {next: 0, disp: 0, actions: 0x0010},
+		0:  {next: 5, disp: 2, actions: 0x0000},
+		1:  {next: 5, disp: 2, actions: 0x0000},
+		2:  {next: 5, disp: 2, actions: 0x0000},
+		3:  {next: 5, disp: 2, actions: 0x0000},
+		4:  {next: 5, disp: 2, actions: 0x0000},
+		5:  {next: 5, disp: 2, actions: 0x0000},
+		6:  {next: 6, disp: 0, actions: 0x0010},
+		7:  {next: 0, disp: 0, actions: 0x0010},
+		8:  {next: 1, disp: 0, actions: 0x0001},
+		9:  {next: 5, disp: 2, actions: 0x0000},
+		10: {next: 4, disp: 0, actions: 0x0008},
 	},
 	6: { // FAILED
-		0: {next: 6, disp: 2, actions: 0x0000},
-		1: {next: 6, disp: 2, actions: 0x0000},
-		2: {next: 6, disp: 2, actions: 0x0000},
-		3: {next: 6, disp: 2, actions: 0x0000},
-		4: {next: 6, disp: 2, actions: 0x0000},
-		5: {next: 6, disp: 2, actions: 0x0000},
-		6: {next: 6, disp: 2, actions: 0x0000},
-		7: {next: 0, disp: 0, actions: 0x0000},
+		0:  {next: 6, disp: 2, actions: 0x0000},
+		1:  {next: 6, disp: 2, actions: 0x0000},
+		2:  {next: 6, disp: 2, actions: 0x0000},
+		3:  {next: 6, disp: 2, actions: 0x0000},
+		4:  {next: 6, disp: 2, actions: 0x0000},
+		5:  {next: 6, disp: 2, actions: 0x0000},
+		6:  {next: 6, disp: 2, actions: 0x0000},
+		7:  {next: 0, disp: 0, actions: 0x0000},
+		8:  {next: 6, disp: 2, actions: 0x0000},
+		9:  {next: 6, disp: 2, actions: 0x0000},
+		10: {next: 6, disp: 2, actions: 0x0000},
 	},
 }
 
 // fsmPathStep evaluates the total transition table for (pathSt, event) in O(1) with zero allocations.
 func fsmPathStep(s pathSt, ev uint8) fsmStepResult {
-	if uint(s) >= 7 || uint(ev) >= 8 {
+	if uint(s) >= 7 || uint(ev) >= 11 {
 		return fsmStepResult{next: uint8(s), disp: fsmDispInvalidState}
 	}
 	return fsmPathTable[s][ev]
@@ -941,11 +1091,12 @@ func fsmPathStep(s pathSt, ev uint8) fsmStepResult {
 // ---------------------------------------------------------------------------
 
 const (
-	fsmPathRole_EV_BIND_CANDIDATE      uint8 = 0
-	fsmPathRole_EV_BIND_INITIAL_ACTIVE uint8 = 1
-	fsmPathRole_EV_PROMOTE_CANDIDATE   uint8 = 2
-	fsmPathRole_EV_DEMOTE_ACTIVE       uint8 = 3
-	fsmPathRole_EV_RECLAIM             uint8 = 4
+	fsmPathRole_EV_BIND_CANDIDATE       uint8 = 0
+	fsmPathRole_EV_BIND_INITIAL_ACTIVE  uint8 = 1
+	fsmPathRole_EV_PROMOTE_CANDIDATE    uint8 = 2
+	fsmPathRole_EV_DEMOTE_ACTIVE        uint8 = 3
+	fsmPathRole_EV_RECLAIM              uint8 = 4
+	fsmPathRole_EV_FALLBACK_TO_RETAINED uint8 = 5
 )
 
 const (
@@ -971,7 +1122,7 @@ var fsmPathRoleValidNext = [4]uint16{
 	0: 0x0007, // FREE
 	1: 0x0007, // CANDIDATE
 	2: 0x000c, // ACTIVE
-	3: 0x0009, // OLD
+	3: 0x000d, // OLD
 }
 
 // fsmPathRoleCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified PathRole FSM.
@@ -979,13 +1130,23 @@ func fsmPathRoleCanTransition(from, to pathRole) bool {
 	return uint(from) < 4 && (uint16(1)<<uint(to))&fsmPathRoleValidNext[from] != 0
 }
 
-var fsmPathRoleTable = [4][5]fsmStepResult{
+// fsmPathRoleSet assigns *p = to and reports a transition outside the verified PathRole
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmPathRoleSet(p *pathRole, to pathRole) {
+	if !fsmPathRoleCanTransition(*p, to) {
+		fsmViolation(fsmMachinePathRole, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
+var fsmPathRoleTable = [4][6]fsmStepResult{
 	0: { // FREE
 		0: {next: 1, disp: 0, actions: 0x0000},
 		1: {next: 2, disp: 0, actions: 0x0000},
 		2: {next: 0, disp: 2, actions: 0x0000},
 		3: {next: 0, disp: 2, actions: 0x0000},
 		4: {next: 0, disp: 2, actions: 0x0000},
+		5: {next: 0, disp: 2, actions: 0x0000},
 	},
 	1: { // CANDIDATE
 		0: {next: 1, disp: 2, actions: 0x0000},
@@ -993,6 +1154,7 @@ var fsmPathRoleTable = [4][5]fsmStepResult{
 		2: {next: 2, disp: 0, actions: 0x0000},
 		3: {next: 1, disp: 2, actions: 0x0000},
 		4: {next: 0, disp: 0, actions: 0x0001},
+		5: {next: 1, disp: 2, actions: 0x0000},
 	},
 	2: { // ACTIVE
 		0: {next: 2, disp: 2, actions: 0x0000},
@@ -1000,6 +1162,7 @@ var fsmPathRoleTable = [4][5]fsmStepResult{
 		2: {next: 2, disp: 2, actions: 0x0000},
 		3: {next: 3, disp: 0, actions: 0x0000},
 		4: {next: 2, disp: 2, actions: 0x0000},
+		5: {next: 2, disp: 2, actions: 0x0000},
 	},
 	3: { // OLD
 		0: {next: 3, disp: 2, actions: 0x0000},
@@ -1007,12 +1170,13 @@ var fsmPathRoleTable = [4][5]fsmStepResult{
 		2: {next: 3, disp: 2, actions: 0x0000},
 		3: {next: 3, disp: 2, actions: 0x0000},
 		4: {next: 0, disp: 0, actions: 0x0001},
+		5: {next: 2, disp: 0, actions: 0x0000},
 	},
 }
 
 // fsmPathRoleStep evaluates the total transition table for (pathRole, event) in O(1) with zero allocations.
 func fsmPathRoleStep(s pathRole, ev uint8) fsmStepResult {
-	if uint(s) >= 4 || uint(ev) >= 5 {
+	if uint(s) >= 4 || uint(ev) >= 6 {
 		return fsmStepResult{next: uint8(s), disp: fsmDispInvalidState}
 	}
 	return fsmPathRoleTable[s][ev]
@@ -1077,7 +1241,7 @@ func fsmSentIsResolved(s sentStatus) bool {
 var fsmSentValidNext = [8]uint16{
 	0: 0x000f, // RESERVED
 	1: 0x000e, // SUBMITTED
-	2: 0x0074, // EMITTED
+	2: 0x007c, // EMITTED
 	3: 0x0088, // BURNED
 	4: 0x0090, // ACKED
 	5: 0x00b0, // LOST
@@ -1088,6 +1252,15 @@ var fsmSentValidNext = [8]uint16{
 // fsmSentCanTransition reports in O(1) whether transitioning from -> to is permitted by the verified SentPacket FSM.
 func fsmSentCanTransition(from, to sentStatus) bool {
 	return uint(from) < 8 && (uint16(1)<<uint(to))&fsmSentValidNext[from] != 0
+}
+
+// fsmSentSet assigns *p = to and reports a transition outside the verified SentPacket
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmSentSet(p *sentStatus, to sentStatus) {
+	if !fsmSentCanTransition(*p, to) {
+		fsmViolation(fsmMachineSentPacket, uint8(*p), uint8(to))
+	}
+	*p = to
 }
 
 var fsmSentTable = [8][9]fsmStepResult{
@@ -1108,7 +1281,7 @@ var fsmSentTable = [8][9]fsmStepResult{
 		2: {next: 1, disp: 3, actions: 0x0000},
 		3: {next: 2, disp: 0, actions: 0x0001},
 		4: {next: 3, disp: 0, actions: 0x0004},
-		5: {next: 1, disp: 3, actions: 0x0000},
+		5: {next: 1, disp: 2, actions: 0x0000},
 		6: {next: 1, disp: 3, actions: 0x0000},
 		7: {next: 1, disp: 3, actions: 0x0000},
 		8: {next: 1, disp: 3, actions: 0x0000},
@@ -1118,7 +1291,7 @@ var fsmSentTable = [8][9]fsmStepResult{
 		1: {next: 2, disp: 3, actions: 0x0000},
 		2: {next: 2, disp: 3, actions: 0x0000},
 		3: {next: 2, disp: 3, actions: 0x0000},
-		4: {next: 2, disp: 3, actions: 0x0000},
+		4: {next: 3, disp: 0, actions: 0x0006},
 		5: {next: 4, disp: 0, actions: 0x000a},
 		6: {next: 5, disp: 0, actions: 0x0006},
 		7: {next: 6, disp: 0, actions: 0x0006},
@@ -1243,6 +1416,15 @@ func fsmParkCanTransition(from, to parkSt) bool {
 	return uint(from) < 5 && (uint16(1)<<uint(to))&fsmParkValidNext[from] != 0
 }
 
+// fsmParkSet assigns *p = to and reports a transition outside the verified ParkLease
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmParkSet(p *parkSt, to parkSt) {
+	if !fsmParkCanTransition(*p, to) {
+		fsmViolation(fsmMachineParkLease, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
 var fsmParkTable = [5][6]fsmStepResult{
 	0: { // IDLE
 		0: {next: 1, disp: 0, actions: 0x0000},
@@ -1340,6 +1522,15 @@ func fsmECNCanTransition(from, to ecnOutcome) bool {
 	return uint(from) < 3 && (uint16(1)<<uint(to))&fsmECNValidNext[from] != 0
 }
 
+// fsmECNSet assigns *p = to and reports a transition outside the verified ECNValidation
+// adjacency to fsmViolation, so engine/IR drift fails tests instead of passing silently.
+func fsmECNSet(p *ecnOutcome, to ecnOutcome) {
+	if !fsmECNCanTransition(*p, to) {
+		fsmViolation(fsmMachineECNValidation, uint8(*p), uint8(to))
+	}
+	*p = to
+}
+
 var fsmECNTable = [3][2]fsmStepResult{
 	0: { // UNKNOWN
 		0: {next: 1, disp: 0, actions: 0x0001},
@@ -1361,6 +1552,70 @@ func fsmECNStep(s ecnOutcome, ev uint8) fsmStepResult {
 		return fsmStepResult{next: uint8(s), disp: fsmDispInvalidState}
 	}
 	return fsmECNTable[s][ev]
+}
+
+func _() {
+	var x [1]struct{}
+	_ = x[stNew-0]
+	_ = x[stCBuild-1]
+	_ = x[stCWaitReply-2]
+	_ = x[stCVerify-3]
+	_ = x[stCFinishing-4]
+	_ = x[stSCollect-5]
+	_ = x[stSBuild-6]
+	_ = x[stSFinishing-7]
+	_ = x[stEstablished-8]
+	_ = x[stClosing-9]
+	_ = x[stDraining-10]
+	_ = x[stQuiescing-11]
+	_ = x[stDead-12]
+	_ = x[cipherUnresolved-0]
+	_ = x[cipherLocked-1]
+	_ = x[cipherFailed-2]
+	_ = x[slotEmpty-0]
+	_ = x[slotActive-1]
+	_ = x[slotRetireSent-2]
+	_ = x[slotRetirePending-3]
+	_ = x[slotRetiredWaitOpen-4]
+	_ = x[slotExhausted-5]
+	_ = x[sendOpen-0]
+	_ = x[sendFin-1]
+	_ = x[sendReset-2]
+	_ = x[sendDone-3]
+	_ = x[recvOpen-0]
+	_ = x[recvFin-1]
+	_ = x[recvReset-2]
+	_ = x[recvDone-3]
+	_ = x[epochSlotEmpty-0]
+	_ = x[epochSlotInstalled-1]
+	_ = x[epochSlotGrace-2]
+	_ = x[psFree-0]
+	_ = x[psValidating-1]
+	_ = x[psReachable-2]
+	_ = x[psReady-3]
+	_ = x[psActive-4]
+	_ = x[psOld-5]
+	_ = x[psFailed-6]
+	_ = x[pathFree-0]
+	_ = x[pathCandidate-1]
+	_ = x[pathActive-2]
+	_ = x[pathOld-3]
+	_ = x[sentReserved-0]
+	_ = x[sentSubmitted-1]
+	_ = x[sentEmitted-2]
+	_ = x[sentBurned-3]
+	_ = x[sentAcked-4]
+	_ = x[sentLost-5]
+	_ = x[sentAbandoned-6]
+	_ = x[sentUnused-7]
+	_ = x[parkIdle-0]
+	_ = x[parkReqWait-1]
+	_ = x[parkLive-2]
+	_ = x[parkWaking-3]
+	_ = x[parkAwakePend-4]
+	_ = x[ecnUnknown-0]
+	_ = x[ecnCapable-1]
+	_ = x[ecnBroken-2]
 }
 
 // ---------------------------------------------------------------------------

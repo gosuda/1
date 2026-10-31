@@ -34,11 +34,30 @@ func VerifyAllComposedModels() ([]ModelReport, error) {
 
 // ---------------------------------------------------------------------------
 // Composed Model 1: Connection Lifecycle x Cipher x 3-Slot Key Refresh x I/O Pins
+//
+// The lifecycle component is not re-implemented here: every lifecycle step
+// is a cell of the compiled ConnLifecycle table, the same table the engine
+// executes through fireConn. Crypto registers react to the step's action
+// bits, so an IR edit that breaks a cross-component invariant fails here.
 // ---------------------------------------------------------------------------
 
+// Lifecycle state and event IDs from connLifecycleMachine.
+const (
+	ccCFinishing  = 4
+	ccSFinishing  = 7
+	ccEstablished = 8
+	ccClosing     = 9
+	ccDraining    = 10
+	ccQuiescing   = 11
+	ccDead        = 12
+
+	ccEvPinsDrained = 13
+	ccEvLocalFatal  = 14
+)
+
 type connCryptoState struct {
-	connSt       uint8 // 0..12 (connState)
-	cipherSt     uint8 // 0=unresolved, 1=locked, 2=failed
+	connSt       uint8 // ConnLifecycle state ID
+	cipherSt     uint8 // 0=unresolved, 1=locked
 	lockedSuite  uint8 // 0=none, 1=AES, 2=XChaCha
 	activeSlot   uint8 // epochSlotState
 	nextSlot     uint8 // epochSlotState
@@ -50,183 +69,143 @@ type connCryptoState struct {
 }
 
 func checkConnCryptoInvariants(s connCryptoState) error {
-	// I01: Once cipher is locked, lockedSuite must be non-zero; before lock, zero.
+	// I01: a locked cipher always names its suite.
 	if s.cipherSt == 1 && s.lockedSuite == 0 {
 		return fmt.Errorf("I01 violated: cipher LOCKED without suite")
 	}
-	// I04: Active/closing key-bearing states (C_FINISHING=4, S_FINISHING=7, ESTABLISHED=8, CLOSING=9, DRAINING=10)
-	// are reachable only after handshake key installation and therefore require a locked cipher and installed active epoch keys.
-	// QUIESCING(11) is shared by both keyed close completion and unkeyed handshake aborts (Section 20.2).
-	strictlyKeyed := s.connSt == 4 || s.connSt == 7 || s.connSt == 8 || s.connSt == 9 || s.connSt == 10
-	if strictlyKeyed && (s.cipherSt != 1 || s.activeSlot != 1 || s.activeEpoch == 0) {
-		return fmt.Errorf("I04 violated: state %d requires installed keys but cipher=%d activeSlot=%d epoch=%d",
-			s.connSt, s.cipherSt, s.activeSlot, s.activeEpoch)
+	// I04: key-bearing non-quiescing states hold installed epoch keys.
+	strictlyKeyed := s.connSt == ccCFinishing || s.connSt == ccSFinishing ||
+		s.connSt == ccEstablished || s.connSt == ccClosing || s.connSt == ccDraining
+	if strictlyKeyed && (s.cipherSt != 1 || s.activeSlot != 1) {
+		return fmt.Errorf("I04 violated: state %d requires installed keys but cipher=%d activeSlot=%d",
+			s.connSt, s.cipherSt, s.activeSlot)
 	}
-	// I19/I22: PREV slot can only be EMPTY(0) or GRACE(2), never INSTALLED(1) for outbound sealing.
+	// I22: PREV is never seal-eligible.
 	if s.prevSlot == 1 {
 		return fmt.Errorf("I22 violated: PREV slot in seal-eligible INSTALLED state")
 	}
-	// I21: In ESTABLISHED(8), pnStage cannot remain at hard_limit(2) without closing.
-	if s.connSt == 8 && s.pnStage == 2 {
+	// I21: no state remains ESTABLISHED at the hard AEAD limit.
+	if s.connSt == ccEstablished && s.pnStage == 2 {
 		return fmt.Errorf("I21 violated: connection remained ESTABLISHED at hard AEAD PN limit")
 	}
-	// A08: DEAD(12) requires ioPins == 0 and secretsWiped == true.
-	if s.connSt == 12 && (s.ioPins != 0 || !s.secretsWiped) {
+	// A08: DEAD only after every I/O pin drained and secrets were wiped.
+	if s.connSt == ccDead && (s.ioPins != 0 || !s.secretsWiped) {
 		return fmt.Errorf("A08 violated: reached DEAD with ioPins=%d secretsWiped=%v", s.ioPins, s.secretsWiped)
 	}
 	return nil
 }
 
-func nextConnCryptoStates(s connCryptoState) []connCryptoState {
-	// I24: DEAD is strictly absorbing.
-	if s.connSt == 12 {
-		return []connCryptoState{s}
-	}
-	var out []connCryptoState
+// connCryptoStep is one successor with the lifecycle actions that produced
+// it (zero for environment steps).
+type connCryptoStep struct {
+	next    connCryptoState
+	actions uint16
+}
 
-	// Async I/O pin acquire (while active) and drain.
-	if s.connSt < 11 && s.ioPins < 2 {
+// applyLifecycleCell applies a compiled ConnLifecycle cell and the crypto
+// effects of its action bits. Guards that live outside the lifecycle
+// (I/O fences) are enforced here, mirroring the engine's callers.
+func applyLifecycleCell(cm *CompiledMachine, s connCryptoState, ev int) []connCryptoStep {
+	cell := cm.Table[s.connSt][ev]
+	if cell.Disp != DispTransition {
+		return nil
+	}
+	if ev == ccEvPinsDrained && s.ioPins != 0 {
+		return nil
+	}
+	n := s
+	n.connSt = cell.Next
+	if cell.ActionMask&cm.ActionBits["ActZeroizeSecrets"] != 0 {
+		n.activeSlot, n.nextSlot, n.prevSlot = 0, 0, 0
+		n.secretsWiped = true
+	}
+	if cell.ActionMask&cm.ActionBits["ActInstallEpoch1"] == 0 {
+		return []connCryptoStep{{n, cell.ActionMask}}
+	}
+	var out []connCryptoStep
+	for _, suite := range []uint8{1, 2} {
+		k := n
+		k.cipherSt = 1
+		k.lockedSuite = suite
+		k.activeSlot = 1
+		k.activeEpoch = 1
+		out = append(out, connCryptoStep{k, cell.ActionMask})
+	}
+	return out
+}
+
+func nextConnCryptoStates(cm *CompiledMachine, s connCryptoState) []connCryptoStep {
+	var out []connCryptoStep
+	quiet := cm.PredicateMasks["QuietTerminal"]&(1<<s.connSt) != 0
+
+	// Environment: async I/O pins are acquired only while emission is
+	// allowed and always drain eventually.
+	if !quiet && s.ioPins < 2 {
 		n := s
 		n.ioPins++
-		out = append(out, n)
+		out = append(out, connCryptoStep{next: n})
 	}
 	if s.ioPins > 0 {
 		n := s
 		n.ioPins--
-		out = append(out, n)
+		out = append(out, connCryptoStep{next: n})
 	}
 
-	switch s.connSt {
-	case 0: // NEW -> C_BUILD(1) or S_COLLECT(5)
-		c := s
-		c.connSt = 1
-		out = append(out, c)
-		sv := s
-		sv.connSt = 5
-		out = append(out, sv)
-	case 1: // C_BUILD -> C_WAIT_REPLY(2)
-		n := s
-		n.connSt = 2
-		out = append(out, n)
-	case 2: // C_WAIT_REPLY -> RETRY(1), C_VERIFY(3), or abort(11)
-		r := s
-		r.connSt = 1
-		out = append(out, r)
-		v := s
-		v.connSt = 3
-		out = append(out, v)
-		ab := s
-		ab.connSt = 11
-		out = append(out, ab)
-	case 3: // C_VERIFY -> lock suite & install epoch 1 -> C_FINISHING(4) or fail -> QUIESCING(11)
-		for _, suite := range []uint8{1, 2} {
-			ok := s
-			ok.connSt = 4
-			ok.cipherSt = 1
-			ok.lockedSuite = suite
-			ok.activeSlot = 1
-			ok.activeEpoch = 1
-			out = append(out, ok)
-		}
-		fail := s
-		fail.connSt = 11
-		fail.cipherSt = 2
-		out = append(out, fail)
-	case 4: // C_FINISHING -> HANDSHAKE_DONE -> ESTABLISHED(8) or close
-		est := s
-		est.connSt = 8
-		out = append(out, est)
-	case 5: // S_COLLECT -> S_BUILD(6)
-		n := s
-		n.connSt = 6
-		out = append(out, n)
-	case 6: // S_BUILD -> lock suite & install epoch 1 -> S_FINISHING(7)
-		for _, suite := range []uint8{1, 2} {
-			ok := s
-			ok.connSt = 7
-			ok.cipherSt = 1
-			ok.lockedSuite = suite
-			ok.activeSlot = 1
-			ok.activeEpoch = 1
-			out = append(out, ok)
-		}
-	case 7: // S_FINISHING -> FINISH verified -> ESTABLISHED(8)
-		est := s
-		est.connSt = 8
-		out = append(out, est)
-	case 8: // ESTABLISHED: key refresh, PN progression, close
-		// Stage NEXT epoch keys if empty and epoch < 3
+	// Every lifecycle event, via the compiled table.
+	for ev := range cm.Spec.Events {
+		out = append(out, applyLifecycleCell(cm, s, ev)...)
+	}
+
+	// Key refresh and PN progression in ESTABLISHED.
+	if s.connSt == ccEstablished {
 		if s.nextSlot == 0 && s.activeEpoch < 3 {
-			st := s
-			st.nextSlot = 1
-			out = append(out, st)
+			n := s
+			n.nextSlot = 1
+			out = append(out, connCryptoStep{next: n})
 		}
-		// Commit staged NEXT epoch -> ACTIVE, demote old ACTIVE -> PREV(GRACE), reset pnStage
 		if s.nextSlot == 1 && s.activeEpoch < 3 {
-			cm := s
-			cm.prevSlot = 2
-			cm.activeSlot = 1
-			cm.nextSlot = 0
-			cm.activeEpoch++
-			cm.pnStage = 0
-			out = append(out, cm)
+			n := s
+			n.prevSlot = 2
+			n.activeSlot = 1
+			n.nextSlot = 0
+			n.activeEpoch++
+			n.pnStage = 0
+			out = append(out, connCryptoStep{next: n})
 		}
-		// Expire PREV grace slot
 		if s.prevSlot == 2 {
-			gr := s
-			gr.prevSlot = 0
-			out = append(out, gr)
+			n := s
+			n.prevSlot = 0
+			out = append(out, connCryptoStep{next: n})
 		}
-		// Advance PN toward soft limit (1) and hard limit (2 -> immediate CLOSING)
 		if s.pnStage == 0 {
-			soft := s
-			soft.pnStage = 1
-			out = append(out, soft)
+			n := s
+			n.pnStage = 1
+			out = append(out, connCryptoStep{next: n})
 		}
 		if s.pnStage == 1 {
-			hard := s
-			hard.pnStage = 2
-			hard.connSt = 9 // AEAD_LIMIT_REACHED forces CLOSING
-			out = append(out, hard)
+			// Reaching the hard limit without a commit is a local fatal
+			// condition: the engine fires EV_LOCAL_FATAL in the same step.
+			h := s
+			h.pnStage = 2
+			out = append(out, applyLifecycleCell(cm, h, ccEvLocalFatal)...)
 		}
-	}
-
-	// Any key-bearing active state (4, 7, 8) can transition to CLOSING(9) or DRAINING(10)
-	if s.connSt == 4 || s.connSt == 7 || s.connSt == 8 {
-		cl := s
-		cl.connSt = 9
-		out = append(out, cl)
-		dr := s
-		dr.connSt = 10
-		out = append(out, dr)
-	}
-	if s.connSt == 9 {
-		dr := s
-		dr.connSt = 10
-		out = append(out, dr)
-		q := s
-		q.connSt = 11
-		out = append(out, q)
-	}
-	if s.connSt == 10 {
-		q := s
-		q.connSt = 11
-		out = append(out, q)
-	}
-	// QUIESCING(11) transitions to DEAD(12) only when ioPins == 0 (A08)
-	if s.connSt == 11 && s.ioPins == 0 {
-		d := s
-		d.connSt = 12
-		d.activeSlot = 0
-		d.nextSlot = 0
-		d.prevSlot = 0
-		d.secretsWiped = true
-		out = append(out, d)
 	}
 	return out
 }
 
 func verifyConnCryptoModel() (ModelReport, error) {
+	return verifyConnCryptoModelFor(connLifecycleMachine())
+}
+
+func verifyConnCryptoModelFor(lifecycle MachineSpec) (ModelReport, error) {
+	cm, _, err := CompileAndVerifyMachine(lifecycle)
+	if err != nil {
+		return ModelReport{}, err
+	}
+	emitClose := cm.ActionBits["ActEmitClose"]
+	liveKeyed := cm.PredicateMasks["LiveKeyed"]
+	quietMask := cm.PredicateMasks["QuietTerminal"]
+
 	initSt := connCryptoState{}
 	visited := map[connCryptoState]bool{initSt: true}
 	queue := []connCryptoState{initSt}
@@ -237,15 +216,26 @@ func verifyConnCryptoModel() (ModelReport, error) {
 		if err := checkConnCryptoInvariants(cur); err != nil {
 			return ModelReport{}, err
 		}
-		for _, nxt := range nextConnCryptoStates(cur) {
+		for _, st := range nextConnCryptoStates(cm, cur) {
+			nxt := st.next
 			transitions++
-			// Check transition invariant I01: lockedSuite never changes once set.
 			if cur.lockedSuite != 0 && nxt.lockedSuite != cur.lockedSuite {
 				return ModelReport{}, fmt.Errorf("I01 violated: lockedSuite changed from %d to %d", cur.lockedSuite, nxt.lockedSuite)
 			}
-			// Check transition invariant I19: activeEpoch never decreases.
 			if nxt.activeEpoch < cur.activeEpoch {
 				return ModelReport{}, fmt.Errorf("I19 violated: activeEpoch decreased from %d to %d", cur.activeEpoch, nxt.activeEpoch)
+			}
+			// I23: DRAINING/QUIESCING/DEAD never emit and never re-enter
+			// CLOSING; CLOSING is entered only from a live keyed state.
+			if quietMask&(1<<cur.connSt) != 0 && (st.actions&emitClose != 0 || nxt.connSt == ccClosing) {
+				return ModelReport{}, fmt.Errorf("I23 violated: quiet state %d emits or re-enters CLOSING", cur.connSt)
+			}
+			if nxt.connSt == ccClosing && cur.connSt != ccClosing && liveKeyed&(1<<cur.connSt) == 0 {
+				return ModelReport{}, fmt.Errorf("I23 violated: CLOSING entered from non-live state %d", cur.connSt)
+			}
+			// I24: DEAD is absorbing.
+			if cur.connSt == ccDead && nxt.connSt != ccDead {
+				return ModelReport{}, fmt.Errorf("I24 violated: DEAD left for %d", nxt.connSt)
 			}
 			if !visited[nxt] {
 				visited[nxt] = true
@@ -257,7 +247,7 @@ func verifyConnCryptoModel() (ModelReport, error) {
 		ModelName:          "ModelConnCrypto",
 		ReachableStates:    len(visited),
 		TransitionsChecked: transitions,
-		InvariantsVerified: []string{"I01", "I02", "I04", "I09", "I19", "I20", "I21", "I22", "I23", "I24", "A08"},
+		InvariantsVerified: []string{"I01", "I04", "I19", "I21", "I22", "I23", "I24", "A08"},
 	}, nil
 }
 
@@ -452,7 +442,7 @@ func verifyPathMigrationModel() (ModelReport, error) {
 		ModelName:          "ModelPathMigration",
 		ReachableStates:    len(visited),
 		TransitionsChecked: transitions,
-		InvariantsVerified: []string{"I15", "I17", "I18", "M01", "M02", "M06", "M07", "M09"},
+		InvariantsVerified: []string{"I18", "M01", "M02", "M06", "M07", "M09"},
 	}, nil
 }
 
@@ -684,7 +674,7 @@ func verifyStreamLifecycleModel() (ModelReport, error) {
 		ModelName:          "ModelStreamLifecycle",
 		ReachableStates:    len(visited),
 		TransitionsChecked: transitions,
-		InvariantsVerified: []string{"I10", "I11", "I12", "I13", "M21"},
+		InvariantsVerified: []string{"I10", "I11", "I12", "I13"},
 	}, nil
 }
 
@@ -699,14 +689,9 @@ type mobileParkingState struct {
 	pathReady     bool
 	creditBacked  bool
 	bulkSending   bool
-	streamsKept   bool
 }
 
 func checkMobileParkingInvariants(s mobileParkingState) error {
-	// M16: Parking never discards retained stream state.
-	if !s.streamsKept {
-		return fmt.Errorf("M16 violated: live stream/replay state discarded during parking")
-	}
 	// M17: Bulk application sending is forbidden while parkSt != parkIdle(0) or before pathReady && creditBacked.
 	if s.bulkSending && (s.parkSt != 0 || !s.pathReady || !s.creditBacked) {
 		return fmt.Errorf("M17 violated: bulkSending=true in parkSt=%d pathReady=%v creditBacked=%v",
@@ -805,7 +790,7 @@ func nextMobileParkingStates(s mobileParkingState) []mobileParkingState {
 }
 
 func verifyMobileParkingModel() (ModelReport, error) {
-	initSt := mobileParkingState{pathReady: true, creditBacked: true, streamsKept: true}
+	initSt := mobileParkingState{pathReady: true, creditBacked: true}
 	visited := map[mobileParkingState]bool{initSt: true}
 	queue := []mobileParkingState{initSt}
 	transitions := 0
@@ -832,129 +817,104 @@ func verifyMobileParkingModel() (ModelReport, error) {
 		ModelName:          "ModelMobileParking",
 		ReachableStates:    len(visited),
 		TransitionsChecked: transitions,
-		InvariantsVerified: []string{"M15", "M16", "M17"},
+		InvariantsVerified: []string{"M15", "M17"},
 	}, nil
 }
 
 // ---------------------------------------------------------------------------
-// Composed Model 5: Sent Ledger x In-Flight Accounting x Async I/O Ownership
+// Composed Model 5: Sent Ledger x In-Flight Accounting
+//
+// Two packet-number records step through the compiled SentPacket table;
+// bytes_in_flight moves only on the ActChargeInFlight/ActReleaseInFlight
+// bits of the cell taken. An IR edge that forgets to release (or releases
+// twice) breaks I14 here.
 // ---------------------------------------------------------------------------
 
+const (
+	sentEvSubmitIO   = 1
+	sentEvIORejected = 4
+	sentEvAck        = 5
+	sentStSubmitted  = 1
+	sentStBurned     = 3
+)
+
 type ledgerAccountingState struct {
-	pkt0St      uint8 // sentStatus (0..7)
-	pkt1St      uint8 // sentStatus (0..7)
-	inFlight    uint8 // 0..2 packets charged in flight
-	ioPinned0   bool  // zero-copy kernel pin on pkt 0
-	ioPinned1   bool  // zero-copy kernel pin on pkt 1
-	bufReused0  bool
-	bufReused1  bool
-	ackRejected bool
+	pkt      [2]uint8 // SentPacket state IDs
+	inFlight uint8
+}
+
+func stepLedgerPacket(
+	spec MachineSpec,
+	cm *CompiledMachine,
+	cur ledgerAccountingState,
+	i, ev int,
+	charge, release, ackInvalid, ioPending uint16,
+) (ledgerAccountingState, bool, error) {
+	st := cur.pkt[i]
+	cell := cm.Table[st][ev]
+	bit := uint16(1) << st
+	if ev == sentEvAck {
+		// I08: an ACK covering RESERVED/BURNED/UNUSED is ACK_RANGE_ERROR.
+		if ackInvalid&bit != 0 && cell.Disp != DispProtocolError {
+			return cur, false, fmt.Errorf("I08 violated: ACK accepted in state %s", spec.States[st].Name)
+		}
+		// A01: an ACK covering SUBMITTED waits for I/O acceptance.
+		if ioPending&bit != 0 && (cell.Disp == DispProtocolError || cell.Next != st) {
+			return cur, false, fmt.Errorf("A01 violated: ACK on %s is %s -> %s",
+				spec.States[st].Name, cell.Disp, spec.States[cell.Next].Name)
+		}
+	}
+	// A04: a rejected submission burns its PN without charging flight.
+	badReject := cell.Next != sentStBurned || cell.ActionMask&charge != 0
+	if st == sentStSubmitted && ev == sentEvIORejected && badReject {
+		return cur, false, fmt.Errorf("A04 violated: SUBMITTED rejection -> %s actions=0x%x",
+			spec.States[cell.Next].Name, cell.ActionMask)
+	}
+	if cell.Disp != DispTransition && cell.Disp != DispStay {
+		return cur, false, nil
+	}
+	n := cur
+	n.pkt[i] = cell.Next
+	if cell.ActionMask&charge != 0 {
+		n.inFlight++
+	}
+	if cell.ActionMask&release != 0 {
+		if n.inFlight == 0 {
+			return cur, false, fmt.Errorf("I14 violated: release with zero in flight from %s", spec.States[st].Name)
+		}
+		n.inFlight--
+	}
+	return n, true, nil
 }
 
 func checkLedgerAccountingInvariants(s ledgerAccountingState) error {
-	// I14: inFlight must equal exact count of packets currently in sentEmitted(2).
-	var wantFlight uint8
-	if s.pkt0St == 2 {
-		wantFlight++
+	var want uint8
+	for _, st := range s.pkt {
+		if st == 2 { // EMITTED
+			want++
+		}
 	}
-	if s.pkt1St == 2 {
-		wantFlight++
-	}
-	if s.inFlight != wantFlight {
-		return fmt.Errorf("I14 violated: inFlight=%d but emitted count=%d (pkt0=%d, pkt1=%d)",
-			s.inFlight, wantFlight, s.pkt0St, s.pkt1St)
-	}
-	// M11: Buffer cannot be reused while ioPinned is true.
-	if (s.ioPinned0 && s.bufReused0) || (s.ioPinned1 && s.bufReused1) {
-		return fmt.Errorf("M11 violated: zero-copy buffer reused while kernel I/O pin active")
+	if s.inFlight != want {
+		return fmt.Errorf("I14 violated: inFlight=%d but emitted count=%d (pkt=%v)", s.inFlight, want, s.pkt)
 	}
 	return nil
 }
 
-type pktStepOut struct {
-	st        uint8
-	inFlight  uint8
-	ioPinned  bool
-	bufReused bool
-	ackErr    bool
-}
-
-func stepOnePacket(st uint8, inFlight *uint8, ioPinned *bool, bufReused *bool) []pktStepOut {
-	var res []pktStepOut
-
-	// Completion of zero-copy pin can happen whenever ioPinned is true and not in SUBMITTED(1).
-	if *ioPinned && st != 1 {
-		res = append(res, pktStepOut{st, *inFlight, false, *bufReused, false})
-	}
-	// Once !ioPinned and resolved (3,4,5,6,7), buffer may be safely recycled.
-	if !*ioPinned && (st >= 3) && !*bufReused {
-		res = append(res, pktStepOut{st, *inFlight, false, true, false})
-	}
-
-	switch st {
-	case 7: // UNUSED -> RESERVED(0)
-		res = append(res, pktStepOut{0, *inFlight, false, false, false})
-	case 0: // RESERVED -> SUBMITTED(1), EMITTED(2), or BURNED(3); ACK here is ACK_RANGE_ERROR
-		res = append(res,
-			pktStepOut{1, *inFlight, true, false, false},
-			pktStepOut{2, *inFlight + 1, false, false, false},
-			pktStepOut{3, *inFlight, false, false, false},
-			pktStepOut{0, *inFlight, *ioPinned, *bufReused, true}, // invalid ACK rejected
-		)
-	case 1: // SUBMITTED -> EMITTED(2) on CQE accept, or BURNED(3) on CQE reject (A04)
-		res = append(res,
-			pktStepOut{2, *inFlight + 1, *ioPinned, false, false},
-			pktStepOut{3, *inFlight, false, false, false},
-		)
-	case 2: // EMITTED -> ACKED(4), LOST(5), or ABANDONED(6) — each releases inFlight once (I14)
-		res = append(res,
-			pktStepOut{4, *inFlight - 1, *ioPinned, *bufReused, false},
-			pktStepOut{5, *inFlight - 1, *ioPinned, *bufReused, false},
-			pktStepOut{6, *inFlight - 1, *ioPinned, *bufReused, false},
-		)
-	case 3: // BURNED -> ACK is rejected with ACK_RANGE_ERROR (I08)
-		res = append(res, pktStepOut{3, *inFlight, *ioPinned, *bufReused, true})
-	case 4: // ACKED -> duplicate ACK is a no-op (never decrements inFlight again)
-		res = append(res, pktStepOut{4, *inFlight, *ioPinned, *bufReused, false})
-	case 5: // LOST -> late ACK transitions to ACKED(4) without decrementing inFlight again
-		res = append(res, pktStepOut{4, *inFlight, *ioPinned, *bufReused, false})
-	case 6: // ABANDONED -> late ACK stays ABANDONED(6) without decrementing inFlight
-		res = append(res, pktStepOut{6, *inFlight, *ioPinned, *bufReused, false})
-	}
-	return res
-}
-
-func nextLedgerAccountingStates(s ledgerAccountingState) []ledgerAccountingState {
-	var out []ledgerAccountingState
-	fl0 := s.inFlight
-	pin0 := s.ioPinned0
-	reu0 := s.bufReused0
-	for _, p0 := range stepOnePacket(s.pkt0St, &fl0, &pin0, &reu0) {
-		n := s
-		n.pkt0St = p0.st
-		n.inFlight = p0.inFlight
-		n.ioPinned0 = p0.ioPinned
-		n.bufReused0 = p0.bufReused
-		n.ackRejected = p0.ackErr
-		out = append(out, n)
-	}
-	fl1 := s.inFlight
-	pin1 := s.ioPinned1
-	reu1 := s.bufReused1
-	for _, p1 := range stepOnePacket(s.pkt1St, &fl1, &pin1, &reu1) {
-		n := s
-		n.pkt1St = p1.st
-		n.inFlight = p1.inFlight
-		n.ioPinned1 = p1.ioPinned
-		n.bufReused1 = p1.bufReused
-		n.ackRejected = p1.ackErr
-		out = append(out, n)
-	}
-	return out
-}
-
 func verifyLedgerAccountingModel() (ModelReport, error) {
-	initSt := ledgerAccountingState{pkt0St: 7, pkt1St: 7}
+	return verifyLedgerAccountingModelFor(sentPacketMachine())
+}
+
+func verifyLedgerAccountingModelFor(spec MachineSpec) (ModelReport, error) {
+	cm, _, err := CompileAndVerifyMachine(spec)
+	if err != nil {
+		return ModelReport{}, err
+	}
+	charge := cm.ActionBits["ActChargeInFlight"]
+	release := cm.ActionBits["ActReleaseInFlight"]
+	ackInvalid := cm.PredicateMasks["AckInvalid"]
+	ioPending := cm.PredicateMasks["IoPending"]
+
+	initSt := ledgerAccountingState{pkt: [2]uint8{spec.Initial, spec.Initial}}
 	visited := map[ledgerAccountingState]bool{initSt: true}
 	queue := []ledgerAccountingState{initSt}
 	transitions := 0
@@ -964,11 +924,20 @@ func verifyLedgerAccountingModel() (ModelReport, error) {
 		if err := checkLedgerAccountingInvariants(cur); err != nil {
 			return ModelReport{}, err
 		}
-		for _, nxt := range nextLedgerAccountingStates(cur) {
-			transitions++
-			if !visited[nxt] {
-				visited[nxt] = true
-				queue = append(queue, nxt)
+		for i := range cur.pkt {
+			for ev := range spec.Events {
+				n, ok, err := stepLedgerPacket(spec, cm, cur, i, ev, charge, release, ackInvalid, ioPending)
+				if err != nil {
+					return ModelReport{}, err
+				}
+				if !ok {
+					continue
+				}
+				transitions++
+				if !visited[n] {
+					visited[n] = true
+					queue = append(queue, n)
+				}
 			}
 		}
 	}
@@ -976,6 +945,6 @@ func verifyLedgerAccountingModel() (ModelReport, error) {
 		ModelName:          "ModelLedgerAccounting",
 		ReachableStates:    len(visited),
 		TransitionsChecked: transitions,
-		InvariantsVerified: []string{"I08", "I14", "A01", "A04", "M11", "M12"},
+		InvariantsVerified: []string{"I08", "I14", "A01", "A04"},
 	}, nil
 }

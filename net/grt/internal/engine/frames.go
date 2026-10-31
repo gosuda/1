@@ -397,7 +397,7 @@ func (c *Conn) applyOpen(sid wire.StreamID) {
 	default:
 		return
 	}
-	s.state = slotActive
+	fsmSlotSet(&s.state, slotActive)
 	s.gen = sid.Generation()
 	s.readTerm = termNone // a new generation retires the old terminal
 	s.uni = sid.Uni()
@@ -406,19 +406,15 @@ func (c *Conn) applyOpen(sid wire.StreamID) {
 	s.send = nil
 	s.recv = &recvHalf{state: recvOpen, segs: make([]rxSeg, 0, 16), limit: uint64(core.local.InitialStreamWindow)}
 	if !s.uni {
-		initCap := 256 * 1024
-		if core.peer.InitialStreamWindow > uint32(initCap) {
-			initCap = int(core.peer.InitialStreamWindow)
-			if initCap > 1024*1024 {
-				initCap = 1024 * 1024
-			}
-		}
-		s.send = &sendHalf{state: sendOpen, buf: make([]byte, 0, initCap), limit: uint64(core.peer.InitialStreamWindow)}
+		// Leave send.buf nil until the application actually writes on the
+		// stream so peer STREAM_OPEN frames cannot force send-buffer
+		// allocations.
+		s.send = &sendHalf{state: sendOpen, limit: uint64(core.peer.InitialStreamWindow)}
 	}
 	// Section 36: accepting an OPEN reserves a small receive grant. Keep at
-	// least one stream window of connection credit ahead of use.
-	if core.connRxLim-core.connRxUsed < s.recv.limit {
-		core.connRxLim = core.connRxUsed + s.recv.limit
+	// least one stream window of connection credit ahead of consumed base.
+	if core.connRxLim-core.connRxAdv < s.recv.limit {
+		core.connRxLim = core.connRxAdv + s.recv.limit
 		c.queueCtrl(ctrlMaxData, 0, 0, core.connRxLim, 0, [16]byte{})
 	}
 	// Notify accept queue.
@@ -464,13 +460,13 @@ func (c *Conn) applyStreamData(sid wire.StreamID, off uint64, data []byte, fin b
 		r.finalKnown = true
 		r.final = end
 		if r.state == recvOpen {
-			r.state = recvFin
+			fsmRecvSet(&r.state, recvFin)
 		}
 	}
 	if r.state == recvFin && r.finalKnown && r.base >= r.final && r.allConsumed() {
 		// recvDone: appConsume reports the persistent errEOF terminal
 		// from here on (section 12.3).
-		r.state = recvDone
+		fsmRecvSet(&r.state, recvDone)
 		s.readTerm, s.readTermGen = termEOF, s.gen
 		c.retireCheck(s, sid)
 	}

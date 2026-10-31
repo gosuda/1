@@ -2,7 +2,7 @@
 
 ## 1. Executive Summary and Feasibility Analysis
 
-GRT/1.1 is explicitly structured around **single-writer deterministic transactions** (Section 22), **orthogonal component finite-state machines (FSMs)** over fixed-width integer registers (Sections 4.6, 12.5–12.7, 15, 17.7, 19, 20, 21, 23.2, 35.3, 35.9, 36.8), **conjunctive boolean emission/commit gates** (Section 22.3), and **83 normative invariants** (`I01`–`I35`, `A01`–`A12`, `M01`–`M24`).
+GRT/1.1 is explicitly structured around **single-writer deterministic transactions** (Section 22), **orthogonal component finite-state machines (FSMs)** over fixed-width integer registers (Sections 4.6, 12.5–12.7, 15, 17.7, 19, 20, 21, 23.2, 29, 35.5, 35.9), **conjunctive boolean emission/commit gates** (Section 22.3), and **normative safety invariants** (`I*`, `A*`, `M*`).
 
 This structure makes GRT/1.1 uniquely suited for a **Single-Source Intermediate Representation (IR)** architecture where a single canonical definition of all protocol state machines, guards, gates, and invariants simultaneously drives:
 1. **Exhaustive Formal Verification** (both a custom explicit-state model checker in Go and an automatic TLA+ specification exporter for TLC/Apalache).
@@ -62,17 +62,17 @@ Every state machine defined in `spec/GRT11.md` is represented as an immutable `M
 
 | Machine ID | Spec Section | States (`uint8`) | State Predicate Sets (Bitmasks) | Engine Type Binding |
 |---|---|---|---|---|
-| `ConnLifecycle` | Section 20.1–20.3 | `PRE_HS`, `RETRY_WAIT`, `HS_SENT`, `EARLY_SENDING`, `ESTABLISHED`, `REKEYING`, `MIGRATING`, `PARKED_LOCAL`, `PARKED_REMOTE`, `CLOSING`, `DRAINING`, `QUIESCING`, `DEAD` (13 states) | `KeyBearing`, `Terminating`, `AppSendEligible`, `Parked`, `HandshakeActive`, `Terminal` | `connState` (`internal/engine/types.go`) |
-| `CipherSelection` | Section 4.6 | `CIPHER_UNSELECTED`, `CIPHER_AES256_GCM`, `CIPHER_XCHACHA20_POLY1305` (3 states) | `Selected`, `Locked` | `uint8` (`Conn.core.cipher`) |
-| `StreamSlot` | Section 12.1, 21.1 | `SLOT_EMPTY`, `SLOT_ACTIVE`, `SLOT_RETIRE_SENT`, `SLOT_RETIRE_PENDING`, `SLOT_RETIRED_WAIT_OPEN`, `SLOT_EXHAUSTED` (6 states) | `OpenEligible`, `RetireInFlight`, `Terminal` | `slotState` (`internal/engine/types.go`) |
-| `StreamSend` | Section 12.5, 21.1 | `SEND_IDLE`, `SEND_OPEN`, `SEND_FIN`, `SEND_DONE`, `SEND_RESET` (5 states) | `Writable`, `FinSignaled`, `Terminal` | `sendState` (`internal/engine/types.go`) |
-| `StreamRecv` | Section 12.6, 21.1 | `RECV_IDLE`, `RECV_OPEN`, `RECV_SIZE_KNOWN`, `RECV_DONE`, `RECV_RESET` (5 states) | `AcceptsData`, `FinalSizeBound`, `Terminal` | `recvState` (`internal/engine/types.go`) |
-| `KeyRefresh` | Section 19, 21.2 | `REFRESH_IDLE`, `REFRESH_COLLECTING`, `REFRESH_STAGED`, `REFRESH_COMMITTED`, `REFRESH_GRACE`, `REFRESH_REKEY_DONE` (6 states) | `NextSlotOccupied`, `PrevSlotDecryptEligible`, `CommitPending` | `refreshState` (`internal/engine/refresh.go`) |
-| `PathLifecycle` | Section 17.1, 17.7, 21.3 | `PATH_FREE`, `PATH_VALIDATING`, `PATH_REACHABLE`, `PATH_READY`, `PATH_ACTIVE`, `PATH_OLD`, `PATH_FAILED` (7 states) | `ControlSendEligible`, `BulkDataEligible`, `ValidationComplete`, `Retained` | `pathState` (`internal/engine/types.go`) |
-| `CongestionControl` | Section 15.1–15.4, 21.4 | `CC_SLOW_START`, `CC_CONGESTION_AVOIDANCE`, `CC_RECOVERY`, `CC_PERSISTENT_CONGESTION` (4 states) | `CwndGrowing`, `InRecovery` | `pathRec` CC mode (`internal/engine/loss.go`) |
-| `ParkClient` | Section 35.9 | `PCLI_ACTIVE`, `PCLI_REQUESTING`, `PCLI_PARKED`, `PCLI_WAKING`, `PCLI_ABORTED` (5 states) | `TimersSuppressed`, `BulkTxBlocked`, `WakePending` | `parkClient` (`internal/engine/park.go`) |
-| `ParkServer` | Section 35.3 | `PSRV_ACTIVE`, `PSRV_PARKED`, `PSRV_WAKE_SENT`, `PSRV_EXPIRED` (4 states) | `LeaseActive`, `ProbingMuted`, `WakeOutstanding` | `parkServer` (`internal/engine/park.go`) |
-| `MemoryCompaction` | Section 36.8 | `MEM_ACTIVE_HOT`, `MEM_IDLE_WARM`, `MEM_PARKED_COMPACT`, `MEM_QUOTA_PRESSURE`, `MEM_REHYDRATING`, `MEM_DRAINING` (6 states) | `ScratchRetained`, `ZeroAllocAdmissionRequired` | `connCore` compaction phase |
+| `ConnLifecycle` | Section 20.1–20.3 | `NEW`, `C_BUILD`, `C_WAIT_REPLY`, `C_VERIFY`, `C_FINISHING`, `S_COLLECT`, `S_BUILD`, `S_FINISHING`, `ESTABLISHED`, `CLOSING`, `DRAINING`, `QUIESCING`, `DEAD` (13 states) | `KeyBearing`, `LiveKeyed`, `Terminating`, `AppSendEligible`, `HandshakeActive`, `Terminal` | `connState` (`internal/engine/lifecycle.go`) |
+| `CipherSelection` | Section 4.6 | `CIPHER_UNSELECTED`, `CIPHER_PROVISIONAL`, `CIPHER_LOCKED` (3 states) | `Selected`, `Locked` | `uint8` (`Conn.core.cipherSt`) |
+| `StreamSlot` | Section 12.1, 21.1 | `EMPTY`, `ACTIVE`, `RETIRE_SENT`, `RETIRE_PENDING`, `RETIRED_WAIT_OPEN`, `EXHAUSTED` (6 states) | `OpenEligible`, `RetireInFlight`, `Terminal` | `slotState` (`internal/engine/stream.go`) |
+| `StreamSend` | Section 12.5, 21.1 | `SEND_OPEN`, `SEND_FIN`, `SEND_RESET`, `SEND_DONE` (4 states) | `Live`, `Retransmittable`, `Terminal` | `sendState` (`internal/engine/stream.go`) |
+| `StreamRecv` | Section 12.6, 21.1 | `RECV_OPEN`, `RECV_FIN`, `RECV_RESET`, `RECV_DONE` (4 states) | `AcceptsData`, `FinalKnown`, `Terminal` | `recvState` (`internal/engine/stream.go`) |
+| `EpochSlot` | Section 19.2, 21.2 | `EMPTY`, `INSTALLED`, `GRACE` (3 states) | `Occupied`, `DecryptEligible`, `SealEligible` | `epochSlotState` (`internal/engine/conn.go`) |
+| `PathValidation` | Section 17.3, 17.7, 21.3 | `INACTIVE`, `PROBING`, `REACHABLE`, `READY`, `FAILED`, `ACTIVE`, `CLOSING` (7 states) | `ControlSendEligible`, `BulkDataEligible`, `ValidationComplete`, `Terminal` | `pathState` (`internal/engine/path.go`) |
+| `PathRole` | Section 17.1, 17.5 | `FREE`, `ACTIVE`, `CANDIDATE`, `OLD` (4 states) | `Occupied`, `PrimaryTx`, `Retained` | `pathRole` (`internal/engine/path.go`) |
+| `ParkLease` | Section 35.5, 35.9 | `IDLE`, `REQ_WAIT`, `LIVE`, `WAKING`, `AWAKE_PEND` (5 states) | `AppGateClosed`, `ControlResendActive`, `LeaseActive` | `parkSt` (`internal/engine/park.go`) |
+| `SentPacket` | Section 13.3, 29 | `UNISSUED`, `SUBMITTED`, `EMITTED`, `BURNED`, `ACKED`, `LOST`, `ABANDONED` (7 states) | `AckVerifiable`, `InFlightCounted`, `Terminal` | `sentStatus` (`internal/engine/packet.go`) |
+| `CongestionControl` | Section 15.1–15.4, 21.4 | `SLOW_START`, `CONGESTION_AVOIDANCE`, `RECOVERY`, `PERSISTENT_CONGESTION` (4 states) | `CwndGrowing`, `InRecovery` | `uint8` (`internal/engine/cc.go`) |
 
 ### 3.2 Guarded Deterministic Transitions and Total Input Semantics
 
@@ -187,14 +187,14 @@ To guarantee ultra-high throughput and zero GC pressure on the packet processing
 3. **Branch-Flattened Conjunctive Gate Evaluators**:
    For hotpath gates (Section 22.3: `TX_ELIGIBLE`, `RX_DECRYPT`, `MIGRATION_CUTOVER`, `STREAM_RETIRE`, `AMP_GUARD`), the generator emits both flag-packing helpers and direct inlined boolean evaluators that combine bitmask state checks with integer bounds checks.
 
-4. **Compile-Time & CI Equivalence Verification**:
-   `TestGeneratedEngineUpToDate` in `internal/formal/formal_test.go` regenerates the Go source in memory and compares it byte-for-byte with `internal/engine/z_formal_gen.go`. Any modification to the IR or manual edit to the generated file fails CI immediately unless regenerated via `go generate ./...`.
+4. **Compile-Time Enum Assertions & CI Equivalence Verification**:
+   `internal/formal/gogen.go` emits compile-time `var _ = func()` assertions (`_ = x[stNew-0]`, `_ = x[slotEmpty-0]`, etc.) binding every handwritten engine state constant to its IR state ID so any ordinal drift fails `go build` immediately. `TestGeneratedEngineUpToDate` in `internal/formal/formal_test.go` regenerates the Go source in memory and compares it byte-for-byte with `internal/engine/z_formal_gen.go`.
 
 ### 5.2 Engine Integration Points
 
-`internal/engine/z_formal_gen.go` is wired directly into `internal/engine`:
-- **`internal/engine/lifecycle.go`**: `keyBearing(s)` and `terminating(s)` delegate directly to the generated bitmask classifiers `fsmConnIsKeyBearing(s)` and `fsmConnIsTerminating(s)`, while `setState` validates lifecycle transitions against the generated transition matrix.
-- **`internal/engine/streamops.go`**: `slotLocalDone(s)` uses the generated `fsmSendIsTerminal(s.send.state)` and `fsmRecvIsTerminal(s.recv.state)` bitmask classifiers; retirement transitions verify against `fsmSlotCanTransition`.
-- **`internal/engine/path.go` & `internal/engine/tx.go`**: Path state eligibility (`fsmPathIsBulkDataEligible`, `fsmPathIsControlSendEligible`) and TX/RX gate checks use the generated predicates.
-- **`internal/engine/refresh.go`**: Key refresh state transitions validate against the generated `KeyRefresh` FSM.
-- **`internal/engine/park.go`**: Client and server parking lease transitions validate against the generated `ParkClient` and `ParkServer` FSMs.
+`internal/engine/z_formal_gen.go` and `internal/engine/fsm_check.go` are wired across all 11 FSMs in `internal/engine`:
+- **`internal/engine/lifecycle.go` & `internal/engine/fsm_check.go`**: `fireConn(ev)` and `mustFireConn(ev)` step `core.state` exclusively through `fsmConnStep(c.core.state, ev)` (`fsmConnTable`), while `keyBearing()`, `terminating()`, `localClose()` (`fsmConnIsLiveKeyed`), and `appSendEligible()` delegate to the generated O(1) bitmask classifiers.
+- **`internal/engine/stream.go`, `internal/engine/frames.go`, `internal/engine/streamops.go`, `internal/engine/app.go`**: Slot, send-half, and receive-half mutations route through `fsmSlotSet`, `fsmSendSet`, and `fsmRecvSet`; `slotLocalDone(s)` uses `fsmEvalStreamHalvesDone`.
+- **`internal/engine/path.go`**: Path validation state and role transitions route through `fsmPathSet` and `fsmPathRoleSet`, while eligibility checks use `fsmPathIsBulkDataEligible` and `fsmPathIsControlSendEligible`.
+- **`internal/engine/refresh.go`, `internal/engine/handshake.go`, `internal/engine/serverhs.go`**: Cipher locking (`fsmCipherSet`) and key-epoch slot lifecycle (`fsmEpochSlotSet`) validate every transition against the generated adjacency masks.
+- **`internal/engine/park.go`, `internal/engine/packet.go`, `internal/engine/cc.go`**: Parking lease transitions (`fsmParkSet`), sent-packet ledger transitions (`fsmSentSet` + `fsmSentIsAckVerifiable`), and congestion-control mode transitions (`fsmCCSet`) execute through the generated verifiers. Any out-of-table transition increments `engine.FSMViolations()`, which `TestMain` asserts is zero across unit, integration, and simulation test suites.

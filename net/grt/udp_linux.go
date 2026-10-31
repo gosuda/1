@@ -14,7 +14,7 @@ import (
 )
 
 func (s *UDPSocket) sendGSOPlatform(payload []byte, segmentSize uint16, src, dst netip.AddrPort, ecn uint8) (bool, error) {
-	var oob [128]byte
+	var oob [sendOOBSize]byte
 	ip := src.Addr().Unmap()
 	var sendSrc netip.Addr
 	if src != s.addr && ip.IsValid() && !ip.IsUnspecified() && ip != s.addr.Addr().Unmap() {

@@ -19,7 +19,7 @@ func TestCompileAndVerifyAllMachines(t *testing.T) {
 	totalCells := 0
 	totalExplicit := 0
 	for _, r := range reports {
-		if !r.Deterministic || !r.Total || !r.AbsorbingTerminals || !r.TerminationReachable {
+		if !r.Deterministic || !r.Total || !r.AbsorbingTerminals || !r.TerminationReachable || !r.Recurrent {
 			t.Fatalf("machine %s failed verification flags: %+v", r.MachineName, r)
 		}
 		if r.ReachableStates != r.NumStates {
@@ -105,6 +105,54 @@ func TestNegativeCheckerDetectsViolations(t *testing.T) {
 	}
 	if _, _, err := CompileAndVerifyMachine(livelock); err == nil || !strings.Contains(err.Error(), "livelock trap") {
 		t.Fatalf("expected livelock trap error, got %v", err)
+	}
+
+	// 5. Terminal-free machine with a state that cannot return to Initial.
+	wedge := epochSlotMachine()
+	wedge.Transitions = wedge.Transitions[:2] // drop every path back to EMPTY
+	if _, _, err := CompileAndVerifyMachine(wedge); err == nil || !strings.Contains(err.Error(), "R02") {
+		t.Fatalf("expected R02 recurrence error, got %v", err)
+	}
+
+	// 6. STAY disposition that moves.
+	badStay := cipherSelectionMachine()
+	badStay.Transitions = append(badStay.Transitions, TransitionSpec{From: 1, Event: 0, To: 2, Disp: DispStay})
+	if _, _, err := CompileAndVerifyMachine(badStay); err == nil || !strings.Contains(err.Error(), "disposition") {
+		t.Fatalf("expected disposition consistency error, got %v", err)
+	}
+
+	// 7. Gate with an overlapping term bit.
+	g := AllGates()[0]
+	g.Terms = append(g.Terms, GateTerm{Name: "Dup", Bit: g.Terms[0].Bit})
+	if err := VerifyGate(g); err == nil || !strings.Contains(err.Error(), "reuses bit") {
+		t.Fatalf("expected gate bit reuse error, got %v", err)
+	}
+}
+
+// The composed lifecycle model executes the IR table, so an IR edit that
+// lets DRAINING re-enter CLOSING (the APP_CLOSE bug class) must fail I23.
+func TestConnCryptoModelCatchesIRRegression(t *testing.T) {
+	m := connLifecycleMachine()
+	m.Transitions = append(m.Transitions, TransitionSpec{
+		From: ccDraining, Event: 10, To: ccClosing, Disp: DispTransition,
+		Actions: []string{"ActEmitClose", "ActArmCloseTimer"},
+	})
+	if _, err := verifyConnCryptoModelFor(m); err == nil || !strings.Contains(err.Error(), "I23") {
+		t.Fatalf("expected I23 violation, got %v", err)
+	}
+}
+
+// An IR edge that resolves an emitted packet without releasing its flight
+// charge must fail I14 in the ledger model.
+func TestLedgerModelCatchesMissingRelease(t *testing.T) {
+	m := sentPacketMachine()
+	for i, tr := range m.Transitions {
+		if tr.From == 2 && tr.Event == 6 { // EMITTED --LOSS--> LOST
+			m.Transitions[i].Actions = []string{"ActRequeueItems"}
+		}
+	}
+	if _, err := verifyLedgerAccountingModelFor(m); err == nil || !strings.Contains(err.Error(), "I14") {
+		t.Fatalf("expected I14 violation, got %v", err)
 	}
 }
 

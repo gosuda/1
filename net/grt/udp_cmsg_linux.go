@@ -3,73 +3,43 @@
 package grt
 
 import (
-	"encoding/binary"
 	"net/netip"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-func parseRecvOOB(oob []byte) (dst netip.Addr, ecn uint8) {
-	rem := oob
-	for len(rem) > 0 {
-		hdr, data, next, err := unix.ParseOneSocketControlMessage(rem)
-		if err != nil {
-			return
-		}
-		rem = next
-		switch hdr.Level {
-		case unix.IPPROTO_IP:
-			switch hdr.Type {
-			case unix.IP_PKTINFO:
-				if len(data) >= 12 {
-					dst = netip.AddrFrom4(*(*[4]byte)(data[8:12]))
-				}
-			}
-		case unix.IPPROTO_IPV6:
-			switch hdr.Type {
-			case unix.IPV6_PKTINFO:
-				if len(data) >= 16 {
-					dst = netip.AddrFrom16(*(*[16]byte)(data[:16]))
-				}
-			case unix.IPV6_TCLASS:
-				if len(data) >= 4 {
-					ecn = uint8(binary.NativeEndian.Uint32(data[:4]) & 3)
-				}
-			}
-		}
-	}
-	return
-}
+const (
+	// IP_PKTINFO carries struct in_pktinfo; ipi_spec_dst selects the source.
+	ipv4SrcType   = unix.IP_PKTINFO
+	ipv4SrcLen    = 12
+	ipv4SrcOffset = 4
+	// Linux accepts an int or a byte for IP_TOS ancillary data.
+	ipv4TOSSendLen = 4
+)
 
-func buildSendOOB(oob []byte, src netip.Addr, dst netip.AddrPort, ecn uint8) int {
-	off := 0
-	if src.IsValid() && !src.IsUnspecified() {
-		if src.Is4() {
-			cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&oob[off]))
-			cmsg.Level = unix.IPPROTO_IP
-			cmsg.Type = unix.IP_PKTINFO
-			cmsg.SetLen(unix.CmsgLen(12))
-			ip4 := src.As4()
-			copy(oob[off+unix.SizeofCmsghdr+4:off+unix.SizeofCmsghdr+8], ip4[:])
-			off += unix.CmsgSpace(12)
-		} else if src.Is6() && !src.Is4In6() {
-			cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&oob[off]))
-			cmsg.Level = unix.IPPROTO_IPV6
-			cmsg.Type = unix.IPV6_PKTINFO
-			cmsg.SetLen(unix.CmsgLen(20))
-			ip6 := src.As16()
-			copy(oob[off+unix.SizeofCmsghdr:off+unix.SizeofCmsghdr+16], ip6[:])
-			off += unix.CmsgSpace(20)
+// IP_PMTUDISC_PROBE sets DF on every datagram while ignoring the kernel's
+// cached path MTU, so PMTU probes (spec section 17.2) test the real path
+// instead of being refused or fragmented locally. Dual-stack sockets also
+// take the IPv4-level options for IPv4-mapped traffic.
+var (
+	socketOptions4 = []sockOpt{
+		{unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_PROBE},
+		{unix.IPPROTO_IP, unix.IP_RECVTOS, 1},
+	}
+	socketOptions6 = []sockOpt{
+		{unix.IPPROTO_IPV6, unix.IPV6_MTU_DISCOVER, unix.IPV6_PMTUDISC_PROBE},
+		{unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_PROBE},
+		{unix.IPPROTO_IP, unix.IP_RECVTOS, 1},
+	}
+)
+
+func parseIPv4Cmsg(typ int32, data []byte, dst *netip.Addr, ecn *uint8) {
+	switch typ {
+	case unix.IP_PKTINFO:
+		if len(data) >= 12 {
+			*dst = netip.AddrFrom4([4]byte(data[8:12]))
 		}
+	case unix.IP_TOS:
+		parseIPv4TOS(data, ecn)
 	}
-	if ecn != 0 && dst.Addr().Is6() && !dst.Addr().Is4In6() {
-		cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&oob[off]))
-		cmsg.Level = unix.IPPROTO_IPV6
-		cmsg.Type = unix.IPV6_TCLASS
-		cmsg.SetLen(unix.CmsgLen(4))
-		binary.NativeEndian.PutUint32(oob[off+unix.SizeofCmsghdr:off+unix.SizeofCmsghdr+4], uint32(ecn))
-		off += unix.CmsgSpace(4)
-	}
-	return off
 }

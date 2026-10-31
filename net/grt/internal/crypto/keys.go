@@ -27,6 +27,7 @@ const (
 	lblEarlyIV          = "early iv"
 	lblBinder           = "binder"
 	lblTicketPSK        = "ticket psk"
+	lblTicketKey        = "ticket key"
 	lblAppExporter      = "application exporter"
 )
 

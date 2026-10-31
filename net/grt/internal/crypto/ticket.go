@@ -164,6 +164,107 @@ func TicketKeyID(ticket []byte) (uint32, bool) {
 	return binary.BigEndian.Uint32(ticket[0:]), true
 }
 
+const (
+	// TicketKeyPeriodS is the envelope-key rotation period (spec section
+	// 9.1: rotate before 24 hours of issuance).
+	TicketKeyPeriodS = 86400
+	// TicketSealsPerKey bounds the envelopes one derived key seals (spec
+	// section 9.1: rotate before 2^24 envelopes).
+	TicketSealsPerKey = 1 << 24
+
+	ticketSubBits    = 12
+	ticketSubMask    = 1<<ticketSubBits - 1
+	ticketPeriodMask = 1<<(32-ticketSubBits) - 1
+)
+
+var (
+	errTicketMasterUnset = errors.New("grt: ticket master key not configured")
+	errTicketClock       = errors.New("grt: ticket clock before unix epoch")
+)
+
+// TicketMaster is the configured ticket master key. Envelope keys are
+// derived on demand and never stored:
+//
+//	period = floor(now_unix_s / 86400)
+//	sub    = (issuance_counter >> 24) mod 4096
+//	key_id = u32((period mod 2^20) << 12 | sub)
+//	key    = L(master, "ticket key", u32(generation) || u64(period) || u16(sub), 32)
+//
+// key_id travels in the existing envelope field, so the wire format is
+// unchanged. One derived key covers one 2^24-counter block of one period,
+// which meets the section 9.1 bound while a single issuer prefix seals
+// fewer than 2^36-2^24 tickets per period. Open accepts the current and
+// previous period only: a ticket lives at most 24 hours, so its issuing
+// period is at most one behind, and older keys become underivable.
+type TicketMaster struct {
+	Key [32]byte
+	// Generation separates the key space of successive master keys.
+	Generation uint32
+}
+
+// Zeroize erases the master key in place.
+func (m *TicketMaster) Zeroize() { *m = TicketMaster{} }
+
+func (m *TicketMaster) periodKey(period uint64, sub uint16) [32]byte {
+	var ctx [14]byte
+	binary.BigEndian.PutUint32(ctx[0:], m.Generation)
+	binary.BigEndian.PutUint64(ctx[4:], period)
+	binary.BigEndian.PutUint16(ctx[12:], sub)
+	return L32(m.Key[:], lblTicketKey, ctx[:])
+}
+
+func ticketPeriod(nowUnix int64) (uint64, error) {
+	if nowUnix < 0 {
+		return 0, errTicketClock
+	}
+	return uint64(nowUnix) / TicketKeyPeriodS, nil
+}
+
+// Seal builds the opaque ticket under the key for (nowUnix, counter) with
+// nonce prefix||counter. counter must be the persistent monotonic
+// issuance counter of spec section 9.1: it both keeps nonces unique and
+// selects the 2^24-envelope key block. An all-zero master is refused
+// because its derived keys would be public.
+func (m *TicketMaster) Seal(nowUnix int64, prefix [16]byte, counter uint64, plain *[TicketPlainBytes]byte) ([TicketWireBytes]byte, error) {
+	if m.Key == ([32]byte{}) {
+		return [TicketWireBytes]byte{}, errTicketMasterUnset
+	}
+	period, err := ticketPeriod(nowUnix)
+	if err != nil {
+		return [TicketWireBytes]byte{}, err
+	}
+	sub := uint16((counter / TicketSealsPerKey) & ticketSubMask)
+	keyID := uint32(period&ticketPeriodMask)<<ticketSubBits | uint32(sub)
+	key := m.periodKey(period, sub)
+	defer Zeroize(key[:])
+	return SealTicket(key, keyID, TicketNonceIssue(prefix, counter), *plain), nil
+}
+
+// Open decrypts a ticket whose key_id names the current or previous
+// period at nowUnix; any other key_id fails without a decryption attempt.
+func (m *TicketMaster) Open(nowUnix int64, ticket []byte) (TicketPlain, error) {
+	keyID, ok := TicketKeyID(ticket)
+	if !ok || m.Key == ([32]byte{}) {
+		return TicketPlain{}, ErrTicketInvalid
+	}
+	cur, err := ticketPeriod(nowUnix)
+	if err != nil {
+		return TicketPlain{}, ErrTicketInvalid
+	}
+	var period uint64
+	switch field := uint64(keyID >> ticketSubBits); {
+	case field == cur&ticketPeriodMask:
+		period = cur
+	case cur > 0 && field == (cur-1)&ticketPeriodMask:
+		period = cur - 1
+	default:
+		return TicketPlain{}, ErrTicketInvalid
+	}
+	key := m.periodKey(period, uint16(keyID&ticketSubMask))
+	defer Zeroize(key[:])
+	return OpenTicket(key, ticket)
+}
+
 // TicketNonceIssue builds an issuance nonce: issuerPrefix16 || counter8.
 // The issuer prefix must be a fresh per-key random value; the counter is a
 // persistent monotonic issuance counter.
