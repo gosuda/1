@@ -144,6 +144,9 @@ git push ws refs/remotes/ws/ws/capy/HQQ-pr-12:refs/heads/land/hqq-pr-12
 
 Review it like any other change. You become the requester, so `OWNERS` applies to you.
 
+Once the change has landed and been exported, the lander closes the original pull request on the mirror with a
+comment (only if its head is exactly what landed; a pull request that got new commits stays open).
+
 ## 7. Security fixes under embargo
 
 If you are fixing an undisclosed vulnerability, do **not** use ordinary branch names or land it. Follow
