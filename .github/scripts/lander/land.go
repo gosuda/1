@@ -66,6 +66,10 @@ type Request struct {
 	Requester string
 	Approvers []string
 	Pushed    time.Time
+	// ReviewMerged marks a request made by merging the review pull request review/<ID> on GitHub
+	// instead of pushing land/<ID>. LandRef is empty; the review pair is removed whatever the outcome,
+	// because the merged pull request cannot be reopened and a rejected pair would be tried again.
+	ReviewMerged bool
 	// ExtraTrailers are appended to the landed commit message.
 	ExtraTrailers []string
 }
@@ -140,6 +144,7 @@ func (l *Lander) DrainLandRequests(ctx context.Context) error {
 		}
 		reqs = append(reqs, req)
 	}
+	reqs = append(reqs, l.mergedReviewRequests(ctx, reqs)...)
 	sort.SliceStable(reqs, func(i, j int) bool {
 		if !reqs[i].Pushed.Equal(reqs[j].Pushed) {
 			return reqs[i].Pushed.Before(reqs[j].Pushed)
@@ -165,9 +170,50 @@ func (l *Lander) DrainLandRequests(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// finishRequest performs the idempotent post-processing of a processed land ref.
+// mergedReviewRequests turns pull requests merged on GitHub into landing requests: merging the
+// review pull request review/<id> of a workspace (or of a staged mirror pull request) lands exactly
+// the reviewed tip. The requester is the authenticated merger, taken from the activity entry that set
+// base/<id> to the merge commit, and approvals count as for a land ref. A pull request is a request
+// only while review/<id> still holds the head it was merged at: the lander deletes the review pair
+// once it has handled the merge, and a branch that moved afterwards holds unreviewed content.
+func (l *Lander) mergedReviewRequests(ctx context.Context, have []Request) []Request {
+	merged, err := l.Forge.MergedPulls(ctx, l.User.Repo)
+	if err != nil {
+		l.Log.Warn("merged pull requests unavailable; merges are picked up on a later cycle", "err", err)
+		return nil
+	}
+	pending := make(map[string]bool, len(have))
+	for _, r := range have {
+		pending[r.ID] = true
+	}
+	var out []Request
+	for _, p := range merged {
+		id, ok := strings.CutPrefix(p.HeadRef, "review/")
+		if !ok || pending[id] {
+			continue
+		}
+		if sha, ok := l.Store.RevParse(ctx, userReview+id); !ok || sha != p.HeadSHA {
+			continue
+		}
+		push, err := l.Forge.PushForTip(ctx, l.User.Repo, "refs/heads/base/"+id, p.MergeSHA)
+		if err != nil {
+			l.Log.Warn("merged review pull request deferred: merger unresolved", "pull", p.Number, "id", id, "err", err)
+			continue
+		}
+		req := Request{ID: id, Tip: p.HeadSHA, Requester: push.Actor, Pushed: push.Time, ReviewMerged: true,
+			ExtraTrailers: []string{"Suda-Landed-From: refs/heads/review/" + id}}
+		if req.Approvers, err = l.Forge.ApproversForTip(ctx, l.User.Repo, "review/"+id, p.HeadSHA); err != nil {
+			l.Log.Warn("approvals unavailable; continuing without", "id", id, "err", err)
+		}
+		out = append(out, req)
+	}
+	return out
+}
+
+// finishRequest performs the idempotent post-processing of a processed land ref or merged review
+// pull request.
 func (l *Lander) finishRequest(ctx context.Context, req Request, res Result) error {
-	if res.Outcome == Deferred || req.LandRef == "" || l.DryRun {
+	if res.Outcome == Deferred || (req.LandRef == "" && !req.ReviewMerged) || l.DryRun {
 		return nil
 	}
 	var errs []error
@@ -181,11 +227,13 @@ func (l *Lander) finishRequest(ctx context.Context, req Request, res Result) err
 	if err := l.Forge.SetStatus(ctx, l.User.Repo, req.Tip, Status{State: state, Context: "suda/land", Description: desc}); err != nil {
 		errs = append(errs, fmt.Errorf("status: %w", err))
 	}
-	leases := []string{req.LandRef + ":" + req.Tip}
-	if err := l.Store.Push(ctx, l.User, Write, false, leases, ":"+req.LandRef); err != nil {
-		errs = append(errs, fmt.Errorf("delete land ref: %w", err))
+	if req.LandRef != "" {
+		leases := []string{req.LandRef + ":" + req.Tip}
+		if err := l.Store.Push(ctx, l.User, Write, false, leases, ":"+req.LandRef); err != nil {
+			errs = append(errs, fmt.Errorf("delete land ref: %w", err))
+		}
 	}
-	if res.Outcome != Rejected {
+	if res.Outcome != Rejected || req.ReviewMerged {
 		for _, ns := range []string{"base", "review"} {
 			ref := "refs/heads/" + ns + "/" + req.ID
 			if sha, ok := l.Store.RevParse(ctx, "refs/user/"+ns+"/"+req.ID); ok {

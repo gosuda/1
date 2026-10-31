@@ -63,16 +63,18 @@ func (l *Lander) reviewPullBody(wf capy.Workflow, pr PullRequest, id string) str
 			strings.TrimRight(l.MagpieURL, "/"), id, id)
 	}
 	fmt.Fprintf(&b, `
-To land it, review it here (approvals bound to the exact tip count for `+"`OWNERS`"+`), then request the landing:
+To land it, review it here (approvals bound to the exact tip count for `+"`OWNERS`"+`), then merge this
+pull request, or request the landing yourself:
 
 `+"```sh"+`
 git fetch ws review/%[1]s
 git push ws FETCH_HEAD:refs/heads/land/%[1]s
 `+"```"+`
 
-The lander exports the result to %[2]s and closes the original pull request. This pull request is
-managed by the lander: it follows the original, and it is closed when the original is closed or no longer
-applies. Do not merge it on GitHub.
+Merging counts as a landing request by the merger for the reviewed tip; the result is the `+"`suda/land`"+`
+status on that tip. The lander exports the result to %[2]s and closes the original pull request. This pull
+request is managed by the lander: it follows the original, and it is closed when the original is closed or
+no longer applies.
 `, id, wf.DestinationRepo)
 	return b.String()
 }

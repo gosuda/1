@@ -369,56 +369,112 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 		return inboundContained, nil
 	}
 
-	req, err := l.inboundRequest(ctx, wf, bMonoTree, imp, tip)
+	steps, err := l.inboundSteps(ctx, wf, base, tip)
 	if err != nil {
 		return inboundPending, err
 	}
-	if req.Requester == "" {
-		return inboundPending, nil // deferred: merger not visible yet
+	landed := false
+	for _, st := range steps {
+		if st.push.Actor == "" {
+			l.Log.Warn("mirror pusher unresolved; deferring inbound", "workflow", wf.Name, "commit", st.commit)
+			return inboundPending, nil // deferred: pusher not visible yet
+		}
+		stepRaw, err := s.Tree(ctx, st.commit)
+		if err != nil {
+			return inboundPending, err
+		}
+		stepImp, err := capy.ImportTree(ctx, s.Dir, bMonoTree, wf, stepRaw)
+		if err != nil {
+			return inboundPending, err
+		}
+		req, err := l.inboundRequest(ctx, wf, bMonoTree, stepImp, st)
+		if err != nil {
+			return inboundPending, err
+		}
+		res, err := l.Land(ctx, req)
+		if err != nil {
+			return inboundPending, err
+		}
+		l.Log.Info("inbound landing processed", "workflow", wf.Name, "commit", st.commit, "requester", req.Requester,
+			"outcome", res.Outcome.String(), "reason", truncate(res.Reason, 200))
+		switch res.Outcome {
+		case Landed:
+			landed = true
+		case AlreadyLanded:
+		case Rejected:
+			// The later pushes contain this one, so nothing after it can land before a member lands
+			// the staged change.
+			return inboundPending, l.stageInbound(ctx, wf, base, bMonoTree, tip, "main")
+		default:
+			return inboundPending, nil
+		}
 	}
-	res, err := l.Land(ctx, req)
-	if err != nil {
-		return inboundPending, err
-	}
-	l.Log.Info("inbound landing processed", "workflow", wf.Name, "outcome", res.Outcome.String(), "reason", truncate(res.Reason, 200))
-	switch res.Outcome {
-	case Landed:
+	if landed {
 		return inboundLanded, nil
-	case AlreadyLanded:
-		return inboundContained, nil
-	case Rejected:
-		return inboundPending, l.stageInbound(ctx, wf, base, bMonoTree, tip, "main")
 	}
-	return inboundPending, nil
+	return inboundContained, nil
 }
 
-// inboundRequest builds the synthetic landing request for a mirror tip: a parentless root with
+// inboundStep is one mirror commit to land and the authenticated push that set the branch to it.
+// An empty push.Actor means the pusher is not visible (yet).
+type inboundStep struct {
+	commit string
+	push   capy.Push
+}
+
+// inboundSteps splits the mirror's progress since the baseline into the pushes that made it, oldest
+// first, so each push is authorized by its own pusher. Judging the whole range by the pusher of the
+// tip alone attributes everything to whoever pushed last, and that is routinely a bot with a
+// per-file grant (the website's metadata workflow pushes right after every merge).
+//
+// When the activity API no longer covers the whole range, or an intermediate commit is not in the
+// store, the range is one step by the tip's pusher, which is never more permissive.
+func (l *Lander) inboundSteps(ctx context.Context, wf capy.Workflow, base capy.SyncBaseline, tip string) ([]inboundStep, error) {
+	ref := "refs/heads/" + wf.Branch
+	chain, err := l.Forge.PushChain(ctx, wf.DestinationRepo, ref, base.Mirror, tip)
+	if err == nil && len(chain) > 0 {
+		steps := make([]inboundStep, 0, len(chain))
+		for _, p := range chain {
+			if _, terr := l.Store.Tree(ctx, p.After); terr != nil {
+				steps = nil
+				break
+			}
+			steps = append(steps, inboundStep{commit: p.After, push: p.Push})
+		}
+		if steps != nil {
+			return steps, nil
+		}
+		l.Log.Warn("mirror push chain has commits missing from the store; judging the tip alone", "workflow", wf.Name)
+	} else if err != nil && !errors.Is(err, capy.ErrActorNotVisible) {
+		return nil, err
+	}
+	push, err := l.Forge.PushForTip(ctx, wf.DestinationRepo, ref, tip)
+	if err != nil {
+		l.Log.Warn("mirror pusher unresolved", "workflow", wf.Name, "tip", tip, "err", err)
+		return []inboundStep{{commit: tip}}, nil
+	}
+	return []inboundStep{{commit: tip, push: push}}, nil
+}
+
+// inboundRequest builds the synthetic landing request for one mirror commit: a parentless root with
 // the baseline trunk tree and a tip carrying the imported prefix.
-func (l *Lander) inboundRequest(ctx context.Context, wf capy.Workflow, bMonoTree, imp, tip string) (Request, error) {
+func (l *Lander) inboundRequest(ctx context.Context, wf capy.Workflow, bMonoTree, imp string, st inboundStep) (Request, error) {
 	s := l.Store
 	root, err := s.CommitTree(ctx, bMonoTree, nil, "suda: inbound base\n", nil)
 	if err != nil {
 		return Request{}, err
 	}
-	meta, err := s.Meta(ctx, tip)
+	meta, err := s.Meta(ctx, st.commit)
 	if err != nil {
 		return Request{}, err
 	}
 	msg := strings.TrimRight(internalTrailerRe.ReplaceAllString(meta.Message, ""), "\n") +
-		fmt.Sprintf("\n\nSuda-Inbound-From: %s@%s\n", wf.DestinationRepo, tip)
+		fmt.Sprintf("\n\nSuda-Inbound-From: %s@%s\n", wf.DestinationRepo, st.commit)
 	work, err := s.CommitTree(ctx, imp, []string{root}, msg, &meta)
 	if err != nil {
 		return Request{}, err
 	}
-	req := Request{ID: "inbound-" + wf.Name, Tip: work}
-	push, err := l.Forge.PushForTip(ctx, wf.DestinationRepo, "refs/heads/"+wf.Branch, tip)
-	if err != nil {
-		l.Log.Warn("mirror pusher unresolved; deferring inbound", "workflow", wf.Name, "tip", tip, "err", err)
-		return req, nil
-	}
-	req.Requester = push.Actor
-	req.Pushed = push.Time
-	return req, nil
+	return Request{ID: "inbound-" + wf.Name, Tip: work, Requester: st.push.Actor, Pushed: st.push.Time}, nil
 }
 
 // stageInbound publishes the import for manual landing as refs/ws/capy/<workflow>-<suffix>.

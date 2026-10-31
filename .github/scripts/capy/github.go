@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -83,12 +84,19 @@ type Push struct {
 	Time  time.Time
 }
 
-// PushForTip returns the authenticated actor and timestamp of the push that set ref to sha, using
-// the repository activity API (unlike commit metadata, GitHub authenticates it). ref is a full
-// name such as refs/heads/land/x.
-func (g *GitHub) PushForTip(ctx context.Context, repo string, ref string, sha string) (Push, error) {
+// RefPush is one ref update from the activity API: Actor moved the ref from Before to After.
+type RefPush struct {
+	Push
+	Before, After string
+}
+
+// refPushes lists the recent updates of ref that set it to a commit, newest first. A merge of a pull
+// request through the web UI is recorded as "pr_merge" rather than "push": the actor is the
+// authenticated merger, who needs the same write access a push needs, so it identifies the pusher.
+func (g *GitHub) refPushes(ctx context.Context, repo, ref string) ([]RefPush, error) {
 	q := url.Values{"ref": {ref}, "per_page": {"100"}}
 	var items []struct {
+		Before    string    `json:"before"`
 		After     string    `json:"after"`
 		Type      string    `json:"activity_type"`
 		Timestamp time.Time `json:"timestamp"`
@@ -97,18 +105,61 @@ func (g *GitHub) PushForTip(ctx context.Context, repo string, ref string, sha st
 		} `json:"actor"`
 	}
 	if err := g.getJSON(ctx, "/repos/"+repo+"/activity?"+q.Encode(), &items); err != nil {
-		return Push{}, err
+		return nil, err
 	}
+	out := make([]RefPush, 0, len(items))
 	for _, it := range items {
-		if it.After != sha || it.Actor == nil || it.Actor.Login == "" {
+		if it.Actor == nil || it.Actor.Login == "" {
 			continue
 		}
 		switch it.Type {
-		case "push", "force_push", "branch_creation":
-			return Push{Actor: strings.ToLower(it.Actor.Login), Time: it.Timestamp}, nil
+		case "push", "force_push", "branch_creation", "pr_merge":
+			out = append(out, RefPush{
+				Push:   Push{Actor: strings.ToLower(it.Actor.Login), Time: it.Timestamp},
+				Before: it.Before,
+				After:  it.After,
+			})
+		}
+	}
+	return out, nil
+}
+
+// PushForTip returns the authenticated actor and timestamp of the push that set ref to sha, using
+// the repository activity API (unlike commit metadata, GitHub authenticates it). ref is a full
+// name such as refs/heads/land/x.
+func (g *GitHub) PushForTip(ctx context.Context, repo string, ref string, sha string) (Push, error) {
+	pushes, err := g.refPushes(ctx, repo, ref)
+	if err != nil {
+		return Push{}, err
+	}
+	for _, p := range pushes {
+		if p.After == sha {
+			return p.Push, nil
 		}
 	}
 	return Push{}, fmt.Errorf("%w: %s@%s", ErrActorNotVisible, ref, sha)
+}
+
+// PushChain returns, oldest first, the updates that moved ref from stop to tip, each with its own
+// authenticated actor. It follows Before links back from tip, so it succeeds only when every
+// update in between is still listed by the activity API; otherwise it wraps ErrActorNotVisible and
+// the caller has to fall back to the actor of the tip alone.
+func (g *GitHub) PushChain(ctx context.Context, repo, ref, stop, tip string) ([]RefPush, error) {
+	pushes, err := g.refPushes(ctx, repo, ref)
+	if err != nil {
+		return nil, err
+	}
+	var chain []RefPush
+	for cur := tip; cur != stop; {
+		i := slices.IndexFunc(pushes, func(p RefPush) bool { return p.After == cur })
+		if i < 0 || len(chain) >= len(pushes) {
+			return nil, fmt.Errorf("%w: %s %s..%s is not covered by the activity API", ErrActorNotVisible, ref, stop, tip)
+		}
+		chain = append(chain, pushes[i])
+		cur = pushes[i].Before
+	}
+	slices.Reverse(chain)
+	return chain, nil
 }
 
 // PusherForTip returns only the login of PushForTip.

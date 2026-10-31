@@ -402,3 +402,90 @@ func TestCommitsCarryTheConfiguredBotIdentityAndKeepMemberAuthors(t *testing.T) 
 		t.Fatalf("front page author = %q", got)
 	}
 }
+
+// devReview publishes a workspace tip as the review pair review/<id> and base/<id> that git ws-pr
+// creates, without a land ref.
+func (e *env) devReview(id string, files map[string]string, msg string) string {
+	tip := e.devWork(id, files, msg)
+	root := git(e.t, e.dev, "rev-list", "--max-parents=0", tip)
+	git(e.t, e.dev, "push", "-q", e.user, tip+":refs/heads/review/"+id, root+":refs/heads/base/"+id, ":refs/heads/land/"+id)
+	return tip
+}
+
+func (e *env) mergePull(id string, number int, head, mergedBy string) {
+	e.forge.merged = map[string][]MergedPull{"gosuda/1": {{Number: number, HeadRef: "review/" + id, HeadSHA: head, MergeSHA: "m" + id}}}
+	e.forge.actors["gosuda/1|refs/heads/base/"+id] = mergedBy
+}
+
+func TestMergingTheReviewPullRequestLandsTheReviewedTip(t *testing.T) {
+	e := newEnv(t)
+	tip := e.devReview("m1", map[string]string{"Q/q.go": "package q\n// merged\n"}, "Q: merged")
+	e.mergePull("m1", 7, tip, "maintainer")
+	e.cycle()
+
+	if !strings.Contains(e.trunkFile("refs/suda/main", "Q/q.go"), "// merged") {
+		t.Fatal("merged review pull request did not land")
+	}
+	msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/history")
+	if !strings.Contains(msg, "Suda-Requester: maintainer") || !strings.Contains(msg, "Suda-Landed-From: refs/heads/review/m1") {
+		t.Fatalf("message lacks provenance trailers:\n%s", msg)
+	}
+	if !e.hasStatus("suda/land success") {
+		t.Fatalf("no success status: %v", e.forge.statuses)
+	}
+	if refs := e.userRefs("refs/heads/review/"); len(refs) != 0 {
+		t.Fatalf("review branch not cleaned: %v", refs)
+	}
+	if refs := e.userRefs("refs/heads/base/"); len(refs) != 0 {
+		t.Fatalf("base branch not cleaned: %v", refs)
+	}
+}
+
+func TestMergedReviewPullRequestIsJudgedByMergerAndApprovers(t *testing.T) {
+	e := newEnv(t)
+	tip := e.devReview("m2", map[string]string{"P/a.go": "package p\n// m2\n"}, "P: m2")
+	e.mergePull("m2", 8, tip, "mallory")
+	before := e.trunkRef("refs/suda/main")
+	e.cycle()
+
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("a merge by a non-owner without approval landed")
+	}
+	if !e.hasStatus("suda/land failure OWNERS") {
+		t.Fatalf("expected OWNERS failure status: %v", e.forge.statuses)
+	}
+	if refs := e.userRefs("refs/heads/review/"); len(refs) != 0 {
+		t.Fatalf("a rejected merge must not be retried every cycle: %v", refs)
+	}
+	n := len(e.forge.statuses)
+	e.cycle()
+	if len(e.forge.statuses) != n {
+		t.Fatalf("rejection repeated: %v", e.forge.statuses)
+	}
+
+	// An owner's approval of the exact tip carries a merge by someone else.
+	tip = e.devReview("m3", map[string]string{"P/a.go": "package p\n// m3\n"}, "P: m3")
+	e.forge.approvals["gosuda/1|review/m3"] = []string{"alice"}
+	e.mergePull("m3", 9, tip, "mallory")
+	e.cycle()
+	if !strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "// m3") {
+		t.Fatal("approved merge did not land")
+	}
+}
+
+func TestReviewBranchThatMovedAfterTheMergeIsNotLanded(t *testing.T) {
+	e := newEnv(t)
+	merged := e.devReview("m4", map[string]string{"Q/q.go": "package q\n// reviewed\n"}, "Q: reviewed")
+	moved := e.devWork("m4-more", map[string]string{"Q/q.go": "package q\n// sneaked in\n"}, "Q: more")
+	git(t, e.dev, "push", "-q", "--force", e.user, moved+":refs/heads/review/m4", ":refs/heads/land/m4-more")
+	e.mergePull("m4", 10, merged, "maintainer")
+	before := e.trunkRef("refs/suda/main")
+	e.cycle()
+
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("content pushed after the merge landed")
+	}
+	if len(e.forge.statuses) != 0 {
+		t.Fatalf("nothing was judged, got %v", e.forge.statuses)
+	}
+}

@@ -41,6 +41,25 @@ nothing depends on events arriving. Durable state lives only in refs (including
 | `LANDER_CACHE_DIR` | `/var/lib/lander/data/cache` | Dependency caches mounted read-only into the sandbox |
 | `LANDER_LISTEN`, `LANDER_WAKE_SECRET` | `:8080`, unset | `/healthz`; `/wake` accepts an HMAC-SHA256 (`X-Hub-Signature-256`) signed POST and only shortens the wait |
 
+## Merged review pull requests
+
+Merging the review pull request `review/<id>` of a workspace or of a staged mirror pull request is a
+landing request, like a push of `land/<id>`. The requester is the authenticated actor that set
+`base/<id>` to the merge commit (activity API, `pr_merge`), the tip is the head the pull request was
+merged at, and approvals of that head count. The lander ignores the merge when `review/<id>` no
+longer holds that head or when `land/<id>` is pending. The review pair is deleted whatever the
+outcome: a merged pull request cannot be reopened, and a rejected pair would be tried every cycle.
+
+## Inbound mirror pushes
+
+The pusher of a mirror commit comes from the repository activity API (`push`, `force_push`,
+`branch_creation`, and `pr_merge` for a pull request merged in the web UI). The pushes that moved the
+branch from the sync baseline to its tip are landed one by one, oldest first, each with its own
+pusher as the requester, so a bot's push after a member's merge does not decide the member's change.
+The first push that fails a check stops the chain and the whole range is staged as
+`refs/ws/capy/<workflow>-main`. When the API does not list every push of the range, or a commit of it
+is missing from the store, the range is judged as one change by the pusher of the tip.
+
 ## Security properties
 
 - The lander never executes repository code. Presubmit prepares sources in the lander process and

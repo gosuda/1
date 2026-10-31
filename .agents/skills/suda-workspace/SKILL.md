@@ -74,4 +74,4 @@ Use a review pull request when a change needs line-by-line comments or formal ap
 
 1. Run `git ws-pr` on the workspace branch. It pushes the base commit to `refs/heads/base/<id>` and the tip to `refs/heads/review/<id>` on `gosuda/1`, then opens a pull request between them.
 2. Approvals count only for the exact tip. Reviewers approve the `review/<id>` tip.
-3. Land the same tip with `git ws-land`. Merging the pull request does not land anything.
+3. Land the same tip by merging the review pull request or with `git ws-land`. A merge is a landing request by the merger for the merged head, and the lander reports the result as a `suda/land` status on that head. If it is rejected, the review branches are deleted, so fix the reason and open a new pull request with `git ws-pr`.

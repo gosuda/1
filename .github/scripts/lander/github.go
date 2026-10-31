@@ -101,6 +101,11 @@ func (f *GitHubForge) PushForTip(ctx context.Context, repo, ref, sha string) (ca
 	return f.client(repo, permContents).PushForTip(ctx, repo, ref, sha)
 }
 
+// PushChain implements Forge through the activity API (contents:read).
+func (f *GitHubForge) PushChain(ctx context.Context, repo, ref, stop, tip string) ([]capy.RefPush, error) {
+	return f.client(repo, permContents).PushChain(ctx, repo, ref, stop, tip)
+}
+
 // PusherForTip returns only the login of PushForTip (contents:read).
 func (f *GitHubForge) PusherForTip(ctx context.Context, repo, ref, sha string) (string, error) {
 	return f.client(repo, permContents).PusherForTip(ctx, repo, ref, sha)
@@ -165,6 +170,38 @@ func (f *GitHubForge) OpenPulls(ctx context.Context, repo string) ([]PullRequest
 			return out, nil
 		}
 	}
+}
+
+// mergedPullsPage bounds MergedPulls: merges the lander has not handled yet are always recent.
+const mergedPullsPage = 50
+
+// MergedPulls implements Forge with one page of closed pull requests, newest activity first, keeping
+// the merged ones (pull_requests:read).
+func (f *GitHubForge) MergedPulls(ctx context.Context, repo string) ([]MergedPull, error) {
+	rp, err := repoPath(repo)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{"state": {"closed"}, "sort": {"updated"}, "direction": {"desc"}, "per_page": {strconv.Itoa(mergedPullsPage)}}
+	var items []struct {
+		Number   int     `json:"number"`
+		MergedAt *string `json:"merged_at"`
+		MergeSHA string  `json:"merge_commit_sha"`
+		Head     struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := f.rest(ctx, repo, permPulls, http.MethodGet, rp+"/pulls?"+q.Encode(), nil, &items); err != nil {
+		return nil, err
+	}
+	var out []MergedPull
+	for _, it := range items {
+		if it.MergedAt != nil && it.MergeSHA != "" {
+			out = append(out, MergedPull{Number: it.Number, HeadRef: it.Head.Ref, HeadSHA: it.Head.SHA, MergeSHA: it.MergeSHA})
+		}
+	}
+	return out, nil
 }
 
 // ClosePull implements Forge: it closes the pull request, then comments. The order avoids a

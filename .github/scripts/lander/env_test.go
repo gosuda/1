@@ -85,12 +85,14 @@ capy.workflow(
 type fakeForge struct {
 	mu        sync.Mutex
 	clock     int64
-	actors    map[string]string // repo|ref -> login
-	def       string            // default actor
+	actors    map[string]string         // repo|ref -> login
+	chains    map[string][]capy.RefPush // repo|ref -> every update of the ref, oldest first
+	def       string                    // default actor
 	approvals map[string][]string
 	teams     map[string]map[string]bool
 	statuses  []string
 	pulls     map[string][]PullRequest
+	merged    map[string][]MergedPull
 	closed    []string // "repo#number: comment"
 	created   []fakeCreated
 	updated   []fakeCreated
@@ -110,6 +112,26 @@ func (f *fakeForge) PushForTip(_ context.Context, repo, ref, sha string) (capy.P
 	f.clock++
 	return capy.Push{Actor: a, Time: time.Unix(1_700_000_000+f.clock, 0)}, nil
 }
+func (f *fakeForge) PushChain(_ context.Context, repo, ref, stop, tip string) ([]capy.RefPush, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	all := f.chains[repo+"|"+ref]
+	var chain []capy.RefPush
+	for cur := tip; cur != stop; {
+		i := -1
+		for j, p := range all {
+			if p.After == cur {
+				i = j
+			}
+		}
+		if i < 0 || len(chain) >= len(all) {
+			return nil, capy.ErrActorNotVisible
+		}
+		chain = append([]capy.RefPush{all[i]}, chain...)
+		cur = all[i].Before
+	}
+	return chain, nil
+}
 func (f *fakeForge) ApproversForTip(_ context.Context, repo, head, sha string) ([]string, error) {
 	return f.approvals[repo+"|"+head], nil
 }
@@ -124,6 +146,10 @@ func (f *fakeForge) SetStatus(_ context.Context, repo, sha string, st Status) er
 }
 func (f *fakeForge) OpenPulls(_ context.Context, repo string) ([]PullRequest, error) {
 	return f.pulls[repo], nil
+}
+
+func (f *fakeForge) MergedPulls(_ context.Context, repo string) ([]MergedPull, error) {
+	return f.merged[repo], nil
 }
 
 func (f *fakeForge) ClosePull(_ context.Context, repo string, number int, comment string) error {

@@ -77,6 +77,33 @@ func TestGitHubForgePushForTipReturnsActivityTimestamp(t *testing.T) {
 	}
 }
 
+func TestGitHubForgeMergedPullsKeepsOnlyMergedPullRequests(t *testing.T) {
+	env := newAppEnv(t, func(f *fakeGitHub) {
+		f.routes = map[string]fakeRoute{
+			"GET /repos/gosuda/1/pulls": func(w http.ResponseWriter, r *http.Request, g grant) {
+				if !checkPerms(w, g, map[string]string{"pull_requests": "read"}) {
+					return
+				}
+				if q := r.URL.Query(); q.Get("state") != "closed" || q.Get("sort") != "updated" || q.Get("direction") != "desc" {
+					http.Error(w, "bad query", http.StatusBadRequest)
+					return
+				}
+				_, _ = w.Write([]byte(`[
+					{"number":3,"merged_at":"2026-10-31T15:33:22Z","merge_commit_sha":"mmm","head":{"ref":"review/x","sha":"hhh"}},
+					{"number":2,"merged_at":null,"merge_commit_sha":"zzz","head":{"ref":"review/y","sha":"ggg"}}]`))
+			},
+		}
+	})
+	f := NewGitHubForge(env.app, "gosuda/1")
+	got, err := f.MergedPulls(context.Background(), "gosuda/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []MergedPull{{Number: 3, HeadRef: "review/x", HeadSHA: "hhh", MergeSHA: "mmm"}}; !slices.Equal(got, want) {
+		t.Fatalf("got %+v; want %+v", got, want)
+	}
+}
+
 func TestGitHubForgeOpenPullsPaginates(t *testing.T) {
 	var mu sync.Mutex
 	var pages []string

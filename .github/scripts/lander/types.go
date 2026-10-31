@@ -26,10 +26,21 @@ type PullRequest struct {
 	Author  string // login of the opener
 }
 
+// MergedPull is a pull request that was merged on GitHub.
+type MergedPull struct {
+	Number   int
+	HeadRef  string
+	HeadSHA  string // head when the pull request was merged
+	MergeSHA string // commit the merge set the base branch to
+}
+
 // Forge abstracts the GitHub API surface the lander needs. All identity answers come from
 // GitHub-authenticated sources; none derive from commit metadata.
 type Forge interface {
 	PushForTip(ctx context.Context, repo, ref, sha string) (capy.Push, error)
+	// PushChain lists, oldest first, the updates that moved ref from stop to tip with the actor of
+	// each. It wraps capy.ErrActorNotVisible when the chain is incomplete.
+	PushChain(ctx context.Context, repo, ref, stop, tip string) ([]capy.RefPush, error)
 	ApproversForTip(ctx context.Context, repo, head, sha string) ([]string, error)
 	TeamResolver(ctx context.Context) capy.TeamResolver
 	SetStatus(ctx context.Context, repo, sha string, st Status) error
@@ -40,6 +51,8 @@ type Forge interface {
 	// CreatePull opens a pull request from head into base (both branches of repo) and returns its
 	// number (pull_requests:write).
 	CreatePull(ctx context.Context, repo, head, base, title, body string) (int, error)
+	// MergedPulls lists the most recently updated merged pull requests of repo (pull_requests:read).
+	MergedPulls(ctx context.Context, repo string) ([]MergedPull, error)
 	// UpdatePull replaces the title and body of a pull request (pull_requests:write).
 	UpdatePull(ctx context.Context, repo string, number int, title, body string) error
 }

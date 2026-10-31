@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gosuda.org/0/scripts/capy"
 )
 
 func (e *env) mirrorCommit(files map[string]string, msg string) string {
@@ -136,6 +138,92 @@ func TestStaleMirrorPlusExternalCommitKeepsBothSides(t *testing.T) {
 	e.cycle()
 	if e.trunkRefMirror() != tip || e.trunkRef("refs/suda/history") != hist {
 		t.Fatal("converged state must be stable")
+	}
+}
+
+// Two mirror pushes land before the lander looks: an owner's, then a bot that holds a per-file grant
+// (the website's metadata workflow pushes right after every merge). Each push is judged by its own
+// pusher, so the owner's change lands although the bot pushed last.
+func TestInboundPushesAreAuthorizedByTheirOwnPusher(t *testing.T) {
+	e := newEnv(t)
+	e.cycle() // bootstrap the baseline
+	e.devWork("owners", map[string]string{"P/OWNERS": "set noparent\n@alice\n@maintainer\nper-file data.json=@bot\n"}, "P: bot grant")
+	e.cycle() // lands the grant and exports it; the baseline is the mirror tip
+	base := e.trunkRefMirror()
+
+	c1 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=2\n"}, "a=2")
+	c2 := e.mirrorCommit(map[string]string{"data.json": "{}\n"}, "update data")
+	e.forge.chains = map[string][]capy.RefPush{"gosuda/p|refs/heads/main": {
+		{Push: capy.Push{Actor: "alice"}, Before: base, After: c1},
+		{Push: capy.Push{Actor: "bot"}, Before: c1, After: c2},
+	}}
+	e.forge.actors["gosuda/p|refs/heads/main"] = "bot"
+
+	e.cycle()
+
+	if !strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "a=2") || !e.trunkHas("P/data.json") {
+		t.Fatal("both mirror pushes must land in the trunk")
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("nothing needs staging, got %v", refs)
+	}
+	if msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/sync/p"); !strings.Contains(msg, "Suda-Sync-Mirror: "+c2) {
+		t.Fatalf("baseline must reach the mirror tip:\n%s", msg)
+	}
+	// The history keeps who pushed each part.
+	log := git(t, e.trunk, "log", "-2", "--format=%B", "refs/suda/history")
+	if !strings.Contains(log, "Suda-Requester: alice") || !strings.Contains(log, "Suda-Requester: bot") {
+		t.Fatalf("each landing must record its own requester:\n%s", log)
+	}
+}
+
+// When the activity API cannot tell who made the earlier pushes, the range is judged by the pusher of
+// the tip alone: a bot with a per-file grant cannot carry an owner's change into the trunk.
+func TestInboundWithoutPushChainFallsBackToTheTipPusher(t *testing.T) {
+	e := newEnv(t)
+	e.cycle() // bootstrap the baseline
+	e.devWork("owners", map[string]string{"P/OWNERS": "set noparent\n@alice\n@maintainer\nper-file data.json=@bot\n"}, "P: bot grant")
+	e.cycle()
+
+	e.mirrorCommit(map[string]string{"a.go": "package p\n// a=2\n"}, "a=2")
+	e.mirrorCommit(map[string]string{"data.json": "{}\n"}, "update data")
+	e.forge.actors["gosuda/p|refs/heads/main"] = "bot"
+
+	e.cycle()
+
+	if e.trunkHas("P/data.json") || strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "a=2") {
+		t.Fatal("the bot's grant covers data.json only; the range must not land")
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 1 || refs[0] != "refs/ws/capy/p-main" {
+		t.Fatalf("staged refs = %v", refs)
+	}
+}
+
+// A push that is not authorized stops the chain: earlier pushes stay landed, the rest is staged.
+func TestInboundChainStopsAtTheFirstUnauthorizedPush(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	base := e.trunkRefMirror()
+	c1 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=2\n"}, "a=2")
+	c2 := e.mirrorCommit(map[string]string{"b.go": "package p\n// b\n"}, "add b")
+	e.forge.chains = map[string][]capy.RefPush{"gosuda/p|refs/heads/main": {
+		{Push: capy.Push{Actor: "alice"}, Before: base, After: c1},
+		{Push: capy.Push{Actor: "mallory"}, Before: c1, After: c2},
+	}}
+
+	e.cycle()
+
+	if !strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "a=2") {
+		t.Fatal("the owner's push must land")
+	}
+	if e.trunkHas("P/b.go") {
+		t.Fatal("the non-owner's push landed")
+	}
+	if e.trunkRefMirror() != c2 {
+		t.Fatal("export must not overwrite the unreviewed mirror commit")
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 1 || refs[0] != "refs/ws/capy/p-main" {
+		t.Fatalf("staged refs = %v", refs)
 	}
 }
 

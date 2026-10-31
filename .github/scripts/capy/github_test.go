@@ -46,6 +46,51 @@ func TestPusherForTipUsesActivityEntryMatchingTip(t *testing.T) {
 	}
 }
 
+func TestPusherForTipAcceptsPullRequestMerges(t *testing.T) {
+	gh := newFakeGitHub(t, map[string]string{
+		"/repos/gosuda/p/activity?per_page=100&ref=refs%2Fheads%2Fmain": `[
+			{"before":"aaa","after":"bbb","activity_type":"pr_merge","actor":{"login":"Alice"}},
+			{"before":"zzz","after":"ccc","activity_type":"branch_deletion","actor":{"login":"Mallory"}}]`,
+	})
+	got, err := gh.PusherForTip(context.Background(), "gosuda/p", "refs/heads/main", "bbb")
+	if err != nil || got != "alice" {
+		t.Fatalf("PusherForTip(pr_merge) = %q, %v; want alice", got, err)
+	}
+	if _, err := gh.PusherForTip(context.Background(), "gosuda/p", "refs/heads/main", "ccc"); !errors.Is(err, capy.ErrActorNotVisible) {
+		t.Fatalf("a ref deletion must not identify a pusher, err = %v", err)
+	}
+}
+
+func TestPushChainReturnsEachPushWithItsOwnActorOldestFirst(t *testing.T) {
+	gh := newFakeGitHub(t, map[string]string{
+		"/repos/gosuda/p/activity?per_page=100&ref=refs%2Fheads%2Fmain": `[
+			{"before":"bbb","after":"ccc","activity_type":"push","actor":{"login":"github-actions[bot]"}},
+			{"before":"aaa","after":"bbb","activity_type":"pr_merge","actor":{"login":"Alice"}},
+			{"before":"000","after":"aaa","activity_type":"push","actor":{"login":"Carol"}}]`,
+	})
+	ctx := context.Background()
+	chain, err := gh.PushChain(ctx, "gosuda/p", "refs/heads/main", "aaa", "ccc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type step struct{ actor, before, after string }
+	var got []step
+	for _, p := range chain {
+		got = append(got, step{p.Actor, p.Before, p.After})
+	}
+	want := []step{{"alice", "aaa", "bbb"}, {"github-actions[bot]", "bbb", "ccc"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("chain = %v, want %v", got, want)
+	}
+	if chain, err := gh.PushChain(ctx, "gosuda/p", "refs/heads/main", "ccc", "ccc"); err != nil || len(chain) != 0 {
+		t.Fatalf("empty range = %v, %v; want no pushes", chain, err)
+	}
+	// The baseline is not an ancestor the API knows about: the range is not covered.
+	if _, err := gh.PushChain(ctx, "gosuda/p", "refs/heads/main", "unknown", "ccc"); !errors.Is(err, capy.ErrActorNotVisible) {
+		t.Fatalf("uncovered range err = %v, want ErrActorNotVisible", err)
+	}
+}
+
 func TestApproversForTipIgnoresStaleCommentedAndDismissedReviews(t *testing.T) {
 	gh := newFakeGitHub(t, map[string]string{
 		"/repos/gosuda/1/pulls?head=gosuda%3Areview%2Fx&per_page=10&state=all": `[{"number":7}]`,
