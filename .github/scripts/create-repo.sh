@@ -33,7 +33,7 @@ ws_register "$NAME" "$PREFIX" "$REPO" main
 
 ws_write_new "$PREFIX/README.md" "$(printf '# %s\n\nPackage `%s` in `//%s`.' "$NAME" "$MOD_PATH" "$PREFIX")"
 ws_write_new "$PREFIX/OWNERS" "@$OWNER"
-ws_write_new "$PREFIX/go.mod" "$(printf 'module %s\n\ngo 1.27.0' "$MOD_PATH")"
+ws_write_new "$PREFIX/go.mod" "$(printf 'module %s\n\ngo 1.27.3' "$MOD_PATH")"
 
 if ws_commit "$PREFIX" "feat($PREFIX): initialize project //$PREFIX ($REPO)"; then
   # The new module joins the root go.work in its own commit (the root go.work is never exported).
