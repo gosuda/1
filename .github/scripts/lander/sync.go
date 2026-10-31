@@ -431,17 +431,20 @@ func (l *Lander) stageInbound(ctx context.Context, wf capy.Workflow, base capy.S
 	if err != nil {
 		return err
 	}
-	return l.publishStaged(ctx, wf.Name+"-"+suffix, bMonoTree, imp, meta, wf.DestinationRepo+"@"+tip)
+	return l.publishStaged(ctx, wf.Name+"-"+suffix, bMonoTree, imp, meta, wf.DestinationRepo+"@"+tip, "")
 }
 
-func (l *Lander) publishStaged(ctx context.Context, name, bMonoTree, imp string, meta CommitMeta, origin string) error {
+// publishStaged force-pushes the staged commit. stagedOn names the mirror state the change was replayed
+// onto ("" when the change is the mirror state itself); the same origin is staged again when it differs.
+func (l *Lander) publishStaged(ctx context.Context, name, bMonoTree, imp string, meta CommitMeta, origin, stagedOn string) error {
 	s := l.Store
 	if l.DryRun {
 		l.Log.Info("dry-run: would stage", "ref", "refs/ws/capy/"+name)
 		return nil
 	}
 	if old, ok := s.RevParse(ctx, userStaged+name); ok {
-		if m, err := s.Meta(ctx, old); err == nil && strings.Contains(m.Message, "Suda-Inbound-From: "+origin+"\n") {
+		if m, err := s.Meta(ctx, old); err == nil && strings.Contains(m.Message, "Suda-Inbound-From: "+origin+"\n") &&
+			(stagedOn == "" || strings.Contains(m.Message, "Suda-Staged-On: "+stagedOn+"\n")) {
 			return nil // already staged for this mirror state
 		}
 	}
@@ -450,6 +453,9 @@ func (l *Lander) publishStaged(ctx context.Context, name, bMonoTree, imp string,
 		return err
 	}
 	msg := strings.TrimRight(internalTrailerRe.ReplaceAllString(meta.Message, ""), "\n") + "\n\nSuda-Inbound-From: " + origin + "\n"
+	if stagedOn != "" {
+		msg += "Suda-Staged-On: " + stagedOn + "\n"
+	}
 	work, err := s.CommitTree(ctx, imp, []string{root}, msg, &meta)
 	if err != nil {
 		return err
@@ -491,9 +497,12 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 			errs = append(errs, err)
 			continue
 		}
-		xRaw, err := s.Tree(ctx, head)
+		xRaw, ok, err := l.replayPull(ctx, wf, base, head, pr.Number)
 		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if !ok {
 			continue
 		}
 		imp, err := capy.ImportTree(ctx, s.Dir, bMonoTree, wf, xRaw)
@@ -502,11 +511,45 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 			continue
 		}
 		origin := fmt.Sprintf("%s#%d@%s", wf.DestinationRepo, pr.Number, head)
-		if err := l.publishStaged(ctx, fmt.Sprintf("%s-pr-%d", wf.Name, pr.Number), bMonoTree, imp, meta, origin); err != nil {
+		if err := l.publishStaged(ctx, fmt.Sprintf("%s-pr-%d", wf.Name, pr.Number), bMonoTree, imp, meta, origin, base.Mirror); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// replayPull returns the raw mirror tree that holds the pull request's own change on top of the mirror
+// state of the sync baseline: a three-way merge of the head with the baseline's mirror commit over their
+// merge base. Importing the head tree itself would also revert every mirror commit made after the pull
+// request branched. ok is false when there is nothing to stage: the head is already part of the mirror,
+// or it conflicts with it (the contributor has to update the branch).
+func (l *Lander) replayPull(ctx context.Context, wf capy.Workflow, base capy.SyncBaseline, head string, number int) (tree string, ok bool, err error) {
+	s := l.Store
+	mb, mbErr := s.Git(ctx, "merge-base", base.Mirror, head)
+	if mbErr != nil {
+		var ge *GitError
+		if errors.As(mbErr, &ge) && ge.ExitCode() == 1 {
+			// Unrelated histories: there is no base to replay from, so the head tree is the change.
+			t, err := s.Tree(ctx, head)
+			return t, err == nil, err
+		}
+		return "", false, mbErr
+	}
+	mb = strings.TrimSpace(mb)
+	if mb == head {
+		return "", false, nil // the mirror already contains the head
+	}
+	out, mergeErr := s.Git(ctx, "merge-tree", "--write-tree", "--merge-base="+mb, base.Mirror, head)
+	if mergeErr != nil {
+		var ge *GitError
+		if errors.As(mergeErr, &ge) && ge.ExitCode() == 1 {
+			l.Log.Warn("pull request conflicts with the mirror; not staged", "workflow", wf.Name, "pull", number)
+			return "", false, nil
+		}
+		return "", false, mergeErr
+	}
+	tree, _, _ = strings.Cut(out, "\n")
+	return tree, true, nil
 }
 
 // export pushes the trunk's export tree on top of the mirror tip, guarded by a lease on that tip.

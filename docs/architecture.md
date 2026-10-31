@@ -265,9 +265,9 @@ Changes to mirrors that are not invertible are always staged (Section 4.5).
 
 ### 4.4 External Pull Request Staging
 
-For each open pull request on a mirror, the lander builds the import construction above from the pull request head and publishes it as `refs/ws/capy/<wf>-pr-<N>` on `gosuda/1`. The staged commit's parent is a root commit carrying the baseline tree, so the diff between them shows only the pull request's changes.
+For each open pull request on a mirror, the lander first replays the pull request onto the mirror state of the sync baseline: a three-way merge of the head with the baseline's mirror commit over their merge base, so mirror commits made after the branch point are not reverted. It then builds the import construction above from the merged tree and publishes it as `refs/ws/capy/<wf>-pr-<N>` on `gosuda/1`. The staged commit's parent is a root commit carrying the baseline tree, so the diff between them shows only the pull request's changes.
 
-- The lander republishes a staged ref only when the pull request head changes.
+- The lander republishes a staged ref when the pull request head changes or the mirror baseline moves (the staged commit records the mirror commit it was replayed onto in `Suda-Staged-On`). A pull request whose merge with the mirror conflicts, or whose head the mirror already contains, is not staged; the contributor has to update the branch.
 - Staged refs never land automatically. A member who reviews one lands it with `git ws-land` (see [AGENTS.md](../AGENTS.md) §4.4). The member is the requester, and the `OWNERS` rules apply.
 - The lander deletes the staged ref when the pull request closes.
 - **Closing after landing.** The staged commit carries the trailer `Suda-Inbound-From: <repo>#<N>@<head sha>`, which the landing keeps. When a mirror is settled (its default branch holds the exported content) and an open pull request's exact head appears in that trailer among the last trunk commits, the lander closes the pull request and posts a comment that names the monorepo commit and the mirror commit. A pull request that received new commits after the landing has a different head and stays open. The lander strips `Suda-*` lines from mirror commit messages before it adds its own trailer, so a contributor cannot forge one. Closing needs `pull_requests: write` on the mirror.

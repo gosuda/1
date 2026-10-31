@@ -464,6 +464,77 @@ func TestLandedMirrorPullRequestsAreCommentedAndClosed(t *testing.T) {
 	}
 }
 
+func TestStagedPullRequestHoldsOnlyItsOwnChangeWhenTheMirrorMovedOn(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	dir := filepath.Join(e.root, "pr-dev")
+	git(t, e.root, "clone", "-q", "-b", "main", e.mirror, dir)
+	write(t, dir, map[string]string{"c7.go": "package p\n"})
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "feature c7")
+	head := git(t, dir, "rev-parse", "HEAD")
+	git(t, dir, "push", "-q", "-f", "origin", head+":refs/pull/7/head")
+
+	// The mirror moves on after the pull request branched: a new file, and a changed one.
+	e.mirrorCommit(map[string]string{"later.go": "package p\n// later\n"}, "later work")
+	e.forge.pulls["gosuda/p"] = []PullRequest{{Number: 7, HeadRef: "f7", HeadSHA: head}}
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	e.cycle()
+	if !e.trunkHas("P/later.go") {
+		t.Fatal("the later mirror commit did not reach the trunk")
+	}
+
+	git(t, e.dev, "fetch", "-q", e.user, "refs/ws/capy/p-pr-7")
+	staged := git(t, e.dev, "rev-parse", "FETCH_HEAD")
+	changes := git(t, e.dev, "diff", "--name-status", staged+"~1", staged)
+	if strings.TrimSpace(changes) != "A\tP/c7.go" {
+		t.Fatalf("the staged change must be the pull request's own delta, got:\n%s", changes)
+	}
+	if msg := git(t, e.dev, "log", "-1", "--format=%B", staged); !strings.Contains(msg, "Suda-Staged-On: ") {
+		t.Fatalf("staged commit must record the mirror state it was replayed onto:\n%s", msg)
+	}
+
+	// Unchanged state is not staged again; a new mirror commit restages on the new state.
+	e.cycle()
+	git(t, e.dev, "fetch", "-q", e.user, "refs/ws/capy/p-pr-7")
+	if got := git(t, e.dev, "rev-parse", "FETCH_HEAD"); got != staged {
+		t.Fatalf("restaged without a state change: %s != %s", got, staged)
+	}
+	e.mirrorCommit(map[string]string{"later2.go": "package p\n"}, "even later work")
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	e.cycle()
+	git(t, e.dev, "fetch", "-q", e.user, "refs/ws/capy/p-pr-7")
+	restaged := git(t, e.dev, "rev-parse", "FETCH_HEAD")
+	if restaged == staged {
+		t.Fatal("a mirror that moved on must restage the open pull request")
+	}
+	if got := strings.TrimSpace(git(t, e.dev, "diff", "--name-status", restaged+"~1", restaged)); got != "A\tP/c7.go" {
+		t.Fatalf("restaged change = %q", got)
+	}
+}
+
+func TestStagedPullRequestThatConflictsWithTheMirrorIsNotStaged(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	dir := filepath.Join(e.root, "pr-dev")
+	git(t, e.root, "clone", "-q", "-b", "main", e.mirror, dir)
+	write(t, dir, map[string]string{"a.go": "package p\n// from the pull request\n"})
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "feature")
+	head := git(t, dir, "rev-parse", "HEAD")
+	git(t, dir, "push", "-q", "-f", "origin", head+":refs/pull/9/head")
+	e.mirrorCommit(map[string]string{"a.go": "package p\n// from main\n"}, "conflicting main change")
+	e.forge.pulls["gosuda/p"] = []PullRequest{{Number: 9, HeadRef: "f9", HeadSHA: head}}
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	e.cycle()
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("a conflicting pull request must not be staged: %v", refs)
+	}
+}
+
 func TestForgedInboundTrailersInMirrorCommitsAreStripped(t *testing.T) {
 	e := newEnv(t)
 	e.cycle()
