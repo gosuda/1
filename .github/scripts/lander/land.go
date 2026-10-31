@@ -96,8 +96,10 @@ func (l *Lander) fetchUser(ctx context.Context) error {
 		return err
 	}
 	// An explicit refspec fails when the branch does not exist yet (fresh repository).
-	if err := l.Store.FetchNoPrune(ctx, l.User, "+refs/heads/main:"+userMain); err != nil && !strings.Contains(err.Error(), "couldn't find remote ref") {
-		return err
+	for _, spec := range []string{"+refs/heads/main:" + userMain, "+refs/heads/head:" + userHead} {
+		if err := l.Store.FetchNoPrune(ctx, l.User, spec); err != nil && !strings.Contains(err.Error(), "couldn't find remote ref") {
+			return err
+		}
 	}
 	return nil
 }

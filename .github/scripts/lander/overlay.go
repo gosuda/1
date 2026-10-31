@@ -86,25 +86,34 @@ func (l *Lander) SyncControlPlane(ctx context.Context) error {
 }
 
 // CopyTrunkToUser mirrors refs/suda/{main,history} into the user repository so workspace pushes
-// have an advertised negotiation base. The copy carries no trust (landing verifies base trees
-// against the real history).
+// have an advertised negotiation base, and keeps the branch refs/heads/head on the history tip so
+// the current tree can be browsed at a stable URL (github.com/<user repo>/tree/head). The copies
+// carry no trust (landing verifies base trees against the real history); a member who rewrites
+// them is undone on the next cycle.
 func (l *Lander) CopyTrunkToUser(ctx context.Context) error {
 	if l.DryRun {
 		return nil
 	}
 	s := l.Store
+	type copySpec struct{ src, dst, local string }
 	var specs, leases []string
-	for _, name := range []string{"main", "history"} {
-		local, ok := s.RevParse(ctx, trunkSuda+name)
+	var updated []copySpec
+	for _, c := range []copySpec{
+		{trunkSuda + "main", "refs/suda/main", userSuda + "main"},
+		{trunkSuda + "history", "refs/suda/history", userSuda + "history"},
+		{trunkSuda + "history", "refs/heads/head", userHead},
+	} {
+		want, ok := s.RevParse(ctx, c.src)
 		if !ok {
 			continue
 		}
-		remote, _ := s.RevParse(ctx, userSuda+name)
-		if remote == local {
+		have, _ := s.RevParse(ctx, c.local)
+		if have == want {
 			continue
 		}
-		specs = append(specs, local+":refs/suda/"+name)
-		leases = append(leases, "refs/suda/"+name+":"+remote)
+		specs = append(specs, want+":"+c.dst)
+		leases = append(leases, c.dst+":"+have)
+		updated = append(updated, c)
 	}
 	if len(specs) == 0 {
 		return nil
@@ -112,9 +121,9 @@ func (l *Lander) CopyTrunkToUser(ctx context.Context) error {
 	if err := s.Push(ctx, l.User, Write, false, leases, specs...); err != nil {
 		return fmt.Errorf("copy trunk refs to user repository: %w", err)
 	}
-	for _, name := range []string{"main", "history"} {
-		if v, ok := s.RevParse(ctx, trunkSuda+name); ok {
-			_, _ = s.Git(ctx, "update-ref", userSuda+name, v)
+	for _, c := range updated {
+		if v, ok := s.RevParse(ctx, c.src); ok {
+			_, _ = s.Git(ctx, "update-ref", c.local, v)
 		}
 	}
 	return nil

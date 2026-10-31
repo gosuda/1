@@ -115,7 +115,7 @@ The lander is one process in one container and the only writer of `gosuda/0`. It
 2. **Control-plane sync**: When the overlay entries of `refs/suda/main` differ from `refs/heads/main`, land an overlay-sync commit.
 3. **Drain landing requests**: Process every `refs/heads/land/*` in `gosuda/1` in order (Section 3.2).
 4. **Publish the lander**: When the deployable tree built from `.github/scripts/lander` and `.github/scripts/capy` differs from `refs/heads/lander`, publish it there (Section 3.4).
-5. **Copy trunk refs**: Copy `refs/suda/main` and `refs/suda/history` to `gosuda/1` with leases.
+5. **Copy trunk refs**: Copy `refs/suda/main` and `refs/suda/history` to `gosuda/1` with leases, and keep the branch `refs/heads/head` of `gosuda/1` on the history tip so the current tree is browsable at `https://github.com/gosuda/1/tree/head`. A member who moves these refs is undone on the next cycle.
 6. **Publish the front page**: Render `docs/user-repo/` of the control plane as the root of `refs/heads/main` in `gosuda/1` (the README and the onboarding guide). A member who overwrites that branch is undone on the next cycle. Executable files are never published there, because every member can write `gosuda/1`.
 7. **Reconcile mirrors**: For every workflow in `capy.star`, reconcile the mirror with the trunk and stage its external pull requests (Section 4).
 8. **Garbage collection**: At most once every 24 hours, prune stale references in `gosuda/1` (Section 3.5).
