@@ -31,7 +31,7 @@ func (l *Lander) Cycle(ctx context.Context) error {
 	step("publish-lander", l.PublishLanderBranch)
 	step("copy-trunk", l.CopyTrunkToUser)
 	step("publish-user-main", l.PublishUserMain)
-	step("mirrors", l.maybeReconcileMirrors)
+	step("mirrors", l.mirrorsStage)
 	step("gc", l.maybeGC)
 	if l.halted != nil {
 		errs = append(errs, l.halted)
@@ -60,15 +60,14 @@ func (l *Lander) Run(ctx context.Context, interval time.Duration, wake <-chan st
 	}
 }
 
-// maybeReconcileMirrors reconciles mirrors when the interval elapsed or a landing advanced the
-// trunk since the last run. Mirror fetches dominate a cycle's cost and mirror events are rare, so
-// they are polled less often than landing requests.
-func (l *Lander) maybeReconcileMirrors(ctx context.Context) error {
+// mirrorsStage runs the mirror reconcile every cycle (changes in the trunk and wake hints are
+// picked up immediately) and adds a sweep of cheap probes every MirrorInterval, which also covers
+// changes that arrive without a wake (missed webhooks, mirrors without a hook).
+func (l *Lander) mirrorsStage(ctx context.Context) error {
 	now := l.Now()
-	forced := l.mirrorsForce.Swap(false)
-	if !forced && l.MirrorInterval > 0 && !l.lastMirrors.IsZero() && now.Sub(l.lastMirrors) < l.MirrorInterval {
-		return nil
+	sweep := l.lastSweep.IsZero() || l.MirrorInterval <= 0 || now.Sub(l.lastSweep) >= l.MirrorInterval
+	if sweep {
+		l.lastSweep = now
 	}
-	l.lastMirrors = now
-	return l.ReconcileMirrors(ctx)
+	return l.ReconcileMirrors(ctx, sweep)
 }

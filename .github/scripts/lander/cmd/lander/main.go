@@ -123,7 +123,7 @@ func main() {
 			return lander.Remote{URL: ghURL + "/" + repo + ".git", Repo: repo}
 		},
 		AckTip:         os.Getenv("LANDER_ACK_TIP"),
-		MirrorInterval: envDur("LANDER_MIRROR_INTERVAL", 5*time.Minute),
+		MirrorInterval: envDur("LANDER_MIRROR_INTERVAL", 30*time.Minute),
 		DryRun:         os.Getenv("LANDER_DRYRUN") != "",
 		Log:            log,
 	}

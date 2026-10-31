@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,10 +18,14 @@ type Lander struct {
 	Config
 	halted error
 	lastGC time.Time
-	// lastMirrors is when mirrors were last reconciled; mirrorsForce skips the interval gate.
-	lastMirrors  time.Time
-	mirrorsForce atomic.Bool
-	mirrorRepos  atomic.Pointer[map[string]bool]
+	// lastSweep is when mirrors were last probed for changes (see ReconcileMirrors).
+	lastSweep   time.Time
+	mirrorRepos atomic.Pointer[map[string]bool]
+
+	mu           sync.Mutex
+	mirrorStates map[string]*mirrorState
+	dirtyRepos   map[string]bool
+	onReconcile  func(workflow string) // test hook
 }
 
 // New validates cfg and returns a Lander.
@@ -231,6 +236,20 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 		return Result{Outcome: Rejected, Reason: fmt.Sprintf(format, a...)}, false, nil
 	}
 
+	if msg, _ := s.Meta(ctx, req.Tip); isEmbargoName(req.ID) || isEmbargoSubject(msg.Message) {
+		allowed := false
+		if l.EmbargoTeam != "" {
+			allowed, err = l.Forge.TeamResolver(ctx)(l.EmbargoTeam, strings.ToLower(req.Requester))
+			if err != nil {
+				return Result{}, false, err
+			}
+		}
+		if !allowed {
+			// Generic on purpose: statuses are visible to every organization member.
+			return reject("embargoed change: only the security response team may land it")
+		}
+	}
+
 	roots, err := s.Git(ctx, "rev-list", "--max-parents=0", req.Tip)
 	if err != nil {
 		return Result{}, false, err
@@ -363,7 +382,6 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	if err := s.Push(ctx, l.Trunk, Write, true, leases, refspecs...); err != nil {
 		return Result{}, true, fmt.Errorf("atomic trunk push: %w", err)
 	}
-	l.mirrorsForce.Store(true)
 	// Keep the local view consistent without waiting for the next fetch.
 	_, _ = s.Git(ctx, "update-ref", trunkMain, snap)
 	_, _ = s.Git(ctx, "update-ref", trunkHistory, hist)
@@ -400,7 +418,12 @@ func (l *Lander) NoteWake(repo string) (relevant bool) {
 		return true
 	}
 	if m := l.mirrorRepos.Load(); m != nil && (*m)[repo] {
-		l.mirrorsForce.Store(true)
+		l.mu.Lock()
+		if l.dirtyRepos == nil {
+			l.dirtyRepos = map[string]bool{}
+		}
+		l.dirtyRepos[repo] = true
+		l.mu.Unlock()
 		return true
 	}
 	return false

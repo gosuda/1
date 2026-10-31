@@ -87,6 +87,11 @@ func (l *Lander) GarbageCollect(ctx context.Context) error {
 		ts, _ := strconv.ParseInt(f[2], 10, 64)
 		age := now.Sub(time.Unix(ts, 0))
 		switch {
+		case strings.HasPrefix(ref, "refs/gc/ws/") && isEmbargoName(strings.TrimPrefix(ref, "refs/gc/ws/")):
+			// Embargoed work may wait for a disclosure date: long TTL, never closed-PR pruning.
+			if age > l.EmbargoTTL {
+				dels = append(dels, del{"refs/ws/" + strings.TrimPrefix(ref, "refs/gc/ws/"), sha})
+			}
 		case strings.HasPrefix(ref, "refs/gc/ws/capy/"):
 			name := strings.TrimPrefix(ref, "refs/gc/ws/capy/")
 			if m := stagedPRRe.FindStringSubmatch(name); m != nil {
@@ -109,7 +114,11 @@ func (l *Lander) GarbageCollect(ctx context.Context) error {
 				ns = "base"
 			}
 			id := strings.TrimPrefix(ref, "refs/gc/"+ns+"/")
-			if userPRsKnown && !reviewOpen["review/"+id] && age > 24*time.Hour {
+			ttl := 24 * time.Hour
+			if isEmbargoName(id) {
+				ttl = l.EmbargoTTL
+			}
+			if userPRsKnown && !reviewOpen["review/"+id] && age > ttl {
 				dels = append(dels, del{"refs/heads/" + ns + "/" + id, sha})
 			}
 		}

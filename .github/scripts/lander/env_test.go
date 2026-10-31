@@ -19,15 +19,16 @@ import (
 // env is a self-contained world: bare trunk, user and mirror repositories on disk, a developer
 // clone, a fake forge and a Lander wired to them.
 type env struct {
-	t      *testing.T
-	root   string
-	trunk  string // bare
-	user   string // bare
-	mirror string // bare, gosuda/p (branch main)
-	dev    string // non-bare working clone used to author commits
-	forge  *fakeForge
-	l      *Lander
-	ctx    context.Context
+	t       *testing.T
+	root    string
+	trunk   string // bare
+	user    string // bare
+	mirror  string // bare, gosuda/p (branch main)
+	mirrorQ string // bare, gosuda/q (branch main)
+	dev     string // non-bare working clone used to author commits
+	forge   *fakeForge
+	l       *Lander
+	ctx     context.Context
 }
 
 func sh(t *testing.T, dir string, env []string, name string, args ...string) string {
@@ -72,6 +73,12 @@ capy.workflow(
         core.exclude(["internal_notes/**", "**.local.toml"]),
         metadata.expose_label("GitOrigin-RevId"),
     ],
+)
+capy.workflow(
+    name = "q",
+    origin = capy.monorepo_path("Q"),
+    destination = capy.github_repo("gosuda/q", branch = "main"),
+    transformations = [metadata.expose_label("GitOrigin-RevId")],
 )
 `
 
@@ -119,9 +126,9 @@ func newEnv(t *testing.T) *env {
 	t.Helper()
 	root := t.TempDir()
 	e := &env{t: t, root: root, ctx: context.Background(),
-		trunk: filepath.Join(root, "trunk.git"), user: filepath.Join(root, "user.git"), mirror: filepath.Join(root, "p.git"),
+		trunk: filepath.Join(root, "trunk.git"), user: filepath.Join(root, "user.git"), mirror: filepath.Join(root, "p.git"), mirrorQ: filepath.Join(root, "q.git"),
 		dev: filepath.Join(root, "dev")}
-	for _, d := range []string{e.trunk, e.user, e.mirror} {
+	for _, d := range []string{e.trunk, e.user, e.mirror, e.mirrorQ} {
 		git(t, root, "init", "-q", "--bare", d)
 	}
 	git(t, e.user, "config", "uploadpack.allowFilter", "true")
@@ -160,16 +167,22 @@ func newEnv(t *testing.T) *env {
 	exp := git(t, e.dev, "rev-parse", snap+":P")
 	_ = exp
 	e.resetMirrorToExport(snap)
+	e.seedMirrorQ(snap)
 
 	e.forge = &fakeForge{def: "maintainer", actors: map[string]string{}, approvals: map[string][]string{},
 		teams: map[string]map[string]bool{}, pulls: map[string][]PullRequest{}}
 	store := &Store{Dir: filepath.Join(root, "store.git")}
 	cfg := Config{
 		Store: store, Forge: e.forge,
-		Trunk:  Remote{URL: e.trunk, Repo: "gosuda/0"},
-		User:   Remote{URL: e.user, Repo: "gosuda/1"},
-		Mirror: func(repo string) Remote { return Remote{URL: e.mirror, Repo: repo} },
-		Log:    slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		Trunk: Remote{URL: e.trunk, Repo: "gosuda/0"},
+		User:  Remote{URL: e.user, Repo: "gosuda/1"},
+		Mirror: func(repo string) Remote {
+			if repo == "gosuda/q" {
+				return Remote{URL: e.mirrorQ, Repo: repo}
+			}
+			return Remote{URL: e.mirror, Repo: repo}
+		},
+		Log: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})),
 	}
 	if err := store.Init(e.ctx); err != nil {
 		t.Fatal(err)
@@ -244,4 +257,29 @@ func (e *env) hasStatus(sub string) bool {
 
 func gitOK(dir string, args ...string) bool {
 	return exec.Command("git", append([]string{"-C", dir}, args...)...).Run() == nil
+}
+
+// seedMirrorQ publishes Q/ as the main branch of the second mirror.
+func (e *env) seedMirrorQ(snap string) {
+	t := e.t
+	tmp := filepath.Join(e.root, "mirror-seed-q")
+	os.RemoveAll(tmp)
+	git(t, e.root, "init", "-q", "-b", "main", tmp)
+	git(t, tmp, "fetch", "-q", e.trunk, snap)
+	git(t, tmp, "read-tree", snap+":Q")
+	tree := git(t, tmp, "write-tree")
+	c := git(t, tmp, "commit-tree", tree, "-m", "seed mirror q")
+	git(t, tmp, "push", "-q", "--force", e.mirrorQ, c+":refs/heads/main")
+}
+
+// trackReconciles records which workflows the lander reconciled.
+func (e *env) trackReconciles() *[]string {
+	var mu sync.Mutex
+	var seen []string
+	e.l.onReconcile = func(name string) {
+		mu.Lock()
+		seen = append(seen, name)
+		mu.Unlock()
+	}
+	return &seen
 }

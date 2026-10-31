@@ -274,3 +274,83 @@ func TestUserRepositoryBranchesAndTagsNeverReachIntoTheTrunk(t *testing.T) {
 		t.Fatal("main must not contain the trunk")
 	}
 }
+
+func TestEmbargoedChangesLandOnlyForTheSecurityTeam(t *testing.T) {
+	e := newEnv(t)
+	before := e.trunkRef("refs/suda/main")
+
+	// Without a configured team an embargoed change cannot land at all, even for an owner.
+	e.devWork("sec-202610-0a1b2c3d", map[string]string{"Q/q.go": "package q\n// fix\n"}, "sec-202610-0a1b2c3d: neutral summary")
+	e.cycle()
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("an embargoed change landed without a security team")
+	}
+	if !e.hasStatus("failure embargoed change: only the security response team may land it") {
+		t.Fatalf("expected a generic embargo rejection: %v", e.forge.statuses)
+	}
+	for _, s := range e.forge.statuses {
+		if strings.Contains(s, "Q/q.go") || strings.Contains(s, "fix") {
+			t.Fatalf("status leaks details of the embargoed change: %s", s)
+		}
+	}
+
+	// With the team configured, a non-member is still rejected and a member lands it.
+	e.l.EmbargoTeam = "gosuda/security-response"
+	e.forge.teams["gosuda/security-response"] = map[string]bool{"carol": true}
+	e.devWork("sec-202610-0a1b2c3d", map[string]string{"Q/q.go": "package q\n// fix\n"}, "sec-202610-0a1b2c3d: neutral summary")
+	e.cycle()
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("a non-member of the security team landed an embargoed change")
+	}
+	// A security-team member who is not an owner of the path still goes through OWNERS.
+	e.forge.def = "carol"
+	e.devWork("sec-202610-0a1b2c3d", map[string]string{"Q/q.go": "package q\n// fix\n"}, "sec-202610-0a1b2c3d: neutral summary")
+	e.cycle()
+	if e.trunkRef("refs/suda/main") != before || !e.hasStatus("failure OWNERS") {
+		t.Fatalf("the security team must not bypass OWNERS: %v", e.forge.statuses)
+	}
+
+	// An owner who is a member of the security team releases it.
+	e.forge.def = "maintainer"
+	e.forge.teams["gosuda/security-response"]["maintainer"] = true
+	e.devWork("sec-202610-0a1b2c3d", map[string]string{"Q/q.go": "package q\n// fix\n"}, "sec-202610-0a1b2c3d: neutral summary")
+	e.cycle()
+	if !strings.Contains(e.trunkFile("refs/suda/main", "Q/q.go"), "// fix") {
+		t.Fatalf("an owner in the security team could not release the change: %v", e.forge.statuses)
+	}
+}
+
+func TestEmbargoMarkerInTheSubjectAlsoGuardsOrdinaryIds(t *testing.T) {
+	e := newEnv(t)
+	before := e.trunkRef("refs/suda/main")
+	e.devWork("fix-q", map[string]string{"Q/q.go": "package q\n// fix\n"}, "sec-202610-deadbeef: neutral summary")
+	e.cycle()
+	if e.trunkRef("refs/suda/main") != before {
+		t.Fatal("a commit marked as embargoed landed under an ordinary id")
+	}
+	// Ordinary changes are unaffected.
+	e.devWork("plain", map[string]string{"Q/q.go": "package q\n// ordinary\n"}, "Q: ordinary change")
+	e.cycle()
+	if !strings.Contains(e.trunkFile("refs/suda/main", "Q/q.go"), "ordinary") {
+		t.Fatal("an ordinary change was blocked by the embargo guard")
+	}
+}
+
+func TestEmbargoNamesAreRecognizedByAnySegment(t *testing.T) {
+	for name, want := range map[string]bool{
+		"sec-202610-0a1b2c3d":       true,
+		"alice/sec/sec-202610-aaaa": true,
+		"alice/sec/anything":        true,
+		"alice/sec-202610-aaaa":     true,
+		"base/sec-x":                true,
+		"alice/security-docs":       false,
+		"alice/second-try":          false,
+		"alice/fix-header":          false,
+		"capy/HQQ-pr-12":            false,
+		"alice/exp-secrets":         false,
+	} {
+		if got := isEmbargoName(name); got != want {
+			t.Errorf("isEmbargoName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}

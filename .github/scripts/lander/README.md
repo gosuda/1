@@ -26,10 +26,12 @@ nothing depends on events arriving. Durable state lives only in refs (including
 | `LANDER_TRUNK_REPO`, `LANDER_USER_REPO` | `gosuda/0`, `gosuda/1` | Trunk and user repositories |
 | `LANDER_STORE` | `/var/lib/lander/data/store.git` | Bare object store shared by all remotes |
 | `LANDER_INTERVAL` | `1m` | Poll interval for landing requests (a `/wake` ends the wait early) |
-| `LANDER_MIRROR_INTERVAL` | `5m` | Minimum gap between mirror reconciles; a landing that advanced the trunk reconciles on the next cycle regardless |
+| `LANDER_MIRROR_INTERVAL` | `30m` | Interval of the mirror sweep (a cheap `ls-remote` plus one pull-request listing per mirror). A mirror is reconciled immediately when its project changed in the trunk or a webhook named it |
 | `LANDER_DRYRUN` | unset | Decide and log, push nothing |
 | `LANDER_SIGNING_KEY_FILE` or `LANDER_SIGNING_KEY` | unset | SSH private key (path, or content) signing lander commits; when set, an unsigned `refs/suda/history` tip halts the queue. The allowed-signers entry is derived from the key's public half |
 | `LANDER_ALLOWED_SIGNERS` | derived | Optional allowed-signers file overriding the derived one |
+| `LANDER_EMBARGO_TEAM` | unset | `org/slug` of the team allowed to land embargoed changes (ids `sec-...`). Unset: they cannot be landed |
+| `LANDER_EMBARGO_TTL` | `4320h` | Age after which embargoed workspace references are pruned (other workspaces: 14 days) |
 | `LANDER_ACK_TIP` | unset | Accept that one unsigned history tip (after reviewing an out-of-band push) |
 | `LANDER_PRESUBMIT` | `docker` | `docker` or `off` |
 | `LANDER_PRESUBMIT_IMAGE`, `_TIMEOUT`, `_CPUS`, `_MEMORY` | `golang:1.27`, `15m`, `2`, `4g` | Sandbox settings |

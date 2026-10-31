@@ -99,6 +99,7 @@ Table 3 lists each specification document in `docs/` and the subsystem boundary 
 | [tooling.md](./tooling.md) | The lander's deployment and configuration, presubmit sandbox, the `capy` command set, the `suda-lander` App, and the `//devtools/azure-magpie` routes. |
 | [google3-and-copybara.md](./google3-and-copybara.md) | Organization audit, `google3` parity matrix, two-tier CI execution, and the Starlark subtree synchronizer (`capy`). |
 | [feasibility-review.md](./feasibility-review.md) | Empirical verification results on Git 2.54.0, plumbing corrections, and GitHub platform constraints. |
+| [security-embargo.md](./security-embargo.md) | Embargoed security work: opaque `sec-` naming, lifecycle, the lander and magpie guards that keep it internal until release, and residual risks. |
 | [hardening-plan.md](./hardening-plan.md) | Trunk hardening and lander migration plan: the findings, decisions, and phased migration that produced this topology, with implementation status. |
 
 ## 7. Build and Verification Procedure

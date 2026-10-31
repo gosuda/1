@@ -238,51 +238,122 @@ func TestGarbageCollectPrunesOnlyStaleWorkspacesAndClosedReviewPairs(t *testing.
 
 var _ = context.Background
 
-func TestMirrorsArePolledOnTheirOwnIntervalButReconcileAfterALanding(t *testing.T) {
+func TestOnlyChangedMirrorsAreReconciled(t *testing.T) {
+	e := newEnv(t)
+	seen := e.trackReconciles()
+	e.cycle()
+	if strings.Join(*seen, ",") != "p,q" {
+		t.Fatalf("first cycle reconciles every mirror, got %v", *seen)
+	}
+
+	*seen = nil
+	e.cycle()
+	if len(*seen) != 0 {
+		t.Fatalf("an idle cycle must not touch any mirror, got %v", *seen)
+	}
+
+	e.devWork("only-p", map[string]string{"P/a.go": "package p\n// a=7\n"}, "P: a=7")
+	e.cycle()
+	if strings.Join(*seen, ",") != "p" {
+		t.Fatalf("a change in P must reconcile only p, got %v", *seen)
+	}
+	if !strings.Contains(e.mirrorFile("a.go"), "a=7") {
+		t.Fatal("p was not exported")
+	}
+
+	*seen = nil
+	e.cycle()
+	if len(*seen) != 0 {
+		t.Fatalf("a settled mirror must stay quiet, got %v", *seen)
+	}
+}
+
+func TestSweepProbesFindMirrorChangesThatCameWithoutAWake(t *testing.T) {
 	e := newEnv(t)
 	now := time.Unix(1_800_000_000, 0)
 	e.l.Now = func() time.Time { return now }
 	e.l.MirrorInterval = time.Hour
-	e.cycle() // first cycle always reconciles (baseline bootstrap)
-	if _, ok := e.l.Store.RevParse(e.ctx, trunkSync+"p"); !ok {
-		t.Fatal("first cycle must reconcile mirrors")
-	}
+	seen := e.trackReconciles()
+	e.cycle()
 
-	// A mirror-side change inside the interval is not looked at.
 	e.mirrorCommit(map[string]string{"b.go": "package p\n// b\n"}, "add b")
 	e.forge.actors["gosuda/p|refs/heads/main"] = "alice"
-	now = now.Add(time.Minute)
+	*seen = nil
+	now = now.Add(5 * time.Minute)
 	e.cycle()
-	if e.trunkHas("P/b.go") {
-		t.Fatal("mirror was reconciled before its interval elapsed")
+	if len(*seen) != 0 || e.trunkHas("P/b.go") {
+		t.Fatalf("no wake and no sweep yet: nothing may be reconciled (got %v)", *seen)
 	}
 
-	// A landing forces reconciliation on the same cycle, which also imports the pending mirror change.
-	e.devWork("x", map[string]string{"P/a.go": "package p\n// a=9\n"}, "P: a=9")
-	now = now.Add(time.Minute)
+	now = now.Add(time.Hour)
 	e.cycle()
-	if !e.trunkHas("P/b.go") || !strings.Contains(e.mirrorFile("a.go"), "a=9") {
-		t.Fatal("a landing must trigger immediate mirror reconciliation")
+	if strings.Join(*seen, ",") != "p" {
+		t.Fatalf("the sweep must find the change in p only, got %v", *seen)
+	}
+	if !e.trunkHas("P/b.go") {
+		t.Fatal("the mirror change was not imported")
+	}
+
+	// The next sweep finds nothing to do.
+	*seen = nil
+	now = now.Add(2 * time.Hour)
+	e.cycle()
+	if len(*seen) != 0 {
+		t.Fatalf("a sweep over unchanged mirrors must not reconcile, got %v", *seen)
 	}
 }
 
-func TestNoteWakeForcesMirrorSyncOnlyForConfiguredMirrors(t *testing.T) {
+func TestWakeHintReconcilesOnlyTheNamedMirror(t *testing.T) {
 	e := newEnv(t)
-	e.cycle() // loads the workflows, learning the mirror repositories
-	e.l.mirrorsForce.Store(false)
-	for repo, want := range map[string]bool{"gosuda/unrelated": false, "gosuda/1": true, "": true, "gosuda/p": true} {
-		if got := e.l.NoteWake(repo); got != want {
-			t.Errorf("NoteWake(%q) = %v, want %v", repo, got, want)
-		}
+	now := time.Unix(1_800_000_000, 0)
+	e.l.Now = func() time.Time { return now }
+	e.l.MirrorInterval = 24 * time.Hour
+	seen := e.trackReconciles()
+	e.cycle()
+
+	e.mirrorCommit(map[string]string{"c.go": "package p\n// c\n"}, "add c")
+	e.forge.actors["gosuda/p|refs/heads/main"] = "alice"
+	if !e.l.NoteWake("gosuda/p") || e.l.NoteWake("gosuda/unrelated") {
+		t.Fatal("NoteWake must accept configured mirrors and ignore unrelated repositories")
 	}
-	if !e.l.mirrorsForce.Load() {
-		t.Fatal("a wake from a configured mirror must force mirror reconciliation")
+	*seen = nil
+	now = now.Add(time.Minute)
+	e.cycle()
+	if strings.Join(*seen, ",") != "p" || !e.trunkHas("P/c.go") {
+		t.Fatalf("wake for p: reconciled %v, imported=%v", *seen, e.trunkHas("P/c.go"))
 	}
-	e.l.mirrorsForce.Store(false)
-	e.l.NoteWake("gosuda/unrelated")
-	e.l.NoteWake("gosuda/1")
-	if e.l.mirrorsForce.Load() {
-		t.Fatal("only mirror wakes force reconciliation")
+}
+
+func TestUnsettledMirrorsAreRetriedOnATimerNotEveryCycle(t *testing.T) {
+	e := newEnv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.l.Now = func() time.Time { return now }
+	e.l.MirrorInterval = 24 * time.Hour
+	seen := e.trackReconciles()
+	e.cycle()
+
+	// A non-owner pushes to the mirror: the change is staged and the mirror stays unsettled.
+	e.mirrorCommit(map[string]string{"d.go": "package p\n// d\n"}, "add d")
+	e.forge.actors["gosuda/p|refs/heads/main"] = "mallory"
+	e.l.NoteWake("gosuda/p")
+	*seen = nil
+	now = now.Add(time.Minute)
+	e.cycle()
+	if strings.Join(*seen, ",") != "p" {
+		t.Fatalf("first attempt: %v", *seen)
+	}
+	*seen = nil
+	now = now.Add(30 * time.Second)
+	e.cycle()
+	if len(*seen) != 0 {
+		t.Fatalf("an unsettled mirror must wait for its retry timer, got %v", *seen)
+	}
+	// Once the pusher is an owner the retry lands it.
+	e.forge.actors["gosuda/p|refs/heads/main"] = "alice"
+	now = now.Add(3 * time.Minute)
+	e.cycle()
+	if strings.Join(*seen, ",") != "p" || !e.trunkHas("P/d.go") {
+		t.Fatalf("retry after the timer: reconciled %v, imported=%v", *seen, e.trunkHas("P/d.go"))
 	}
 }
 
@@ -305,5 +376,34 @@ func TestBaselineWritesSurviveProjectsThatShipWorkflows(t *testing.T) {
 	}
 	if !e.mirrorHas(".github/workflows/ci.yml") {
 		t.Fatal("workflow file must be exported to the mirror")
+	}
+}
+
+func TestGarbageCollectKeepsEmbargoedReferencesUntilTheirOwnTTL(t *testing.T) {
+	e := newEnv(t)
+	old := time.Now().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	veryOld := time.Now().Add(-200 * 24 * time.Hour).Format(time.RFC3339)
+	tip := e.devWork("tmp", map[string]string{"Q/q.go": "package q\n// gc\n"}, "gc")
+	mk := func(date string) string {
+		return sh(t, e.dev, []string{"GIT_COMMITTER_DATE=" + date, "GIT_AUTHOR_DATE=" + date}, "git", "commit-tree", tip+"^{tree}", "-p", tip, "-m", "old")
+	}
+	c30, c200 := mk(old), mk(veryOld)
+	git(t, e.dev, "push", "-q", e.user,
+		c30+":refs/ws/alice/plain", c30+":refs/ws/alice/sec/sec-202610-aaaaaaaa", c200+":refs/ws/alice/sec/sec-202601-bbbbbbbb",
+		c30+":refs/heads/review/sec-202610-aaaaaaaa", c30+":refs/heads/base/sec-202610-aaaaaaaa",
+		c30+":refs/heads/review/old-plain")
+	git(t, e.dev, "push", "-q", e.user, ":refs/heads/land/tmp")
+	e.l.WorkspaceTTL = 14 * 24 * time.Hour
+	e.l.EmbargoTTL = 180 * 24 * time.Hour
+	if err := e.l.GarbageCollect(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	ws := strings.Join(e.userRefs("refs/ws/"), ",")
+	if ws != "refs/ws/alice/sec/sec-202610-aaaaaaaa" {
+		t.Fatalf("ws refs after GC = %s (plain pruned at 14d, embargoed kept until its own TTL)", ws)
+	}
+	heads := strings.Join(e.userRefs("refs/heads/"), ",")
+	if !strings.Contains(heads, "review/sec-202610-aaaaaaaa") || !strings.Contains(heads, "base/sec-202610-aaaaaaaa") || strings.Contains(heads, "old-plain") {
+		t.Fatalf("heads after GC = %s", heads)
 	}
 }

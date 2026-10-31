@@ -73,6 +73,11 @@ type Config struct {
 	MaxLandAttempts int
 	// WorkspaceTTL is the age after which refs/ws/* in the user repository are pruned.
 	WorkspaceTTL time.Duration
+	// EmbargoTeam ("org/slug") may land embargoed changes (ids "sec-...", see embargo.go). When
+	// empty, embargoed changes cannot be landed at all.
+	EmbargoTeam string
+	// EmbargoTTL is the age after which embargoed workspace references are pruned (default 180 days).
+	EmbargoTTL time.Duration
 	// AckTip, when set, accepts that unsigned refs/suda/history tip once.
 	AckTip string
 	DryRun bool
@@ -93,6 +98,9 @@ func (c *Config) defaults() {
 	}
 	if c.WorkspaceTTL == 0 {
 		c.WorkspaceTTL = 14 * 24 * time.Hour
+	}
+	if c.EmbargoTTL == 0 {
+		c.EmbargoTTL = 180 * 24 * time.Hour
 	}
 	if c.Now == nil {
 		c.Now = time.Now
