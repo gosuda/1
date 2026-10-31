@@ -9,8 +9,34 @@ This guide takes you from nothing to a landed change. It applies to people and t
 
 ## 2. One-time setup
 
-Clone the control plane from `gosuda/0` **read-only**. The control plane carries the trusted `.gitconfig`
-aliases and the rules agents follow; that is why you clone it instead of this repository.
+### The one-liner
+
+With `gh` logged in (`gh auth login`), run this once. List the directories your task needs after the options:
+
+```bash
+gh api -H 'Accept: application/vnd.github.raw' repos/gosuda/0/contents/.github/scripts/onboard.sh \
+  | bash -s -- -d gosuda-0 ipc/hqq web/gosuda
+```
+
+Options: `-d <dir>` target directory (default `gosuda-0`), `-p https` to clone over HTTPS instead of SSH.
+The script clones `gosuda/0` **read-only** (blob-less and sparse), includes the trusted `.gitconfig`, runs
+`git suda-init` (adds the `ws` remote, which is `gosuda/1`, and disables pushes to `origin`), and sets the
+sparse directories. It refuses to guess: unknown directories, an existing non-clone target, or a dirty
+clone stop it with a message.
+
+The script comes from `gosuda/0`, where only the lander and org owners write. Do not run a copy of it from a
+branch of `gosuda/1`.
+
+### Re-running it
+
+Run the same command with `-d` pointing at your existing clone to refresh the aliases from the current
+control plane. It needs the clone on a clean `main` (your `ws/...` branches are never touched) and tells you
+what to do otherwise. This also replaces the manual refresh below.
+
+### Doing it by hand
+
+The control plane carries the trusted `.gitconfig` aliases and the rules agents follow; that is why you
+clone `gosuda/0` instead of this repository.
 
 ```bash
 git clone --filter=blob:none --sparse git@github.com:gosuda/0.git
@@ -26,7 +52,7 @@ git sparse-checkout set ipc/hqq web/gosuda # only the directories your task need
 
 ### Already set up before the migration?
 
-Your clone still has the old aliases. Refresh them once:
+Your clone still has the old aliases. Re-run the one-liner with `-d` set to your clone, or refresh by hand:
 
 ```bash
 git fetch origin refs/heads/main
