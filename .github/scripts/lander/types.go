@@ -76,6 +76,9 @@ type Config struct {
 	// AckTip, when set, accepts that unsigned refs/suda/history tip once.
 	AckTip string
 	DryRun bool
+	// MirrorInterval bounds how often mirrors are fetched and reconciled. Zero means every cycle.
+	// A landing that advanced the trunk forces the next cycle to reconcile immediately.
+	MirrorInterval time.Duration
 
 	Now func() time.Time
 	Log *slog.Logger

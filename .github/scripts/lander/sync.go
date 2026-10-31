@@ -37,6 +37,11 @@ func (l *Lander) ReconcileMirrors(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	repos := make(map[string]bool, len(cfg.Workflows))
+	for _, wf := range cfg.Workflows {
+		repos[wf.DestinationRepo] = true
+	}
+	l.mirrorRepos.Store(&repos)
 	if err := l.Store.FetchNoPrune(ctx, l.User, "+refs/ws/capy/*:"+userStaged+"*"); err != nil {
 		l.Log.Warn("fetch staged refs failed", "err", err)
 	}

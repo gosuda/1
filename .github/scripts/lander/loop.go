@@ -30,7 +30,7 @@ func (l *Lander) Cycle(ctx context.Context) error {
 	step("drain", l.DrainLandRequests)
 	step("publish-lander", l.PublishLanderBranch)
 	step("copy-trunk", l.CopyTrunkToUser)
-	step("mirrors", l.ReconcileMirrors)
+	step("mirrors", l.maybeReconcileMirrors)
 	step("gc", l.maybeGC)
 	if l.halted != nil {
 		errs = append(errs, l.halted)
@@ -57,4 +57,17 @@ func (l *Lander) Run(ctx context.Context, interval time.Duration, wake <-chan st
 		case <-t.C:
 		}
 	}
+}
+
+// maybeReconcileMirrors reconciles mirrors when the interval elapsed or a landing advanced the
+// trunk since the last run. Mirror fetches dominate a cycle's cost and mirror events are rare, so
+// they are polled less often than landing requests.
+func (l *Lander) maybeReconcileMirrors(ctx context.Context) error {
+	now := l.Now()
+	forced := l.mirrorsForce.Swap(false)
+	if !forced && l.MirrorInterval > 0 && !l.lastMirrors.IsZero() && now.Sub(l.lastMirrors) < l.MirrorInterval {
+		return nil
+	}
+	l.lastMirrors = now
+	return l.ReconcileMirrors(ctx)
 }

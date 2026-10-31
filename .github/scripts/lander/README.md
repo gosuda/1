@@ -21,17 +21,20 @@ nothing depends on events arriving. Durable state lives only in refs (including
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
-| `LANDER_APP_ID`, `LANDER_APP_KEY_FILE` | required | `suda-lander` GitHub App id and private key (PEM) |
+| `LANDER_APP_ID` | required | `suda-lander` GitHub App id |
+| `LANDER_APP_KEY_FILE` or `LANDER_APP_KEY` | required | App private key (PEM) as a file path, or the PEM content itself (literal `\n` is expanded) |
 | `LANDER_TRUNK_REPO`, `LANDER_USER_REPO` | `gosuda/0`, `gosuda/1` | Trunk and user repositories |
-| `LANDER_STORE` | `/var/lib/lander/store.git` | Bare object store shared by all remotes |
-| `LANDER_INTERVAL` | `15s` | Poll interval |
+| `LANDER_STORE` | `/var/lib/lander/data/store.git` | Bare object store shared by all remotes |
+| `LANDER_INTERVAL` | `1m` | Poll interval for landing requests (a `/wake` ends the wait early) |
+| `LANDER_MIRROR_INTERVAL` | `5m` | Minimum gap between mirror reconciles; a landing that advanced the trunk reconciles on the next cycle regardless |
 | `LANDER_DRYRUN` | unset | Decide and log, push nothing |
-| `LANDER_SIGNING_KEY`, `LANDER_ALLOWED_SIGNERS` | unset | SSH key signing lander commits; when set, an unsigned `refs/suda/history` tip halts the queue |
+| `LANDER_SIGNING_KEY_FILE` or `LANDER_SIGNING_KEY` | unset | SSH private key (path, or content) signing lander commits; when set, an unsigned `refs/suda/history` tip halts the queue. The allowed-signers entry is derived from the key's public half |
+| `LANDER_ALLOWED_SIGNERS` | derived | Optional allowed-signers file overriding the derived one |
 | `LANDER_ACK_TIP` | unset | Accept that one unsigned history tip (after reviewing an out-of-band push) |
 | `LANDER_PRESUBMIT` | `docker` | `docker` or `off` |
 | `LANDER_PRESUBMIT_IMAGE`, `_TIMEOUT`, `_CPUS`, `_MEMORY` | `golang:1.27`, `15m`, `2`, `4g` | Sandbox settings |
 | `LANDER_DOCKER`, `DOCKER_HOST` | `docker` | Docker CLI and daemon for the sandbox (use a dedicated daemon) |
-| `LANDER_CACHE_DIR` | `/var/lib/lander/cache` | Dependency caches mounted read-only into the sandbox |
+| `LANDER_CACHE_DIR` | `/var/lib/lander/data/cache` | Dependency caches mounted read-only into the sandbox |
 | `LANDER_LISTEN`, `LANDER_WAKE_SECRET` | `:8080`, unset | `/healthz`; `/wake` accepts an HMAC-SHA256 (`X-Hub-Signature-256`) signed POST and only shortens the wait |
 
 ## Security properties

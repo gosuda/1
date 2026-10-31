@@ -237,3 +237,51 @@ func TestGarbageCollectPrunesOnlyStaleWorkspacesAndClosedReviewPairs(t *testing.
 }
 
 var _ = context.Background
+
+func TestMirrorsArePolledOnTheirOwnIntervalButReconcileAfterALanding(t *testing.T) {
+	e := newEnv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.l.Now = func() time.Time { return now }
+	e.l.MirrorInterval = time.Hour
+	e.cycle() // first cycle always reconciles (baseline bootstrap)
+	if _, ok := e.l.Store.RevParse(e.ctx, trunkSync+"p"); !ok {
+		t.Fatal("first cycle must reconcile mirrors")
+	}
+
+	// A mirror-side change inside the interval is not looked at.
+	e.mirrorCommit(map[string]string{"b.go": "package p\n// b\n"}, "add b")
+	e.forge.actors["gosuda/p|refs/heads/main"] = "alice"
+	now = now.Add(time.Minute)
+	e.cycle()
+	if e.trunkHas("P/b.go") {
+		t.Fatal("mirror was reconciled before its interval elapsed")
+	}
+
+	// A landing forces reconciliation on the same cycle, which also imports the pending mirror change.
+	e.devWork("x", map[string]string{"P/a.go": "package p\n// a=9\n"}, "P: a=9")
+	now = now.Add(time.Minute)
+	e.cycle()
+	if !e.trunkHas("P/b.go") || !strings.Contains(e.mirrorFile("a.go"), "a=9") {
+		t.Fatal("a landing must trigger immediate mirror reconciliation")
+	}
+}
+
+func TestNoteWakeForcesMirrorSyncOnlyForConfiguredMirrors(t *testing.T) {
+	e := newEnv(t)
+	e.cycle() // loads the workflows, learning the mirror repositories
+	e.l.mirrorsForce.Store(false)
+	for repo, want := range map[string]bool{"gosuda/unrelated": false, "gosuda/1": true, "": true, "gosuda/p": true} {
+		if got := e.l.NoteWake(repo); got != want {
+			t.Errorf("NoteWake(%q) = %v, want %v", repo, got, want)
+		}
+	}
+	if !e.l.mirrorsForce.Load() {
+		t.Fatal("a wake from a configured mirror must force mirror reconciliation")
+	}
+	e.l.mirrorsForce.Store(false)
+	e.l.NoteWake("gosuda/unrelated")
+	e.l.NoteWake("gosuda/1")
+	if e.l.mirrorsForce.Load() {
+		t.Fatal("only mirror wakes force reconciliation")
+	}
+}

@@ -18,7 +18,7 @@ COPY --from=build /usr/local/go /usr/local/go
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=build /out/lander /usr/local/bin/lander
 ENV PATH=/usr/local/go/bin:$PATH \
-    LANDER_STORE=/var/lib/lander/store.git
+    LANDER_STORE=/var/lib/lander/data/store.git
 RUN useradd --system --uid 10001 --home-dir /var/lib/lander --create-home lander
 USER 10001
 VOLUME /var/lib/lander

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gosuda.org/0/scripts/capy"
@@ -16,6 +17,10 @@ type Lander struct {
 	Config
 	halted error
 	lastGC time.Time
+	// lastMirrors is when mirrors were last reconciled; mirrorsForce skips the interval gate.
+	lastMirrors  time.Time
+	mirrorsForce atomic.Bool
+	mirrorRepos  atomic.Pointer[map[string]bool]
 }
 
 // New validates cfg and returns a Lander.
@@ -326,7 +331,7 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	}
 
 	if l.DryRun {
-		l.Log.Info("dry-run: would land", "id", req.ID, "tree", newTree, "changed", len(strings.Fields(newTree)))
+		l.Log.Info("dry-run: would land", "id", req.ID, "tree", newTree)
 		return Result{Outcome: Landed, Hist: "dry-run"}, false, nil
 	}
 
@@ -351,6 +356,7 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	if err := s.Push(ctx, l.Trunk, Write, true, leases, refspecs...); err != nil {
 		return Result{}, true, fmt.Errorf("atomic trunk push: %w", err)
 	}
+	l.mirrorsForce.Store(true)
 	// Keep the local view consistent without waiting for the next fetch.
 	_, _ = s.Git(ctx, "update-ref", trunkMain, snap)
 	_, _ = s.Git(ctx, "update-ref", trunkHistory, hist)
@@ -375,4 +381,20 @@ func summarize(v []string) string {
 		return strings.Join(v[:5], "; ") + fmt.Sprintf("; … %d more", len(v)-5)
 	}
 	return strings.Join(v, "; ")
+}
+
+// NoteWake classifies a wake hint. A webhook is only a hint: it may name the repository that
+// changed, and the lander uses that solely to decide how much to re-check, never what to do.
+// relevant is false for repositories the lander does not watch (so org-wide webhooks cost
+// nothing). A change in a configured mirror forces the next cycle to reconcile mirrors.
+// An empty repo (for example a bare wake) is relevant but forces nothing.
+func (l *Lander) NoteWake(repo string) (relevant bool) {
+	if repo == "" || repo == l.User.Repo || repo == l.Trunk.Repo {
+		return true
+	}
+	if m := l.mirrorRepos.Load(); m != nil && (*m)[repo] {
+		l.mirrorsForce.Store(true)
+		return true
+	}
+	return false
 }

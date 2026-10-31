@@ -152,7 +152,7 @@ loop:
 ```
 
 - **Wake sources (D5)**:
-  - One full cycle every `LANDER_INTERVAL` (default 15 s): every stage fetches fresh refs, so landing requests, mirror tips, and open mirror PRs are all polled at that cadence.
+  - One cycle every `LANDER_INTERVAL` (default 1 minute) polls trunk refs and landing requests. Mirrors (tips and open pull requests) are reconciled at most every `LANDER_MIRROR_INTERVAL` (default 5 minutes), or on the next cycle after a landing advanced the trunk.
   - An optional HMAC-verified `/wake` request (sent by the magpie webhook) shortens the wait. Its payload is never read as input.
 - **State**: All durable state lives in refs and commit statuses. A restart resumes without recovery steps. Running a second instance is prohibited; leases make it harmless but wasteful.
 - **Object cache**: A full clone of `gosuda/0` (21,864 KB) without a blob filter. `gosuda/1` and the mirrors are fetched into separate namespaces of the same store. This removes the partial-clone failure class behind F8.
