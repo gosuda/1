@@ -31,7 +31,9 @@ os.chdir(root)
 
 def tracked_gomods(prefix):
     out = subprocess.run(["git", "ls-files", "-z", "--", prefix], capture_output=True, text=True, check=True).stdout
-    return sorted(p for p in out.split("\0") if p == "go.mod" or p.endswith("/go.mod"))
+    mods = (p for p in out.split("\0") if p == "go.mod" or p.endswith("/go.mod"))
+    # The go tool ignores testdata and vendor directories, so their go.mod files are fixtures, not modules.
+    return sorted(p for p in mods if not {"testdata", "vendor"} & set(p.split("/")[:-1]))
 
 
 def version(s):

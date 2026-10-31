@@ -83,6 +83,19 @@ before=$(git rev-parse HEAD)
 "$SCRIPT_DIR/go-work-add.sh" crypto/lib >/dev/null
 check "go-work-add.sh is idempotent" test "$(git rev-parse HEAD)" = "$before"
 
+# 3b. go.mod files under testdata/ or vendor/ are fixtures and never join go.work.
+mkup "$TMP/up-fixture" example.org/fixture 1.24.0
+mkdir -p "$TMP/up-fixture/testdata/mod" "$TMP/up-fixture/vendor/v"
+printf 'module example.org/fixture/testdata\n' >"$TMP/up-fixture/testdata/mod/go.mod"
+printf 'module example.org/fixture/vendored\n' >"$TMP/up-fixture/vendor/v/go.mod"
+git -C "$TMP/up-fixture" add -A
+git -C "$TMP/up-fixture" commit -q -m fixtures
+SUDA_IMPORT_URL="$TMP/up-fixture" "$SCRIPT_DIR/import-repo.sh" storage/fixture gosuda/fixture >/dev/null
+"$SCRIPT_DIR/go-work-add.sh" storage/fixture >/dev/null
+check "the fixture's root module joins go.work" grep -qx $'\t./storage/fixture' go.work
+check_not "testdata modules stay out of go.work" grep -q 'testdata' go.work
+check_not "vendor modules stay out of go.work" grep -q 'vendor' go.work
+
 # 4. A newer go directive raises go.work's.
 mkup "$TMP/up-new" example.org/new 1.26.1
 SUDA_IMPORT_URL="$TMP/up-new" "$SCRIPT_DIR/import-repo.sh" net/new gosuda/new >/dev/null
