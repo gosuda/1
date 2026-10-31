@@ -20,7 +20,7 @@ Attach the trunk namespace and the `ws` remote, and restrict the working directo
 
 1. Enable the repository Git aliases from `.gitconfig`.
 2. Run `git suda-init`. It adds the `ws` remote, disables pushes to `origin`, and fetches `refs/suda/main` and `refs/suda/history` in blobless mode.
-3. Configure sparse checkout for the target domain directories.
+3. Configure sparse checkout for the target domain directories. To add projects later, run `git sparse-checkout add <domain>/<project>`; running `set` again replaces the list and drops `.agents` and `.github` unless you name them.
 4. Create a new workspace branch rooted at `origin/suda/main`.
 
 ```bash

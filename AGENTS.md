@@ -96,7 +96,7 @@ Execute these steps with standard `git` commands or the aliases in `.gitconfig`.
 
 1. Enable the repository Git aliases: `git config include.path ../.gitconfig`.
 2. Attach the trunk references and the `ws` remote: `git suda-init`.
-3. Restrict sparse checkout to the target directories: `git sparse-checkout set <domain>/<project>`.
+3. Restrict sparse checkout to the target directories: `git sparse-checkout set <domain>/<project>`. To fetch more projects later, run `git sparse-checkout add <domain>/<project>`; running `set` again replaces the list and drops `.agents` and `.github` unless you name them.
 4. Create an isolated workspace branch from `origin/suda/main`: `git ws-new agent-<name>/<task-id>`.
 5. Run the package test suite inside every modified project directory before saving.
 6. Commit, then push work-in-progress to `refs/ws/agent-<name>/<task-id>` on `gosuda/1`: `git ws-save`.
