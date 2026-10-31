@@ -149,6 +149,14 @@ export function buildRedirectLocation(pathname: string, repo: string, refs: Suda
   if (trimmed === "commit") {
     return `${base}/commit/${refs.mainSha}`;
   }
+  // Tree view at the head of refs/suda/history (the commit with parents, so GitHub shows its
+  // history and "last commit" labels, unlike the parentless snapshot behind /tree).
+  if (trimmed === "head") {
+    return `${base}/tree/${refs.historySha}`;
+  }
+  if (trimmed.startsWith("head/")) {
+    return `${base}/tree/${refs.historySha}/${trimmed.slice("head/".length)}`;
+  }
   if (trimmed === "history") {
     return `${base}/commits/${refs.historySha}`;
   }

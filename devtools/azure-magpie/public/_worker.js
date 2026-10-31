@@ -84,6 +84,12 @@ function buildRedirectLocation(pathname, repo, refs) {
   if (trimmed === "commit") {
     return `${base}/commit/${refs.mainSha}`;
   }
+  if (trimmed === "head") {
+    return `${base}/tree/${refs.historySha}`;
+  }
+  if (trimmed.startsWith("head/")) {
+    return `${base}/tree/${refs.historySha}/${trimmed.slice("head/".length)}`;
+  }
   if (trimmed === "history") {
     return `${base}/commits/${refs.historySha}`;
   }

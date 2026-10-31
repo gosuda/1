@@ -54,6 +54,22 @@ describe("buildRedirectLocation", () => {
     );
   });
 
+  test("routes /head to the tree view at the head of refs/suda/history", () => {
+    expect(buildRedirectLocation("/head", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.historySha}`,
+    );
+    expect(buildRedirectLocation("/head/", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.historySha}`,
+    );
+    expect(buildRedirectLocation("/head/ipc/hqq/HQQ", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.historySha}/ipc/hqq/HQQ`,
+    );
+    // /tree keeps pointing at the snapshot commit.
+    expect(buildRedirectLocation("/tree", "gosuda/1", SAMPLE_REFS)).toBe(
+      `https://github.com/gosuda/1/tree/${SAMPLE_REFS.mainSha}`,
+    );
+  });
+
   test("routes history and blame paths to refs/suda/history", () => {
     expect(buildRedirectLocation("/history", "gosuda/1", SAMPLE_REFS)).toBe(
       `https://github.com/gosuda/1/commits/${SAMPLE_REFS.historySha}`,

@@ -10,6 +10,7 @@
 | :--- | :--- | :--- |
 | `/` or `/diff` | `GET` | Serves the web interface for generating comparison links, inspecting active workspaces, and browsing subtrees |
 | `/tree` or `/tree/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
+| `/head` or `/head/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/tree/<suda-history-sha>/<path>`: the tree view at the head of `refs/suda/history` |
 | `/blob/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/blob/<suda-main-sha>/<path>` |
 | `/commit` or `/commit/<ref>` | `GET` | Resolves `<ref>` (defaults to `refs/suda/main`) and redirects (`302`) to `https://github.com/gosuda/1/commit/<sha>` |
 | `/history` or `/history/<path>` | `GET` | Redirects (`302`) to `https://github.com/gosuda/1/commits/<suda-history-sha>/<path>` |
