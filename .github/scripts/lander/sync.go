@@ -512,6 +512,10 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 			continue
 		}
 		if !ok {
+			// Nothing to stage now; a ref staged earlier would show a stale, misleading change.
+			if err := l.dropStaged(ctx, fmt.Sprintf("%s-pr-%d", wf.Name, pr.Number)); err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
 		imp, err := capy.ImportTree(ctx, s.Dir, bMonoTree, wf, xRaw)
@@ -562,6 +566,25 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// dropStaged deletes a staged reference that no longer describes the mirror pull request.
+func (l *Lander) dropStaged(ctx context.Context, name string) error {
+	if l.DryRun {
+		return nil
+	}
+	s := l.Store
+	old, ok := s.RevParse(ctx, userStaged+name)
+	if !ok {
+		return nil
+	}
+	ref := "refs/ws/capy/" + name
+	if err := s.Push(ctx, l.User, Write, false, []string{ref + ":" + old}, ":"+ref); err != nil {
+		return fmt.Errorf("drop staged %s: %w", name, err)
+	}
+	_, _ = s.Git(ctx, "update-ref", "-d", userStaged+name)
+	l.Log.Info("dropped stale staged change", "ref", ref)
+	return nil
 }
 
 // replayPull returns the raw mirror tree that holds the pull request's own change on top of the mirror

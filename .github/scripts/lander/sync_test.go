@@ -621,6 +621,35 @@ func TestStagedPullRequestHoldsOnlyItsOwnChangeWhenTheMirrorMovedOn(t *testing.T
 	}
 }
 
+func TestStagedPullRequestThatStartsConflictingLosesItsStaleStagedRef(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	dir := filepath.Join(e.root, "pr-dev")
+	git(t, e.root, "clone", "-q", "-b", "main", e.mirror, dir)
+	write(t, dir, map[string]string{"a.go": "package p\n// from the pull request\n"})
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "feature")
+	head := git(t, dir, "rev-parse", "HEAD")
+	git(t, dir, "push", "-q", "-f", "origin", head+":refs/pull/9/head")
+	e.forge.pulls["gosuda/p"] = []PullRequest{{Number: 9, HeadRef: "f9", HeadSHA: head, Title: "t"}}
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 1 {
+		t.Fatalf("the pull request must be staged first: %v", refs)
+	}
+
+	e.mirrorCommit(map[string]string{"a.go": "package p\n// from main\n"}, "conflicting main change")
+	e.l.NoteWake("gosuda/p")
+	e.cycle()
+	e.cycle()
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("a staged ref that no longer applies must be dropped: %v", refs)
+	}
+	if got := e.closedOn("gosuda/1"); len(got) != 1 {
+		t.Fatalf("its review pull request must be retired too: %v", e.forge.closed)
+	}
+}
+
 func TestStagedPullRequestThatConflictsWithTheMirrorIsNotStaged(t *testing.T) {
 	e := newEnv(t)
 	e.cycle()
