@@ -1,0 +1,30 @@
+bin/
+dist/
+*.wasm
+web/oxc-parser.js
+web/wasm_exec.js
+web/oxc_parser_wasm_bg.wasm
+node_modules/
+coverage/
+rewriter-rs/target/
+wasm-kernel
+target/
+Cargo.lock.bak
+.lean-ctx/
+/.lean-ctxmeta.json
+/zeroproxy-server.exe
+
+# Personal and runtime files for Claude Code; only shared settings (.claude/settings.json) are tracked.
+.claude/settings.local.json
+.claude/*.lock
+
+# Network tape snapshots written by matrix runners (overwritten on each run).
+test/browser/hole-matrix/.last-tape.json
+test/browser/nav-matrix/.last-tape.json
+
+# Local dependency caches and generated diagnostics belong outside commits.
+/.npm-cache/
+/.puppeteer-cache/
+/artifacts/
+/.ai/dogfood/
+.DS_Store

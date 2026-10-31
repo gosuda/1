@@ -1,0 +1,472 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { preludeSource } = require('./_prelude.cjs');
+
+let bundle;
+function loadRewriter() {
+  if (!bundle) {
+    const dist = path.resolve(process.env.ZP_E2E_DIST || 'dist');
+    const ctx = { console, atob, btoa, TextEncoder, TextDecoder, Uint8Array, WebAssembly, FinalizationRegistry, URL };
+    ctx.globalThis = ctx;
+    ctx.self = ctx;
+    vm.createContext(ctx);
+    // Missing or invalid artifacts are errors, never a reason to skip CI.
+    vm.runInContext(fs.readFileSync(path.join(dist, 'web/zp-page-bundle.js'), 'utf8'), ctx,
+      { filename: 'zp-page-bundle.js' });
+    bundle = ctx.ZPBundle;
+  }
+  return bundle;
+}
+
+// The rewriter plants `__zp_lex_decl`/`__zp_lex_bind` around classic
+// top-level let/const/class, and `__zp_export_vars` for a strict script's var and
+// function. Run their real prelude source rather than a stub, injecting only its
+// free variables.
+let lexHelpersSource;
+function installLexHelpers(ctx, realmGlobal) {
+  if (!lexHelpersSource) {
+    const src = preludeSource().split('\r\n').join('\n');
+    const start = src.indexOf("    define(root, '__zp_lex_decl', (lexMap, varNames) => {");
+    const end = src.indexOf("    define(root, '__zp_lex_scope', zpLexScope);", start);
+    assert.ok(start >= 0 && end > start, 'prelude __zp_lex_decl/__zp_lex_bind source not found');
+    // Keep the helpers and the three defines only; the lex scope proxy after them and the end
+    // marker is the prelude's executor wrapper, which the rewriter never emits.
+    const bindEnd = src.indexOf('\n', src.indexOf("define(root, '__zp_export_vars'", start)) + 1;
+    assert.ok(bindEnd > start && bindEnd <= end, 'prelude __zp_export_vars end not found');
+    lexHelpersSource = src.slice(start, bindEnd);
+  }
+  const define = (_target, key, fn) => { ctx[key] = fn; return true; };
+  // eslint-disable-next-line no-new-func
+  new Function('define', 'root', 'zpLex', '__zp_lex_env', 'nativeReflectGOPD', 'nativeReflectDefineProperty', 'newMap', lexHelpersSource)(
+    define, realmGlobal, new Map(), null, Reflect.getOwnPropertyDescriptor, Reflect.defineProperty, () => new Map());
+}
+
+function executionContext() {
+  const location = { href: 'https://target.example/start', hash: 1 };
+  const rawLocation = { href: 'https://proxy.example/zp/p/secret', hash: 100 };
+  const window = { location: rawLocation };
+  function WebSocket(url, protocols) { this.url = url; this.protocols = protocols; }
+  window.WebSocket = WebSocket;
+  const ctx = { window, location: rawLocation, document: { defaultView: window }, WebSocket };
+  ctx.globalThis = ctx;
+  let realmGlobal;
+  ctx.__zp_get = (base, key) => {
+    if ((base === ctx || base === realmGlobal || base === window) && key === 'location') return location;
+    if (base === rawLocation) return location[key];
+    return base[key];
+  };
+  ctx.__zp_set = (base, key, value) => {
+    if ((base === ctx || base === realmGlobal || base === window) && key === 'location') location.href = String(value);
+    else if ((base === location || base === rawLocation) && key === 'href') location.href = String(value);
+    else base[key] = value;
+    return value;
+  };
+  // 07-membrane.js: a plain call's real global reads as the page's window
+  ctx.__zp_this = t => (t === realmGlobal || t === ctx ? window : t);
+  ctx.__zp_assign = (base, key, op, value) => {
+    assert.equal(op, '+=');
+    return ctx.__zp_set(base, key, ctx.__zp_get(base, key) + value);
+  };
+  ctx.__zp_update = (base, key, op, prefix) => {
+    const previous = Number(ctx.__zp_get(base, key));
+    const next = op === '++' ? previous + 1 : previous - 1;
+    ctx.__zp_set(base, key, next);
+    return prefix ? next : previous;
+  };
+  ctx.__zp_get.d = new Proxy({}, { set: (_, key, value) => { ctx.__zp_set(ctx, key, value); return true; } });
+  ctx.__zp_call = (base, key, args) => Reflect.apply(base[key], base, args);
+  // The inline guards' tests (07-membrane.js): a data base with an ordinary key keeps the native access.
+  const dataBase = b => typeof b === 'string' || typeof b === 'function' || Array.isArray(b) || ArrayBuffer.isView(b);
+  ctx.__zp_fast = (b, k) => b != null && dataBase(b) && (typeof k === 'number'
+    || (typeof k === 'string' && k !== 'constructor' && k !== 'prepareStackTrace' && k !== 'postMessage' && k !== 'location'));
+  ctx.__zp_fastset = (b, k) => b != null && (Array.isArray(b) || ArrayBuffer.isView(b))
+    && (typeof k === 'number' || (typeof k === 'string' && k !== 'location' && k !== 'name'));
+  ctx.__zp_guards = { fast: 0 };
+  vm.createContext(ctx);
+  // Node contextifies the global object: code inside the VM sees a distinct
+  // identity from the host sandbox, unlike ordinary objects passed through it.
+  realmGlobal = vm.runInContext('globalThis', ctx);
+  installLexHelpers(ctx, realmGlobal);
+  return { ctx, location };
+}
+
+function rewrite(source, kind = 'classic', target = 'https://target.example/app.js') {
+  return loadRewriter().rewriteScript(source, kind, target, 'https://proxy.example');
+}
+
+test('built rewriter virtualizes globals and aliases without changing local bindings', () => {
+  const { ctx } = executionContext();
+  const code = rewrite(`
+    const location = { href: 'local' };
+    const w = window;
+    window.result = [location.href, window.location.href, window['loca' + 'tion'].href,
+      document.defaultView.location.href, w.location.href];
+  `);
+  vm.runInContext(code, ctx);
+  assert.deepEqual(Array.from(ctx.window.result), ['local', ...Array(4).fill('https://target.example/start')]);
+});
+
+test('built rewriter rejects invalid programs rather than returning executable source', () => {
+  assert.throws(() => rewrite('if ('));
+  assert.throws(() => rewrite('export const = 1', 'module'));
+  assert.throws(() => rewrite('window.location', 'unknown-kind'));
+});
+
+test('event handlers and dynamic function bodies retain return and parameter semantics', () => {
+  const { ctx } = executionContext();
+  vm.runInContext(rewrite('window.result = (function(event) { return event.type + location.href; })({type: "click:"});', 'event-handler'), ctx);
+  assert.equal(ctx.window.result, 'click:https://target.example/start');
+  vm.runInContext(rewrite('window.result = (function(location) { return location.href + window.location.href; })({href: "local:"});', 'function'), ctx);
+  assert.equal(ctx.window.result, 'local:https://target.example/start');
+});
+
+test('module imports are canonical same-origin proxy URLs and import.meta retains the target', async () => {
+  const target = 'https://target.example/assets/main.js?version=1';
+  const { ctx } = executionContext();
+  const imported = [];
+  const mod = new vm.SourceTextModule(rewrite('import value from "./dep.js"; window.result = [value, import.meta.url];', 'module', target), { context: ctx });
+  await mod.link(async specifier => {
+    imported.push(specifier);
+    return new vm.SyntheticModule(['default'], function() { this.setExport('default', 'dependency'); }, { context: ctx });
+  });
+  await mod.evaluate();
+  assert.deepEqual(imported, ['https://proxy.example/zp/api/script?u=' + encodeURIComponent('https://target.example/assets/dep.js') + '&kind=module']);
+  assert.deepEqual(Array.from(ctx.window.result), ['dependency', target]);
+});
+
+test('target URLs with query strings and extensionless paths remain executable', () => {
+  const { ctx, location } = executionContext();
+  vm.runInContext(rewrite('window.location = "/next";', 'classic', 'https://target.example/app.js?ts=12#frag'), ctx);
+  assert.equal(location.href, '/next');
+  vm.runInContext(rewrite('window.result = location.href;', 'classic', 'https://target.example/challenge/v1?ray=abc'), ctx);
+  assert.equal(ctx.window.result, '/next');
+});
+
+test('assignment results, compound writes and WebSocket constructors preserve observable values', () => {
+  const { ctx, location } = executionContext();
+  vm.runInContext(rewrite(`
+    const assigned = (window.location = "https://google.com/");
+    location.href += "#frag";
+    const ws = new WebSocket("ws://example.test/socket", ["chat"]);
+    const ws2 = new window.WebSocket("wss://example.test/secure");
+    window.result = { assigned, href: location.href, wsURL: ws.url, ws2URL: ws2.url };
+  `), ctx);
+  assert.equal(location.href, 'https://google.com/#frag');
+  assert.equal(ctx.window.result.assigned, 'https://google.com/');
+  assert.equal(ctx.window.result.href, 'https://google.com/#frag');
+  assert.equal(ctx.window.result.wsURL, 'ws://example.test/socket');
+  assert.equal(ctx.window.result.ws2URL, 'wss://example.test/secure');
+});
+
+test('class fields, destructuring assignments, local loops and prefix/postfix updates remain executable', () => {
+  const { ctx, location } = executionContext();
+  vm.runInContext(rewrite(`
+    class Boundary {
+      static parent;
+      parent;
+      constructor(source) { ({ parent: this.parent, location } = source); }
+      method() {
+        let count = 0;
+        for (let window = 0; window < 2; window++) count += window;
+        return { location, current: this.parent, count };
+      }
+    }
+    const boundary = new Boundary({ parent: "local-parent", location: "https://target.example/next" });
+    const post = location.hash++;
+    const pre = ++window.location.hash;
+    window.result = { values: boundary.method(), post, pre };
+  `), ctx);
+  assert.equal(location.href, 'https://target.example/next');
+  assert.equal(ctx.window.result.values.current, 'local-parent');
+  assert.equal(ctx.window.result.values.location.href, 'https://target.example/next');
+  assert.equal(ctx.window.result.values.count, 1);
+  assert.equal(ctx.window.result.post, 1);
+  assert.equal(ctx.window.result.pre, 3);
+});
+
+test('nested member writes retain global assignment RHS patches', () => {
+  const { ctx, location } = executionContext();
+  vm.runInContext(rewrite(`
+    const receiver = { href: '' };
+    receiver.href = (location = '/nested');
+    window.result = receiver.href;
+  `), ctx);
+  assert.equal(location.href, '/nested');
+  assert.equal(ctx.window.result, '/nested');
+});
+
+test('member references evaluate once, read before the RHS, and retain native numeric updates', () => {
+  const { ctx } = executionContext();
+  vm.runInContext(rewrite(`
+    const trace = [];
+    let value = '2';
+    const receiver = {
+      get href() { trace.push(['get', this === receiver]); return value; },
+      set href(next) { trace.push(['set', this === receiver, next]); value = next; }
+    };
+    function base() { trace.push(['base']); return receiver; }
+    function rhs() { trace.push(['rhs']); value = 'changed'; return '3'; }
+    const assigned = (base().href += rhs());
+    const post = base().href++;
+    const pre = --base().href;
+    value = 7n;
+    const bigPost = base().href++;
+    const bigPre = ++base().href;
+    window.result = { assigned, post, pre, bigPost, bigPre, value, trace };
+  `), ctx);
+  const result = ctx.window.result;
+  assert.equal(result.assigned, '23');
+  assert.equal(result.post, 23);
+  assert.equal(result.pre, 23);
+  assert.equal(result.bigPost, 7n);
+  assert.equal(result.bigPre, 9n);
+  assert.equal(result.value, 9n);
+  assert.deepEqual(Array.from(result.trace, row => Array.from(row)), [
+    ['base'], ['get', true], ['rhs'], ['set', true, '23'],
+    ['base'], ['get', true], ['set', true, 24],
+    ['base'], ['get', true], ['set', true, 23],
+    ['base'], ['get', true], ['set', true, 8n],
+    ['base'], ['get', true], ['set', true, 9n]
+  ]);
+});
+
+test('member logical writes preserve short circuiting and await/yield in the enclosing scope', async () => {
+  const { ctx } = executionContext();
+  await vm.runInContext(rewrite(`
+    window.result = (async () => {
+      const trace = [];
+      let value = 0;
+      const receiver = {
+        get href() { trace.push('get'); return value; },
+        set href(next) { trace.push('set'); value = next; }
+      };
+      function rhs() { trace.push('rhs'); return 5; }
+      const skippedAnd = (receiver.href &&= rhs());
+      const skippedNullish = (receiver.href ??= rhs());
+      const assigned = (receiver.href ||= await rhs());
+      const skippedOr = (receiver.href ||= rhs());
+      function* update() { return receiver.href += yield 'pause'; }
+      const iterator = update();
+      const suspended = iterator.next();
+      value = 100;
+      const resumed = iterator.next(2);
+      return { skippedAnd, skippedNullish, assigned, skippedOr, suspended, resumed, value, trace };
+    })();
+  `), ctx);
+  const result = await ctx.window.result;
+  assert.deepEqual([result.skippedAnd, result.skippedNullish, result.assigned, result.skippedOr], [0, 0, 5, 5]);
+  assert.equal(result.suspended.value, 'pause');
+  assert.equal(result.suspended.done, false);
+  assert.equal(result.resumed.value, 7);
+  assert.equal(result.resumed.done, true);
+  assert.equal(result.value, 7);
+  assert.deepEqual(Array.from(result.trace), ['get', 'get', 'get', 'rhs', 'set', 'get', 'get', 'set']);
+});
+
+test('nested member destructuring, defaults and loop targets keep write order without target reads', () => {
+  const { ctx } = executionContext();
+  vm.runInContext(rewrite(`
+    const trace = [];
+    const receiver = {
+      get parent() { throw new Error('write-only target was read'); },
+      set parent(value) { trace.push(['set', this === receiver, value]); }
+    };
+    function base() { trace.push(['base']); return receiver; }
+    const source = { get nested() { trace.push(['source']); return [undefined, 'rest']; } };
+    function fallback() { trace.push(['default']); return 'fallback'; }
+    const assigned = ({ nested: [base().parent = fallback(), ...base().parent] } = source);
+    for (base().parent of ['loop']) {}
+    for (base().parent in { entry: true }) {}
+    window.result = { sameSource: assigned === source, trace };
+  `), ctx);
+  assert.equal(ctx.window.result.sameSource, true);
+  assert.deepEqual(Array.from(ctx.window.result.trace, row =>
+    Array.from(row, value => Array.isArray(value) ? Array.from(value) : value)), [
+    ['source'], ['base'], ['default'], ['set', true, 'fallback'],
+    ['base'], ['set', true, ['rest']],
+    ['base'], ['set', true, 'loop'], ['base'], ['set', true, 'entry']
+  ]);
+});
+
+test('member target wrappers retain automatic semicolon insertion and conditional statement boundaries', () => {
+  const { ctx } = executionContext();
+  vm.runInContext(rewrite(`
+    const receiver = { href: 1 }
+    receiver.href += 2
+    if (false) receiver.href++
+    else receiver.href *= 3
+    window.result = receiver.href
+  `), ctx);
+  assert.equal(ctx.window.result, 9);
+});
+
+// Optional chains short-circuit the entire chain without evaluating keys or arguments to their right.
+// Compare native and rewritten evaluation order, return value, and error class across each case.
+test('optional chains keep native short-circuit and evaluation order', () => {
+  const cases = [
+    'let n = null; r = n?.[log("k")];',
+    'let n = null; r = n?.[log("k")].b;',
+    'let n = null; r = n?.[log("k")]?.[log("j")];',
+    'let o = { a: { b: 1 } }; r = o?.[log("a")].b;',
+    'let o = { a: null }; r = o?.[log("a")]?.[log("j")];',
+    'let o = { a: null }; r = o?.[log("a")].b;',
+    'let n = null; r = n?.b[log("k")];',
+    'let o = { b: { k: 2 } }; r = o?.b[log("k")];',
+    'let n = null; r = n?.[log("k")](log("arg"));',
+    'let o = { m(x) { return this === o && x; } }; r = o?.[log("m")](log("arg"));',
+    'let o = {}; r = o[log("m")]?.(log("arg"));',
+    'let o = { m(x) { return this === o && x; } }; r = o[log("m")]?.(log("arg"));',
+    'let o = { m() { return { k: 5 }; } }; r = o[log("m")]?.().k;',
+    'let o = {}; r = o[log("m")]?.().k[log("z")];',
+    'let n = null; r = n?.m?.(log("arg"))[log("z")];',
+    'let o = { m: null }; r = o.m?.(log("arg"))[log("z")];',
+    'let o = { location: { href: "L" } }; r = o?.location?.[log("href")];',
+    'let f = null; r = f?.(log("arg"))[log("k")];',
+    'let f = (x) => ({ k: x }); r = f?.(log("arg"))[log("k")];',
+    'let o = null; r = o?.m?.[log("k")];',
+    'let a = { b: null }; r = (a?.b)?.[log("k")];',
+    'r = [1, 2]?.[log(0)] + [3]?.[log(0)];',
+    'let x = null; r = x?.[log("k")] ?? log("dflt");',
+    'let x = null; r = typeof x?.[log("k")];',
+    'r = [{ url: { desktop: "d" } }].map((e) => e.url[!e.url.mobile ? "desktop" : "mobile"] + "|" + e.poster?.[!e.poster.mobile ? "desktop" : "mobile"]).join();',
+  ];
+  const run = (ctx, code) => {
+    ctx.L = [];
+    ctx.log = (v) => { ctx.L.push(v); return v; };
+    try { vm.runInContext(code, ctx); return JSON.stringify([ctx.r === undefined ? '<undef>' : ctx.r, ctx.L]); }
+    catch (e) { return 'threw:' + (e && e.name) + ' ' + JSON.stringify(ctx.L); }
+  };
+  for (const src of cases) {
+    const native = run(vm.createContext({}), src);
+    const { ctx } = executionContext();
+    // Helper contracts (07-membrane.js / worker-prelude.js).
+    ctx.__zp_oget = (b, k) => (b == null ? undefined : ctx.__zp_get(b, k));
+    ctx.__zp_ocall = (b, k, args, flags) => {
+      if (b == null) { if (flags & 2) return undefined; throw new TypeError('nullish base'); }
+      const fn = ctx.__zp_get(b, k);
+      if (fn == null && (flags & 1)) return undefined;
+      return Reflect.apply(fn, b, args);
+    };
+    ctx.__zp_ochain = (b, cont) => (b == null ? undefined : cont(b));
+    ctx.__zp_ocallv = (b, k) => {
+      if (b == null) throw new TypeError('nullish base');
+      const fn = ctx.__zp_get(b, k);
+      if (fn == null) return undefined;
+      return function () { return Reflect.apply(fn, b, arguments); };
+    };
+    const code = rewrite(src);
+    assert.equal(run(ctx, code), native, `${src}\n  rewritten: ${code.replace(/;\{const __zp_bad[^}]*\}/, '')}`);
+  }
+});
+
+// Inline guards (zp-rewriter guard_claim): a computed member read, write, or call keeps its native access when the base is
+// data, storing operands in function temporaries while preserving evaluation order, receiver binding, and generator/recursion state.
+test('inline-guarded members behave exactly as the native ones', () => {
+  const program = `
+    const trace = [];
+    const t = (tag, v) => (trace.push(tag), v);
+    const obj = { get k() { trace.push('get k'); return 2; }, m(x) { return [this === obj, x]; } };
+    function f(arr, str, ta, fn, i) {
+      'use strict';
+      const out = [];
+      out.push(t('o1', arr)[t('k1', i)], str[i], ta[i], fn['length'], arr[arr[0]]);
+      t('o2', arr)[t('k2', i + 1)] = t('v2', 9);
+      out.push(arr[1 + i]);
+      arr[3] = function () {}; out.push(arr[3].name); arr[3] = class {}; out.push(arr[3].name); arr[3] = () => 1; out.push(arr[3].name);
+      out.push([function () {}][0].name, fnv[t('k6', 'name')]);
+      const recv = [{ replace(q) { trace.push('replace:' + q); return q; } }];
+      recv[0].replace('q');
+      out.push(t('o3', arr)[t('k3', 'indexOf')](t('a3', 9)), str['charCodeAt'](i), fn['call'](null, 4));
+      out.push(obj[t('k4', 'k')], obj['m'](5)[0], obj[t('k5', 'm')](6)[1]);
+      out.push([1, 2, 3][arr[0] - 1], arr[i](0)[0]);
+      let n = 0
+      arr[n] = 'asi'
+      arr[n]
+      out.push(arr[n]);
+      try { Object.freeze(ta.slice())[0] = 1; const fz = Object.freeze([1]); fz[0] = 2; out.push('no throw'); } catch (e) { out.push(e.constructor.name); }
+      function* g(a) { a[0] = yield a[0]; return a[0]; }
+      const it = g(arr); out.push(it.next().value, it.next('y').value);
+      const rec = (a, d) => { if (d === 0) return a[0]; return a[rec(a, d - 1) === 'y' ? 0 : 1]; };
+      out.push(rec(arr, 3));
+      return out;
+    }
+    const fnv = function (a, b) { return a + b; };
+    const r = f([1, x => [x], 3, 4], 'hello', new Uint8Array([7, 8, 9]), fnv, 1);
+    window.result = JSON.stringify({ r, trace });
+  `;
+  const native = vm.createContext({ window: {} });
+  vm.runInContext(program, native);
+  const rewritten = rewrite(program);
+  assert.match(rewritten, /__zp_t_1=/, 'no guard was emitted');
+  const { ctx } = executionContext();
+  vm.runInContext(rewritten, ctx);
+  assert.equal(ctx.window.result, native.window.result);
+});
+
+// `new Function(params, body)` rewrites the body inside a wrapper and slices it back out,
+// preserving inline guard temporaries while rejecting bodies that bind internal runtime names.
+test('the prelude slices a rewritten Function body back out, guards and refusals included', () => {
+  const src = preludeSource().split('\r\n').join('\n');
+  const grab = (start, end) => { const a = src.indexOf(start); const b = src.indexOf(end, a); assert.ok(a >= 0 && b > a, start); return src.slice(a, b); };
+  const code = grab('    function functionPrefix(kind) {', '    function dynamicSource(')
+    + grab('    function rewriteDynamicFunctionBody(params, body, kind) {', '    function rewriteWithPageRewriter(');
+  const parseSyntaxError = message => new SyntaxError(message);
+  const normalizedError = name => Object.assign(new Error(name), { name });
+  const unwrap = new Function('callPageRewriter', 'parseSyntaxError', 'normalizedError', code + '\nreturn rewriteDynamicFunctionBody;')(
+    source => rewrite(source, 'classic'), parseSyntaxError, normalizedError);
+  const { ctx } = executionContext();
+  const body = unwrap(['a', 'i'], 'var t = [];\nt.push(a[i], a[i + 1]);\nreturn t[0] + t[1] // last line', 'function');
+  assert.match(body, /__zp_t_1=/, 'no guard in the body');
+  const fn = vm.runInContext('(function (a, i) {\n' + body + '\n})', ctx);
+  assert.equal(fn([3, 4, 5], 1), 9);
+  assert.throws(() => unwrap(['__zp_get'], 'return location', 'function'), SyntaxError);
+});
+
+// A strict script is run through an indirect `eval`, which keeps its own var environment where a script of the document shares the global one.
+// Bing's second strict inline script begins with `var _w = _w || {}` after the first one's `var _w = window`, and its code ahead of that line read
+// `_w.performance` from an `undefined` copy.
+test('strict scripts that redeclare a global var share one binding with the script that made it', () => {
+  const { ctx } = executionContext();
+  const geval = vm.runInContext('(0, eval)', ctx);
+  geval(rewrite(`"use strict"; var shared = {tag: 'first'}; var counter = 1; function pick() { return 'first'; }
+    function callPick() { return pick(); } function readCounter() { return counter; }`));
+  geval(rewrite(`"use strict"; var early = shared.tag; var shared = shared || {}; var counter; function pick() { return 'second'; }
+    function readCounterToo() { return counter; } window.result = [early, shared.tag, counter];`));
+  assert.deepEqual(Array.from(ctx.window.result), ['first', 'first', 1], 'a redeclaration neither resets nor hides the earlier value');
+  assert.equal(vm.runInContext('callPick()', ctx), 'second', 'a function declaration replaces the earlier one for the earlier script too');
+  vm.runInContext('counter = 7', ctx);
+  assert.deepEqual([vm.runInContext('readCounter()', ctx), vm.runInContext('readCounterToo()', ctx)], [7, 7], 'a write through the global reaches both copies');
+  // An external script is not run through `eval`: its vars are the global's own, and a getter made from its closures would read itself.
+  vm.runInContext(rewrite('"use strict"; var counter; var realOnly = 3; window.realSeen = [counter, realOnly];'), ctx);
+  assert.deepEqual(Array.from(ctx.window.realSeen), [7, 3], 'a real script declaring an exported name reads the global');
+  assert.equal(vm.runInContext('counter = 8; counter', ctx), 8);
+  assert.equal(vm.runInContext('readCounter()', ctx), 8, 'the exported name still reaches the earlier script');
+});
+
+test('a strict script takes over a configurable data property of the global and leaves a fixed one alone', () => {
+  const { ctx } = executionContext();
+  vm.runInContext("globalThis.seeded = 5; Object.defineProperty(globalThis, 'fixed', { value: 1 });", ctx);
+  vm.runInContext('(0, eval)', ctx)(rewrite('"use strict"; var seeded; var fixed; function readSeeded() { return seeded; } window.result = [seeded, fixed];'));
+  assert.deepEqual(Array.from(ctx.window.result), [5, undefined], 'seeded keeps its value; the fixed property cannot be shadowed by an export');
+  assert.equal(vm.runInContext('fixed', ctx), 1);
+  assert.equal(vm.runInContext('seeded = 9; readSeeded()', ctx), 9);
+});
+
+// A compound write to a dangerous member inside another write (`a.top = b.top += n`, YouTube's bundle) is rebased with the enclosing range; it once came out with a
+// marker in it and the whole script failed to parse.
+test('a compound write to a dangerous member nested in another write keeps its value and its order', () => {
+  const { ctx } = executionContext();
+  const code = rewrite(`var a = {}, b = { top: 1 }, order = [];
+    a.top = b.top += 5;
+    var x = { href: 'p' }, y = { href: 'q' };
+    x.href = y.href += 'r';
+    var m = { loc: null };
+    m.location = (order.push('rhs'), { location: 'z' }).location += 'w';
+    window.result = [a.top, b.top, x.href + '|' + y.href, order.join(), typeof m.location];`);
+  assert.ok(!/[\u0001-\u0008]/.test(code), 'no marker may reach the output');
+  vm.runInContext(code, ctx);
+  assert.deepEqual(Array.from(ctx.window.result), [6, 6, 'qr|qr', 'rhs', 'string']);
+});
