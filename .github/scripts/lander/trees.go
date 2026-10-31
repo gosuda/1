@@ -84,24 +84,30 @@ func (s *Store) ChangedPaths(ctx context.Context, a, b string) ([]string, error)
 	return res, nil
 }
 
+// MkTree writes one tree level from entries (blobs, trees, or gitlinks) with git mktree. Unlike
+// BuildTree it does not flatten: untouched subtrees are referenced by id, so the cost depends on the
+// number of entries given, not on the size of the trees below them.
+func (s *Store) MkTree(ctx context.Context, entries []TreeEntry) (string, error) {
+	var b strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%s %s %s\t%s\x00", e.Mode, e.Type, e.OID, e.Path)
+	}
+	return s.run(ctx, nil, nil, strings.NewReader(b.String()), "mktree", "-z")
+}
+
 // pickTop returns the top-level entries of tree whose names are in names.
 func (s *Store) pickTop(ctx context.Context, tree string, names map[string]bool) ([]TreeEntry, error) {
-	all, err := s.ListTree(ctx, tree, true)
+	all, err := s.ListTree(ctx, tree, false)
 	if err != nil {
 		return nil, err
 	}
 	var res []TreeEntry
 	for _, e := range all {
-		if names[topComponent(e.Path)] {
+		if names[e.Path] {
 			res = append(res, e)
 		}
 	}
 	return res, nil
-}
-
-func topComponent(p string) string {
-	top, _, _ := strings.Cut(p, "/")
-	return top
 }
 
 // overlayNames returns the top-level entry names of the control-plane tree.
@@ -118,9 +124,9 @@ func (s *Store) overlayNames(ctx context.Context, ctrlTree string) (map[string]b
 }
 
 // withOverlay returns target with every top-level entry named in names replaced by the entries
-// of ctrl (names absent from ctrl are removed).
+// of ctrl (names absent from ctrl are removed). It only touches the top level.
 func (s *Store) withOverlay(ctx context.Context, target, ctrl string, names map[string]bool) (string, error) {
-	targetEntries, err := s.ListTree(ctx, target, true)
+	targetEntries, err := s.ListTree(ctx, target, false)
 	if err != nil {
 		return "", err
 	}
@@ -130,19 +136,19 @@ func (s *Store) withOverlay(ctx context.Context, target, ctrl string, names map[
 	}
 	var res []TreeEntry
 	for _, e := range targetEntries {
-		if !names[topComponent(e.Path)] {
+		if !names[e.Path] {
 			res = append(res, e)
 		}
 	}
 	res = append(res, ctrlEntries...)
-	return s.BuildTree(ctx, res)
+	return s.MkTree(ctx, res)
 }
 
-// extractOverlay returns the sub-tree of tree made of the top-level entries named in names.
+// extractOverlay returns the tree made of the top-level entries of tree named in names.
 func (s *Store) extractOverlay(ctx context.Context, tree string, names map[string]bool) (string, error) {
 	entries, err := s.pickTop(ctx, tree, names)
 	if err != nil {
 		return "", err
 	}
-	return s.BuildTree(ctx, entries)
+	return s.MkTree(ctx, entries)
 }
