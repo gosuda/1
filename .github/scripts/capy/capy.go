@@ -508,10 +508,10 @@ func SpliceSubtree(ctx context.Context, repoDir string, baseTreeOID string, pref
 	defer cleanup()
 
 	env := []string{"GIT_INDEX_FILE=" + tmpIdx, "GIT_NO_LAZY_FETCH=1"}
-	if _, err := gitOutput(ctx, repoDir, env, "--no-lazy-fetch", "read-tree", baseTreeOID); err != nil {
+	if _, err := gitOutput(ctx, repoDir, env, "read-tree", baseTreeOID); err != nil {
 		return "", fmt.Errorf("read-tree %s: %w", baseTreeOID, err)
 	}
-	if _, err := gitOutput(ctx, repoDir, env, "--no-lazy-fetch", "rm", "-r", "--cached", "--ignore-unmatch", "--", cleaned); err != nil {
+	if _, err := gitOutput(ctx, repoDir, env, "rm", "-r", "--cached", "--ignore-unmatch", "--", cleaned); err != nil {
 		return "", fmt.Errorf("rm --cached %s: %w", cleaned, err)
 	}
 
@@ -520,12 +520,12 @@ func SpliceSubtree(ctx context.Context, repoDir string, baseTreeOID string, pref
 		fmt.Fprintf(&buf, "%s %s %s\t%s/%s\n", e.Mode, e.Type, e.OID, cleaned, e.Path)
 	}
 	if buf.Len() > 0 {
-		if _, err := gitOutputWithStdin(ctx, repoDir, env, &buf, "--no-lazy-fetch", "update-index", "--index-info"); err != nil {
+		if _, err := gitOutputWithStdin(ctx, repoDir, env, &buf, "update-index", "--index-info"); err != nil {
 			return "", fmt.Errorf("update-index %s: %w", cleaned, err)
 		}
 	}
 
-	out, err := gitOutput(ctx, repoDir, env, "--no-lazy-fetch", "write-tree", "--missing-ok")
+	out, err := gitOutput(ctx, repoDir, env, "write-tree", "--missing-ok")
 	if err != nil {
 		return "", fmt.Errorf("write-tree: %w", err)
 	}
@@ -866,10 +866,10 @@ func writeIndexTree(ctx context.Context, repoDir string, entries []treeEntry) (s
 	}
 
 	env := []string{"GIT_INDEX_FILE=" + tmpIdx, "GIT_NO_LAZY_FETCH=1"}
-	if _, err := gitOutputWithStdin(ctx, repoDir, env, &buf, "--no-lazy-fetch", "update-index", "--index-info"); err != nil {
+	if _, err := gitOutputWithStdin(ctx, repoDir, env, &buf, "update-index", "--index-info"); err != nil {
 		return "", fmt.Errorf("update-index: %w", err)
 	}
-	out, err := gitOutput(ctx, repoDir, env, "--no-lazy-fetch", "write-tree", "--missing-ok")
+	out, err := gitOutput(ctx, repoDir, env, "write-tree", "--missing-ok")
 	if err != nil {
 		return "", fmt.Errorf("write-tree: %w", err)
 	}

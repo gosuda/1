@@ -131,3 +131,21 @@ func TestEnvBoolIsStrict(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckGitVersionRequiresMergeTreeMergeBase(t *testing.T) {
+	for in, ok := range map[string]bool{
+		"git version 2.39.5":               false,
+		"git version 1.9.1":                false,
+		"git version 2.40.0":               true,
+		"git version 2.47.3":               true,
+		"git version 3.0.0":                true,
+		"git version 2.54.0 (Apple Git-1)": true,
+	} {
+		if err := checkGitVersion(in); (err == nil) != ok {
+			t.Errorf("checkGitVersion(%q) = %v, want ok=%v", in, err, ok)
+		}
+	}
+	if checkGitVersion("something else") == nil {
+		t.Error("unparsable output must be an error")
+	}
+}

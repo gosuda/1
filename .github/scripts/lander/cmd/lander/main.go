@@ -140,6 +140,10 @@ func main() {
 		}
 	}
 
+	if err := requireGit(); err != nil {
+		fatalf("%v", err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -343,4 +347,29 @@ func materializeSigning(privateKey []byte, allowedSigners string) (*lander.Signi
 		}
 	}
 	return &lander.Signing{KeyFile: keyPath, AllowedSigners: allowedSigners}, nil
+}
+
+var gitVersionRe = regexp.MustCompile(`git version (\d+)\.(\d+)`)
+
+// requireGit fails fast when git lacks `merge-tree --write-tree --merge-base` (git 2.40), which
+// the landing merge depends on.
+func requireGit() error {
+	out, err := exec.Command("git", "--version").Output()
+	if err != nil {
+		return fmt.Errorf("git not found: %w", err)
+	}
+	return checkGitVersion(string(out))
+}
+
+func checkGitVersion(out string) error {
+	m := gitVersionRe.FindStringSubmatch(out)
+	if m == nil {
+		return fmt.Errorf("cannot parse git version from %q", strings.TrimSpace(out))
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	if major < 2 || (major == 2 && minor < 40) {
+		return fmt.Errorf("git %d.%d is too old: the lander needs git 2.40+ for merge-tree --merge-base", major, minor)
+	}
+	return nil
 }

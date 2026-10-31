@@ -1,7 +1,7 @@
 # Build context: the root of refs/heads/lander (published by the lander from .github/scripts).
 #   docker build -t lander:$(git rev-parse --short HEAD) .
 ARG GO_VERSION=1.27.3
-FROM golang:${GO_VERSION} AS build
+FROM golang:${GO_VERSION}-trixie AS build
 WORKDIR /src
 COPY capy ./capy
 COPY lander ./lander
@@ -9,7 +9,7 @@ RUN cd lander && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/lande
 
 FROM docker:cli AS dockercli
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git openssh-client ca-certificates \
  && rm -rf /var/lib/apt/lists/*
