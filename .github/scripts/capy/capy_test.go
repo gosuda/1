@@ -173,21 +173,27 @@ func TestCheckVisibilityDetectsProhibitedCorpAndExperimentalImports(t *testing.T
 	ctx := context.Background()
 	repo := initTestRepo(t)
 
+	// The root go.mod makes gosuda.org/0/... resolve to the tree; without it these imports are external.
+	writeRepoFiles(t, repo, map[string]string{"go.mod": "module gosuda.org/0\n"})
 	writeRepoFiles(t, repo, map[string]string{
-		"web/securl/main.go":        "package main\nimport \"gosuda.org/0/corp/lemonsso\"\n",
-		"corp/lemonsso/sso.go":      "package lemonsso\nimport \"gosuda.org/0/experimental/alice/proto\"\n",
-		"experimental/bob/exp.go":   "package exp\nimport \"gosuda.org/0/corp/lemonsso\"\nimport \"gosuda.org/0/net/ivnp\"\n",
-		"third_party/zstd/zstd.go":  "package zstd\nimport \"gosuda.org/0/web/gosuda\"\n",
+		"web/securl/main.go":       "package main\nimport \"gosuda.org/0/corp/lemonsso\"\n",
+		"corp/lemonsso/sso.go":     "package lemonsso\nimport \"gosuda.org/0/experimental/alice/proto\"\n",
+		"experimental/bob/exp.go":  "package exp\nimport \"gosuda.org/0/corp/lemonsso\"\nimport \"gosuda.org/0/net/ivnp\"\n",
+		"third_party/zstd/zstd.go": "package zstd\nimport \"gosuda.org/0/web/gosuda\"\n",
 	})
 	badTree := commitTree(t, repo)
+	wantBad := []string{
+		"corp/lemonsso/sso.go:2: prohibited import in corp domain: gosuda.org/0/experimental/alice/proto -> experimental",
+		"experimental/bob/exp.go:2: prohibited import in experimental domain: gosuda.org/0/corp/lemonsso -> corp",
+		"third_party/zstd/zstd.go:2: prohibited import in third_party domain: gosuda.org/0/web/gosuda -> public",
+		"web/securl/main.go:2: prohibited import in public domain: gosuda.org/0/corp/lemonsso -> corp",
+	}
 
 	violations, err := capy.CheckVisibility(ctx, repo, badTree)
 	if err != nil {
 		t.Fatalf("CheckVisibility: %v", err)
 	}
-	if len(violations) != 4 {
-		t.Fatalf("violations = %v, want 4 tier violations", violations)
-	}
+	wantViolations(t, violations, wantBad...)
 
 	writeRepoFiles(t, repo, map[string]string{
 		"web/securl/main.go":       "package main\n",
@@ -200,23 +206,27 @@ func TestCheckVisibilityDetectsProhibitedCorpAndExperimentalImports(t *testing.T
 	if err != nil {
 		t.Fatalf("CheckVisibility(clean): %v", err)
 	}
-	if len(violations) != 0 {
-		t.Fatalf("clean tree violations = %v, want empty", violations)
-	}
+	wantViolations(t, violations)
 
 	violations, err = capy.CheckVisibilityDiff(ctx, repo, cleanTree, badTree)
 	if err != nil {
 		t.Fatalf("CheckVisibilityDiff: %v", err)
 	}
-	if len(violations) != 4 {
-		t.Fatalf("diff violations = %v, want 4 violations", violations)
-	}
+	wantViolations(t, violations, wantBad...)
 }
 
-func TestCheckOwnersEnforcesHierarchicalRulesAndExperimentalSandbox(t *testing.T) {
-	ctx := context.Background()
-	repo := initTestRepo(t)
+func checkOwners(t *testing.T, repo, base, tree string, requester string, approvers ...string) []string {
+	t.Helper()
+	v, err := capy.CheckOwners(context.Background(), repo, base, tree, capy.Identity{Requester: requester, Approvers: approvers},
+		func(team, login string) (bool, error) { return team == "gosuda/core" && login == "carol", nil })
+	if err != nil {
+		t.Fatalf("CheckOwners: %v", err)
+	}
+	return v
+}
 
+func TestCheckOwnersEnforcesHierarchyAndApprovals(t *testing.T) {
+	repo := initTestRepo(t)
 	writeRepoFiles(t, repo, map[string]string{
 		"OWNERS":                        "@rootadmin\n",
 		"net/OWNERS":                    "@netlead\n",
@@ -225,51 +235,119 @@ func TestCheckOwnersEnforcesHierarchicalRulesAndExperimentalSandbox(t *testing.T
 		"net/ivnp/README.md":            "# IVNP\n",
 		"experimental/charlie/proto.go": "package proto\n",
 	})
-	baseTree := commitTree(t, repo)
+	base := commitTree(t, repo)
 
-	// 1. Unauthorized edit to net/ivnp/relay.go (set noparent blocks @netlead and @rootadmin)
+	// set noparent blocks @netlead and @rootadmin; editing OWNERS itself is also gated.
 	writeRepoFiles(t, repo, map[string]string{
 		"net/ivnp/relay.go": "package ivnp\n// edit\n",
 		"net/ivnp/OWNERS":   "set noparent\n@alice\n@mallory\n",
 	})
-	unauthTree := commitTree(t, repo)
-
-	actors := capy.ExtractCommitActors("mallory <mallory@gosuda.org>", "net/ivnp: hack\n\nReviewed-by: @netlead\n")
-	violations, err := capy.CheckOwners(ctx, repo, baseTree, unauthTree, actors)
-	if err != nil {
-		t.Fatalf("CheckOwners: %v", err)
+	edit := commitTree(t, repo)
+	if v := checkOwners(t, repo, base, edit, "mallory", "netlead"); len(v) != 2 {
+		t.Fatalf("violations = %v, want 2 (relay.go, OWNERS)", v)
 	}
-	if len(violations) != 2 {
-		t.Fatalf("violations = %v, want 2 violations (relay.go and OWNERS tamper attempt)", violations)
+	if v := checkOwners(t, repo, base, edit, "mallory", "alice"); len(v) != 0 {
+		t.Fatalf("approved violations = %v, want none", v)
 	}
 
-	// 2. Approved via Reviewed-by: @alice
-	approvedActors := capy.ExtractCommitActors("mallory <mallory@gosuda.org>", "net/ivnp: fix\n\nReviewed-by: @alice\n")
-	violations, err = capy.CheckOwners(ctx, repo, baseTree, unauthTree, approvedActors)
-	if err != nil {
-		t.Fatalf("CheckOwners(approved): %v", err)
-	}
-	if len(violations) != 0 {
-		t.Fatalf("approved violations = %v, want empty", violations)
-	}
-
-	// 3. Per-file rule allows @docwriter to edit README.md and charlie to edit experimental/charlie/*
+	// Per-file rule and the experimental sandbox of the requester.
 	writeRepoFiles(t, repo, map[string]string{
 		"net/ivnp/relay.go":             "package ivnp\n",
 		"net/ivnp/OWNERS":               "set noparent\n@alice\nper-file *.md=@docwriter\n",
 		"net/ivnp/README.md":            "# IVNP updated\n",
 		"experimental/charlie/proto.go": "package proto\n// sandbox\n",
 	})
-	docAndExpTree := commitTree(t, repo)
+	docExp := commitTree(t, repo)
+	if v := checkOwners(t, repo, base, docExp, "docwriter"); len(v) != 1 || !strings.HasPrefix(v[0], "experimental/charlie/proto.go") {
+		t.Fatalf("docwriter violations = %v, want only the experimental/charlie path", v)
+	}
+	if v := checkOwners(t, repo, base, docExp, "docwriter", "charlie"); len(v) != 1 {
+		t.Fatalf("approver charlie must not own experimental/charlie unless requester: %v", v)
+	}
+}
 
-	docActors := capy.ExtractCommitActors("docwriter <docwriter@gosuda.org>", "docs + exp")
-	violations, err = capy.CheckOwners(ctx, repo, baseTree, docAndExpTree, docActors)
-	if err != nil {
-		t.Fatalf("CheckOwners(doc+exp): %v", err)
+// Each case is a bypass that the commit-derived identity model accepted.
+func TestCheckOwnersRejectsForgeryAndSelfApproval(t *testing.T) {
+	repo := initTestRepo(t)
+	writeRepoFiles(t, repo, map[string]string{
+		"OWNERS":                "@rootadmin\n@gosuda/core\n",
+		"net/ivnp/OWNERS":       "set noparent\n@alice\n",
+		"net/ivnp/relay.go":     "package ivnp\n",
+		"experimental/bob/x.go": "package x\n",
+		"corp/OWNERS":           "set require-review\n@dave\n@erin\n",
+		"corp/svc/a.go":         "package svc\n",
+	})
+	base := commitTree(t, repo)
+	baseCommit := runGit(t, repo, "rev-parse", "HEAD")
+	reset := func() {
+		runGit(t, repo, "reset", "-q", "--hard", baseCommit)
+		runGit(t, repo, "clean", "-fdq")
 	}
-	if len(violations) != 0 {
-		t.Fatalf("doc+exp violations = %v, want empty", violations)
-	}
+
+	t.Run("new OWNERS cannot approve its own directory", func(t *testing.T) {
+		reset()
+		writeRepoFiles(t, repo, map[string]string{
+			"net/ivnp/sub/OWNERS": "set noparent\n@mallory\n",
+			"net/ivnp/sub/e.go":   "package sub\n",
+		})
+		tree := commitTree(t, repo)
+		if v := checkOwners(t, repo, base, tree, "mallory"); len(v) != 2 {
+			t.Fatalf("violations = %v, want 2", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "alice"); len(v) != 0 {
+			t.Fatalf("alice (nearest owner) violations = %v", v)
+		}
+	})
+	t.Run("other users cannot edit someone else's sandbox", func(t *testing.T) {
+		reset()
+		writeRepoFiles(t, repo, map[string]string{"experimental/bob/x.go": "package x // evil\n"})
+		tree := commitTree(t, repo)
+		if v := checkOwners(t, repo, base, tree, "mallory"); len(v) != 1 {
+			t.Fatalf("mallory violations = %v, want 1", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "Bob"); len(v) != 0 {
+			t.Fatalf("bob violations = %v, want none (case-insensitive login)", v)
+		}
+	})
+	t.Run("wildcard and unresolved teams match nobody", func(t *testing.T) {
+		reset()
+		writeRepoFiles(t, repo, map[string]string{"web/new.go": "package web\n"})
+		tree := commitTree(t, repo)
+		// "*" style entries and non-members of @gosuda/core are rejected, members pass.
+		if v := checkOwners(t, repo, base, tree, "mallory"); len(v) != 1 {
+			t.Fatalf("non-member violations = %v, want 1", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "carol"); len(v) != 0 {
+			t.Fatalf("team member violations = %v, want none", v)
+		}
+	})
+	t.Run("set require-review needs an owner other than the requester", func(t *testing.T) {
+		reset()
+		writeRepoFiles(t, repo, map[string]string{"corp/svc/a.go": "package svc // v2\n"})
+		tree := commitTree(t, repo)
+		if v := checkOwners(t, repo, base, tree, "dave"); len(v) != 1 {
+			t.Fatalf("self-review violations = %v, want 1", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "dave", "dave"); len(v) != 1 {
+			t.Fatalf("self as approver violations = %v, want 1", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "dave", "erin"); len(v) != 0 {
+			t.Fatalf("reviewed violations = %v, want none", v)
+		}
+		if v := checkOwners(t, repo, base, tree, "mallory", "alice"); len(v) != 1 {
+			t.Fatalf("non-owner approver violations = %v, want 1", v)
+		}
+	})
+	t.Run("paths without any OWNERS entry fail closed", func(t *testing.T) {
+		bare := initTestRepo(t)
+		writeRepoFiles(t, bare, map[string]string{"a/b.go": "package a\n"})
+		b := commitTree(t, bare)
+		writeRepoFiles(t, bare, map[string]string{"a/b.go": "package a // x\n"})
+		n := commitTree(t, bare)
+		if v := checkOwners(t, bare, b, n, "anyone"); len(v) != 1 {
+			t.Fatalf("violations = %v, want 1", v)
+		}
+	})
 }
 
 func TestFormatCommitMessageScrubsInternalLinesAndAppendsOriginTrailer(t *testing.T) {

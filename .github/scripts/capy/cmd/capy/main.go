@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"gosuda.org/0/scripts/capy"
 )
@@ -62,14 +63,55 @@ func main() {
 	case "check-owners":
 		fs := flag.NewFlagSet("check-owners", flag.ExitOnError)
 		repoDir := fs.String("repo", ".", "path to git repository")
-		baseTreeOID := fs.String("base-tree", "", "base tree-ish")
+		baseTreeOID := fs.String("base-tree", "", "base tree-ish (OWNERS are read only from here)")
 		treeOID := fs.String("tree", "HEAD", "new tree-ish")
-		author := fs.String("author", "", "commit author name/email")
-		msg := fs.String("msg", "", "commit message (may contain Reviewed-by/Approved-by trailers)")
+		requester := fs.String("requester", "", "login that requested the landing")
+		approvers := fs.String("approvers", "", "comma-separated logins that approved the exact tip")
+		var teams teamFlags
+		fs.Var(&teams, "team", "static team membership org/slug=login,login (repeatable)")
+		ghRepo := fs.String("github-repo", "", "resolve identity through the GitHub API on this owner/repo (needs GITHUB_TOKEN)")
+		ghRef := fs.String("github-ref", "", "full ref whose tip push identifies the requester")
+		ghSHA := fs.String("github-sha", "", "tip sha of -github-ref")
+		ghReview := fs.String("github-review-head", "", "review branch (review/<id>) whose PR approvals count")
 		_ = fs.Parse(args)
 
-		actors := capy.ExtractCommitActors(*author, *msg)
-		violations, err := capy.CheckOwners(ctx, *repoDir, *baseTreeOID, *treeOID, actors)
+		id := capy.Identity{Requester: *requester}
+		for _, a := range strings.Split(*approvers, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				id.Approvers = append(id.Approvers, a)
+			}
+		}
+		var resolver capy.TeamResolver
+		if len(teams) > 0 {
+			resolver = teams.resolver()
+		}
+		if *ghRepo != "" {
+			token := os.Getenv("GITHUB_TOKEN")
+			if token == "" {
+				fatal(fmt.Errorf("-github-repo requires GITHUB_TOKEN"))
+			}
+			gh := capy.NewGitHub(token)
+			if id.Requester == "" {
+				login, err := gh.PusherForTip(ctx, *ghRepo, *ghRef, *ghSHA)
+				if err != nil {
+					fatal(err)
+				}
+				id.Requester = login
+			}
+			if *ghReview != "" {
+				got, err := gh.ApproversForTip(ctx, *ghRepo, *ghReview, *ghSHA)
+				if err != nil {
+					fatal(err)
+				}
+				id.Approvers = append(id.Approvers, got...)
+			}
+			if resolver == nil {
+				resolver = gh.TeamResolver(ctx)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "check-owners: requester=%q approvers=%v\n", id.Requester, id.Approvers)
+
+		violations, err := capy.CheckOwners(ctx, *repoDir, *baseTreeOID, *treeOID, id, resolver)
 		if err != nil {
 			fatal(err)
 		}
@@ -107,7 +149,7 @@ func main() {
 		repoDir := fs.String("repo", ".", "path to git repository")
 		cfgPath := fs.String("config", "capy.star", "path to capy.star")
 		wfName := fs.String("workflow", "", "workflow name")
-		baseTree := fs.String("base-tree", "", "base monorepo root tree-ish")
+		baseTree := fs.String("base-tree", "", "monorepo root tree-ish at the last sync point (not the current trunk)")
 		subTree := fs.String("sub-tree", "", "external repository root tree-ish")
 		_ = fs.Parse(args)
 
@@ -119,7 +161,7 @@ func main() {
 		if !ok {
 			fatal(fmt.Errorf("unknown workflow %q", *wfName))
 		}
-		newRoot, err := capy.SpliceSubtree(ctx, *repoDir, *baseTree, wf.OriginPrefix, *subTree)
+		newRoot, err := capy.ImportTree(ctx, *repoDir, *baseTree, wf, *subTree)
 		if err != nil {
 			fatal(err)
 		}
@@ -156,4 +198,25 @@ func usage() {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "capy: %v\n", err)
 	os.Exit(1)
+}
+
+// teamFlags implements repeatable -team org/slug=login,login flags for offline runs and tests.
+type teamFlags []string
+
+func (t *teamFlags) String() string     { return strings.Join(*t, ";") }
+func (t *teamFlags) Set(v string) error { *t = append(*t, v); return nil }
+
+func (t teamFlags) resolver() capy.TeamResolver {
+	members := map[string]map[string]bool{}
+	for _, spec := range t {
+		name, list, _ := strings.Cut(spec, "=")
+		m := map[string]bool{}
+		for _, l := range strings.Split(list, ",") {
+			m[strings.ToLower(strings.TrimSpace(l))] = true
+		}
+		members[strings.ToLower(name)] = m
+	}
+	return func(team, login string) (bool, error) {
+		return members[strings.ToLower(team)][login], nil
+	}
 }

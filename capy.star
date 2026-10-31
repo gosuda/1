@@ -8,11 +8,14 @@ PILOT_REPOS = [
     ("hqq-sqlite3", "ipc/hqq/hqq-sqlite3", "gosuda/hqq-sqlite3", False),
     ("hqq-zstd", "ipc/hqq/hqq-zstd", "gosuda/hqq-zstd", False),
     ("securl", "web/securl", "gosuda/securl", False),
-    ("portalite", "net/portalite", "gosuda/portalite", False),
+    ("portalite", "net/portalite", "gosuda/portalite", False, "master"),
     ("azure-magpie", "devtools/azure-magpie", "gosuda/azure-magpie", False),
 ]
 
-for name, prefix, repo, strip_replaces in PILOT_REPOS:
+# Entries are (name, monorepo prefix, mirror repo, strip_replaces[, branch]); branch defaults to "main".
+for entry in PILOT_REPOS:
+    name, prefix, repo, strip_replaces = entry[0], entry[1], entry[2], entry[3]
+    branch = entry[4] if len(entry) > 4 else "main"
     transforms = [
         core.exclude(["internal_notes/**", "**.local.toml"]),
         metadata.expose_label("GitOrigin-RevId"),
@@ -22,7 +25,7 @@ for name, prefix, repo, strip_replaces in PILOT_REPOS:
     capy.workflow(
         name = name,
         origin = capy.monorepo_path(prefix),
-        destination = capy.github_repo(repo, branch = "main"),
+        destination = capy.github_repo(repo, branch = branch),
         mode = "SQUASH",
         transformations = transforms,
     )

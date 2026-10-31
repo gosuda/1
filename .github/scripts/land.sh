@@ -47,12 +47,24 @@ GIT_AUTHOR_EMAIL=$(git log -1 --format="%ae" "$WORK_SHA")
 GIT_AUTHOR_DATE=$(git log -1 --format="%aI" "$WORK_SHA")
 export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE
 
+# Authorization uses GitHub-authenticated identities only; commit author and trailers are ignored.
+# SUDA_REQUESTER/SUDA_APPROVERS override the lookup for offline runs and tests.
+TASK_ID="${LAND_REF#refs/heads/land/}"
+if [ -n "${SUDA_REQUESTER:-}" ]; then
+  OWNERS_IDENTITY=(-requester "$SUDA_REQUESTER" -approvers "${SUDA_APPROVERS:-}")
+else
+  export GITHUB_TOKEN="${GITHUB_TOKEN:-${MIRROR_TOKEN:-}}"
+  OWNERS_IDENTITY=(-github-repo "${SUDA_LAND_REPO:-gosuda/0}" -github-ref "$LAND_REF" -github-sha "$WORK_SHA")
+  if [ "$TASK_ID" != "$LAND_REF" ]; then
+    OWNERS_IDENTITY+=(-github-review-head "review/${TASK_ID}")
+  fi
+fi
+
 "$CAPY_BIN" check-owners \
   -repo "$REPO_ROOT" \
   -base-tree "$MAIN_TREE" \
   -tree "$NEW_TREE" \
-  -author "${GIT_AUTHOR_NAME} <${GIT_AUTHOR_EMAIL}>" \
-  -msg "$RAW_MSG"
+  "${OWNERS_IDENTITY[@]}"
 
 if CTRL_TREE=$(git rev-parse --verify -q "refs/remotes/origin/main^{tree}"); then
   NEW_TREE=$("$(dirname "$0")/sync-control-plane.sh" --overlay-tree "$NEW_TREE" "$CTRL_TREE")
@@ -69,7 +81,6 @@ git push --atomic origin \
   "${HIST}:refs/suda/history" \
   ":${LAND_REF}"
 
-TASK_ID="${LAND_REF#refs/heads/land/}"
 if [ "$TASK_ID" != "$LAND_REF" ]; then
   git push origin ":refs/heads/base/${TASK_ID}" ":refs/heads/review/${TASK_ID}" >/dev/null 2>&1 || true
 fi

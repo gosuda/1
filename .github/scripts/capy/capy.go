@@ -99,11 +99,13 @@ type transformValue struct {
 	t Transformation
 }
 
-func (v *transformValue) String() string        { return fmt.Sprintf("transform(%s)", v.t.Kind) }
-func (v *transformValue) Type() string          { return "transformation" }
-func (v *transformValue) Freeze()               {}
-func (v *transformValue) Truth() starlark.Bool  { return starlark.True }
-func (v *transformValue) Hash() (uint32, error) { return 0, errors.New("unhashable type: transformation") }
+func (v *transformValue) String() string       { return fmt.Sprintf("transform(%s)", v.t.Kind) }
+func (v *transformValue) Type() string         { return "transformation" }
+func (v *transformValue) Freeze()              {}
+func (v *transformValue) Truth() starlark.Bool { return starlark.True }
+func (v *transformValue) Hash() (uint32, error) {
+	return 0, errors.New("unhashable type: transformation")
+}
 
 func buildStarlarkModules(cfg *Config) starlark.StringDict {
 	capyMod := &starlarkstruct.Module{
@@ -530,118 +532,33 @@ func SpliceSubtree(ctx context.Context, repoDir string, baseTreeOID string, pref
 	return strings.TrimSpace(out), nil
 }
 
-var publicDomains = []string{"web", "net", "ipc", "storage", "crypto", "ai", "devtools"}
-
-var (
-	forbiddenPublicImportRe       = regexp.MustCompile(`(gosuda\.org/(0/)?(corp|experimental)/|(\.\./)+(corp|experimental)/)`)
-	forbiddenThirdPartyImportRe   = regexp.MustCompile(`(gosuda\.org/(0/)?(web|net|ipc|storage|crypto|ai|devtools|corp|experimental)/|(\.\./)+(web|net|ipc|storage|crypto|ai|devtools|corp|experimental)/)`)
-	forbiddenCorpImportRe         = regexp.MustCompile(`(gosuda\.org/(0/)?experimental/|(\.\./)+experimental/)`)
-	forbiddenExperimentalImportRe = regexp.MustCompile(`(gosuda\.org/(0/)?corp/|(\.\./)+corp/)`)
-)
-
-// CheckVisibility scans domains in treeOID and returns any lines that violate google3 visibility boundaries.
-func CheckVisibility(ctx context.Context, repoDir string, treeOID string) ([]string, error) {
-	return CheckVisibilityDiff(ctx, repoDir, "", treeOID)
+// Identity carries the GitHub-authenticated principals behind a landing request. Commit author,
+// committer, and message trailers are self-asserted and are never part of an Identity.
+type Identity struct {
+	// Requester is the login that pushed the landing ref tip (or the mirror merger for inbound changes).
+	Requester string
+	// Approvers are logins whose approval is bound to the exact tip being landed.
+	Approvers []string
 }
 
-// CheckVisibilityDiff scans domains in treeOID (or only files added/modified since baseTreeOID when non-empty)
-// and returns any lines that violate google3 visibility boundaries:
-//   - Public domains & third_party/*: cannot import corp/* or experimental/*
-//   - corp/*: cannot import experimental/*
-//   - experimental/*: cannot import corp/*
-func CheckVisibilityDiff(ctx context.Context, repoDir string, baseTreeOID string, treeOID string) ([]string, error) {
-	var entries []treeEntry
-	if baseTreeOID != "" {
-		raw, err := gitOutput(ctx, repoDir, nil, "diff-tree", "-r", "-z", "--no-commit-id", "--diff-filter=AM", baseTreeOID, treeOID)
-		if err != nil {
-			return nil, fmt.Errorf("diff-tree %s %s: %w", baseTreeOID, treeOID, err)
-		}
-		entries, err = parseDiffTree(raw)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		raw, err := gitOutput(ctx, repoDir, nil, "ls-tree", "-r", "-z", treeOID)
-		if err != nil {
-			return nil, fmt.Errorf("ls-tree %s: %w", treeOID, err)
-		}
-		entries, err = parseLSTree(raw)
-		if err != nil {
-			return nil, err
-		}
-	}
+// TeamResolver reports whether login is an active member of team ("org/slug"). A nil resolver
+// denies every team entry.
+type TeamResolver func(team string, login string) (bool, error)
 
-	var violations []string
-	for _, e := range entries {
-		if e.Type != "blob" || !isSourceFile(e.Path) {
-			continue
-		}
-		ruleRe, tierName := visibilityRuleForPath(e.Path)
-		if ruleRe == nil {
-			continue
-		}
-		blob, err := gitReadBlob(ctx, repoDir, e.OID)
-		if err != nil {
-			return nil, err
-		}
-		lines := strings.Split(string(blob), "\n")
-		for idx, line := range lines {
-			if ruleRe.MatchString(line) {
-				violations = append(violations, fmt.Sprintf("%s:%d: prohibited import in %s domain: %s", e.Path, idx+1, tierName, strings.TrimSpace(line)))
-			}
-		}
-	}
-	sort.Strings(violations)
-	return violations, nil
-}
-
-func visibilityRuleForPath(relPath string) (*regexp.Regexp, string) {
-	if isPublicDomainPath(relPath) {
-		return forbiddenPublicImportRe, "public"
-	}
-	if strings.HasPrefix(relPath, "third_party/") {
-		return forbiddenThirdPartyImportRe, "third_party"
-	}
-	if strings.HasPrefix(relPath, "corp/") {
-		return forbiddenCorpImportRe, "corp"
-	}
-	if strings.HasPrefix(relPath, "experimental/") {
-		return forbiddenExperimentalImportRe, "experimental"
-	}
-	return nil, ""
-}
-
-var trailerActorRe = regexp.MustCompile(`(?im)^(?:Reviewed-by|Approved-by|Suda-Reviewer):\s*(.+)$`)
-
-// ExtractCommitActors combines author identifiers with any Reviewed-by / Approved-by trailers in commitMsg.
-func ExtractCommitActors(author string, commitMsg string) []string {
-	var actors []string
-	addTokens := func(raw string) {
-		for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
-			return r == ',' || r == ';' || r == '<' || r == '>' || r == ' ' || r == '\t'
-		}) {
-			cleaned := strings.TrimSpace(strings.TrimPrefix(part, "@"))
-			if cleaned != "" {
-				actors = append(actors, strings.ToLower(cleaned))
-				if atIdx := strings.IndexByte(cleaned, '@'); atIdx > 0 {
-					actors = append(actors, strings.ToLower(cleaned[:atIdx]))
-				}
-			}
-		}
-	}
-	addTokens(author)
-	for _, m := range trailerActorRe.FindAllStringSubmatch(commitMsg, -1) {
-		if len(m) > 1 {
-			addTokens(m[1])
-		}
-	}
-	return actors
+func normalizeLogin(s string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "@"))
 }
 
 // CheckOwners verifies hierarchical google3 OWNERS rules between baseTreeOID and newTreeOID.
-// Paths under experimental/<actor>/* are sandboxed and automatically permitted for any authenticated actor.
-// Existing OWNERS files are always read from baseTreeOID so a commit cannot self-approve by modifying OWNERS.
-func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTreeOID string, actors []string) ([]string, error) {
+//
+//   - OWNERS files are read only from baseTreeOID, so a change cannot approve itself by adding or
+//     editing an OWNERS file. A new directory inherits from its nearest existing ancestor.
+//   - An entry "org/team" is resolved through teams; the literal "*" matches nobody.
+//   - experimental/<actor>/... is approved for the requester whose login equals <actor>; otherwise the
+//     normal OWNERS chain applies.
+//   - "set require-review" in any OWNERS file of the chain requires an owner other than the requester.
+//   - A path whose OWNERS chain is empty is rejected (fail closed).
+func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTreeOID string, id Identity, teams TeamResolver) ([]string, error) {
 	raw, err := gitOutput(ctx, repoDir, nil, "diff-tree", "-r", "-z", "--no-commit-id", baseTreeOID, newTreeOID)
 	if err != nil {
 		return nil, fmt.Errorf("diff-tree %s %s: %w", baseTreeOID, newTreeOID, err)
@@ -660,31 +577,80 @@ func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTre
 		if dir != "" && dir != "." {
 			ownersPath = dir + "/OWNERS"
 		}
-		content, err := gitReadTreePath(ctx, repoDir, baseTreeOID, ownersPath)
-		if err != nil {
-			content, err = gitReadTreePath(ctx, repoDir, newTreeOID, ownersPath)
+		var parsed *parsedOwnersFile
+		if content, err := gitReadTreePath(ctx, repoDir, baseTreeOID, ownersPath); err == nil {
+			parsed = parseOwnersContent(string(content))
 		}
-		if err != nil {
-			ownersCache[dir] = nil
-			return nil
-		}
-		parsed := parseOwnersContent(string(content))
 		ownersCache[dir] = parsed
 		return parsed
 	}
 
+	requester := normalizeLogin(id.Requester)
+	principals := make([]string, 0, 1+len(id.Approvers))
+	if requester != "" {
+		principals = append(principals, requester)
+	}
+	var approvers []string
+	for _, a := range id.Approvers {
+		if n := normalizeLogin(a); n != "" && n != requester {
+			approvers = append(approvers, n)
+		}
+	}
+	principals = append(principals, approvers...)
+
+	memberOf := func(owner string, login string) (bool, error) {
+		if strings.Contains(owner, "/") {
+			if teams == nil {
+				return false, nil
+			}
+			return teams(owner, login)
+		}
+		return owner == login, nil
+	}
+	anyOwner := func(owners []string, logins []string) (bool, error) {
+		for _, owner := range owners {
+			if owner == "*" {
+				continue
+			}
+			for _, login := range logins {
+				ok, err := memberOf(owner, login)
+				if err != nil {
+					return false, err
+				}
+				if ok {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
+
 	var violations []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Path, "experimental/") {
-			parts := strings.Split(e.Path, "/")
-			if len(parts) >= 3 && len(actors) > 0 {
+		if parts := strings.Split(e.Path, "/"); parts[0] == "experimental" && len(parts) >= 3 && requester != "" && normalizeLogin(parts[1]) == requester {
+			continue
+		}
+		chain := ownersChain(e.Path, readOwners)
+		if len(chain.owners) == 0 {
+			violations = append(violations, fmt.Sprintf("%s: no OWNERS entry covers this path", e.Path))
+			continue
+		}
+		ok, err := anyOwner(chain.owners, principals)
+		if err != nil {
+			return nil, err
+		}
+		if ok && chain.requireReview {
+			ok, err = anyOwner(chain.owners, approvers)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				violations = append(violations, fmt.Sprintf("%s: requires review by an owner other than the requester %q (required one of %v)", e.Path, requester, chain.owners))
 				continue
 			}
 		}
-
-		allowed, required := isPathApproved(e.Path, actors, readOwners)
-		if !allowed {
-			violations = append(violations, fmt.Sprintf("%s: missing OWNERS approval (actors=%v, required one of %v)", e.Path, actors, required))
+		if !ok {
+			violations = append(violations, fmt.Sprintf("%s: missing OWNERS approval (requester=%q approvers=%v, required one of %v)", e.Path, requester, approvers, chain.owners))
 		}
 	}
 	sort.Strings(violations)
@@ -697,9 +663,10 @@ type perFileRule struct {
 }
 
 type parsedOwnersFile struct {
-	noparent bool
-	owners   []string
-	perFile  []perFileRule
+	noparent      bool
+	requireReview bool
+	owners        []string
+	perFile       []perFileRule
 }
 
 func parseOwnersContent(content string) *parsedOwnersFile {
@@ -714,6 +681,10 @@ func parseOwnersContent(content string) *parsedOwnersFile {
 		}
 		if line == "set noparent" {
 			res.noparent = true
+			continue
+		}
+		if line == "set require-review" {
+			res.requireReview = true
 			continue
 		}
 		if strings.HasPrefix(line, "per-file ") {
@@ -736,7 +707,7 @@ func parseOwnersContent(content string) *parsedOwnersFile {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && (fields[0] == "*" || strings.ContainsAny(fields[0], "*?. /")) {
+		if len(fields) >= 2 && !strings.HasPrefix(fields[0], "@") && (fields[0] == "*" || strings.ContainsAny(fields[0], "*?. /")) {
 			var ruleOwners []string
 			for _, tok := range fields[1:] {
 				ruleOwners = append(ruleOwners, strings.ToLower(strings.TrimPrefix(tok, "@")))
@@ -755,22 +726,32 @@ func parseOwnersContent(content string) *parsedOwnersFile {
 	return res
 }
 
-func isPathApproved(relPath string, actors []string, readOwners func(dir string) *parsedOwnersFile) (bool, []string) {
+type ownersChainResult struct {
+	owners        []string
+	requireReview bool
+}
+
+// ownersChain collects the owner set that governs relPath, walking from its directory up to the
+// root until a "set noparent" is reached.
+func ownersChain(relPath string, readOwners func(dir string) *parsedOwnersFile) ownersChainResult {
 	baseName := path.Base(relPath)
 	curDir := path.Dir(relPath)
 	if curDir == "." {
 		curDir = ""
 	}
 
-	var candidateOwners []string
+	var res ownersChainResult
 	for {
 		if pf := readOwners(curDir); pf != nil {
 			for _, rule := range pf.perFile {
 				if matchGlob(rule.glob, baseName) || matchGlob(rule.glob, relPath) {
-					candidateOwners = append(candidateOwners, rule.owners...)
+					res.owners = append(res.owners, rule.owners...)
 				}
 			}
-			candidateOwners = append(candidateOwners, pf.owners...)
+			res.owners = append(res.owners, pf.owners...)
+			if pf.requireReview {
+				res.requireReview = true
+			}
 			if pf.noparent {
 				break
 			}
@@ -785,25 +766,7 @@ func isPathApproved(relPath string, actors []string, readOwners func(dir string)
 			curDir = parent
 		}
 	}
-
-	if len(candidateOwners) == 0 {
-		return true, nil
-	}
-
-	for _, owner := range candidateOwners {
-		if owner == "*" && len(actors) > 0 {
-			return true, candidateOwners
-		}
-		if owner == "gosuda/core" && len(actors) > 0 {
-			return true, candidateOwners
-		}
-		for _, actor := range actors {
-			if actor == owner {
-				return true, candidateOwners
-			}
-		}
-	}
-	return false, candidateOwners
+	return res
 }
 
 func gitReadTreePath(ctx context.Context, repoDir string, treeOID string, relPath string) ([]byte, error) {
@@ -815,28 +778,6 @@ func gitReadTreePath(ctx context.Context, repoDir string, treeOID string, relPat
 		return nil, err
 	}
 	return gitReadBlob(ctx, repoDir, strings.TrimSpace(oidOut))
-}
-
-func isPublicDomainPath(relPath string) bool {
-	for _, dom := range publicDomains {
-		if strings.HasPrefix(relPath, dom+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-func isSourceFile(relPath string) bool {
-	base := path.Base(relPath)
-	if base == "go.mod" || base == "Cargo.toml" {
-		return true
-	}
-	switch path.Ext(relPath) {
-	case ".go", ".rs", ".ts", ".tsx", ".js", ".py":
-		return true
-	default:
-		return false
-	}
 }
 
 func parseDiffTree(raw string) ([]treeEntry, error) {

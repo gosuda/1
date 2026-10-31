@@ -92,6 +92,7 @@ Each specification document in `docs/` covers one subsystem boundary.
 | [tooling.md](./tooling.md) | Server-side scripts (`land.sh`, `sync-inbound.sh`), GitHub App configuration, and `//devtools/azure-magpie` routes. |
 | [google3-and-copybara.md](./google3-and-copybara.md) | Organization audit across 125 repositories, `google3` parity matrix, two-tier CI execution, and the Starlark subtree synchronizer (`capy`). |
 | [feasibility-review.md](./feasibility-review.md) | Empirical verification results on Git 2.54.0, corrected plumbing invocations, and GitHub platform constraints. |
+| [hardening-plan.md](./hardening-plan.md) | Proposed migration to the two-repository topology (`gosuda/0` trunk, `gosuda/1` user repository), the self-hosted lander, and phased exit criteria for the 2026-10-30 review findings. |
 
 ## 7. Build and Verification Procedure
 

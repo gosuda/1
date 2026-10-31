@@ -44,7 +44,10 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 	writeRepoFiles(t, work, map[string]string{
 		"web/securl/main.go":    "package main\n// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n// line 6\n// line 7\n// line 8\n// line 9\n// line 10\n",
 		"net/portalite/conn.go": "package portalite\nconst Port = 443\n",
+		"OWNERS":                "@maintainer\n",
 	})
+	// corp/lemonsso is a vanity-path module, so bad-vis below resolves its import through this go.mod.
+	writeRepoFiles(t, work, map[string]string{"corp/lemonsso/go.mod": "module gosuda.org/lemonsso\n\ngo 1.27\n"})
 	tree0 := commitTree(t, work)
 	snap0 := runGit(t, work, "commit-tree", tree0, "-m", "initial trunk")
 	runGit(t, work, "push", "-q", "origin", snap0+":refs/suda/main", snap0+":refs/suda/history")
@@ -73,7 +76,7 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 	runGit(t, work, "push", "-q", "--force", "origin", snap1+":refs/suda/main", hist1+":refs/suda/history")
 
 	// Execute land.sh for refs/heads/land/task-1.
-	runCmd(t, work, landScript, "refs/heads/land/task-1")
+	runCmdEnv(t, work, []string{"SUDA_REQUESTER=maintainer"}, landScript, "refs/heads/land/task-1")
 
 	mergedMain := runGit(t, bareOrigin, "rev-parse", "refs/suda/main")
 	mergedHist := runGit(t, bareOrigin, "rev-parse", "refs/suda/history")
@@ -114,7 +117,7 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 	runGit(t, work, "fetch", "-q", "origin", "+refs/suda/main:refs/remotes/origin/suda/main")
 	runGit(t, work, "switch", "-q", "-c", "ws/agent/bad-vis", "refs/remotes/origin/suda/main")
 	writeRepoFiles(t, work, map[string]string{
-		"web/securl/leak.go": "package main\nimport \"gosuda.org/0/corp/lemonsso\"\n",
+		"web/securl/leak.go": "package main\nimport \"gosuda.org/lemonsso\"\n",
 	})
 	runGit(t, work, "add", "-A")
 	runGit(t, work, "commit", "-qm", "bad import")
@@ -122,8 +125,14 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 
 	cmd := exec.Command(landScript, "refs/heads/land/bad-vis")
 	cmd.Dir = work
-	if out, err := cmd.CombinedOutput(); err == nil {
+	cmd.Env = append(os.Environ(), "SUDA_REQUESTER=maintainer")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
 		t.Fatalf("land.sh succeeded on visibility violation, want non-zero exit:\n%s", out)
+	}
+	const wantViolation = "web/securl/leak.go:2: prohibited import in public domain: gosuda.org/lemonsso -> corp"
+	if !strings.Contains(string(out), wantViolation) {
+		t.Fatalf("land.sh rejected the landing without the visibility violation %q:\n%s", wantViolation, out)
 	}
 	if afterMain := runGit(t, bareOrigin, "rev-parse", "refs/suda/main"); afterMain != mergedMain {
 		t.Fatalf("refs/suda/main advanced on rejected landing: got %s, want %s", afterMain, mergedMain)
@@ -137,7 +146,7 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 	runGit(t, work, "add", "-A")
 	runGit(t, work, "-c", "user.name=alice", "-c", "user.email=alice@gosuda.org", "commit", "-qm", "net/portalite: add OWNERS")
 	runGit(t, work, "push", "-q", "origin", "HEAD:refs/heads/land/add-owners")
-	runCmd(t, work, landScript, "refs/heads/land/add-owners")
+	runCmdEnv(t, work, []string{"SUDA_REQUESTER=maintainer"}, landScript, "refs/heads/land/add-owners")
 	ownersMain := runGit(t, bareOrigin, "rev-parse", "refs/suda/main")
 
 	// Unauthorized attempt by mallory without Reviewed-by: @alice
@@ -152,6 +161,7 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 
 	unauthCmd := exec.Command(landScript, "refs/heads/land/unauth")
 	unauthCmd.Dir = work
+	unauthCmd.Env = append(os.Environ(), "SUDA_REQUESTER=mallory")
 	if out, err := unauthCmd.CombinedOutput(); err == nil {
 		t.Fatalf("land.sh succeeded on unauthorized OWNERS edit, want non-zero exit:\n%s", out)
 	}
@@ -159,10 +169,18 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 		t.Fatalf("refs/suda/main advanced on rejected OWNERS landing: got %s, want %s", afterOwners, ownersMain)
 	}
 
-	// Approved attempt with Reviewed-by: @alice
-	runGit(t, work, "-c", "user.name=mallory", "-c", "user.email=mallory@gosuda.org", "commit", "--amend", "-qm", "net/portalite: authorized change\n\nReviewed-by: @alice")
+	// A self-written trailer and a spoofed commit author must not approve anything.
+	runGit(t, work, "-c", "user.name=alice", "-c", "user.email=alice@gosuda.org", "commit", "--amend", "-qm", "net/portalite: forged\n\nReviewed-by: @alice")
 	runGit(t, work, "push", "-q", "--force", "origin", "HEAD:refs/heads/land/unauth")
-	runCmd(t, work, landScript, "refs/heads/land/unauth")
+	forgedCmd := exec.Command(landScript, "refs/heads/land/unauth")
+	forgedCmd.Dir = work
+	forgedCmd.Env = append(os.Environ(), "SUDA_REQUESTER=mallory")
+	if out, err := forgedCmd.CombinedOutput(); err == nil {
+		t.Fatalf("land.sh accepted a forged Reviewed-by trailer and author:\n%s", out)
+	}
+
+	// Approval bound to the authenticated approver (alice) lands the change.
+	runCmdEnv(t, work, []string{"SUDA_REQUESTER=mallory", "SUDA_APPROVERS=alice"}, landScript, "refs/heads/land/unauth")
 	if finalMain := runGit(t, bareOrigin, "rev-parse", "refs/suda/main"); finalMain == ownersMain {
 		t.Fatal("refs/suda/main did not advance after Reviewed-by approval")
 	}
@@ -170,8 +188,14 @@ func TestLandScriptMergesDivergedWorkspaceAndEnforcesVisibility(t *testing.T) {
 
 func runCmd(t *testing.T, dir string, name string, args ...string) string {
 	t.Helper()
+	return runCmdEnv(t, dir, nil, name, args...)
+}
+
+func runCmdEnv(t *testing.T, dir string, env []string, name string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %s: %v (%s)", name, strings.Join(args, " "), err, out)
