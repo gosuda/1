@@ -25,6 +25,9 @@ The unified source tree on `refs/suda/main` and the linear commit chain on `refs
 | `//devtools/potly` | `gosuda/potly` | [Browse `//devtools/potly`](https://magpie.gosuda.org/tree/devtools/potly) | [Commits `//devtools/potly`](https://magpie.gosuda.org/history/devtools/potly) |
 | `//net/autoirc2p` | `gosuda/AutoIRC2P` | [Browse `//net/autoirc2p`](https://magpie.gosuda.org/tree/net/autoirc2p) | [Commits `//net/autoirc2p`](https://magpie.gosuda.org/history/net/autoirc2p) |
 | `//net/portal-multiplatform-sdk` | `gosuda/portal-multiplatform-sdk` | [Browse `//net/portal-multiplatform-sdk`](https://magpie.gosuda.org/tree/net/portal-multiplatform-sdk) | [Commits `//net/portal-multiplatform-sdk`](https://magpie.gosuda.org/history/net/portal-multiplatform-sdk) |
+| `//crypto/randflake` | `gosuda/randflake` | [Browse `//crypto/randflake`](https://magpie.gosuda.org/tree/crypto/randflake) | [Commits `//crypto/randflake`](https://magpie.gosuda.org/history/crypto/randflake) |
+| `//ai/jimin` | `gosuda/jimin` | [Browse `//ai/jimin`](https://magpie.gosuda.org/tree/ai/jimin) | [Commits `//ai/jimin`](https://magpie.gosuda.org/history/ai/jimin) |
+| `//web/telemetry` | `gosuda/telemetry.gosuda.org` | [Browse `//web/telemetry`](https://magpie.gosuda.org/tree/web/telemetry) | [Commits `//web/telemetry`](https://magpie.gosuda.org/history/web/telemetry) |
 <!-- SUDA_EXPLORER_END -->
 
 ## 2. Reference Namespace Map
