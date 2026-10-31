@@ -131,6 +131,10 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.claims = claims
 	f.mu.Unlock()
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/app":
+		_, _ = fmt.Fprint(w, `{"id":123,"slug":"suda-lander"}`)
+	case r.Method == http.MethodGet && r.URL.Path == "/users/suda-lander[bot]":
+		_, _ = fmt.Fprint(w, `{"id":350558086,"login":"suda-lander[bot]","type":"Bot"}`)
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/installation"):
 		f.mu.Lock()
 		f.installs++
@@ -460,5 +464,16 @@ func TestAppTokenRejectsInvalidInput(t *testing.T) {
 	}
 	if n := env.fake.installCount(); n != 0 {
 		t.Errorf("invalid input reached GitHub %d times", n)
+	}
+}
+
+func TestAppBotIdentityUsesTheBotUserIdNotTheAppId(t *testing.T) {
+	env := newAppEnv(t, nil)
+	id, err := env.app.BotIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Name != "suda-lander[bot]" || id.Email != "350558086+suda-lander[bot]@users.noreply.github.com" {
+		t.Fatalf("identity = %+v", id)
 	}
 }

@@ -354,3 +354,25 @@ func TestEmbargoNamesAreRecognizedByAnySegment(t *testing.T) {
 		}
 	}
 }
+
+func TestCommitsCarryTheConfiguredBotIdentityAndKeepMemberAuthors(t *testing.T) {
+	e := newEnv(t)
+	bot := Identity{Name: "suda-lander[bot]", Email: "350558086+suda-lander[bot]@users.noreply.github.com"}
+	e.l.Store.Identity = bot
+	e.devWork("who", map[string]string{"Q/q.go": "package q\n// who\n"}, "Q: who", "GIT_AUTHOR_NAME=Wendy", "GIT_AUTHOR_EMAIL=wendy@example.invalid")
+	e.cycle()
+
+	landed := "refs/suda/history"
+	if got := git(t, e.trunk, "log", "-1", "--format=%an <%ae> | %cn <%ce>", landed); got != "Wendy <wendy@example.invalid> | suda-lander[bot] <350558086+suda-lander[bot]@users.noreply.github.com>" {
+		t.Fatalf("landed commit identities = %q (author must stay the member, committer is the bot)", got)
+	}
+	// Commits the lander writes itself carry the bot as author and committer.
+	for _, ref := range []string{"refs/suda/sync/p", "refs/heads/lander"} {
+		if got := git(t, e.trunk, "log", "-1", "--format=%an <%ae> | %cn <%ce>", ref); !strings.Contains(got, bot.Email) || strings.Contains(got, "lander@gosuda.org") {
+			t.Fatalf("%s identities = %q", ref, got)
+		}
+	}
+	if got := git(t, e.user, "log", "-1", "--format=%an <%ae>", "refs/heads/main"); !strings.Contains(got, bot.Email) {
+		t.Fatalf("front page author = %q", got)
+	}
+}

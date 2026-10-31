@@ -63,13 +63,14 @@ func TestSigningDerivesAllowedSignersFromThePrivateKey(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 	priv, _ := os.ReadFile(key)
-	sg, err := materializeSigning(priv, "")
+	sg, err := materializeSigning(priv, "", "lander@gosuda.org", "350558086+suda-lander[bot]@users.noreply.github.com", "lander@gosuda.org")
 	if err != nil {
 		t.Fatal(err)
 	}
 	signers, _ := os.ReadFile(sg.AllowedSigners)
 	pub, _ := os.ReadFile(key + ".pub")
-	if !strings.HasPrefix(string(signers), "lander@gosuda.org "+strings.Fields(string(pub))[0]+" "+strings.Fields(string(pub))[1]) {
+	want := "lander@gosuda.org,350558086+suda-lander[bot]@users.noreply.github.com " + strings.Fields(string(pub))[0] + " " + strings.Fields(string(pub))[1]
+	if !strings.HasPrefix(string(signers), want) {
 		t.Fatalf("allowed signers = %q", signers)
 	}
 }

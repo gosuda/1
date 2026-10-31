@@ -82,6 +82,7 @@ Table 2 lists the settings an operator provides. The lander README (`.github/scr
 | `LANDER_MIRROR_INTERVAL` | `5m` | Minimum gap between mirror reconciles; a landing that advanced the trunk reconciles on the next cycle |
 | `LANDER_DRYRUN` | unset | Decide and log, push nothing |
 | `LANDER_SIGNING_KEY`, `LANDER_ALLOWED_SIGNERS` | unset | SSH key that signs lander commits, and the allowed signers that verify the history tip. The key requires the signers file. |
+| `LANDER_COMMITTER_NAME`, `LANDER_COMMITTER_EMAIL` | App bot identity | Identity on commits the lander creates. Default: the App's bot identity (`<slug>[bot]`, `<bot user id>+<slug>[bot]@users.noreply.github.com`), which GitHub attributes to the App and renders with its logo. The id in the email is the bot user's id, not the App id |
 | `LANDER_ACK_TIP` | unset | Accepts one unsigned history tip after an operator reviews it |
 | `LANDER_PRESUBMIT` | `docker` | `docker` runs the sandbox; `off` skips presubmit |
 | `LANDER_WAKE_SECRET` | unset | Enables `/wake`, which accepts HMAC-SHA256 signed requests only |

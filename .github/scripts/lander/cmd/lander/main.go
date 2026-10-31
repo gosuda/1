@@ -105,9 +105,10 @@ func main() {
 	}
 	app := &lander.App{ID: appID, Key: key, BaseURL: apiURL, HTTP: &http.Client{Timeout: 30 * time.Second}, Now: time.Now}
 
-	store := &lander.Store{Dir: env("LANDER_STORE", "/var/lib/lander/data/store.git"), Tokens: app, Log: log}
+	ident := committerIdentity(app, log)
+	store := &lander.Store{Dir: env("LANDER_STORE", "/var/lib/lander/data/store.git"), Tokens: app, Log: log, Identity: ident}
 	if sk, err := secret("LANDER_SIGNING_KEY_FILE", "LANDER_SIGNING_KEY"); err == nil {
-		signing, err := materializeSigning(sk, os.Getenv("LANDER_ALLOWED_SIGNERS"))
+		signing, err := materializeSigning(sk, os.Getenv("LANDER_ALLOWED_SIGNERS"), ident.Email, lander.LegacyIdentity.Email)
 		if err != nil {
 			fatalf("signing key: %v", err)
 		}
@@ -323,10 +324,30 @@ func normalizePEM(raw string) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
+// committerIdentity resolves the identity of commits the lander creates. LANDER_COMMITTER_NAME and
+// LANDER_COMMITTER_EMAIL win; otherwise the App's bot identity is looked up; if GitHub cannot be
+// reached the legacy identity keeps the lander working (commits then lack the App avatar).
+func committerIdentity(app *lander.App, log *slog.Logger) lander.Identity {
+	if n, e := os.Getenv("LANDER_COMMITTER_NAME"), os.Getenv("LANDER_COMMITTER_EMAIL"); n != "" && e != "" {
+		return lander.Identity{Name: n, Email: e}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	id, err := app.BotIdentity(ctx)
+	if err != nil {
+		log.Warn("cannot resolve the App's bot identity; using the legacy committer identity", "err", err)
+		return lander.LegacyIdentity
+	}
+	log.Info("committer identity", "name", id.Name, "email", id.Email)
+	return id
+}
+
 // materializeSigning writes the signing key to a private temp file (ssh-keygen and git need a
 // path) and, unless an allowed-signers file is configured, derives one from the key's public half:
-// the lander verifies only its own signatures.
-func materializeSigning(privateKey []byte, allowedSigners string) (*lander.Signing, error) {
+// the lander verifies only its own signatures. git matches the allowed-signers principal against
+// the committer email, so every identity that ever committed with this key must be listed:
+// history written before an identity change keeps verifying.
+func materializeSigning(privateKey []byte, allowedSigners string, principals ...string) (*lander.Signing, error) {
 	dir, err := os.MkdirTemp("", "lander-signing-*")
 	if err != nil {
 		return nil, err
@@ -340,8 +361,16 @@ func materializeSigning(privateKey []byte, allowedSigners string) (*lander.Signi
 		if err != nil {
 			return nil, fmt.Errorf("derive public key: %w", err)
 		}
+		seen := map[string]bool{}
+		var uniq []string
+		for _, p := range principals {
+			if p != "" && !seen[p] {
+				seen[p] = true
+				uniq = append(uniq, p)
+			}
+		}
 		allowedSigners = dir + "/allowed_signers"
-		line := "lander@gosuda.org " + strings.TrimSpace(string(pub)) + "\n"
+		line := strings.Join(uniq, ",") + " " + strings.TrimSpace(string(pub)) + "\n"
 		if err := os.WriteFile(allowedSigners, []byte(line), 0o600); err != nil {
 			return nil, err
 		}

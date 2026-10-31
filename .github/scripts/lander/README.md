@@ -32,6 +32,7 @@ nothing depends on events arriving. Durable state lives only in refs (including
 | `LANDER_ALLOWED_SIGNERS` | derived | Optional allowed-signers file overriding the derived one |
 | `LANDER_EMBARGO_TEAM` | unset | `org/slug` of the team allowed to land embargoed changes (ids `sec-...`). Unset: they cannot be landed |
 | `LANDER_EMBARGO_TTL` | `4320h` | Age after which embargoed workspace references are pruned (other workspaces: 14 days) |
+| `LANDER_COMMITTER_NAME`, `LANDER_COMMITTER_EMAIL` | the App's bot identity | Identity on every commit the lander creates (author as well for commits it writes itself). Default: looked up from GitHub at start (`<slug>[bot]`, `<bot user id>+<slug>[bot]@users.noreply.github.com`), so commits show the App's logo; falls back to `Suda Lander <lander@gosuda.org>` when GitHub is unreachable |
 | `LANDER_ACK_TIP` | unset | Accept that one unsigned history tip (after reviewing an out-of-band push) |
 | `LANDER_PRESUBMIT` | `docker` | `docker` or `off` |
 | `LANDER_PRESUBMIT_IMAGE`, `_TIMEOUT`, `_CPUS`, `_MEMORY` | `golang:1.27`, `15m`, `2`, `4g` | Sandbox settings |

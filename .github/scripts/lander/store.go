@@ -49,8 +49,28 @@ type Store struct {
 	Dir    string
 	Tokens TokenSource
 	Log    *slog.Logger
+	// Identity is the committer on every commit the lander creates. Empty means LegacyIdentity.
+	Identity Identity
 	// Signing, when non-nil, signs commits created by CommitTree.
 	Signing *Signing
+}
+
+// Identity is the name and email on commits the lander creates (committer always, author for
+// commits the lander itself writes: overlay syncs, baselines, front page, staged roots).
+type Identity struct {
+	Name  string
+	Email string
+}
+
+// LegacyIdentity was used before the bot identity; verification must keep accepting it for
+// commits already in the history.
+var LegacyIdentity = Identity{Name: "Suda Lander", Email: "lander@gosuda.org"}
+
+func (s *Store) identity() Identity {
+	if s.Identity.Name == "" || s.Identity.Email == "" {
+		return LegacyIdentity
+	}
+	return s.Identity
 }
 
 // Signing configures SSH commit signing for commits the lander authors.
@@ -101,12 +121,13 @@ func (s *Store) authEnv(ctx context.Context, r Remote, access Access) ([]string,
 
 func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", s.Dir}, args...)...)
+	id := s.identity()
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_NO_LAZY_FETCH=1",
 		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_COMMITTER_NAME=Suda Lander",
-		"GIT_COMMITTER_EMAIL=lander@gosuda.org",
+		"GIT_COMMITTER_NAME="+id.Name,
+		"GIT_COMMITTER_EMAIL="+id.Email,
 	)
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdin = stdin
@@ -239,7 +260,8 @@ func (s *Store) CommitTree(ctx context.Context, tree string, parents []string, m
 	if author != nil && author.AuthorName != "" {
 		env = append(env, "GIT_AUTHOR_NAME="+author.AuthorName, "GIT_AUTHOR_EMAIL="+author.AuthorEmail, "GIT_AUTHOR_DATE="+author.AuthorDate)
 	} else {
-		env = append(env, "GIT_AUTHOR_NAME=Suda Lander", "GIT_AUTHOR_EMAIL=lander@gosuda.org")
+		id := s.identity()
+		env = append(env, "GIT_AUTHOR_NAME="+id.Name, "GIT_AUTHOR_EMAIL="+id.Email)
 	}
 	return s.run(ctx, nil, env, strings.NewReader(msg), args...)
 }
