@@ -10,6 +10,19 @@ members: it is written only by the lander, the service that lands your changes.
 > yourself: anyone in the organization can write here. This page and the guide are generated from the
 > control plane of `gosuda/0` and restored automatically if overwritten.
 
+## Set up in one line
+
+With the [GitHub CLI](https://cli.github.com) logged in (`gh auth login`):
+
+```bash
+gh api -H 'Accept: application/vnd.github.raw' repos/gosuda/0/contents/.github/scripts/onboard.sh | bash -s -- -d gosuda-0 ipc/hqq web/gosuda
+```
+
+This clones `gosuda/0` read-only, registers the aliases, adds the `ws` remote (this repository), disables
+pushes to `origin`, and selects the directories you list. Run it again later to refresh the aliases.
+The script is served from `gosuda/0`, where only the lander writes; never run a copy taken from a branch of
+this repository. Prefer to read it first? <https://github.com/gosuda/0/blob/main/.github/scripts/onboard.sh>
+
 ## Contribution flow at a glance
 
 ```text
