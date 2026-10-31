@@ -266,6 +266,34 @@ func TestCheckOwnersEnforcesHierarchyAndApprovals(t *testing.T) {
 	}
 }
 
+// A bot login granted one generated file by a root per-file rule may change that file and nothing else,
+// and only when it is the authenticated requester.
+func TestCheckOwnersPerFileBotGrantCoversOnlyItsFile(t *testing.T) {
+	repo := initTestRepo(t)
+	writeRepoFiles(t, repo, map[string]string{
+		"OWNERS":                          "@rootadmin\nper-file web/gosuda/zdata/data.json.zstd=@github-actions[bot]\n",
+		"web/gosuda/zdata/data.json.zstd": "v1",
+		"web/gosuda/zdata/other.json":     "v1",
+		"web/gosuda/main.go":              "package main\n",
+	})
+	base := commitTree(t, repo)
+
+	writeRepoFiles(t, repo, map[string]string{"web/gosuda/zdata/data.json.zstd": "v2"})
+	data := commitTree(t, repo)
+	if v := checkOwners(t, repo, base, data, "github-actions[bot]"); len(v) != 0 {
+		t.Fatalf("the bot must own its generated file: %v", v)
+	}
+	if v := checkOwners(t, repo, base, data, "mallory"); len(v) != 1 {
+		t.Fatalf("others must not gain the grant: %v", v)
+	}
+
+	writeRepoFiles(t, repo, map[string]string{"web/gosuda/zdata/other.json": "v2", "web/gosuda/main.go": "package main\n// x\n"})
+	other := commitTree(t, repo)
+	if v := checkOwners(t, repo, base, other, "github-actions[bot]"); len(v) != 2 {
+		t.Fatalf("the bot must not own anything else in the directory: %v", v)
+	}
+}
+
 // Each case is a bypass that the commit-derived identity model accepted.
 func TestCheckOwnersRejectsForgeryAndSelfApproval(t *testing.T) {
 	repo := initTestRepo(t)
