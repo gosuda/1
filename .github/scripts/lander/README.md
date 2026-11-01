@@ -60,8 +60,9 @@ After each landed push whose mirror commit the trunk now exports exactly, the sy
 that commit and the next push merges against it, so consecutive pushes that edit the same lines land.
 A baseline left behind such a commit (a chain that stopped earlier) catches up at the start of the
 next reconcile. The first push that fails a check stops the chain and the whole range is staged as
-`refs/ws/capy/<workflow>-main`. When the API does not list every push of the range, or a commit of it
-is missing from the store, the range is judged as one change by the pusher of the tip.
+`refs/ws/capy/<workflow>-main`, which is deleted once the mirror is settled again. When the API does
+not list every push of the range, or a commit of it is missing from the store, the range is judged as
+one change by the pusher of the tip.
 
 A `pr_merge` step also carries approvals (`mirrorPullReview` in `sync.go`). The lander finds the pull
 request whose merge commit is the step's commit, then takes the reviewers whose latest decisive review

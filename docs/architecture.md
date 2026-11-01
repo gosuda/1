@@ -261,7 +261,7 @@ Inbound handling outcomes:
 
 - **Landed**: The trunk contains the mirror change. The next pass finds the trees in agreement and advances the baseline.
 - **Already contained**: The trunk already holds the change. The export proceeds.
-- **Staged**: The import is published as `refs/ws/capy/<wf>-main` on `gosuda/1` for a member to land. Export for that workflow waits.
+- **Staged**: The import is published as `refs/ws/capy/<wf>-main` on `gosuda/1` for a member to land. Export for that workflow waits. The lander deletes the staged ref once the mirror is settled again (the trunk holds the mirror state), whichever way the change reached the trunk.
 - **Deferred**: The pusher is not visible in the activity API yet. The next cycle retries.
 
 Changes to mirrors that are not invertible are always staged (Section 4.5).

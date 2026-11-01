@@ -311,6 +311,9 @@ func TestInboundFromNonOwnerIsStagedAndBlocksExport(t *testing.T) {
 	if !e.trunkHas("P/b.go") || !e.mirrorHas("b.go") || !strings.Contains(e.mirrorFile("a.go"), "a=2") {
 		t.Fatal("member landing of the staged change did not converge both sides")
 	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("the staged change must be dropped once the mirror is settled, got %v", refs)
+	}
 }
 
 func TestMirrorPullRequestsAreStagedAndPrunedWhenClosed(t *testing.T) {

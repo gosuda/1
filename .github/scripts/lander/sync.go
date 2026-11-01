@@ -247,6 +247,11 @@ func (l *Lander) reconcile(ctx context.Context, wf capy.Workflow) (settled bool,
 				if cerr := l.closeLandedPulls(ctx, wf); cerr != nil {
 					l.Log.Warn("closing landed mirror pull requests failed", "workflow", wf.Name, "err", cerr)
 				}
+				// The trunk holds every mirror change now, so a staged inbound change is obsolete,
+				// whether it landed through the staged ref or later through the automatic path.
+				if derr := l.dropStaged(ctx, wf.Name+"-main"); derr != nil {
+					l.Log.Warn("dropping the staged inbound change failed", "workflow", wf.Name, "err", derr)
+				}
 			}
 			if err == nil {
 				err = l.stagePulls(ctx, wf)
@@ -817,7 +822,8 @@ func (l *Lander) stagePulls(ctx context.Context, wf capy.Workflow) error {
 	return errors.Join(errs...)
 }
 
-// dropStaged deletes a staged reference that no longer describes the mirror pull request.
+// dropStaged deletes a staged reference that no longer describes the mirror pull request or, for
+// <workflow>-main, the mirror state.
 func (l *Lander) dropStaged(ctx context.Context, name string) error {
 	if l.DryRun {
 		return nil
