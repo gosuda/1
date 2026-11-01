@@ -1,0 +1,23 @@
+[
+  {
+    "date": "2026-09-12",
+    "macrostructure": "Stat-Led",
+    "theme": "Cobalt",
+    "enrichment": "none",
+    "brief": "I2P reseed service dashboard — archive download, signer cert install instructions, keyspace coverage"
+  },
+  {
+    "date": "2026-09-06",
+    "macrostructure": "Bento Grid",
+    "theme": "Grid",
+    "enrichment": "none",
+    "brief": "Readiness and service-first router console; explicit collection failures and progressive diagnostics"
+  },
+  {
+    "date": "2026-08-27",
+    "macrostructure": "Bento Grid",
+    "theme": "Grid",
+    "enrichment": "none",
+    "brief": "IVNP embedded I2P router operations console"
+  }
+]
