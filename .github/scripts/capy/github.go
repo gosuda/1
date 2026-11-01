@@ -322,6 +322,23 @@ func (g *GitHub) ApproversForTip(ctx context.Context, repo string, head string, 
 	return out, nil
 }
 
+// OrgAdmin reports whether login is an active admin of org (GET /orgs/{org}/memberships/{login},
+// members:read). Only a 404 means "not a member"; every other failure is returned.
+func (g *GitHub) OrgAdmin(ctx context.Context, org string, login string) (bool, error) {
+	var m struct {
+		State string `json:"state"`
+		Role  string `json:"role"`
+	}
+	if err := g.getJSON(ctx, fmt.Sprintf("/orgs/%s/memberships/%s", url.PathEscape(org), url.PathEscape(login)), &m); err != nil {
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	return m.State == "active" && m.Role == "admin", nil
+}
+
 // TeamResolver returns a resolver backed by the organization team membership API with
 // per-resolver caching. Entries are "org/slug".
 func (g *GitHub) TeamResolver(ctx context.Context) TeamResolver {

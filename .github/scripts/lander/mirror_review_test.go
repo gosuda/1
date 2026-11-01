@@ -126,6 +126,34 @@ func TestMirrorPullRequestsWithoutAValidApprovalAreStagedUnderRequireReview(t *t
 	}
 }
 
+// An organization admin's unapproved change on the mirror lands under `set require-review`, even when
+// the admin is not on the OWNERS list, as GitHub's admin ruleset bypass let it in. The landed commit
+// records the bypass.
+func TestOrgAdminMirrorPushBypassesOwnersApprovals(t *testing.T) {
+	e := newEnv(t)
+	base := e.requireReviewOnP()
+	_, merge := e.mirrorPull(31, base, map[string]string{"c.go": "package p\n// c\n"}, nil)
+	e.forge.chains = map[string][]capy.RefPush{"gosuda/p|refs/heads/main": {
+		{Push: capy.Push{Actor: "boss"}, Before: base, After: merge},
+	}}
+	e.forge.admins = map[string]bool{"boss": true}
+
+	e.cycle()
+
+	if !e.trunkHas("P/c.go") {
+		t.Fatalf("the admin push did not land: %v", e.userRefs("refs/ws/capy/"))
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("nothing needs staging, got %v", refs)
+	}
+	msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/history")
+	for _, want := range []string{"Suda-Requester: boss", "Suda-Review-Bypass: boss"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("landed history lacks %q:\n%s", want, msg)
+		}
+	}
+}
+
 // Without `set require-review`, an owner's merge needs no approval, and a merge by a non-owner lands
 // on an owner's approval of the merged head.
 func TestOwnerApprovalOfAMirrorPullRequestCarriesANonOwnerMerge(t *testing.T) {

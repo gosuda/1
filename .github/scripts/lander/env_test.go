@@ -92,6 +92,7 @@ type fakeForge struct {
 	mergedFor map[string]capy.MergedPull  // repo|merge sha -> merged pull request
 	pullOK    map[string][]capy.Approval  // repo#number -> approvals of that pull request
 	teams     map[string]map[string]bool
+	admins    map[string]bool // organization admins
 	statuses  []string
 	pulls     map[string][]PullRequest
 	merged    map[string][]MergedPull
@@ -146,6 +147,9 @@ func (f *fakeForge) PullApprovals(_ context.Context, repo string, number int) ([
 }
 func (f *fakeForge) TeamResolver(context.Context) capy.TeamResolver {
 	return func(team, login string) (bool, error) { return f.teams[team][login], nil }
+}
+func (f *fakeForge) OrgAdmin(_ context.Context, login string) (bool, error) {
+	return f.admins[login], nil
 }
 func (f *fakeForge) SetStatus(_ context.Context, repo, sha string, st Status) error {
 	f.mu.Lock()

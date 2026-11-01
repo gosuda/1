@@ -111,7 +111,7 @@ An owner approves the pull request on a commit. Every commit has a `Change-Id:` 
 also covers the same change after a clean rebase onto a newer trunk: `git ws-sync`, then `git ws-land` (or
 `git ws-pr` again for a new patchset). If the diff changes in any way, even in whitespace, ask for a new approval.
 `git ws-ps` lists the patchsets and `git ws-psdiff <a> <b>` compares two of them. Changes under `.github/`
-additionally require an owner other than yourself (`set require-review`).
+additionally require an owner other than yourself (`set require-review`), unless you are an organization admin.
 
 Optional helpers: `git ws-autosave start` backs up your uncommitted work to `gosuda/1` (readable by every
 member, so it follows the same rules as any commit) and `git ws-resume` restores it on another machine;

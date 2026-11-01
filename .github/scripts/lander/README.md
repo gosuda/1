@@ -69,12 +69,26 @@ workable for projects that merge on the mirror: another owner's approval on the 
 lands the merge. A failed pull-request lookup counts as no approval. The landed commit records
 `Suda-Mirror-Pull: <repo>#<N>`.
 
+## Organization admin bypass
+
+A requester who is an active admin of the organization (`GET /orgs/{org}/memberships/{login}`,
+`role: admin`, `state: active`, members:read) bypasses `OWNERS` approvals, matching the
+`OrganizationAdmin` bypass of GitHub rulesets. The lander first runs `CheckOwners` normally and asks
+for the role only when that fails. For an admin it re-runs the check with `Identity.Admin`, which
+accepts every path whose `OWNERS` chain is not empty, including `set noparent` and
+`set require-review` chains the admin is not on. A path with no `OWNERS` entry, visibility, `go.mod`,
+and presubmit still reject. The bypass applies to workspace landings, merged review pull requests,
+and inbound mirror pushes alike. The landed commit records `Suda-Review-Bypass: <login>`, and the log
+has an `organization admin bypassed OWNERS` warning with the waived violations. A failed role lookup
+fails the landing attempt and is retried.
+
 ## Security properties
 
 - The lander never executes repository code. Presubmit prepares sources in the lander process and
   runs tests in containers with `--network none`, a read-only root, no credentials and no host env.
 - Authorization comes only from GitHub-authenticated identities (activity API pusher, PR approvals
-  bound to the exact tip or to a patch-identical patchset of the same change, org team membership).
+  bound to the exact tip or to a patch-identical patchset of the same change, org team membership,
+  org admin role).
   Commit author and trailers are informational: a `Change-Id` only selects which pull requests are
   consulted, never what is approved.
 - Installation tokens are minted per repository and operation with narrowed permissions.

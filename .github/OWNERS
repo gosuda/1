@@ -1,4 +1,5 @@
-# Control-plane code (landing pipeline, capy, lander, workflows) needs an owner other than the requester.
+# Control-plane code (landing pipeline, capy, lander, workflows) needs an owner other than the requester,
+# unless the requester is an organization admin (AGENTS.md 2.1, rule 6).
 set require-review
 @lemon-mint
 @gosunuts
