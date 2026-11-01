@@ -88,6 +88,9 @@ type Push struct {
 type RefPush struct {
 	Push
 	Before, After string
+	// PRMerge marks a pull request merged through the web UI (activity type pr_merge); After is then
+	// the merge commit of that pull request.
+	PRMerge bool
 }
 
 // refPushes lists the recent updates of ref that set it to a commit, newest first. A merge of a pull
@@ -115,9 +118,10 @@ func (g *GitHub) refPushes(ctx context.Context, repo, ref string) ([]RefPush, er
 		switch it.Type {
 		case "push", "force_push", "branch_creation", "pr_merge":
 			out = append(out, RefPush{
-				Push:   Push{Actor: strings.ToLower(it.Actor.Login), Time: it.Timestamp},
-				Before: it.Before,
-				After:  it.After,
+				Push:    Push{Actor: strings.ToLower(it.Actor.Login), Time: it.Timestamp},
+				Before:  it.Before,
+				After:   it.After,
+				PRMerge: it.Type == "pr_merge",
 			})
 		}
 	}
@@ -199,47 +203,107 @@ func (g *GitHub) ReviewApprovals(ctx context.Context, repo string, head string) 
 		return ReviewState{}, err
 	}
 	slices.SortFunc(prs, func(a, b pull) int { return a.Number - b.Number })
-	type decision struct {
-		state, commit string
-	}
 	var rs ReviewState
-	latest := map[string]decision{}
-	var order []string
+	d := newDecisions()
 	for _, pr := range prs {
 		rs.Pull = max(rs.Pull, pr.Number)
-		for page := 1; ; page++ {
-			var reviews []struct {
-				User *struct {
-					Login string `json:"login"`
-				} `json:"user"`
-				State  string `json:"state"`
-				Commit string `json:"commit_id"`
-			}
-			p := fmt.Sprintf("/repos/%s/pulls/%d/reviews?per_page=100&page=%d", repo, pr.Number, page)
-			if err := g.getJSON(ctx, p, &reviews); err != nil {
-				return ReviewState{}, err
-			}
-			for _, r := range reviews {
-				if r.User == nil || r.State == "COMMENTED" || r.State == "PENDING" {
-					continue
-				}
-				login := strings.ToLower(r.User.Login)
-				if _, seen := latest[login]; !seen {
-					order = append(order, login)
-				}
-				latest[login] = decision{state: r.State, commit: r.Commit}
-			}
-			if len(reviews) < 100 {
-				break
-			}
+		if err := g.readDecisions(ctx, repo, pr.Number, d); err != nil {
+			return ReviewState{}, err
 		}
 	}
-	for _, login := range order {
-		if d := latest[login]; d.state == "APPROVED" && d.commit != "" {
-			rs.Approvals = append(rs.Approvals, Approval{Login: login, Commit: d.commit})
-		}
-	}
+	rs.Approvals = d.approvals()
 	return rs, nil
+}
+
+// PullApprovals returns every reviewer of one pull request whose latest decisive review is APPROVED,
+// with the commit that approval is bound to.
+func (g *GitHub) PullApprovals(ctx context.Context, repo string, number int) ([]Approval, error) {
+	d := newDecisions()
+	if err := g.readDecisions(ctx, repo, number, d); err != nil {
+		return nil, err
+	}
+	return d.approvals(), nil
+}
+
+// MergedPull is a pull request that GitHub merged, and the head commit it merged.
+type MergedPull struct {
+	Number int
+	Head   string
+}
+
+// MergedPullForCommit returns the pull request whose merge produced mergeSHA, the commit a pr_merge
+// activity set the branch to. ok is false when no merged pull request has that merge commit.
+func (g *GitHub) MergedPullForCommit(ctx context.Context, repo, mergeSHA string) (pr MergedPull, ok bool, err error) {
+	var items []struct {
+		Number   int     `json:"number"`
+		MergedAt *string `json:"merged_at"`
+		MergeSHA string  `json:"merge_commit_sha"`
+		Head     struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	if err := g.getJSON(ctx, "/repos/"+repo+"/commits/"+url.PathEscape(mergeSHA)+"/pulls", &items); err != nil {
+		return MergedPull{}, false, err
+	}
+	for _, it := range items {
+		if it.MergedAt != nil && it.MergeSHA == mergeSHA && it.Head.SHA != "" {
+			return MergedPull{Number: it.Number, Head: it.Head.SHA}, true, nil
+		}
+	}
+	return MergedPull{}, false, nil
+}
+
+// decisions keeps the latest decisive review of each reviewer, in order of first review.
+type decisions struct {
+	latest map[string]decision
+	order  []string
+}
+
+type decision struct {
+	state, commit string
+}
+
+func newDecisions() *decisions { return &decisions{latest: map[string]decision{}} }
+
+// readDecisions applies the reviews of one pull request, oldest first. COMMENTED and PENDING reviews
+// decide nothing; DISMISSED and CHANGES_REQUESTED supersede an earlier approval.
+func (g *GitHub) readDecisions(ctx context.Context, repo string, number int, d *decisions) error {
+	for page := 1; ; page++ {
+		var reviews []struct {
+			User *struct {
+				Login string `json:"login"`
+			} `json:"user"`
+			State  string `json:"state"`
+			Commit string `json:"commit_id"`
+		}
+		p := fmt.Sprintf("/repos/%s/pulls/%d/reviews?per_page=100&page=%d", repo, number, page)
+		if err := g.getJSON(ctx, p, &reviews); err != nil {
+			return err
+		}
+		for _, r := range reviews {
+			if r.User == nil || r.State == "COMMENTED" || r.State == "PENDING" {
+				continue
+			}
+			login := strings.ToLower(r.User.Login)
+			if _, seen := d.latest[login]; !seen {
+				d.order = append(d.order, login)
+			}
+			d.latest[login] = decision{state: r.State, commit: r.Commit}
+		}
+		if len(reviews) < 100 {
+			return nil
+		}
+	}
+}
+
+func (d *decisions) approvals() []Approval {
+	var out []Approval
+	for _, login := range d.order {
+		if dec := d.latest[login]; dec.state == "APPROVED" && dec.commit != "" {
+			out = append(out, Approval{Login: login, Commit: dec.commit})
+		}
+	}
+	return out
 }
 
 // ApproversForTip returns reviewers whose latest decisive review on a pull request from

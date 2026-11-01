@@ -116,6 +116,16 @@ func (f *GitHubForge) ReviewApprovals(ctx context.Context, repo, head string) (c
 	return f.client(repo, permPulls).ReviewApprovals(ctx, repo, head)
 }
 
+// MergedPullForCommit implements Forge through the commit pulls API (pull_requests:read).
+func (f *GitHubForge) MergedPullForCommit(ctx context.Context, repo, mergeSHA string) (capy.MergedPull, bool, error) {
+	return f.client(repo, permPulls).MergedPullForCommit(ctx, repo, mergeSHA)
+}
+
+// PullApprovals implements Forge through the reviews API (pull_requests:read).
+func (f *GitHubForge) PullApprovals(ctx context.Context, repo string, number int) ([]capy.Approval, error) {
+	return f.client(repo, permPulls).PullApprovals(ctx, repo, number)
+}
+
 // TeamResolver implements Forge through organization membership (members:read). The token is minted
 // on defaultRepo because organization permissions apply through any repository of the installation.
 func (f *GitHubForge) TeamResolver(ctx context.Context) capy.TeamResolver {

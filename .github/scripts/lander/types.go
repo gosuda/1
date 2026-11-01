@@ -46,6 +46,12 @@ type Forge interface {
 	// commit that approval is bound to (pull_requests:read). Whether an approval of another commit
 	// still counts is the lander's decision (see patchset.go), not the forge's.
 	ReviewApprovals(ctx context.Context, repo, head string) (capy.ReviewState, error)
+	// MergedPullForCommit returns the pull request of repo whose merge commit is mergeSHA and the
+	// head it merged; ok is false when there is none (pull_requests:read).
+	MergedPullForCommit(ctx context.Context, repo, mergeSHA string) (pr capy.MergedPull, ok bool, err error)
+	// PullApprovals returns the reviewers of pull request number of repo whose latest decisive review
+	// approves, with the commit each approval is bound to (pull_requests:read).
+	PullApprovals(ctx context.Context, repo string, number int) ([]capy.Approval, error)
 	TeamResolver(ctx context.Context) capy.TeamResolver
 	SetStatus(ctx context.Context, repo, sha string, st Status) error
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)

@@ -391,6 +391,10 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 		if err != nil {
 			return inboundPending, err
 		}
+		if pull, approvers := l.mirrorPullApprovals(ctx, wf, st); pull > 0 {
+			req.Approvers = approvers
+			req.ExtraTrailers = append(req.ExtraTrailers, fmt.Sprintf("Suda-Mirror-Pull: %s#%d", wf.DestinationRepo, pull))
+		}
 		res, err := l.Land(ctx, req)
 		if err != nil {
 			return inboundPending, err
@@ -416,10 +420,58 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 }
 
 // inboundStep is one mirror commit to land and the authenticated push that set the branch to it.
-// An empty push.Actor means the pusher is not visible (yet).
+// An empty push.Actor means the pusher is not visible (yet). before is the commit the push moved the
+// branch from and prMerge marks a pull request merged on GitHub; both are known only from a push
+// chain.
 type inboundStep struct {
-	commit string
-	push   capy.Push
+	commit  string
+	push    capy.Push
+	before  string
+	prMerge bool
+}
+
+// mirrorPullApprovals returns, for a step that merged a pull request on the mirror, the pull request
+// number and the reviewers whose approval counts for it: their latest decisive review on that pull
+// request approves exactly the head that was merged, and the push changes the branch exactly as the
+// reviewed head changes its merge base with the branch (the same patch-id test as for patchsets),
+// so a merge that resolved conflicts or a squash that added content needs a member landing. Pull
+// request lookups that fail count as no approval: the step is then judged by its merger alone.
+func (l *Lander) mirrorPullApprovals(ctx context.Context, wf capy.Workflow, st inboundStep) (pull int, approvers []string) {
+	if !st.prMerge || st.before == "" {
+		return 0, nil
+	}
+	pr, ok, err := l.Forge.MergedPullForCommit(ctx, wf.DestinationRepo, st.commit)
+	if err != nil {
+		l.Log.Warn("merged mirror pull request unavailable; judging the merger alone", "workflow", wf.Name, "commit", st.commit, "err", err)
+		return 0, nil
+	}
+	if !ok {
+		return 0, nil
+	}
+	approvals, err := l.Forge.PullApprovals(ctx, wf.DestinationRepo, pr.Number)
+	if err != nil {
+		l.Log.Warn("mirror pull request approvals unavailable; judging the merger alone", "workflow", wf.Name, "pull", pr.Number, "err", err)
+		return pr.Number, nil
+	}
+	var onHead []string
+	for _, a := range approvals {
+		if a.Commit == pr.Head {
+			onHead = append(onHead, a.Login)
+		}
+	}
+	if len(onHead) == 0 {
+		return pr.Number, nil
+	}
+	base, err := l.Store.Git(ctx, "merge-base", pr.Head, st.before)
+	if err != nil {
+		l.Log.Warn("reviewed head of the mirror pull request is not in the store; its approvals do not count", "workflow", wf.Name, "pull", pr.Number, "head", pr.Head)
+		return pr.Number, nil
+	}
+	if !newPatchCache(l.Store).sameRange(ctx, strings.TrimSpace(base), pr.Head, st.before, st.commit) {
+		l.Log.Info("mirror merge differs from the reviewed head; its approvals do not count", "workflow", wf.Name, "pull", pr.Number, "head", pr.Head, "merge", st.commit)
+		return pr.Number, nil
+	}
+	return pr.Number, onHead
 }
 
 // inboundSteps splits the mirror's progress since the baseline into the pushes that made it, oldest
@@ -439,7 +491,7 @@ func (l *Lander) inboundSteps(ctx context.Context, wf capy.Workflow, base capy.S
 				steps = nil
 				break
 			}
-			steps = append(steps, inboundStep{commit: p.After, push: p.Push})
+			steps = append(steps, inboundStep{commit: p.After, push: p.Push, before: p.Before, prMerge: p.PRMerge})
 		}
 		if steps != nil {
 			return steps, nil

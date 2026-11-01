@@ -60,6 +60,15 @@ The first push that fails a check stops the chain and the whole range is staged 
 `refs/ws/capy/<workflow>-main`. When the API does not list every push of the range, or a commit of it
 is missing from the store, the range is judged as one change by the pusher of the tip.
 
+A `pr_merge` step also carries approvals (`mirrorPullApprovals` in `sync.go`). The lander finds the pull
+request whose merge commit is the step's commit, then takes the reviewers whose latest decisive review
+approves exactly its head (fetched from `refs/pull/*/head`). The approvals count only when
+`git patch-id --verbatim` of `before..merge` equals that of `merge-base(head, before)..head`, so a merge
+that resolved conflicts or added content is judged by its merger alone. This makes `set require-review`
+workable for projects that merge on the mirror: another owner's approval on the mirror pull request
+lands the merge. A failed pull-request lookup counts as no approval. The landed commit records
+`Suda-Mirror-Pull: <repo>#<N>`.
+
 ## Security properties
 
 - The lander never executes repository code. Presubmit prepares sources in the lander process and

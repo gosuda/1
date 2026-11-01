@@ -49,19 +49,19 @@ func ChangeID(msg string) string {
 	return id
 }
 
-// patchCache computes and remembers, for the commits of one landing request, the patch each
-// makes to its own root snapshot.
+// patchCache computes and remembers patches between commits of the store: for workspace commits
+// the patch each makes to its own root snapshot, for mirror pushes the patch between two states.
 type patchCache struct {
 	s     *Store
-	paths map[string]string // commit -> changed paths with status
-	ids   map[string]string // commit -> patch id
+	paths map[string]string // "from..to" -> changed paths with status
+	ids   map[string]string // "from..to" -> patch id
 }
 
 func newPatchCache(s *Store) *patchCache {
 	return &patchCache{s: s, paths: map[string]string{}, ids: map[string]string{}}
 }
 
-var errNoPatch = errors.New("commit makes no change to its root snapshot")
+var errNoPatch = errors.New("the range makes no change")
 
 // root returns the single parentless commit below commit: the trunk snapshot a workspace was
 // started from.
@@ -79,39 +79,33 @@ func (p *patchCache) root(ctx context.Context, commit string) (string, error) {
 	return "", fmt.Errorf("commit %s has %d root commits, want 1", commit, len(strings.Fields(roots)))
 }
 
-// changed lists the paths a commit changes against its root with their status, a cheap necessary
-// condition for two commits to carry the same patch.
-func (p *patchCache) changed(ctx context.Context, commit string) (string, error) {
-	if v, ok := p.paths[commit]; ok {
+// changed lists the paths that change from one commit to another with their status, a cheap
+// necessary condition for two ranges to carry the same patch.
+func (p *patchCache) changed(ctx context.Context, from, to string) (string, error) {
+	key := from + ".." + to
+	if v, ok := p.paths[key]; ok {
 		return v, nil
 	}
-	root, err := p.root(ctx, commit)
+	out, err := p.s.Git(ctx, "diff-tree", "-r", "--name-status", "--no-renames", "--no-ext-diff", from, to)
 	if err != nil {
 		return "", err
 	}
-	out, err := p.s.Git(ctx, "diff-tree", "-r", "--name-status", "--no-renames", "--no-ext-diff", root, commit)
-	if err != nil {
-		return "", err
-	}
-	p.paths[commit] = out
+	p.paths[key] = out
 	return out, nil
 }
 
-// id returns the patch id of a commit's change to its root: git patch-id --verbatim over the full
-// binary diff. Verbatim keeps whitespace significant (a whitespace edit is a different patch);
-// hunk line numbers and blob ids are ignored, so a clean rebase onto a newer snapshot keeps the
+// id returns the patch id of the change from one commit to another: git patch-id --verbatim over
+// the full binary diff. Verbatim keeps whitespace significant (a whitespace edit is a different
+// patch); hunk line numbers and blob ids are ignored, so a clean rebase onto a newer base keeps the
 // id while file names, modes, content, and binary payloads all take part in it.
-func (p *patchCache) id(ctx context.Context, commit string) (string, error) {
-	if v, ok := p.ids[commit]; ok {
+func (p *patchCache) id(ctx context.Context, from, to string) (string, error) {
+	key := from + ".." + to
+	if v, ok := p.ids[key]; ok {
 		return v, nil
-	}
-	root, err := p.root(ctx, commit)
-	if err != nil {
-		return "", err
 	}
 	// Plumbing never runs external diff drivers or textconv filters; both are also disabled
 	// explicitly because the lander must never execute repository-controlled commands.
-	diff, err := p.s.Git(ctx, "diff-tree", "-p", "--binary", "--no-renames", "--no-ext-diff", "--no-textconv", root, commit)
+	diff, err := p.s.Git(ctx, "diff-tree", "-p", "--binary", "--no-renames", "--no-ext-diff", "--no-textconv", from, to)
 	if err != nil {
 		return "", err
 	}
@@ -123,26 +117,39 @@ func (p *patchCache) id(ctx context.Context, commit string) (string, error) {
 	if id == "" {
 		return "", errNoPatch
 	}
-	p.ids[commit] = id
+	p.ids[key] = id
 	return id, nil
 }
 
-// same reports whether a and b make the same patch to their own roots.
-func (p *patchCache) same(ctx context.Context, a, b string) bool {
-	pa, err := p.changed(ctx, a)
+// sameRange reports whether aFrom..aTo and bFrom..bTo make the same, non-empty patch.
+func (p *patchCache) sameRange(ctx context.Context, aFrom, aTo, bFrom, bTo string) bool {
+	pa, err := p.changed(ctx, aFrom, aTo)
 	if err != nil {
 		return false
 	}
-	pb, err := p.changed(ctx, b)
+	pb, err := p.changed(ctx, bFrom, bTo)
 	if err != nil || pa != pb {
 		return false
 	}
-	ia, err := p.id(ctx, a)
+	ia, err := p.id(ctx, aFrom, aTo)
 	if err != nil {
 		return false
 	}
-	ib, err := p.id(ctx, b)
+	ib, err := p.id(ctx, bFrom, bTo)
 	return err == nil && ia == ib
+}
+
+// same reports whether workspace commits a and b make the same patch to their own roots.
+func (p *patchCache) same(ctx context.Context, a, b string) bool {
+	ra, err := p.root(ctx, a)
+	if err != nil {
+		return false
+	}
+	rb, err := p.root(ctx, b)
+	if err != nil {
+		return false
+	}
+	return p.sameRange(ctx, ra, a, rb, b)
 }
 
 // reviewHeads returns the review branch ids whose pull requests can approve tip of landing

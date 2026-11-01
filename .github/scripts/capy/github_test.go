@@ -137,6 +137,24 @@ func TestReviewApprovalsKeepsTheCommitEachApprovalIsBoundTo(t *testing.T) {
 	}
 }
 
+func TestMergedPullForCommitMatchesOnlyTheMergeThatProducedTheCommit(t *testing.T) {
+	gh := newFakeGitHub(t, map[string]string{
+		"/repos/gosuda/p/commits/mmm/pulls": `[
+			{"number":4,"merged_at":null,"merge_commit_sha":"mmm","head":{"sha":"open"}},
+			{"number":5,"merged_at":"2026-11-01T00:00:00Z","merge_commit_sha":"other","head":{"sha":"h5"}},
+			{"number":6,"merged_at":"2026-11-01T00:00:00Z","merge_commit_sha":"mmm","head":{"sha":"h6"}}]`,
+		"/repos/gosuda/p/commits/nnn/pulls": `[{"number":4,"merged_at":null,"merge_commit_sha":"nnn","head":{"sha":"open"}}]`,
+	})
+	ctx := context.Background()
+	pr, ok, err := gh.MergedPullForCommit(ctx, "gosuda/p", "mmm")
+	if err != nil || !ok || pr != (capy.MergedPull{Number: 6, Head: "h6"}) {
+		t.Fatalf("MergedPullForCommit(mmm) = %+v, %v, %v; want #6 at h6", pr, ok, err)
+	}
+	if _, ok, err := gh.MergedPullForCommit(ctx, "gosuda/p", "nnn"); err != nil || ok {
+		t.Fatalf("an unmerged pull request must not match: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestTeamResolverTreatsOnly404AsNonMember(t *testing.T) {
 	gh := newFakeGitHub(t, map[string]string{
 		"/orgs/gosuda/teams/core/memberships/carol":   `{"state":"active"}`,
