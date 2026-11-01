@@ -1,0 +1,561 @@
+package utils
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base32"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.org/x/net/idna"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+)
+
+var (
+	errNameIsRequired                            = errors.New("name is required")
+	errNameIsInvalid                             = errors.New("name is invalid")
+	errNameMustSingleDNSLabel                    = errors.New("name must be a single dns label")
+	errNameMust63CharactersOrFewer               = errors.New("name must be 63 characters or fewer")
+	errNameMustNotStartOrEnd                     = errors.New("name must not start or end with hyphen")
+	errNameMustContainOnlyLettersNumbers         = errors.New("name must contain only letters, numbers, or hyphen")
+	errRelayURLIsEmpty                           = errors.New("relay url is empty")
+	errRelayURLIsInvalid                         = errors.New("relay url is invalid")
+	errRelayURLHostIsEmpty                       = errors.New("relay url host is empty")
+	errRelayURLMustNotIncludeCredentials         = errors.New("relay url must not include credentials")
+	errRelayURLHasInvalidPort                    = errors.New("relay url has an invalid port")
+	errRelayURLPortMustBetween1                  = errors.New("relay url port must be between 1 and 65535")
+	errRelayURLMustUseHTTPS                      = errors.New("relay url must use https")
+	errRootHostIsRequired                        = errors.New("root host is required")
+	errNameMustNotLookLikeCanonical              = errors.New("name must not look like a canonical hostname (40 hexadecimal characters, alone or after a hyphen)")
+	errHostnameDoesNotContainCanonicalLease      = errors.New("hostname does not contain a canonical lease address")
+	errAddressMustContain40HexadecimalCharacters = errors.New("address must contain 40 hexadecimal characters")
+	errTargetAddressIsRequired                   = errors.New("target address is required")
+	errTargetURLHostIsEmpty                      = errors.New("target url host is empty")
+	errTargetURLPathNotSupported                 = errors.New("target url path is not supported")
+	errTargetURLQueryNotSupported                = errors.New("target url query is not supported")
+	errTargetURLFragmentNotSupported             = errors.New("target url fragment is not supported")
+)
+
+func SplitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func TrimHexPrefix(raw string) string {
+	hasHexPrefix := len(raw) >= 2 && raw[0] == '0'
+	if hasHexPrefix && (raw[1] == 'x' || raw[1] == 'X') {
+		return raw[2:]
+	}
+	return raw
+}
+
+func NormalizeDNSLabel(raw string) (string, error) {
+	label := sanitizeDNSLabelInput(raw)
+	if label == "" {
+		return "", errNameIsRequired
+	}
+
+	if !isPlainDNSLabel(label) {
+		ascii, err := idna.Lookup.ToASCII(label)
+		if err != nil {
+			return "", errNameIsInvalid
+		}
+		label = NormalizeHostname(ascii)
+	}
+	if strings.Contains(label, ".") {
+		return "", errNameMustSingleDNSLabel
+	}
+	if len(label) > 63 {
+		return "", errNameMust63CharactersOrFewer
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return "", errNameMustNotStartOrEnd
+	}
+	for _, r := range label {
+		validRune := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
+		if validRune {
+			continue
+		}
+		return "", errNameMustContainOnlyLettersNumbers
+	}
+	return label, nil
+}
+
+func sanitizeDNSLabelInput(raw string) string {
+	input := strings.TrimSpace(strings.ToLower(raw))
+	if input == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(input))
+	previousHyphen := false
+
+	for _, r := range input {
+		if r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			previousHyphen = false
+			continue
+		}
+		if previousHyphen {
+			continue
+		}
+		b.WriteByte('-')
+		previousHyphen = true
+	}
+
+	return strings.Trim(b.String(), "-")
+}
+
+func isPlainDNSLabel(label string) bool {
+	for _, r := range label {
+		validRune := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
+		if validRune {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func NormalizeRelayURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errRelayURLIsEmpty
+	}
+	if !strings.Contains(trimmed, "://") {
+		trimmed = "https://" + strings.TrimPrefix(trimmed, "//")
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", errRelayURLIsInvalid
+	}
+	if parsed.Host == "" && parsed.Path != "" && !strings.Contains(parsed.Path, "/") {
+		parsed, err = url.Parse("https://" + strings.TrimSpace(parsed.Path))
+		if err != nil {
+			return "", errRelayURLIsInvalid
+		}
+	}
+	if parsed.Host == "" {
+		return "", errRelayURLHostIsEmpty
+	}
+	if parsed.User != nil {
+		return "", errRelayURLMustNotIncludeCredentials
+	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return "", errRelayURLHasInvalidPort
+	}
+	if port := parsed.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", errRelayURLPortMustBetween1
+		}
+	}
+	if strings.EqualFold(parsed.Scheme, "http") && IsLocalRelayHost(parsed.Hostname()) {
+		parsed.Scheme = "https"
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return "", errRelayURLMustUseHTTPS
+	}
+
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(strings.ToLower(parsed.Path), "/relay") {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/relay")
+	}
+	return parsed.String(), nil
+}
+
+func PortalRootHost(portalURL string) string {
+	u, err := url.Parse(strings.TrimSpace(portalURL))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return NormalizeHostname(u.Hostname())
+}
+
+func NormalizeHostname(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	host = strings.TrimSuffix(host, ".")
+	return host
+}
+
+// NormalizeHostWithoutPort normalizes a hostname and drops its port, if any.
+func NormalizeHostWithoutPort(hostname string) string {
+	hostname = strings.TrimSpace(hostname)
+	if host, _, err := net.SplitHostPort(hostname); err == nil {
+		hostname = host
+	}
+	return NormalizeHostname(hostname)
+}
+
+func NormalizeBaseDomain(domain string) string {
+	return strings.TrimPrefix(NormalizeHostname(domain), "*.")
+}
+
+func DomainCandidates(domain string) []string {
+	normalized := NormalizeHostname(domain)
+	parts := strings.Split(normalized, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	candidates := make([]string, 0, len(parts)-1)
+	for i := range len(parts) - 1 {
+		candidates = append(candidates, strings.Join(parts[i:], "."))
+	}
+	return candidates
+}
+
+func HostnameMatchesBaseDomain(hostname, baseDomain string) bool {
+	hostname = NormalizeHostname(hostname)
+	baseDomain = NormalizeBaseDomain(baseDomain)
+	if hostname == "" || baseDomain == "" {
+		return false
+	}
+	return hostname == baseDomain || strings.HasSuffix(hostname, "."+baseDomain)
+}
+
+func HostnameMatchesPattern(pattern, hostname string) bool {
+	pattern = NormalizeHostname(pattern)
+	hostname = NormalizeHostname(hostname)
+	if pattern == "" || hostname == "" {
+		return false
+	}
+	if pattern == hostname {
+		return true
+	}
+	if !strings.HasPrefix(pattern, "*.") {
+		return false
+	}
+	suffix := strings.TrimPrefix(pattern, "*.")
+	if !strings.Contains(suffix, ".") {
+		return false
+	}
+	_, rest, ok := strings.Cut(hostname, ".")
+	return ok && rest == suffix
+}
+
+func NormalizeChildHostnames(inputs []string, baseDomain string) []string {
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	baseDomain = NormalizeBaseDomain(baseDomain)
+	return normalizeUniqueStrings(inputs, func(input string) string {
+		hostname := NormalizeHostname(input)
+		if hostname == "" || hostname == baseDomain || !HostnameMatchesBaseDomain(hostname, baseDomain) {
+			return ""
+		}
+		return hostname
+	})
+}
+
+func NormalizeURLPath(raw string) string {
+	clean := path.Clean(strings.TrimSpace(raw))
+	if clean == "." || clean == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	// Prevent scheme-relative or otherwise ambiguous paths like "//example" or "/\example".
+	if len(clean) > 1 && (clean[1] == '/' || clean[1] == '\\') {
+		clean = "/"
+	}
+	if clean != "/" {
+		clean = strings.TrimSuffix(clean, "/")
+	}
+	return clean
+}
+
+func NormalizeRelayURLs(inputs ...string) ([]string, error) {
+	out := make([]string, 0, len(inputs))
+
+	for _, input := range inputs {
+		for _, part := range SplitCSV(input) {
+			normalized, err := NormalizeRelayURL(part)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, normalized)
+		}
+	}
+
+	return normalizeUniqueStrings(out, strings.TrimSpace), nil
+}
+
+func RemoveRelayURL(inputs []string, target string) []string {
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return append([]string(nil), inputs...)
+	}
+
+	filtered := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		input = strings.TrimSpace(input)
+		if input == "" || input == target {
+			continue
+		}
+		filtered = append(filtered, input)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
+func LeaseHostname(name, rootHost string) (string, error) {
+	label, err := NormalizeDNSLabel(name)
+	if err != nil {
+		return "", err
+	}
+	rootHost = NormalizeHostname(rootHost)
+	if rootHost == "" {
+		return "", errRootHostIsRequired
+	}
+	if ip := net.ParseIP(rootHost); ip != nil && ip.IsLoopback() {
+		rootHost = "localhost"
+	}
+	return label + "." + rootHost, nil
+}
+
+// NormalizeServiceName normalizes a service name to a DNS label that cannot
+// be mistaken for a canonical label, so a friendly hostname never collides
+// with an identity-bound one.
+func NormalizeServiceName(raw string) (string, error) {
+	label, err := NormalizeDNSLabel(raw)
+	if err != nil {
+		return "", err
+	}
+	if hasCanonicalShape(label) {
+		return "", errNameMustNotLookLikeCanonical
+	}
+	return label, nil
+}
+
+// ExtractCanonicalHostnameAddress extracts the 40-character hexadecimal EVM
+// address embedded in the first DNS label of a canonical Portal lease hostname
+// (<address>.<root>, <name>-<address>.<root>, or <hash>--<address>.<root>) and
+// returns it with a lowercase 0x prefix.
+func ExtractCanonicalHostnameAddress(hostname string) (string, error) {
+	label, rest, ok := strings.Cut(NormalizeHostWithoutPort(hostname), ".")
+	if !ok || label == "" || rest == "" || !hasCanonicalShape(label) {
+		return "", errHostnameDoesNotContainCanonicalLease
+	}
+	address := label[len(label)-40:]
+	return "0x" + strings.ToLower(address), nil
+}
+
+// hasCanonicalShape reports whether label is shaped like a canonical label:
+// a 40-character hex address, alone or after a hyphen.
+func hasCanonicalShape(label string) bool {
+	if isHexAddress(label) {
+		return true
+	}
+	prefix, address, ok := strings.Cut(label[max(len(label)-41, 0):], "-")
+	return ok && prefix == "" && isHexAddress(address)
+}
+
+func isHexAddress(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// canonicalNameHash returns the name part of a long name's canonical label.
+func canonicalNameHash(label string) string {
+	h := sha256.New()
+	h.Write([]byte(types.CanonicalLeaseNameHashDomain))
+	h.Write([]byte{0, byte(len(label))})
+	h.Write([]byte(label))
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(h.Sum(nil))
+	return strings.ToLower(encoded[:types.CanonicalLeaseNameHashLength])
+}
+
+// CanonicalLeaseHostname returns the identity-bound hostname for a lease.
+// The full 20-byte EVM address is encoded as lowercase hexadecimal so the
+// hostname cannot move between authenticated identities. When name is empty,
+// it returns an address-only canonical hostname. See
+// types.CanonicalLeaseNameMaxLength for how a name enters the label.
+func CanonicalLeaseHostname(name, address, rootHost string) (string, error) {
+	name = strings.TrimSpace(name)
+	address = strings.ToLower(TrimHexPrefix(strings.TrimSpace(address)))
+	if len(address) != 40 {
+		return "", errAddressMustContain40HexadecimalCharacters
+	}
+	if _, err := hex.DecodeString(address); err != nil {
+		return "", errAddressMustContain40HexadecimalCharacters
+	}
+	if name == "" {
+		return LeaseHostname(address, rootHost)
+	}
+	label, err := NormalizeServiceName(name)
+	if err != nil {
+		return "", err
+	}
+	if len(label) <= types.CanonicalLeaseNameMaxLength {
+		return LeaseHostname(label+"-"+address, rootHost)
+	}
+	return LeaseHostname(canonicalNameHash(label)+"--"+address, rootHost)
+}
+
+func NormalizeTargetAddr(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errTargetAddressIsRequired
+	}
+
+	if strings.Contains(raw, "://") {
+		targetURL, err := url.Parse(raw)
+		if err != nil {
+			return "", fmt.Errorf("parse target url: %w", err)
+		}
+		if !strings.EqualFold(targetURL.Scheme, "http") && !strings.EqualFold(targetURL.Scheme, "https") {
+			return "", fmt.Errorf("unsupported target url scheme %q", targetURL.Scheme)
+		}
+		if targetURL.Host == "" {
+			return "", errTargetURLHostIsEmpty
+		}
+		if targetURL.Path != "" && targetURL.Path != "/" {
+			return "", errTargetURLPathNotSupported
+		}
+		if targetURL.RawQuery != "" {
+			return "", errTargetURLQueryNotSupported
+		}
+		if targetURL.Fragment != "" {
+			return "", errTargetURLFragmentNotSupported
+		}
+		raw = targetURL.Host
+	}
+
+	if _, _, err := net.SplitHostPort(raw); err == nil {
+		return raw, nil
+	}
+	if strings.Count(raw, ":") == 0 && !strings.ContainsAny(raw, "[]") {
+		return net.JoinHostPort(raw, "80"), nil
+	}
+	host := raw
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return net.JoinHostPort(host, "80"), nil
+	}
+	return "", fmt.Errorf("invalid target address %q", raw)
+}
+
+func HostPortOrLoopback(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func EnsurePort(host string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, "443")
+}
+
+// IsLocalRelayHost identifies the existing local-development TLS trust exception.
+func IsLocalRelayHost(host string) bool {
+	host = NormalizeHostname(host)
+	switch host {
+	case "", "localhost":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.HasSuffix(host, ".localhost")
+}
+
+// IsLocalOnlyRelayHost rejects locally scoped destinations for public relay
+// discovery and overlay gateways. It must not widen local TLS trust.
+// Other non-public IP literals and resolved addresses still require IsPublicIP.
+func IsLocalOnlyRelayHost(host string) bool {
+	host = NormalizeHostname(host)
+	return IsLocalRelayHost(host) || strings.Contains(host, "%") || strings.HasSuffix(host, ".local")
+}
+
+func SleepOrDone(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func RandomID(prefix string) string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		panic(err)
+	}
+	return prefix + hex.EncodeToString(buf)
+}
+
+func normalizeUniqueStrings(inputs []string, normalize func(string) string) []string {
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(inputs))
+	seen := make(map[string]struct{}, len(inputs))
+	for _, input := range inputs {
+		normalized := normalize(input)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
