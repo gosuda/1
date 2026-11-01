@@ -1,0 +1,197 @@
+# Automatic runs are restricted to release-* tags on release(scope): commits.
+name: Gradle CI
+
+on:
+  push:
+    tags: ["release-*"]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/verify-release-gate.py
+      - uses: gradle/actions/wrapper-validation@v4
+
+  jvm-and-android:
+    needs: release-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: native/bridge/go.sum
+      - name: Install pinned Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - name: Common JVM and native adapter tests
+        run: ./gradlew :portal-sdk:testAndroidHostTest :portal-sdk:linuxX64Test --no-configuration-cache
+      - name: Publish Android SDK graph to isolated Maven repository
+        run: ./gradlew publishAndroidSdkToSampleRepository --no-configuration-cache
+      - name: Build debug and optimized Android Maven consumers
+        run: |
+          ./gradlew :samples:android:assembleDebug :samples:android:assembleRelease \
+            -Pportal.samples.repository="$GITHUB_WORKSPACE/build/sample-maven" --no-configuration-cache
+      - name: Verify both Android ABIs survived AAR and APK packaging
+        run: python3 scripts/verify-android-packaging.py
+
+  ios-compile:
+    needs: release-gate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: native/bridge/go.sum
+      - name: Record Apple toolchain and install XcodeGen
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+      - name: Test and stage all self-contained iOS variants
+        run: |
+          ./gradlew :portal-sdk:iosSimulatorArm64Test publishIosSdkToSampleRepository \
+            :portal-sdk:assemblePortalSDKReleaseXCFramework --no-configuration-cache
+          ./scripts/verify-ios-maven-consumer.sh "$GITHUB_WORKSPACE/build/sample-maven"
+      - name: Package and link clean SwiftPM consumers
+        run: |
+          ./scripts/package-ios-xcframework.sh
+          ./scripts/verify-ios-swift-package.sh
+      - name: Compile complete iOS sample
+        run: |
+          xcodegen generate --spec samples/ios/project.yml --project samples/ios
+          xcodebuild -project samples/ios/PortalSample.xcodeproj -scheme PortalSample \
+            -configuration Release -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PortalSDK-ios
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-engine-provenance
+          path: native/ios/
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-native:
+    needs: release-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x64 }
+          - { os: windows-latest, target: windows-x64 }
+          - { os: macos-latest, target: macos-universal }
+    steps:
+      - name: Preserve native source bytes on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: native/bridge/go.sum
+      - name: Set up pinned zig for glibc baseline
+        if: matrix.target == 'linux-x64'
+        run: |
+          curl -fsSL -o zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/tools/zig"
+          tar -xJf zig.tar.xz -C "$HOME/tools/zig" --strip-components=1
+          echo "ZIG=$HOME/tools/zig/zig" >> "$GITHUB_ENV"
+      - name: Set up MinGW
+        if: matrix.target == 'windows-x64'
+        run: choco install mingw --yes --no-progress
+      - name: Build and verify desktop engine
+        shell: bash
+        run: |
+          ./scripts/verify-desktop-engine.sh --self-test
+          ./scripts/build-desktop-engine.sh "${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            linux-x64) bin=native/desktop/linux-x64/libportaltunnel.so ;;
+            windows-x64) bin=native/desktop/windows-x64/portaltunnel.dll ;;
+            macos-universal) bin=native/desktop/macos-universal/libportaltunnel.dylib ;;
+          esac
+          ./scripts/verify-desktop-engine.sh "$bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-engine-${{ matrix.target }}
+          path: native/desktop/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-package:
+    needs: desktop-native
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-linux-x64
+          path: native/desktop/linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-windows-x64
+          path: native/desktop/windows-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-macos-universal
+          path: native/desktop/macos-universal
+      - name: Set up MinGW for the Windows C ABI test stub
+        if: runner.os == 'Windows'
+        run: choco install mingw --yes --no-progress
+      - name: Stage complete desktop SDK graph
+        run: ./gradlew publishDesktopSdkToSampleRepository -Pportal.native.requireComplete=true --no-configuration-cache
+      - name: Build and package desktop Maven consumer
+        run: |
+          ./gradlew :samples:desktop:build :samples:desktop:createDistributable \
+            -Pportal.samples.repository="$GITHUB_WORKSPACE/build/sample-maven" --no-configuration-cache
+      - name: Exercise SDK and Maven-consumer runtime
+        run: |
+          ./gradlew :portal-sdk:desktopTest :samples:desktop:minecraftSmoke :samples:desktop:ondeviceSmoke \
+            -Pportal.samples.repository="$GITHUB_WORKSPACE/build/sample-maven" --no-configuration-cache
