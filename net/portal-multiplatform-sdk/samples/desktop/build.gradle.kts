@@ -1,0 +1,72 @@
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+
+plugins {
+    kotlin("jvm")
+    alias(libs.plugins.compose.multiplatform)
+    alias(libs.plugins.kotlin.compose)
+}
+
+group = "org.gosuda.portal.sample"
+version = "0.1.0"
+
+
+dependencies {
+    // Deliberately consume the published KMP coordinate. This prevents the
+    // sample from hiding broken Maven metadata/native-runtime dependencies
+    // behind a same-build project dependency.
+    implementation(libs.portal.sdk)
+    implementation(compose.desktop.currentOs)
+    implementation(compose.material3)
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.zstd.jni)
+}
+compose.desktop {
+    application {
+        mainClass = "org.gosuda.portal.sample.MainKt"
+        nativeDistributions {
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
+            // jlink does not infer modules used by the app or its dependencies.
+            // Preferences backs settings; HttpClient powers Ollama/downloads.
+            modules("java.prefs", "java.net.http", "jdk.httpserver", "jdk.crypto.ec")
+            packageName = "PortalDesktopSample"
+            packageVersion = "1.0.0"
+            linux {
+                iconFile.set(project.file("packaging/icon.png"))
+            }
+            windows {
+                iconFile.set(project.file("packaging/icon.ico"))
+            }
+            macOS {
+                iconFile.set(project.file("packaging/icon.icns"))
+            }
+        }
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+// Headless publish smoke: opens a real tunnel to a loopback server and
+// fetches the public URL through the relay. `./gradlew :samples:desktop:smoke`.
+tasks.register<JavaExec>("smoke") {
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.gosuda.portal.sample.SmokeKt")
+}
+
+// Headless on-device content check: starts the Ollama/Markov loopback server
+// and exercises its endpoints. `./gradlew :samples:desktop:ondeviceSmoke`.
+tasks.register<JavaExec>("ondeviceSmoke") {
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.gosuda.portal.sample.OnDeviceSmokeKt")
+}
+
+// Headless Minecraft join smoke: drives a fake 1.21.1 client through the
+// full login → configuration → play path. `./gradlew :samples:desktop:minecraftSmoke`.
+tasks.register<JavaExec>("minecraftSmoke") {
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.gosuda.portal.sample.MinecraftSmokeKt")
+}
