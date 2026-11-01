@@ -56,7 +56,10 @@ The pusher of a mirror commit comes from the repository activity API (`push`, `f
 `branch_creation`, and `pr_merge` for a pull request merged in the web UI). The pushes that moved the
 branch from the sync baseline to its tip are landed one by one, oldest first, each with its own
 pusher as the requester, so a bot's push after a member's merge does not decide the member's change.
-The first push that fails a check stops the chain and the whole range is staged as
+After each landed push whose mirror commit the trunk now exports exactly, the sync baseline moves to
+that commit and the next push merges against it, so consecutive pushes that edit the same lines land.
+A baseline left behind such a commit (a chain that stopped earlier) catches up at the start of the
+next reconcile. The first push that fails a check stops the chain and the whole range is staged as
 `refs/ws/capy/<workflow>-main`. When the API does not list every push of the range, or a commit of it
 is missing from the store, the range is judged as one change by the pusher of the tip.
 

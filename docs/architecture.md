@@ -227,6 +227,8 @@ Suda-Sync-Mirror: <mirror commit>
 
 When the export of the trunk equals the mirror tree and no baseline exists, the lander writes the baseline. A mirror that differs from the trunk without a baseline is logged and left unchanged until one exists.
 
+An agreement point need not be the mirror tip. When the export of the trunk equals the normalized tree of a first-parent mirror commit between the baseline and the tip (for example after an inbound chain landed its first pushes and stopped), the lander moves the baseline to that commit before it merges the rest. Within one inbound chain it does the same after every landed push. Otherwise a later push that edits the lines an earlier push edited would conflict with that push's own landing in a 3-way merge against the older baseline. Only exact equality advances the baseline, so a trunk-only change under the prefix is never mistaken for a mirror deletion.
+
 ### 4.2 Reconcile Algorithm
 
 For each workflow, the lander compares three trees: `B` (the export of the baseline monorepo commit), `M` (the export of the current trunk), and `X` (the mirror tip, normalized to drop excluded paths). Table 2 maps the states to actions.
