@@ -1,0 +1,526 @@
+package configuration
+
+import (
+	"errors"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	filesystemstore "gosuda.org/ivnp/state/internal/filesystem_store"
+)
+
+func TestParseOperatingDefaults(t *testing.T) {
+	config, err := ParseOperating("", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.State.MaxDestinations != 64 {
+		t.Fatalf("default destination capacity = %d, want 64", config.State.MaxDestinations)
+	}
+	if config.Network.ID != 2 || !config.Network.IPv4 || config.Network.IPv6 {
+		t.Fatalf("network = %#v", config.Network)
+	}
+	if !config.NTCP2.Enabled || !config.SSU2.Enabled ||
+		config.NTCP2.Bind != (Endpoint{Host: "0.0.0.0"}) || config.SSU2.Bind != (Endpoint{Host: "0.0.0.0"}) {
+		t.Fatalf("transport defaults = %#v %#v", config.NTCP2, config.SSU2)
+	}
+	if config.Control.Enabled || config.HTTPProxy.Enabled || config.SOCKS5.Enabled || config.Metrics.Enabled {
+		t.Fatalf("listeners must default disabled: %#v", config)
+	}
+	if len(config.HTTPProxy.Outproxies) != 1 || config.HTTPProxy.Outproxies[0] != "exit.stormycloud.i2p" {
+		t.Fatalf("default HTTP outproxies = %q", config.HTTPProxy.Outproxies)
+	}
+	if !config.Reseed.Enabled || len(config.Reseed.Endpoints) == 0 || config.Reseed.Timeout != 30*time.Second || config.Log != (Log{Level: "info", Format: "text"}) {
+		t.Fatalf("defaults = %#v", config)
+	}
+	if len(config.Reseed.PriorityEndpoints) != 1 || config.Reseed.PriorityEndpoints[0] != "https://hotseed.gosuda.org/i2pseeds.su3?netid=2" || config.Reseed.PriorityTimeout != 2*time.Second {
+		t.Fatalf("priority reseed defaults = %#v", config.Reseed)
+	}
+	for _, endpoint := range config.Reseed.Endpoints {
+		if !strings.HasPrefix(endpoint, "https://") || !strings.HasSuffix(endpoint, "/i2pseeds.su3?netid=2") {
+			t.Fatalf("default reseed endpoint = %q", endpoint)
+		}
+	}
+	tunnel := config.Tunnel
+	coreDefaultsRejected := !tunnel.Enabled || tunnel.Lifetime != 10*time.Minute || config.Router.Floodfill || config.Router.Version != "0.9.70" || config.NetDB.LookupCapacity != 32
+	exploratoryDefaultsRejected := tunnel.ExploratoryInboundTarget != 4 || tunnel.ExploratoryOutboundTarget != 4 || tunnel.ExploratoryPoolCapacity != 8
+	clientDefaultsRejected := tunnel.ClientInboundTarget != 2 || tunnel.ClientOutboundTarget != 2 || tunnel.ClientPoolCapacity != 4
+	if coreDefaultsRejected || exploratoryDefaultsRejected || clientDefaultsRejected {
+		t.Fatalf("production defaults = %#v", config)
+	}
+}
+
+func TestParseOperatingPriorityReseed(t *testing.T) {
+	config, err := ParseOperating("[reseed]\npriority_endpoints = https://hotseed.gosuda.org/i2pseeds.su3?netid=2\npriority_timeout = 3s\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Reseed.PriorityEndpoints) != 1 || config.Reseed.PriorityEndpoints[0] != "https://hotseed.gosuda.org/i2pseeds.su3?netid=2" || config.Reseed.PriorityTimeout != 3*time.Second {
+		t.Fatalf("parsed priority reseed = %#v", config.Reseed)
+	}
+}
+
+func TestParseOperatingFloodfillMode(t *testing.T) {
+	config, err := ParseOperating("[router]\nfloodfill = true\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.Router.Floodfill {
+		t.Fatal("explicit floodfill mode was disabled")
+	}
+	if _, err = ParseOperating("[router]\nfloodfill = sometimes\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("invalid floodfill value error = %v", err)
+	}
+}
+
+func TestParseOperatingTransitMode(t *testing.T) {
+	config, err := ParseOperating("", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.Router.Transit {
+		t.Fatal("default transit mode was disabled")
+	}
+	config, err = ParseOperating("[router]\ntransit = false\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Router.Transit {
+		t.Fatal("explicit transit = false stayed enabled")
+	}
+	if _, err = ParseOperating("[router]\ntransit = sometimes\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("invalid transit value error = %v", err)
+	}
+}
+func TestParseOperatingDisablesReseedOnlyWithExplicitEmptyEndpoints(t *testing.T) {
+	disabled, err := ParseOperating("[reseed]\nenabled = false\nendpoints =\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Reseed.Enabled || len(disabled.Reseed.Endpoints) != 0 {
+		t.Fatalf("disabled reseed = %#v", disabled.Reseed)
+	}
+	for _, text := range []string{
+		"[reseed]\nenabled = false\n",
+		"[reseed]\nenabled = true\nendpoints =\n",
+	} {
+		if _, err = ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v, want invalid operating config", text, err)
+		}
+	}
+}
+
+func TestDefaultAddressBookHasVerifiedRemoteSubscription(t *testing.T) {
+	cfg, err := ParseOperating("", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AddressBook.Enabled {
+		t.Fatal("default hosts resolver is disabled")
+	}
+	expectedSubscriptions := []string{
+		"http://reg.i2p/export/hosts.txt",
+		"http://identiguy.i2p/hosts.txt",
+		"http://stats.i2p/cgi-bin/newhosts.txt",
+		"https://raw.githubusercontent.com/i2p/i2p.i2p/master/installer/resources/hosts.txt",
+	}
+	if len(cfg.AddressBook.Subscriptions) != len(expectedSubscriptions) {
+		t.Fatalf("default addressbook subscriptions count = %d, want %d: %#v", len(cfg.AddressBook.Subscriptions), len(expectedSubscriptions), cfg.AddressBook.Subscriptions)
+	}
+	for i, sub := range expectedSubscriptions {
+		if cfg.AddressBook.Subscriptions[i] != sub {
+			t.Errorf("subscription[%d] = %q, want %q", i, cfg.AddressBook.Subscriptions[i], sub)
+		}
+	}
+	localOnly, err := ParseOperating("[addressbook]\nsubscriptions =\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(localOnly.AddressBook.Subscriptions) != 0 {
+		t.Fatalf("explicit local-only subscriptions = %#v", localOnly.AddressBook.Subscriptions)
+	}
+	remote, err := ParseOperating("[addressbook]\nsubscriptions = https://example.com/hosts.txt\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remote.AddressBook.Subscriptions) != 1 || remote.AddressBook.Subscriptions[0] != "https://example.com/hosts.txt" {
+		t.Fatalf("requested remote subscription = %#v", remote.AddressBook.Subscriptions)
+	}
+}
+
+func TestLoadOperatingResolvesRelativePaths(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "ivnp.conf")
+	if err := filesystemstore.WriteAtomic(path, []byte("[paths]\ndata_dir = data\nstate_dir = runtime/state\nstate_path = runtime/state/router.bin\nkey_path = keys/router.key\n"), 0o600, maxConfigBytes); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadOperating(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.DataDir != filepath.Join(directory, "data") || config.StateDir != filepath.Join(directory, "runtime", "state") || config.StatePath != filepath.Join(directory, "runtime", "state", "router.bin") || config.KeyPath != filepath.Join(directory, "keys", "router.key") {
+		t.Fatalf("relative paths = %#v", config)
+	}
+}
+
+func TestLoadOrCreateOperatingInstallsPrivateSafeDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ivnp.conf")
+	first, err := LoadOrCreateOperating(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := filesystemstore.OpenRegular(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := filesystemstore.ValidatePrivateFile(file); err != nil {
+		t.Fatalf("first-run config permissions: %v", err)
+	}
+	if first.Control.Enabled || first.HTTPProxy.Enabled || first.SOCKS5.Enabled || first.Metrics.Enabled {
+		t.Fatalf("first-run privileged listeners enabled: %#v", first)
+	}
+	second, err := LoadOrCreateOperating(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.StatePath != first.StatePath || second.KeyPath != first.KeyPath {
+		t.Fatalf("restart defaults changed: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestLoadOperatingRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ivnp.conf")
+	if _, err := LoadOrCreateOperating(path); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "ivnp-link.conf")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOperating(link); err == nil {
+		t.Fatal("LoadOperating accepted a symlink")
+	}
+}
+
+func TestParseOperatingRejectsUnknownAndDuplicateKeys(t *testing.T) {
+	for _, text := range []string{
+		"[router]\nunknown = value\n",
+		"[ntcp2]\nenabled = true\nenabled = false\n",
+		"[unknown]\nvalue = true\n",
+	} {
+		_, err := ParseOperating(text, "/etc/ivnp/ivnp.conf")
+		if err == nil {
+			t.Fatalf("ParseOperating(%q) succeeded", text)
+		}
+		if !errors.Is(err, ErrInvalidOperating) && !errors.Is(err, ErrMalformed) {
+			t.Fatalf("ParseOperating(%q) error = %v", text, err)
+		}
+	}
+}
+
+func TestParseOperatingRejectsPartialAndInvalidTransportEndpoints(t *testing.T) {
+	for _, text := range []string{
+		"[ntcp2]\nbind_host = 127.0.0.1\n",
+		"[ssu2]\nadvertise_host = 0.0.0.0\nadvertise_port = 12345\n",
+		"[nat]\nnatpmp_endpoint = 127.0.0.1:5351\n",
+		"[nat]\nnatpmp_endpoint = 10.2.0.1\n",
+		"[nat]\nupnp_endpoint = ftp://192.168.0.1/root.xml\n",
+		"[ntcp2]\nenabled = false\n[ssu2]\nenabled = false\n",
+	} {
+		if _, err := ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v, want invalid operating config", text, err)
+		}
+	}
+}
+
+func TestParseOperatingAcceptsAutomaticTransportPorts(t *testing.T) {
+	operating, err := ParseOperating(
+		"[ntcp2]\nbind_host = 0.0.0.0\nbind_port = 0\nadvertise_port = 0\n"+
+			"[ssu2]\nadvertise_host = 203.0.113.7\n[nat]\nnatpmp_endpoint = 10.2.0.1:5351\nupnp_endpoint = http://192.168.0.1/rootDesc.xml\n",
+		"/etc/ivnp/ivnp.conf",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operating.NTCP2.Bind.Port != 0 || operating.NTCP2.Advertised != (Endpoint{}) {
+		t.Fatalf("automatic NTCP2 endpoints = %#v", operating.NTCP2)
+	}
+	if operating.SSU2.Advertised != (Endpoint{Host: "203.0.113.7"}) {
+		t.Fatalf("automatic SSU2 advertisement = %#v", operating.SSU2.Advertised)
+	}
+	if operating.NAT.NATPMPEndpoint != netip.MustParseAddrPort("10.2.0.1:5351") || operating.NAT.UPnPEndpoint != "http://192.168.0.1/rootDesc.xml" {
+		t.Fatalf("explicit NAT endpoints = %#v", operating.NAT)
+	}
+}
+
+func TestParseOperatingListenerAuthenticationPolicy(t *testing.T) {
+	unauthenticated := "[control]\nenabled = true\nlisten_host = 192.0.2.10\nlisten_port = 7650\n"
+	if _, err := ParseOperating(unauthenticated, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("unauthenticated remote listener error = %v", err)
+	}
+
+	const token = "8GxbrMTEnPS6IQvjGDkAcQ"
+	config, err := ParseOperating(unauthenticated+"bearer_token = "+token+"\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Control.BearerToken != token || !config.Control.Enabled {
+		t.Fatal("control listener did not retain its authenticated configuration")
+	}
+	if strings.Contains(config.String(), token) || strings.Contains(config.Control.String(), token) {
+		t.Fatal("configuration string leaked bearer token")
+	}
+
+	metrics, err := ParseOperating("[metrics]\nenabled = true\nlisten_host = 192.0.2.10\nlisten_port = 9090\nbearer_token = "+token+"\n", "/etc/ivnp/ivnp.conf")
+	if err != nil || !metrics.Metrics.Enabled || metrics.Metrics.BearerToken != token {
+		t.Fatalf("authenticated remote metrics = %#v, %v", metrics.Metrics, err)
+	}
+
+	secret := "leaked-secret"
+	_, err = ParseOperating("[metrics]\nbearer_token = "+secret+"\n", "/etc/ivnp/ivnp.conf")
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("token error leaked secret: %v", err)
+	}
+
+	loopback, err := ParseOperating("[http_proxy]\nenabled = true\n", "/etc/ivnp/ivnp.conf")
+	if err != nil || !loopback.HTTPProxy.Enabled || loopback.HTTPProxy.BearerToken != "" {
+		t.Fatalf("loopback listener = %#v, %v", loopback.HTTPProxy, err)
+	}
+}
+
+func TestParseOperatingHTTPOutproxies(t *testing.T) {
+	config, err := ParseOperating("[http_proxy]\noutproxies = EXIT.STORMYCLOUD.I2P, outproxy.bandura.i2p\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.HTTPProxy.Outproxies) != 2 || config.HTTPProxy.Outproxies[0] != "exit.stormycloud.i2p" || config.HTTPProxy.Outproxies[1] != "outproxy.bandura.i2p" {
+		t.Fatalf("HTTP outproxies = %q", config.HTTPProxy.Outproxies)
+	}
+	disabled, err := ParseOperating("[http_proxy]\noutproxies =\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.HTTPProxy.Outproxies == nil || len(disabled.HTTPProxy.Outproxies) != 0 {
+		t.Fatalf("explicitly disabled HTTP outproxies = %#v", disabled.HTTPProxy.Outproxies)
+	}
+	for _, value := range []string{"example.com", "-bad.i2p", "bad_.i2p", "exit.stormycloud.i2p,exit.stormycloud.i2p"} {
+		if _, err := ParseOperating("[http_proxy]\noutproxies = "+value+"\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("outproxies %q error = %v", value, err)
+		}
+	}
+}
+
+func TestParseOperatingRestrictsUnauthenticatedProxyProtocols(t *testing.T) {
+	const token = "8GxbrMTEnPS6IQvjGDkAcQ"
+	for _, text := range []string{
+		"[http_proxy]\nenabled = true\nlisten_host = 192.0.2.10\nlisten_port = 4444\nbearer_token = " + token + "\n",
+		"[socks5]\nenabled = true\nlisten_host = 192.0.2.10\nlisten_port = 4447\nbearer_token = " + token + "\n",
+		"[http_proxy]\nenabled = true\nbearer_token = " + token + "\n",
+		"[socks5]\nenabled = true\nbearer_token = " + token + "\n",
+		"[http_proxy]\nbearer_token = " + token + "\n",
+		"[socks5]\nbearer_token = " + token + "\n",
+		"[metrics]\nenabled = true\nlisten_host = 192.0.2.10\nlisten_port = 9090\n",
+	} {
+		if _, err := ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v", text, err)
+		}
+	}
+}
+
+func TestParseOperatingRejectsOutOfRangeNumbersAndDurations(t *testing.T) {
+	for _, text := range []string{
+		"[network]\nid = 0\n",
+		"[state]\nmax_bytes = 1024\n",
+		"[ntcp2]\nmax_sessions = 0\n",
+		"[ssu2]\nidle_timeout = 0s\n",
+		"[metrics]\nmax_connections = 0\n",
+		"[reseed]\nenabled = true\nendpoints = https://reseed.example/i2p\nmax_total_bytes = 65536\nmax_archive_bytes = 131072\n",
+		"[reseed]\nenabled = true\nendpoints = http://reseed.example/i2p\n",
+	} {
+		if _, err := ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v, want invalid operating config", text, err)
+		}
+	}
+}
+
+func TestParseOperatingAcceptsMaximalReseedEndpoints(t *testing.T) {
+	const query = "?netid=2"
+	endpoint := "https://" + strings.Repeat("a", maxReseedEndpointBytes-len("https:///")-len(query)) + "/" + query
+	endpoints := strings.Repeat(endpoint+",", maxReseedEndpoints-1) + endpoint
+	text := "[reseed]\nenabled = true\nendpoints = " + endpoints + "\n"
+	if len("endpoints = "+endpoints) != len("endpoints = ")+maxReseedEndpoints*maxReseedEndpointBytes+maxReseedEndpoints-1 {
+		t.Fatalf("reseed endpoint line length = %d", len("endpoints = "+endpoints))
+	}
+
+	config, err := ParseOperating(text, "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Reseed.Endpoints) != maxReseedEndpoints {
+		t.Fatalf("reseed endpoints = %d, want %d", len(config.Reseed.Endpoints), maxReseedEndpoints)
+	}
+	if config.Reseed.Endpoints[0] != endpoint || config.Reseed.Endpoints[maxReseedEndpoints-1] != endpoint {
+		t.Fatalf("reseed endpoints = %#v", config.Reseed.Endpoints)
+	}
+}
+
+func TestParseOperatingRequiresExactReseedNetworkQuery(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://reseed.example/i2pseeds.su3",
+		"https://reseed.example/i2pseeds.su3?",
+		"https://reseed.example/i2pseeds.su3?netid=3",
+		"https://reseed.example/i2pseeds.su3?netid=2&other=1",
+		"https://user:password@reseed.example/i2pseeds.su3?netid=2",
+	} {
+		text := "[reseed]\nendpoints = " + endpoint + "\n"
+		if _, err := ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v, want invalid operating config", endpoint, err)
+		}
+	}
+	if _, err := parseReseedEndpoints("https://reseed.example/i2pseeds.su3?netid=2#fragment", 2); err == nil {
+		t.Fatal("parseReseedEndpoints() accepted a fragment")
+	}
+	privateConfig, err := ParseOperating("[network]\nid = 42\n[reseed]\nenabled = true\nendpoints = https://reseed.example/i2pseeds.su3?netid=42\ntrusted_cert_files = certs/reseed.pem\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatalf("ParseOperating(custom netid reseed): %v", err)
+	}
+	if len(privateConfig.Reseed.Endpoints) != 1 || privateConfig.Reseed.Endpoints[0] != "https://reseed.example/i2pseeds.su3?netid=42" || len(privateConfig.Reseed.PriorityEndpoints) != 0 {
+		t.Fatalf("private reseed endpoints = %#v", privateConfig.Reseed)
+	}
+	if len(privateConfig.Reseed.TrustedCertPaths) != 1 || privateConfig.Reseed.TrustedCertPaths[0] != "/etc/ivnp/certs/reseed.pem" {
+		t.Fatalf("trusted cert paths = %#v", privateConfig.Reseed.TrustedCertPaths)
+	}
+	if _, err := ParseOperating("[network]\nid = 42\n[reseed]\nenabled = true\nendpoints = https://reseed.example/i2pseeds.su3?netid=2\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("mismatched netid query error = %v", err)
+	}
+}
+
+func TestParseOperatingNetworkProfilesAndOverrides(t *testing.T) {
+	direct, err := ParseOperating("[network]\nid = 77\nprofile = direct\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatalf("direct profile error: %v", err)
+	}
+	if direct.Network.ID != 77 || direct.Network.Profile != NetworkProfileDirect || !direct.Router.Floodfill || !direct.Router.Transit {
+		t.Fatalf("direct network/router = %#v %#v", direct.Network, direct.Router)
+	}
+	if !direct.NetDB.DisableBucketSubnetQuota || direct.NetDB.BucketSubnetQuota != 0 || direct.NetDB.MinRouters != 1 || direct.NetDB.RouterInfoFloodfillK != 1 || direct.NetDB.LeaseSetFloodfillK != 1 {
+		t.Fatalf("direct netdb = %#v", direct.NetDB)
+	}
+	if direct.Tunnel.Hops != 1 || !direct.Tunnel.DisableIPRestriction || direct.Tunnel.IPRestriction != 0 || direct.Tunnel.MaintenanceInterval != 3*time.Second || direct.Tunnel.ProbeTimeout != 5*time.Second {
+		t.Fatalf("direct tunnel = %#v", direct.Tunnel)
+	}
+	if direct.Reseed.Enabled || len(direct.Reseed.Endpoints) != 0 || len(direct.HTTPProxy.Outproxies) != 0 || len(direct.AddressBook.Subscriptions) != 0 {
+		t.Fatalf("direct external dependencies remained enabled: reseed=%#v outproxies=%#v subscriptions=%#v", direct.Reseed, direct.HTTPProxy.Outproxies, direct.AddressBook.Subscriptions)
+	}
+
+	dedicatedOverride, err := ParseOperating("[network]\nid = 88\nprofile = dedicated\n[tunnel]\nhops = 2\nip_restriction = 0\nprobe_timeout = 8s\nprobe_failure_threshold = 3\n[netdb]\nmin_routers = 4\nbucket_subnet_quota = 0\nrouter_info_floodfill_k = 3\nlease_set_floodfill_k = 3\nexploration_bootstrap_delay = 250ms\nexploration_steady_delay = 2s\n[reseed]\nbucket_subnet_quota = 0\nbucket_admit_limit = 32\nverify_anchor_count = 4\nmerge_wait = 1s\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatalf("dedicated override error: %v", err)
+	}
+	if dedicatedOverride.Network.Profile != NetworkProfileDedicated || dedicatedOverride.Tunnel.Hops != 2 || !dedicatedOverride.Tunnel.DisableIPRestriction || dedicatedOverride.Tunnel.ProbeTimeout != 8*time.Second || dedicatedOverride.Tunnel.ProbeFailureThreshold != 3 {
+		t.Fatalf("dedicated tunnel override = %#v", dedicatedOverride.Tunnel)
+	}
+	if dedicatedOverride.NetDB.MinRouters != 4 || !dedicatedOverride.NetDB.DisableBucketSubnetQuota || dedicatedOverride.NetDB.RouterInfoFloodfillK != 3 || dedicatedOverride.NetDB.LeaseSetFloodfillK != 3 {
+		t.Fatalf("dedicated netdb override = %#v", dedicatedOverride.NetDB)
+	}
+	if dedicatedOverride.NetDB.ExplorationBootstrapDelay != 250*time.Millisecond || dedicatedOverride.NetDB.ExplorationSteadyDelay != 2*time.Second {
+		t.Fatalf("dedicated netdb exploration override = %#v", dedicatedOverride.NetDB)
+	}
+	if !dedicatedOverride.Reseed.DisableBucketSubnetQuota || dedicatedOverride.Reseed.BucketAdmitLimit != 32 || dedicatedOverride.Reseed.VerifyAnchorCount != 4 || dedicatedOverride.Reseed.MergeWait != time.Second {
+		t.Fatalf("dedicated reseed override = %#v", dedicatedOverride.Reseed)
+	}
+
+	if _, err := ParseOperating("[network]\nprofile = unknown_profile\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("unknown profile error = %v", err)
+	}
+}
+
+func TestParseOperatingTunnelAndNetDB(t *testing.T) {
+	text := "[router]\nversion = 1.2.3\n[netdb]\nbucket_capacity = 48\nlookup_capacity = 64\n[tunnel]\nenabled = true\nhops = 3\nexploratory_inbound_target = 3\nexploratory_outbound_target = 2\nexploratory_pool_capacity = 6\nclient_inbound_target = 2\nclient_outbound_target = 2\nclient_pool_capacity = 4\nbuild_pending_capacity = 12\nlifetime = 10m\nrenew_before = 3m\nmaintenance_interval = 45s\nbandwidth_rate_bytes_per_second = 65536\nbandwidth_burst_bytes = 131072\n"
+	operating, err := ParseOperating(text, "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parseOperatingTunnelAndNetDBRejected := operating.Router.Version != "1.2.3" || operating.NetDB.BucketCapacity != 48 || operating.NetDB.LookupCapacity != 64 || !operating.Tunnel.Enabled || operating.Tunnel.Hops != 3 ||
+		operating.Tunnel.ExploratoryInboundTarget != 3 || operating.Tunnel.ExploratoryOutboundTarget != 2 || operating.Tunnel.ExploratoryPoolCapacity != 6 ||
+		operating.Tunnel.ClientInboundTarget != 2 || operating.Tunnel.ClientOutboundTarget != 2 || operating.Tunnel.ClientPoolCapacity != 4 ||
+		operating.Tunnel.Lifetime != 10*time.Minute || operating.Tunnel.BandwidthRateBytesPerSecond != 65_536 ||
+		operating.Tunnel.BandwidthBurstBytes != 131_072
+	if parseOperatingTunnelAndNetDBRejected {
+		t.Fatalf("operating = %#v", operating)
+	}
+}
+
+func TestParseOperatingDestinationCapacity(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  int
+	}{
+		{value: "1", want: 1},
+		{value: "190", want: 190},
+		{value: "256", want: 256},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			config, err := ParseOperating("[state]\nmax_destinations = "+test.value+"\n", "/etc/ivnp/ivnp.conf")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.State.MaxDestinations != test.want {
+				t.Fatalf("destination capacity = %d, want %d", config.State.MaxDestinations, test.want)
+			}
+		})
+	}
+}
+
+func TestParseOperatingRejectsUnsafeTunnelBoundsAndUnknownKeys(t *testing.T) {
+	for _, text := range []string{
+		"[netdb]\nunknown = 1\n",
+		"[tunnel]\nexploratory_inbound_target = 3\nexploratory_pool_capacity = 5\n",
+		"[tunnel]\nclient_outbound_target = 3\nclient_pool_capacity = 5\n",
+		"[tunnel]\nlifetime = 9m\n",
+		"[tunnel]\nlifetime = 11m\n",
+		"[tunnel]\nhops = 8\n",
+		"[tunnel]\nrenew_before = 10m\n",
+		"[tunnel]\nrenew_before = 30s\nmaintenance_interval = 31s\n",
+		"[state]\nmax_destinations = 0\n",
+		"[state]\nmax_destinations = 257\n",
+	} {
+		if _, err := ParseOperating(text, "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+			t.Fatalf("ParseOperating(%q) error = %v", text, err)
+		}
+	}
+}
+
+func TestParseOperatingStaticBootstrapFilesAreOptionalAndResolved(t *testing.T) {
+	config, err := ParseOperating("[netdb]\nbootstrap_router_info_files = peers/a.dat, /var/lib/ivnp/b.dat\n", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/etc/ivnp/peers/a.dat", "/var/lib/ivnp/b.dat"}
+	if len(config.NetDB.BootstrapRouterInfoPaths) != len(want) {
+		t.Fatalf("bootstrap paths = %#v", config.NetDB.BootstrapRouterInfoPaths)
+	}
+	for index := range want {
+		if config.NetDB.BootstrapRouterInfoPaths[index] != want[index] {
+			t.Fatalf("bootstrap paths = %#v, want %#v", config.NetDB.BootstrapRouterInfoPaths, want)
+		}
+	}
+	defaults, err := ParseOperating("", "/etc/ivnp/ivnp.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(defaults.NetDB.BootstrapRouterInfoPaths) != 0 {
+		t.Fatalf("default bootstrap paths = %#v, want none", defaults.NetDB.BootstrapRouterInfoPaths)
+	}
+}
+
+func TestParseOperatingRejectsDuplicateStaticBootstrapFiles(t *testing.T) {
+	if _, err := ParseOperating("[netdb]\nbootstrap_router_info_files = peers/a.dat, peers/../peers/a.dat\n", "/etc/ivnp/ivnp.conf"); !errors.Is(err, ErrInvalidOperating) {
+		t.Fatalf("duplicate bootstrap path error = %v", err)
+	}
+}
