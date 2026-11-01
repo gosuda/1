@@ -106,6 +106,12 @@ func (f *GitHubForge) PushChain(ctx context.Context, repo, ref, stop, tip string
 	return f.client(repo, permContents).PushChain(ctx, repo, ref, stop, tip)
 }
 
+// BranchPushes implements Forge through the activity API of repo with a token of viaRepo
+// (contents:read).
+func (f *GitHubForge) BranchPushes(ctx context.Context, viaRepo, repo, ref string) ([]capy.RefPush, error) {
+	return f.client(viaRepo, permContents).RefPushes(ctx, repo, ref)
+}
+
 // PusherForTip returns only the login of PushForTip (contents:read).
 func (f *GitHubForge) PusherForTip(ctx context.Context, repo, ref, sha string) (string, error) {
 	return f.client(repo, permContents).PusherForTip(ctx, repo, ref, sha)

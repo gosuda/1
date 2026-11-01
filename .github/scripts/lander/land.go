@@ -65,6 +65,9 @@ type Request struct {
 	Tip       string // commit in the store
 	Requester string
 	Approvers []string
+	// Authors are the pushers of the reviewed head of a pull request merged on a mirror, nil when
+	// unknown (see capy.Identity.Authors).
+	Authors []string
 	// Review is the number of the review pull request of the change in the user repository, 0 when
 	// the change was never sent for review. The landed commit records it as Suda-Review.
 	Review int
@@ -347,7 +350,7 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	} else if len(v) > 0 {
 		return reject("go.mod: %s", summarize(v))
 	}
-	id := capy.Identity{Requester: req.Requester, Approvers: req.Approvers}
+	id := capy.Identity{Requester: req.Requester, Approvers: req.Approvers, Authors: req.Authors}
 	teams := l.Forge.TeamResolver(ctx)
 	v, err := capy.CheckOwners(ctx, s.Dir, mainTree, newTree, id, teams)
 	if err != nil {

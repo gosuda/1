@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -391,9 +392,13 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 		if err != nil {
 			return inboundPending, err
 		}
-		if pull, approvers := l.mirrorPullApprovals(ctx, wf, st); pull > 0 {
-			req.Approvers = approvers
-			req.ExtraTrailers = append(req.ExtraTrailers, fmt.Sprintf("Suda-Mirror-Pull: %s#%d", wf.DestinationRepo, pull))
+		if rv := l.mirrorPullReview(ctx, wf, st); rv.pull > 0 {
+			req.Approvers = rv.approvers
+			req.Authors = rv.authors
+			req.ExtraTrailers = append(req.ExtraTrailers, fmt.Sprintf("Suda-Mirror-Pull: %s#%d", wf.DestinationRepo, rv.pull))
+			for _, a := range rv.authors {
+				req.ExtraTrailers = append(req.ExtraTrailers, "Suda-Mirror-Author: "+a)
+			}
 		}
 		res, err := l.Land(ctx, req)
 		if err != nil {
@@ -430,28 +435,41 @@ type inboundStep struct {
 	prMerge bool
 }
 
-// mirrorPullApprovals returns, for a step that merged a pull request on the mirror, the pull request
-// number and the reviewers whose approval counts for it: their latest decisive review on that pull
-// request approves exactly the head that was merged, and the push changes the branch exactly as the
-// reviewed head changes its merge base with the branch (the same patch-id test as for patchsets),
-// so a merge that resolved conflicts or a squash that added content needs a member landing. Pull
-// request lookups that fail count as no approval: the step is then judged by its merger alone.
-func (l *Lander) mirrorPullApprovals(ctx context.Context, wf capy.Workflow, st inboundStep) (pull int, approvers []string) {
+// mirrorPullReview is the review evidence of a pull request merged on the mirror.
+type mirrorPullReview struct {
+	pull      int      // pull request number, 0 when the step is not a pull request merge
+	approvers []string // reviewers whose approval counts for the merged head
+	authors   []string // pushers of the reviewed head, nil when unknown
+}
+
+// mirrorPullReview returns, for a step that merged a pull request on the mirror, the pull request
+// number, the reviewers whose approval counts for it, and the authors of the reviewed head.
+//
+// An approval counts when the reviewer's latest decisive review on that pull request approves exactly
+// the head that was merged, and the push changes the branch exactly as the reviewed head changes its
+// merge base with the branch (the same patch-id test as for patchsets), so a merge that resolved
+// conflicts or a squash that added content needs a member landing. Pull request lookups that fail
+// count as no approval: the step is then judged by its merger alone.
+//
+// The authors (see headAuthors) let a reviewer who also merged count under set require-review, the
+// GitHub flow of "author pushes, reviewer approves and merges".
+func (l *Lander) mirrorPullReview(ctx context.Context, wf capy.Workflow, st inboundStep) mirrorPullReview {
 	if !st.prMerge || st.before == "" {
-		return 0, nil
+		return mirrorPullReview{}
 	}
 	pr, ok, err := l.Forge.MergedPullForCommit(ctx, wf.DestinationRepo, st.commit)
 	if err != nil {
 		l.Log.Warn("merged mirror pull request unavailable; judging the merger alone", "workflow", wf.Name, "commit", st.commit, "err", err)
-		return 0, nil
+		return mirrorPullReview{}
 	}
 	if !ok {
-		return 0, nil
+		return mirrorPullReview{}
 	}
+	rv := mirrorPullReview{pull: pr.Number}
 	approvals, err := l.Forge.PullApprovals(ctx, wf.DestinationRepo, pr.Number)
 	if err != nil {
 		l.Log.Warn("mirror pull request approvals unavailable; judging the merger alone", "workflow", wf.Name, "pull", pr.Number, "err", err)
-		return pr.Number, nil
+		return rv
 	}
 	var onHead []string
 	for _, a := range approvals {
@@ -460,18 +478,53 @@ func (l *Lander) mirrorPullApprovals(ctx context.Context, wf capy.Workflow, st i
 		}
 	}
 	if len(onHead) == 0 {
-		return pr.Number, nil
+		return rv
 	}
 	base, err := l.Store.Git(ctx, "merge-base", pr.Head, st.before)
 	if err != nil {
 		l.Log.Warn("reviewed head of the mirror pull request is not in the store; its approvals do not count", "workflow", wf.Name, "pull", pr.Number, "head", pr.Head)
-		return pr.Number, nil
+		return rv
 	}
 	if !newPatchCache(l.Store).sameRange(ctx, strings.TrimSpace(base), pr.Head, st.before, st.commit) {
 		l.Log.Info("mirror merge differs from the reviewed head; its approvals do not count", "workflow", wf.Name, "pull", pr.Number, "head", pr.Head, "merge", st.commit)
-		return pr.Number, nil
+		return rv
 	}
-	return pr.Number, onHead
+	rv.approvers = onHead
+	rv.authors = l.headAuthors(ctx, wf, pr, st.before)
+	return rv
+}
+
+// headAuthors returns the authenticated pushers of the reviewed head of a merged mirror pull request.
+// It follows the head branch's updates back from the head through the activity API of the head
+// repository (a fork included) until the branch held only commits the mirror branch already had (an
+// ancestor of before, the branch the pull request merged into) or did not exist. Every pusher on that
+// path is an author, including a force push whose content was later replaced, which only makes the
+// set larger. It returns nil, so the merger stays the only author, when the head branch is unknown or
+// the activity API does not cover the path.
+func (l *Lander) headAuthors(ctx context.Context, wf capy.Workflow, pr capy.MergedPull, before string) []string {
+	if pr.HeadRepo == "" || pr.HeadRef == "" {
+		return nil
+	}
+	pushes, err := l.Forge.BranchPushes(ctx, wf.DestinationRepo, pr.HeadRepo, "refs/heads/"+pr.HeadRef)
+	if err != nil {
+		l.Log.Warn("head branch activity unavailable; judging the merger alone", "workflow", wf.Name, "pull", pr.Number, "head", pr.HeadRepo+":"+pr.HeadRef, "err", err)
+		return nil
+	}
+	var authors []string
+	for cur, steps := pr.Head, 0; ; steps++ {
+		if strings.Trim(cur, "0") == "" || l.Store.isAncestor(ctx, cur, before) {
+			return authors
+		}
+		i := slices.IndexFunc(pushes, func(p capy.RefPush) bool { return p.After == cur })
+		if i < 0 || steps >= len(pushes) {
+			l.Log.Info("head branch activity does not reach the mirror branch; judging the merger alone", "workflow", wf.Name, "pull", pr.Number, "head", pr.HeadRepo+":"+pr.HeadRef, "missing", cur)
+			return nil
+		}
+		if !slices.Contains(authors, pushes[i].Actor) {
+			authors = append(authors, pushes[i].Actor)
+		}
+		cur = pushes[i].Before
+	}
 }
 
 // inboundSteps splits the mirror's progress since the baseline into the pushes that made it, oldest

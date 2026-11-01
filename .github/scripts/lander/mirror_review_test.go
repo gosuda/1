@@ -126,6 +126,70 @@ func TestMirrorPullRequestsWithoutAValidApprovalAreStagedUnderRequireReview(t *t
 	}
 }
 
+// GitHub flow on a mirror: alice pushes the head branch, maintainer approves it and merges. Under
+// `set require-review` the merger's approval counts because the head branch's pushers, not the
+// merger, are the authors. A fix-up the reviewer pushed onto the branch makes the reviewer an author.
+func TestMirrorMergeByTheReviewerOfAnotherAuthorsBranch(t *testing.T) {
+	const zero = "0000000000000000000000000000000000000000"
+	cases := []struct {
+		name   string
+		branch func(base, head string) []capy.RefPush // head branch updates, oldest first
+		land   bool
+		author string
+	}{
+		{name: "author pushed, reviewer merged", land: true, author: "alice", branch: func(base, head string) []capy.RefPush {
+			return []capy.RefPush{
+				{Push: capy.Push{Actor: "maintainer"}, Before: zero, After: base}, // created at the mirror tip: no content
+				{Push: capy.Push{Actor: "alice"}, Before: base, After: head},
+			}
+		}},
+		{name: "reviewer pushed a fix-up", branch: func(base, head string) []capy.RefPush {
+			mid := strings.Repeat("1", 40) // replaced by a force push, so absent from the store
+			return []capy.RefPush{
+				{Push: capy.Push{Actor: "alice"}, Before: base, After: mid},
+				{Push: capy.Push{Actor: "maintainer"}, Before: mid, After: head},
+			}
+		}},
+		{name: "head branch activity incomplete", branch: func(base, head string) []capy.RefPush {
+			return []capy.RefPush{{Push: capy.Push{Actor: "alice"}, Before: strings.Repeat("2", 40), After: head}}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t)
+			base := e.requireReviewOnP()
+			head, merge := e.mirrorPull(41, base, map[string]string{"c.go": "package p\n// c\n"}, nil)
+			e.forge.chains = map[string][]capy.RefPush{
+				"gosuda/p|refs/heads/main":    {{Push: capy.Push{Actor: "maintainer"}, Before: base, After: merge, PRMerge: true}},
+				"gosuda/p|refs/heads/feature": c.branch(base, head),
+			}
+			e.forge.mergedFor["gosuda/p|"+merge] = capy.MergedPull{Number: 41, Head: head, HeadRepo: "gosuda/p", HeadRef: "feature"}
+			e.forge.pullOK["gosuda/p#41"] = []capy.Approval{{Login: "maintainer", Commit: head}}
+
+			e.cycle()
+
+			if got := e.trunkHas("P/c.go"); got != c.land {
+				t.Fatalf("landed = %v, want %v (staged %v)", got, c.land, e.userRefs("refs/ws/capy/"))
+			}
+			if !c.land {
+				if refs := e.userRefs("refs/ws/capy/"); len(refs) != 1 || refs[0] != "refs/ws/capy/p-main" {
+					t.Fatalf("staged refs = %v", refs)
+				}
+				return
+			}
+			msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/history")
+			for _, want := range []string{"Suda-Requester: maintainer", "Suda-Approved-By: maintainer", "Suda-Mirror-Author: " + c.author, "Suda-Mirror-Pull: gosuda/p#41"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("landed history lacks %q:\n%s", want, msg)
+				}
+			}
+			if strings.Contains(msg, "Suda-Mirror-Author: maintainer") || strings.Contains(msg, "Suda-Review-Bypass") {
+				t.Fatalf("the branch creator without content is no author, and no bypass is needed:\n%s", msg)
+			}
+		})
+	}
+}
+
 // An organization admin's unapproved change on the mirror lands under `set require-review`, even when
 // the admin is not on the OWNERS list, as GitHub's admin ruleset bypass let it in. The landed commit
 // records the bypass.
