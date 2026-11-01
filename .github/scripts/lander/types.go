@@ -41,7 +41,11 @@ type Forge interface {
 	// PushChain lists, oldest first, the updates that moved ref from stop to tip with the actor of
 	// each. It wraps capy.ErrActorNotVisible when the chain is incomplete.
 	PushChain(ctx context.Context, repo, ref, stop, tip string) ([]capy.RefPush, error)
-	ApproversForTip(ctx context.Context, repo, head, sha string) ([]string, error)
+	// ReviewApprovals reads the pull requests opened from branch head ("review/<id>") of repo: the
+	// number of the newest one and every reviewer whose latest decisive review approves, with the
+	// commit that approval is bound to (pull_requests:read). Whether an approval of another commit
+	// still counts is the lander's decision (see patchset.go), not the forge's.
+	ReviewApprovals(ctx context.Context, repo, head string) (capy.ReviewState, error)
 	TeamResolver(ctx context.Context) capy.TeamResolver
 	SetStatus(ctx context.Context, repo, sha string, st Status) error
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
@@ -150,6 +154,7 @@ const (
 	userLand     = "refs/user/land/"
 	userReview   = "refs/user/review/"
 	userBase     = "refs/user/base/"
+	userCL       = "refs/user/cl/" // patchsets: refs/ws/cl/<change-id>/<tip> of the user repository
 	userSuda     = "refs/user/suda/"
 	userMain     = "refs/user/main"
 	userStaged   = "refs/user/staged/"

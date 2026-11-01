@@ -94,8 +94,9 @@ the `suda/land` status on your commit.
   landing branch; commit authors and `Reviewed-by:` lines count for nothing.
 - If you own every path you changed, `git ws-land` is enough.
 - Otherwise run **`git ws-pr`**. It opens a pull request here (`base/<task>` <- `review/<task>`) that shows only
-  your change. An owner approves it **on the exact commit you will land**; push another commit and you need a
-  new approval. Then run `git ws-land`.
+  your change. An owner approves it on a commit; the approval also covers the same change after a clean rebase
+  (`git ws-sync`; every `git ws-pr` is kept as an immutable patchset). Edit the diff, even only whitespace, and you
+  need a new approval. Then run `git ws-land`.
 - Changes under `.github/` always need an owner other than you.
 
 ### Experiments, new projects, imports
@@ -134,6 +135,8 @@ the `suda/land` status on your commit.
 | `refs/ws/<actor>/<id>` | Your work in progress | You |
 | `refs/heads/land/<id>` | A landing request; deleted once processed | You |
 | `refs/heads/base/<id>`, `refs/heads/review/<id>` | A review pull request pair (`git ws-pr`) | You |
+| `refs/ws/cl/<change-id>/<tip>` | An immutable patchset of a change sent for review (`git ws-pr`) | You |
+| `refs/ws/autosave/<actor>/<id>` | Your working-state backup (`git ws-autosave`, restore with `git ws-resume`) | You |
 | `refs/ws/capy/<project>-pr-<N>`, `refs/ws/capy/<project>-main` | External changes staged from public mirrors | The lander |
 | `refs/suda/main`, `refs/suda/history` | **Untrusted copies** of the trunk, kept only so pushes stay small | The lander |
 | `refs/heads/main` | This page and the guide | The lander |

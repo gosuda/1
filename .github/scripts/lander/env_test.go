@@ -83,20 +83,20 @@ capy.workflow(
 `
 
 type fakeForge struct {
-	mu        sync.Mutex
-	clock     int64
-	actors    map[string]string         // repo|ref -> login
-	chains    map[string][]capy.RefPush // repo|ref -> every update of the ref, oldest first
-	def       string                    // default actor
-	approvals map[string][]string
-	teams     map[string]map[string]bool
-	statuses  []string
-	pulls     map[string][]PullRequest
-	merged    map[string][]MergedPull
-	closed    []string // "repo#number: comment"
-	created   []fakeCreated
-	updated   []fakeCreated
-	nextPull  int
+	mu       sync.Mutex
+	clock    int64
+	actors   map[string]string           // repo|ref -> login
+	chains   map[string][]capy.RefPush   // repo|ref -> every update of the ref, oldest first
+	def      string                      // default actor
+	reviews  map[string]capy.ReviewState // repo|head -> pull request and approvals
+	teams    map[string]map[string]bool
+	statuses []string
+	pulls    map[string][]PullRequest
+	merged   map[string][]MergedPull
+	closed   []string // "repo#number: comment"
+	created  []fakeCreated
+	updated  []fakeCreated
+	nextPull int
 }
 
 func (f *fakeForge) PushForTip(_ context.Context, repo, ref, sha string) (capy.Push, error) {
@@ -132,8 +132,8 @@ func (f *fakeForge) PushChain(_ context.Context, repo, ref, stop, tip string) ([
 	}
 	return chain, nil
 }
-func (f *fakeForge) ApproversForTip(_ context.Context, repo, head, sha string) ([]string, error) {
-	return f.approvals[repo+"|"+head], nil
+func (f *fakeForge) ReviewApprovals(_ context.Context, repo, head string) (capy.ReviewState, error) {
+	return f.reviews[repo+"|"+head], nil
 }
 func (f *fakeForge) TeamResolver(context.Context) capy.TeamResolver {
 	return func(team, login string) (bool, error) { return f.teams[team][login], nil }
@@ -241,7 +241,7 @@ func newEnv(t *testing.T) *env {
 	e.resetMirrorToExport(snap)
 	e.seedMirrorQ(snap)
 
-	e.forge = &fakeForge{def: "maintainer", actors: map[string]string{}, approvals: map[string][]string{},
+	e.forge = &fakeForge{def: "maintainer", actors: map[string]string{}, reviews: map[string]capy.ReviewState{},
 		teams: map[string]map[string]bool{}, pulls: map[string][]PullRequest{}}
 	store := &Store{Dir: filepath.Join(root, "store.git")}
 	cfg := Config{

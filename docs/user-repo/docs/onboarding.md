@@ -106,9 +106,22 @@ To get an owner's approval:
 git ws-pr                            # opens a pull request in gosuda/1 (base/<id> <- review/<id>)
 ```
 
-An owner approves the pull request **on the exact commit you will land**. If you push another commit, ask for
-a new approval. Then run `git ws-land` as usual. Changes under `.github/` additionally require an owner other
-than yourself (`set require-review`).
+An owner approves the pull request on a commit. Every commit has a `Change-Id:` trailer (added by `git ws-save`,
+`git ws-pr` and `git ws-land`) and every `git ws-pr` keeps the commit as an immutable patchset, so the approval
+also covers the same change after a clean rebase onto a newer trunk: `git ws-sync`, then `git ws-land` (or
+`git ws-pr` again for a new patchset). If the diff changes in any way, even in whitespace, ask for a new approval.
+`git ws-ps` lists the patchsets and `git ws-psdiff <a> <b>` compares two of them. Changes under `.github/`
+additionally require an owner other than yourself (`set require-review`).
+
+Optional helpers: `git ws-autosave start` backs up your uncommitted work to `gosuda/1` (readable by every
+member, so it follows the same rules as any commit) and `git ws-resume` restores it on another machine;
+`git ws-wt <you>/<task>` adds a second workspace without a new clone; `git suda-cl <number|Change-Id>` finds a
+landed change.
+
+`git suda-init` installs the aliases and their script (`.github/scripts/ws.sh`) into your clone's Git directory, so they
+work the same on every branch and in every worktree. Run it again when the control plane changes them; a clone set up
+before `ws.sh` existed needs two runs. Running several agents at once? Give each its own worktree (`git ws-wt`), never
+use `git stash`, and fetch through the aliases or `git suda-ws fetch` so that concurrent fetches do not collide.
 
 ## 5. Experiments, new projects, imports
 

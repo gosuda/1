@@ -54,6 +54,7 @@ Table 3 lists every reference of an embargoed change. The lander and magpie trea
 | :--- | :--- | :--- |
 | Workspace | `refs/ws/<login>/sec/<id>` (a follow-up: `refs/ws/<login>/sec/<id>-2`) | The author, with `git ws-save` |
 | Review pair | `refs/heads/base/<id>`, `refs/heads/review/<id>` | The author, with `git ws-pr` |
+| Patchsets | `refs/ws/cl/sec/<change-id>/<tip>`, chosen by `git ws-pr` because the branch has a `sec` segment or the subject starts with `sec-` | The author, with `git ws-pr` |
 | Landing request (release only) | `refs/heads/land/<id>` | A security-team member, with `git ws-land` |
 
 `git ws-new <login>/sec/<id>` creates the branch; `git ws-pr` and `git ws-land` derive the id from the last path segment, which is the embargo id.

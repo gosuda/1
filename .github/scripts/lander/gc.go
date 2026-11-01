@@ -76,6 +76,18 @@ func (l *Lander) GarbageCollect(ctx context.Context) error {
 	}
 
 	now := l.Now()
+	// Patchsets of one change expire together, measured from its newest patchset: an older
+	// patchset may still carry the approval that a trivially rebased tip inherits.
+	clNewest := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 || !strings.HasPrefix(f[0], "refs/gc/ws/cl/") {
+			continue
+		}
+		change, _, _ := strings.Cut(strings.TrimPrefix(f[0], "refs/gc/ws/cl/"), "/")
+		ts, _ := strconv.ParseInt(f[2], 10, 64)
+		clNewest[change] = max(clNewest[change], ts)
+	}
 	type del struct{ ref, sha string }
 	var dels []del
 	for _, line := range strings.Split(out, "\n") {
@@ -103,6 +115,11 @@ func (l *Lander) GarbageCollect(ctx context.Context) error {
 			}
 			if age > l.WorkspaceTTL {
 				dels = append(dels, del{"refs/ws/capy/" + name, sha})
+			}
+		case strings.HasPrefix(ref, "refs/gc/ws/cl/"):
+			change, _, _ := strings.Cut(strings.TrimPrefix(ref, "refs/gc/ws/cl/"), "/")
+			if now.Sub(time.Unix(clNewest[change], 0)) > l.WorkspaceTTL {
+				dels = append(dels, del{"refs/ws/" + strings.TrimPrefix(ref, "refs/gc/ws/"), sha})
 			}
 		case strings.HasPrefix(ref, "refs/gc/ws/"):
 			if age > l.WorkspaceTTL {

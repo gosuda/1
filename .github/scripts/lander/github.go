@@ -111,9 +111,9 @@ func (f *GitHubForge) PusherForTip(ctx context.Context, repo, ref, sha string) (
 	return f.client(repo, permContents).PusherForTip(ctx, repo, ref, sha)
 }
 
-// ApproversForTip implements Forge through the pull request and review APIs (pull_requests:read).
-func (f *GitHubForge) ApproversForTip(ctx context.Context, repo, head, sha string) ([]string, error) {
-	return f.client(repo, permPulls).ApproversForTip(ctx, repo, head, sha)
+// ReviewApprovals implements Forge through the pull request and review APIs (pull_requests:read).
+func (f *GitHubForge) ReviewApprovals(ctx context.Context, repo, head string) (capy.ReviewState, error) {
+	return f.client(repo, permPulls).ReviewApprovals(ctx, repo, head)
 }
 
 // TeamResolver implements Forge through organization membership (members:read). The token is minted

@@ -131,7 +131,7 @@ Wake-up sources:
 
 Each landing request is one `refs/heads/land/<id>` in `gosuda/1`. The lander processes requests in the order of the activity-API timestamp of the push that set each tip. Each request runs through these checks. The first failing check rejects the request, and the trunk does not change.
 
-1. **Identity**: The requester is the pusher of the tip, as reported by the `gosuda/1` activity API for `refs/heads/land/<id>`. The approvers are the reviewers whose `APPROVED` review is bound to the tip, and only when `refs/heads/review/<id>` points at the same commit. When the activity entry is not visible yet, the request is deferred to a later cycle without a status.
+1. **Identity**: The requester is the pusher of the tip, as reported by the `gosuda/1` activity API for `refs/heads/land/<id>`. The approvers are the reviewers whose latest decisive review (anything but a comment) is `APPROVED` on the tip, or on another patchset of the same change that makes the identical patch to its own base snapshot (`git patch-id --verbatim`). The lander reads reviews from the pull request of `refs/heads/review/<id>` and of every other review branch whose tip has the same `Change-Id`, and reads the approved commit from `refs/ws/cl/<change-id>/<tip>`; an approval it cannot read or that covers a different patch does not count. When the activity entry is not visible yet, the request is deferred to a later cycle without a status.
 2. **Base provenance**: The request must have exactly one root commit, and that root's tree must equal the tree of one of the last 500 `refs/suda/history` commits. Otherwise the request is rejected with `unknown base tree <sha>: run git ws-sync`.
 3. **Merge**: When the trunk tree differs from the base, the lander runs `git merge-tree --write-tree --name-only --merge-base=<base tree> <trunk tree> <request tree>`. A conflict rejects the request and lists the conflicting paths.
 4. **Visibility**: The lander runs the visibility check of Section 3.3 on the changed files. A violation rejects the request.
@@ -140,6 +140,7 @@ Each landing request is one `refs/heads/land/<id>` in `gosuda/1`. The lander pro
 7. **Commit and publish**: The lander creates the snapshot commit (parentless) and the history commit (parent `refs/suda/history`) for the new tree. Both copy the author and date of the request tip and carry these trailers:
    - `Suda-Landed-From: refs/heads/land/<id>`
    - `Suda-Requester: <login>` and one `Suda-Approved-By: <login>` for each approver
+   - `Suda-Review: gosuda/1#<N>` when the change has a review pull request. The tip's own `Change-Id` trailer stays in the message.
 
    When the change edits control-plane paths, the lander also creates a commit on `refs/heads/main` as a child of the previous control-plane commit. Then it pushes everything in one `--atomic` push to `gosuda/0`, with a lease on every updated reference (`refs/suda/main`, `refs/suda/history`, and `refs/heads/main` when it changed).
 8. **Post-commit**: Each action is idempotent and repeated by later cycles until it succeeds:
@@ -166,7 +167,7 @@ sequenceDiagram
   Member->>U: git ws-save (refs/ws/actor/id)
   Member->>U: git ws-land (refs/heads/land/id)
   loop Every lander cycle
-    L->>U: Fetch refs/heads/land/*, base/*, review/*, refs/suda/*
+    L->>U: Fetch refs/heads/land/*, base/*, review/*, refs/ws/cl/*, refs/suda/*
     L->>U: Resolve pusher (activity API) and approvals bound to the tip
     L->>L: Base provenance, merge-tree, visibility, OWNERS
     L->>S: Presubmit on the candidate archive
@@ -201,7 +202,7 @@ The visibility check resolves references rather than matching text. It builds a 
 
 Once every 24 hours, the lander fetches `refs/ws/*`, `refs/heads/base/*`, and `refs/heads/review/*` from `gosuda/1` without blobs and deletes:
 
-- `refs/ws/*` whose tip commit is older than 14 days, including staged refs.
+- `refs/ws/*` whose tip commit is older than 14 days, including staged refs and autosave refs. The patchsets `refs/ws/cl/<change-id>/<tip>` of one change are the exception: they expire together, 14 days after the newest of them.
 - `refs/ws/capy/<wf>-pr-<N>` whose pull request is no longer open.
 - `refs/heads/base/<id>` and `refs/heads/review/<id>` pairs whose review pull request is no longer open and that are more than a day old.
 

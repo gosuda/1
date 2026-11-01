@@ -3,6 +3,8 @@ package lander
 import (
 	"strings"
 	"testing"
+
+	"gosuda.org/0/scripts/capy"
 )
 
 func TestLandAdvancesTrunkAtomicallyAndPreservesAuthorship(t *testing.T) {
@@ -62,7 +64,7 @@ func TestForgedIdentityNeverAuthorizes(t *testing.T) {
 
 	// The same change lands when an authenticated owner approves the exact tip.
 	tip := e.devWork("forge2", map[string]string{"P/a.go": "package p\n// ok\n"}, "P: change")
-	e.forge.approvals["gosuda/1|review/forge2"] = []string{"alice"}
+	e.forge.reviews["gosuda/1|review/forge2"] = capy.ReviewState{Approvals: []capy.Approval{{Login: "alice", Commit: tip}}}
 	git(t, e.dev, "push", "-q", e.user, tip+":refs/heads/review/forge2")
 	e.cycle()
 	if !strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "// ok") {
@@ -465,7 +467,7 @@ func TestMergedReviewPullRequestIsJudgedByMergerAndApprovers(t *testing.T) {
 
 	// An owner's approval of the exact tip carries a merge by someone else.
 	tip = e.devReview("m3", map[string]string{"P/a.go": "package p\n// m3\n"}, "P: m3")
-	e.forge.approvals["gosuda/1|review/m3"] = []string{"alice"}
+	e.forge.reviews["gosuda/1|review/m3"] = capy.ReviewState{Pull: 9, Approvals: []capy.Approval{{Login: "alice", Commit: tip}}}
 	e.mergePull("m3", 9, tip, "mallory")
 	e.cycle()
 	if !strings.Contains(e.trunkFile("refs/suda/main", "P/a.go"), "// m3") {

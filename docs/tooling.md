@@ -24,7 +24,8 @@ The `refs/heads/main` branch contains the agent rules, Git aliases, the Starlark
         ├── create-repo.sh        # workspace commit for a new project
         ├── import-repo.sh        # workspace commit importing an existing repository (unmodified copy)
         ├── go-work-add.sh        # workspace commit adding a project's Go modules to the root go.work
-        ├── test-workspace-scripts.sh  # offline smoke test of the three helpers above
+        ├── ws.sh                 # the workspace tools behind the aliases (installed by suda-init): Change-Id, patchsets, autosave, worktrees, fetch lock
+        ├── test-workspace-scripts.sh  # offline smoke test of the helpers above and ws.sh
         ├── capy/                 # Starlark evaluator, visibility and OWNERS checks, export and import
         └── lander/               # the lander service and its deployment (deploy/deploy.sh)
 ```
@@ -151,7 +152,7 @@ Starlark configuration is evaluated by the built-in modules listed in [google3-a
 
 ## 5. Magpie Routes and Mirror Repository
 
-The `//devtools/azure-magpie` project serves the Diff Link Generator UI and resolves `refs/suda/*` and `refs/ws/*` at the edge. The site is read-only. It accepts no landing requests; a landing is submitted only with `git ws-land`. The site sits behind Cloudflare Access, and the webhook path is the only exception. The worker reads the trunk from `gosuda/0` and workspaces from `gosuda/1`.
+The `//devtools/azure-magpie` project serves the web UI (overview, changes and patchsets, diff links) and resolves `refs/suda/*` and `refs/ws/*` at the edge. The site is read-only. It accepts no landing requests; a landing is submitted only with `git ws-land`. The site sits behind Cloudflare Access, and the webhook path is the only exception. The worker reads the trunk from `gosuda/0` and workspaces from `gosuda/1`.
 
 `gosuda/azure-magpie` is an ordinary public mirror of `//devtools/azure-magpie`. It holds no landing workflow and no landing secrets.
 
@@ -159,7 +160,10 @@ Table 5 lists the supported routes.
 
 | Request Path | Target Redirect Location or Response |
 | :--- | :--- |
-| `GET /` or `GET /<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
+| `GET /`, `GET /changes`, `GET /changes/<change-id or N>`, `GET /diff` | `200` HTML UI: overview, the list of changes, one change with its patchsets, approvals per patchset, and the interdiff between two patchsets, and the diff link generator |
+| `GET /api/changes` | `200` JSON list of changes built from the patchset refs `refs/ws/cl/<change-id>/<tip>` of `gosuda/1`. `refs/ws/cl/sec/*` and changes with a `sec-` subject are never listed |
+| `GET /api/changes/<change-id>` or `GET /api/changes/<N>` | `200` JSON detail: patchsets with their base snapshot and files, the review pull request and its approvals when the App may read pull requests; `N` is the review pull request number. `404` for hidden or unknown changes |
+| `GET /tree` or `GET /tree/<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-main-sha>/<path>` |
 | `GET /head` or `GET /head/<path>` | `302` to `https://github.com/gosuda/1/tree/<suda-history-sha>/<path>`, the tree view at the head of `refs/suda/history` |
 | `GET /blob/<path>` | `302` to `https://github.com/gosuda/1/blob/<suda-main-sha>/<path>` |
 | `GET /commit` or `GET /commit/<ref>` | `302` to `https://github.com/gosuda/1/commit/<resolved-sha>` |

@@ -168,23 +168,45 @@ func (g *GitHub) PusherForTip(ctx context.Context, repo string, ref string, sha 
 	return p.Actor, err
 }
 
-// ApproversForTip returns reviewers whose latest decisive review on a pull request from
-// branch head ("review/<id>") is APPROVED and bound to sha.
-func (g *GitHub) ApproversForTip(ctx context.Context, repo string, head string, sha string) ([]string, error) {
+// Approval is a reviewer whose latest decisive review is APPROVED, and the commit that review is
+// bound to.
+type Approval struct {
+	Login  string // lower case
+	Commit string
+}
+
+// ReviewState summarizes the pull requests opened from one review branch.
+type ReviewState struct {
+	// Pull is the number of the newest pull request from the branch; 0 when there is none.
+	Pull int
+	// Approvals lists, in order of first review, every reviewer whose latest decisive review
+	// (anything but COMMENTED and PENDING) is APPROVED. DISMISSED and CHANGES_REQUESTED reviews
+	// supersede earlier approvals of the same reviewer.
+	Approvals []Approval
+}
+
+// ReviewApprovals reads the pull requests from branch head ("review/<id>") and the reviews on
+// them. Decisions are applied oldest pull request and oldest review first, so the most recent
+// decision of a reviewer wins.
+func (g *GitHub) ReviewApprovals(ctx context.Context, repo string, head string) (ReviewState, error) {
 	owner, _, _ := strings.Cut(repo, "/")
 	q := url.Values{"head": {owner + ":" + head}, "state": {"all"}, "per_page": {"10"}}
-	var prs []struct {
+	type pull struct {
 		Number int `json:"number"`
 	}
+	var prs []pull
 	if err := g.getJSON(ctx, "/repos/"+repo+"/pulls?"+q.Encode(), &prs); err != nil {
-		return nil, err
+		return ReviewState{}, err
 	}
+	slices.SortFunc(prs, func(a, b pull) int { return a.Number - b.Number })
 	type decision struct {
 		state, commit string
 	}
+	var rs ReviewState
 	latest := map[string]decision{}
 	var order []string
 	for _, pr := range prs {
+		rs.Pull = max(rs.Pull, pr.Number)
 		for page := 1; ; page++ {
 			var reviews []struct {
 				User *struct {
@@ -195,7 +217,7 @@ func (g *GitHub) ApproversForTip(ctx context.Context, repo string, head string, 
 			}
 			p := fmt.Sprintf("/repos/%s/pulls/%d/reviews?per_page=100&page=%d", repo, pr.Number, page)
 			if err := g.getJSON(ctx, p, &reviews); err != nil {
-				return nil, err
+				return ReviewState{}, err
 			}
 			for _, r := range reviews {
 				if r.User == nil || r.State == "COMMENTED" || r.State == "PENDING" {
@@ -212,10 +234,25 @@ func (g *GitHub) ApproversForTip(ctx context.Context, repo string, head string, 
 			}
 		}
 	}
-	var out []string
 	for _, login := range order {
-		if d := latest[login]; d.state == "APPROVED" && d.commit == sha {
-			out = append(out, login)
+		if d := latest[login]; d.state == "APPROVED" && d.commit != "" {
+			rs.Approvals = append(rs.Approvals, Approval{Login: login, Commit: d.commit})
+		}
+	}
+	return rs, nil
+}
+
+// ApproversForTip returns reviewers whose latest decisive review on a pull request from
+// branch head ("review/<id>") is APPROVED and bound to exactly sha.
+func (g *GitHub) ApproversForTip(ctx context.Context, repo string, head string, sha string) ([]string, error) {
+	rs, err := g.ReviewApprovals(ctx, repo, head)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, a := range rs.Approvals {
+		if a.Commit == sha {
+			out = append(out, a.Login)
 		}
 	}
 	return out, nil

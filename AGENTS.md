@@ -16,6 +16,8 @@ In `gosuda/0` (`origin`, read-only for members):
 In `gosuda/1` (`ws`, where members push):
 
 - `refs/ws/<actor>/<id>` stores isolated work-in-progress commits for an active task.
+- `refs/ws/cl/<change-id>/<tip>` stores an immutable patchset: a tip that `git ws-pr` sent for review. The lander fetches these refs to read the commit a reviewer approved after `refs/heads/review/<id>` moved on, and prunes all patchsets of a change 14 days after the newest one. Embargoed work uses `refs/ws/cl/sec/<change-id>/<tip>`, which magpie never lists and the lander keeps for the embargo TTL.
+- `refs/ws/autosave/<actor>/<id>` stores the private working-state backup of `git ws-autosave`. It is never reviewed or landed.
 - `refs/heads/land/<id>` is a landing request. The lander deletes it once it processes the request, whether the request lands or is rejected.
 - `refs/heads/base/<id>` and `refs/heads/review/<id>` are the review pair created by `git ws-pr`. The lander deletes both after the change lands.
 - `refs/ws/capy/<wf>-main` and `refs/ws/capy/<wf>-pr-<N>` are external changes staged by the lander. A staged change lands only through a member's landing request.
@@ -39,7 +41,7 @@ The lander runs `capy check-owners` and `capy check-visibility` against the trun
 1. The lander reads `OWNERS` files only from the base trunk tree, which is `refs/suda/main` before the request lands. A change cannot approve itself by adding or editing an `OWNERS` file. A new `OWNERS` file takes effect once it has landed, and a new directory inherits from its nearest existing ancestor.
 2. For each changed path, the chain starts at the file's directory and walks toward the root. `set noparent` stops the walk. `per-file <glob>=@owner1,@owner2` adds owners for matching file names or repository paths. A mirror workflow that commits a generated file as a bot gets exactly that file this way (for example `per-file data.json.zstd=@github-actions[bot]` in `web/gosuda/zdata/OWNERS`, declared in the file's own directory); the bot must be the authenticated pusher, and the grant covers nothing else. `OWNERS` files are never exported to mirrors.
 3. Owners are GitHub logins (`@login`) or teams (`@org/team`). A team owner matches when the GitHub API reports an active membership. The literal `*` matches nobody. The root `OWNERS` names explicit owners.
-4. A path is approved when the requester or an approver belongs to its owner set. Approvals count only when they are `APPROVED` on the exact tip being landed.
+4. A path is approved when the requester or an approver belongs to its owner set. Approvals count only when they are `APPROVED` on the exact tip being landed, or on another patchset of the same change that makes the identical patch against its own base snapshot (Section 4.5). A different diff, a whitespace-only edit, a mode change, or a patchset the lander cannot read never inherits an approval.
 5. `set require-review` in any `OWNERS` file of the chain requires an approver other than the requester. `.github/OWNERS` uses it for the control plane.
 6. A path with no owners anywhere in its chain is rejected.
 7. Commit author, committer, and `Reviewed-by:` or `Approved-by:` trailers are not identities. They never approve anything.
@@ -123,7 +125,7 @@ git ws-land
 When a change needs line-by-line review comments or formal `OWNERS` sign-off on GitHub:
 
 1. Run `git ws-pr` on the workspace branch. It pushes the workspace base commit to `refs/heads/base/<task-id>` and `HEAD` to `refs/heads/review/<task-id>` on `gosuda/1`, then opens a pull request between them that contains only the workspace delta.
-2. Reviewers approve the `review/<task-id>` tip. An approval counts only for the exact commit that is landed.
+2. Reviewers approve the `review/<task-id>` tip. An approval counts for the exact commit that is landed and for a patch-identical patchset of the same change (Section 4.5).
 3. Land the same tip either by merging the review pull request on GitHub or with `git ws-land`. A merge counts as a landing request by the merger for the head that was merged, and the approvals on that head count. The lander reads the merger from GitHub's activity record, never from commit metadata, and ignores a merge once `refs/heads/review/<task-id>` no longer holds the merged head. Merging is a request, not a result: if the lander rejects it (`OWNERS`, visibility, presubmit, conflict), the failure appears as a `suda/land` status on the merged head, the review branches are deleted, and a new `git ws-pr` is needed. After the change lands, the lander deletes `refs/heads/base/<task-id>` and `refs/heads/review/<task-id>`.
 
 ### 4.3 Experimental Sandbox and Graduation Flow (`git ws-exp`, `git ws-graduate`)
@@ -140,3 +142,28 @@ External contributors and public CI runners interact with standalone `gosuda/<re
 2. **Inbound pull request staging**: The lander stages each open pull request on a mirror as `refs/ws/capy/<wf>-pr-<N>` on `gosuda/1` and deletes the staged ref when the pull request closes. Staged changes never land automatically.
 3. **Inbound push landing**: A push to a mirror branch (including a pull request merged on GitHub) lands automatically only when the pusher owns the prefix under the rules in Section 2.1. Each push since the last sync is judged by its own pusher, oldest first, so a later push by a bot cannot take over an earlier push by a member. If the activity API no longer lists every push, the pusher of the branch tip is judged for the whole range. Otherwise the lander stages it as `refs/ws/capy/<wf>-main`, and the mirror export for that workflow waits until the change is incorporated.
 4. **Landing a staged change**: Fetch with `git fetch ws`, create a workspace branch from the staged ref (`git switch -c ws/<actor>/capy-<wf>-pr-<N> refs/remotes/ws/ws/capy/<wf>-pr-<N>`), then run `git ws-land`. You become the requester, so the `OWNERS` rules apply to you. If the lander rejects the request for an unknown base or a merge conflict, run `git ws-sync` and resolve the conflicts with the `suda-resolve-conflicts` skill.
+
+### 4.5 Changes, Patchsets, and Autosave
+
+The flow gives every workspace the identity and review semantics of a changelist.
+
+1. **Change identity.** A change is identified by the `Change-Id: I<40 hex>` trailer of its tip commit. `git ws-save`, `git ws-pr`, and `git ws-land` add it once (`git ws-id` does so explicitly), reuse an existing one, and keep it across amends, rebases, and renamed branches.
+2. **Patchsets.** `git ws-pr` pushes the tip to the immutable `refs/ws/cl/<change-id>/<tip>` next to the review branches. Run it again after `git ws-sync` or an amend to add a patchset to the same pull request. `git ws-ps` lists the patchsets of the current change, and `git ws-psdiff <a> <b>` shows the interdiff between two of them.
+3. **Approval carry-over.** An approval is bound by GitHub to a commit. The lander counts it for the landing tip when the approved commit is the tip, or makes the same patch to its own root snapshot (`git patch-id --verbatim` of the full binary diff, so whitespace, modes, and binary content take part). The lander reads approvals from the pull request of `refs/heads/review/<id>` and of every other review branch whose tip carries the same `Change-Id`. After the trunk moves, `git ws-sync` followed by `git ws-land` therefore lands a clean rebase without a new review. A conflict resolved differently or any content edit needs a new approval, and `OWNERS` are still evaluated against the trunk at landing time.
+4. **Numbers.** The landed commit keeps its `Change-Id` and records `Suda-Review: gosuda/1#<N>` when a review pull request existed. `git suda-cl <N|Change-Id>` finds the landed commit on `refs/suda/history`.
+5. **Autosave.** `git ws-autosave start` backs up the working state (tracked files and untracked files that `.gitignore` does not exclude) to `refs/ws/autosave/<actor>/<id>` without touching the index, `HEAD`, or the branch. It is opt-in and never starts implicitly. Other machines restore it with `git ws-resume`. The refs in `gosuda/1` are readable by every member, so keep secrets out of the working tree as you would out of any commit.
+6. **Instant workspaces.** `git ws-wt <actor>/<id>` adds a worktree on a new workspace branch rooted at `origin/suda/main`, with the same sparse directories, without a new clone.
+
+`git suda-init` installs the workspace tools, `.gitconfig` and `.github/scripts/ws.sh`, from the checkout into the common Git directory (`suda.gitconfig`, `suda-ws.sh`). The aliases run that installed copy, so every branch and worktree of the clone uses the same version, including branches whose tree predates `ws.sh`. Run `git suda-init` again after the control plane changes `.gitconfig` or `ws.sh`. On a clone whose installed aliases predate `ws.sh`, run it twice: the first run installs the new aliases, and the second run installs `ws.sh`. On a checkout without `ws.sh`, `git suda-init` keeps the installed tools. To try an edited `ws.sh`, run `bash .github/scripts/ws.sh <subcommand>` directly.
+
+### 4.6 Parallel Agents and Worktrees
+
+Run parallel agents as one blobless clone per machine with one worktree per agent. Each worktree holds one change.
+
+1. **One change, one worktree, one agent.** Create the worktree with `git ws-wt <actor>/<id> [<dir>]`. It shares objects, blobs fetched on demand, trunk refs, and aliases with the clone, and keeps its own index, `HEAD`, rebase state, sparse directories, and autosave state. Git refuses to check out one branch in two worktrees.
+2. **Split concurrent work on one project into separate changes.** Give each change files that the others do not touch. The lander serializes landings. When one change conflicts with another that landed first, the later change runs `git ws-sync` and resolves the conflict.
+3. **Change several projects atomically in one worktree.** List each project in the worktree's sparse directories. The change lands in a single landing.
+4. **Never use `git stash`.** `refs/stash` is shared by every worktree, so one agent can pop another agent's work. Commit and `git ws-save` instead, or run `git ws-autosave once`. The command hook denies `git stash`.
+5. **Run fetches through the workspace tools.** Worktrees share their remote-tracking refs, and two concurrent fetches fail with `cannot lock ref`. `ws-new`, `ws-sync`, `ws-exp`, `suda-log`, `suda-init`, and every `ws.sh` subcommand fetch under one lock in the common Git directory. Fetch with `git suda-ws fetch <args>`; the command hook rewrites a plain `git fetch` to this form. Pushes need no lock, because each workspace pushes its own refs.
+6. **Do not change shared state.** Run `git config` only with `--worktree`. Never run `git gc --prune=now` or `git worktree prune`, and never delete another agent's branch.
+7. **Use separate clones when there is an isolation boundary.** This covers agents in their own container, VM, or remote machine (a worktree's `.git` file holds the absolute path of the clone), agents that push with different GitHub identities (the lander's requester is the pusher), and agents that must not affect each other's Git state.
