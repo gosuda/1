@@ -132,6 +132,16 @@ func (f *GitHubForge) TeamResolver(ctx context.Context) capy.TeamResolver {
 	return f.client(f.defaultRepo, permMembers).TeamResolver(ctx)
 }
 
+// OrgAdmin implements Forge through organization membership (members:read) of the owner of
+// defaultRepo.
+func (f *GitHubForge) OrgAdmin(ctx context.Context, login string) (bool, error) {
+	org, _, ok := strings.Cut(f.defaultRepo, "/")
+	if !ok || org == "" {
+		return false, fmt.Errorf("github forge: no organization in default repository %q", f.defaultRepo)
+	}
+	return f.client(f.defaultRepo, permMembers).OrgAdmin(ctx, org, login)
+}
+
 // SetStatus implements Forge with POST /repos/{repo}/statuses/{sha} (statuses:write). The
 // description is truncated to GitHub's limit.
 func (f *GitHubForge) SetStatus(ctx context.Context, repo, sha string, st Status) error {

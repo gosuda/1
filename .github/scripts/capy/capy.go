@@ -539,6 +539,10 @@ type Identity struct {
 	Requester string
 	// Approvers are logins whose approval is bound to the exact tip being landed.
 	Approvers []string
+	// Admin reports that Requester is an active organization admin. Like GitHub's OrganizationAdmin
+	// ruleset bypass, it waives owner membership and "set require-review"; a path with no OWNERS
+	// entry stays rejected.
+	Admin bool
 }
 
 // TeamResolver reports whether login is an active member of team ("org/slug"). A nil resolver
@@ -557,7 +561,8 @@ func normalizeLogin(s string) string {
 //   - experimental/<actor>/... is approved for the requester whose login equals <actor>; otherwise the
 //     normal OWNERS chain applies.
 //   - "set require-review" in any OWNERS file of the chain requires an owner other than the requester.
-//   - A path whose OWNERS chain is empty is rejected (fail closed).
+//   - An Identity with Admin set (an organization admin requester) satisfies every non-empty chain.
+//   - A path whose OWNERS chain is empty is rejected (fail closed), also for an admin.
 func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTreeOID string, id Identity, teams TeamResolver) ([]string, error) {
 	raw, err := gitOutput(ctx, repoDir, nil, "diff-tree", "-r", "-z", "--no-commit-id", baseTreeOID, newTreeOID)
 	if err != nil {
@@ -633,6 +638,9 @@ func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTre
 		chain := ownersChain(e.Path, readOwners)
 		if len(chain.owners) == 0 {
 			violations = append(violations, fmt.Sprintf("%s: no OWNERS entry covers this path", e.Path))
+			continue
+		}
+		if id.Admin && requester != "" {
 			continue
 		}
 		ok, err := anyOwner(chain.owners, principals)

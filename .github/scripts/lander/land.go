@@ -348,9 +348,32 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 		return reject("go.mod: %s", summarize(v))
 	}
 	id := capy.Identity{Requester: req.Requester, Approvers: req.Approvers}
-	if v, err := capy.CheckOwners(ctx, s.Dir, mainTree, newTree, id, l.Forge.TeamResolver(ctx)); err != nil {
+	teams := l.Forge.TeamResolver(ctx)
+	v, err := capy.CheckOwners(ctx, s.Dir, mainTree, newTree, id, teams)
+	if err != nil {
 		return Result{}, false, err
-	} else if len(v) > 0 {
+	}
+	// An organization admin bypasses OWNERS approvals, as on GitHub. The admin lookup runs only for a
+	// change that needs it, and the landed commit records the bypass.
+	bypassed := false
+	if len(v) > 0 && req.Requester != "" {
+		admin, err := l.Forge.OrgAdmin(ctx, req.Requester)
+		if err != nil {
+			return Result{}, false, err
+		}
+		if admin {
+			waived := v
+			id.Admin = true
+			if v, err = capy.CheckOwners(ctx, s.Dir, mainTree, newTree, id, teams); err != nil {
+				return Result{}, false, err
+			}
+			if len(v) == 0 {
+				bypassed = true
+				l.Log.Warn("organization admin bypassed OWNERS", "id", req.ID, "requester", req.Requester, "waived", summarize(waived))
+			}
+		}
+	}
+	if len(v) > 0 {
 		return reject("OWNERS: %s", summarize(v))
 	}
 
@@ -400,6 +423,9 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	}
 	for _, a := range req.Approvers {
 		msg += "Suda-Approved-By: " + a + "\n"
+	}
+	if bypassed {
+		msg += "Suda-Review-Bypass: " + req.Requester + "\n"
 	}
 	if req.Review > 0 {
 		msg += fmt.Sprintf("Suda-Review: %s#%d\n", l.User.Repo, req.Review)

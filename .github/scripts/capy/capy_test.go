@@ -266,6 +266,42 @@ func TestCheckOwnersEnforcesHierarchyAndApprovals(t *testing.T) {
 	}
 }
 
+// An organization admin passes noparent and require-review without being an owner or having an
+// approver, but a path no OWNERS file covers stays rejected.
+func TestCheckOwnersAdminBypassesApprovalsButNotUncoveredPaths(t *testing.T) {
+	repo := initTestRepo(t)
+	writeRepoFiles(t, repo, map[string]string{
+		"net/ivnp/OWNERS":   "set noparent\nset require-review\n@alice\n",
+		"net/ivnp/relay.go": "package ivnp\n",
+		"orphan/o.go":       "package orphan\n",
+	})
+	base := commitTree(t, repo)
+	writeRepoFiles(t, repo, map[string]string{
+		"net/ivnp/relay.go": "package ivnp\n// edit\n",
+		"orphan/o.go":       "package orphan\n// edit\n",
+	})
+	tree := commitTree(t, repo)
+	check := func(id capy.Identity) []string {
+		t.Helper()
+		v, err := capy.CheckOwners(context.Background(), repo, base, tree, id, nil)
+		if err != nil {
+			t.Fatalf("CheckOwners: %v", err)
+		}
+		return v
+	}
+
+	if v := check(capy.Identity{Requester: "boss"}); len(v) != 2 {
+		t.Fatalf("a non-admin non-owner must be rejected on both paths: %v", v)
+	}
+	if v := check(capy.Identity{Requester: "alice"}); len(v) != 2 {
+		t.Fatalf("require-review must still bind a non-admin owner: %v", v)
+	}
+	wantViolations(t, check(capy.Identity{Requester: "boss", Admin: true}), "orphan/o.go: no OWNERS entry covers this path")
+	wantViolations(t, check(capy.Identity{Admin: true}),
+		"net/ivnp/relay.go: missing OWNERS approval (requester=\"\" approvers=[], required one of [alice])",
+		"orphan/o.go: no OWNERS entry covers this path")
+}
+
 // A bot login granted one generated file by a per-file rule in that file's own directory may change that
 // file and nothing else, and only when it is the authenticated requester.
 func TestCheckOwnersPerFileBotGrantCoversOnlyItsFile(t *testing.T) {

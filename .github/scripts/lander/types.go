@@ -53,6 +53,9 @@ type Forge interface {
 	// approves, with the commit each approval is bound to (pull_requests:read).
 	PullApprovals(ctx context.Context, repo string, number int) ([]capy.Approval, error)
 	TeamResolver(ctx context.Context) capy.TeamResolver
+	// OrgAdmin reports whether login is an active admin of the organization (members:read). An
+	// admin bypasses OWNERS approval rules the way GitHub's OrganizationAdmin ruleset bypass does.
+	OrgAdmin(ctx context.Context, login string) (bool, error)
 	SetStatus(ctx context.Context, repo, sha string, st Status) error
 	OpenPulls(ctx context.Context, repo string) ([]PullRequest, error)
 	// ClosePull closes a pull request and then posts comment on it (pull_requests:write). A

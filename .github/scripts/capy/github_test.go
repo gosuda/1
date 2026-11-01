@@ -155,6 +155,26 @@ func TestMergedPullForCommitMatchesOnlyTheMergeThatProducedTheCommit(t *testing.
 	}
 }
 
+func TestOrgAdminRequiresAnActiveAdminMembership(t *testing.T) {
+	gh := newFakeGitHub(t, map[string]string{
+		"/orgs/gosuda/memberships/root":    `{"state":"active","role":"admin"}`,
+		"/orgs/gosuda/memberships/invited": `{"state":"pending","role":"admin"}`,
+		"/orgs/gosuda/memberships/member":  `{"state":"active","role":"member"}`,
+	})
+	ctx := context.Background()
+	for login, want := range map[string]bool{"root": true, "invited": false, "member": false, "nobody": false} {
+		got, err := gh.OrgAdmin(ctx, "gosuda", login)
+		if err != nil || got != want {
+			t.Errorf("OrgAdmin(%s) = %v, %v; want %v", login, got, err, want)
+		}
+	}
+	bad := capy.NewGitHub("wrong")
+	bad.BaseURL = gh.BaseURL
+	if _, err := bad.OrgAdmin(ctx, "gosuda", "root"); err == nil {
+		t.Error("401 must surface as an error, not as non-admin")
+	}
+}
+
 func TestTeamResolverTreatsOnly404AsNonMember(t *testing.T) {
 	gh := newFakeGitHub(t, map[string]string{
 		"/orgs/gosuda/teams/core/memberships/carol":   `{"state":"active"}`,
