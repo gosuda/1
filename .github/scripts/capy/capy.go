@@ -539,6 +539,11 @@ type Identity struct {
 	Requester string
 	// Approvers are logins whose approval is bound to the exact tip being landed.
 	Approvers []string
+	// Authors are the logins that pushed the reviewed commits, when the lander knows them (the head
+	// branch of a pull request merged on a mirror). "set require-review" then needs an owner approver
+	// outside Authors, so a reviewer who also merged counts. Nil means the requester alone wrote the
+	// change. Authors never approve or own anything.
+	Authors []string
 	// Admin reports that Requester is an active organization admin. Like GitHub's OrganizationAdmin
 	// ruleset bypass, it waives owner membership and "set require-review"; a path with no OWNERS
 	// entry stays rejected.
@@ -560,7 +565,8 @@ func normalizeLogin(s string) string {
 //   - An entry "org/team" is resolved through teams; the literal "*" matches nobody.
 //   - experimental/<actor>/... is approved for the requester whose login equals <actor>; otherwise the
 //     normal OWNERS chain applies.
-//   - "set require-review" in any OWNERS file of the chain requires an owner other than the requester.
+//   - "set require-review" in any OWNERS file of the chain requires an owner approver other than the
+//     requester, or other than every login in Authors when Authors is set.
 //   - An Identity with Admin set (an organization admin requester) satisfies every non-empty chain.
 //   - A path whose OWNERS chain is empty is rejected (fail closed), also for an admin.
 func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTreeOID string, id Identity, teams TeamResolver) ([]string, error) {
@@ -595,10 +601,30 @@ func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTre
 	if requester != "" {
 		principals = append(principals, requester)
 	}
-	var approvers []string
+	self := map[string]bool{requester: true}
+	selfDesc := fmt.Sprintf("the requester %q", requester)
+	if id.Authors != nil {
+		self = make(map[string]bool, len(id.Authors))
+		var names []string
+		for _, a := range id.Authors {
+			if n := normalizeLogin(a); n != "" && !self[n] {
+				self[n] = true
+				names = append(names, n)
+			}
+		}
+		selfDesc = fmt.Sprintf("the authors %v", names)
+	}
+	var approvers, reviewers []string
 	for _, a := range id.Approvers {
-		if n := normalizeLogin(a); n != "" && n != requester {
+		n := normalizeLogin(a)
+		if n == "" {
+			continue
+		}
+		if n != requester {
 			approvers = append(approvers, n)
+		}
+		if !self[n] {
+			reviewers = append(reviewers, n)
 		}
 	}
 	principals = append(principals, approvers...)
@@ -648,12 +674,12 @@ func CheckOwners(ctx context.Context, repoDir string, baseTreeOID string, newTre
 			return nil, err
 		}
 		if ok && chain.requireReview {
-			ok, err = anyOwner(chain.owners, approvers)
+			ok, err = anyOwner(chain.owners, reviewers)
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
-				violations = append(violations, fmt.Sprintf("%s: requires review by an owner other than the requester %q (required one of %v)", e.Path, requester, chain.owners))
+				violations = append(violations, fmt.Sprintf("%s: requires review by an owner other than %s (required one of %v)", e.Path, selfDesc, chain.owners))
 				continue
 			}
 		}

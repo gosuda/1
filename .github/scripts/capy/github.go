@@ -93,10 +93,10 @@ type RefPush struct {
 	PRMerge bool
 }
 
-// refPushes lists the recent updates of ref that set it to a commit, newest first. A merge of a pull
+// RefPushes lists the recent updates of ref that set it to a commit, newest first. A merge of a pull
 // request through the web UI is recorded as "pr_merge" rather than "push": the actor is the
 // authenticated merger, who needs the same write access a push needs, so it identifies the pusher.
-func (g *GitHub) refPushes(ctx context.Context, repo, ref string) ([]RefPush, error) {
+func (g *GitHub) RefPushes(ctx context.Context, repo, ref string) ([]RefPush, error) {
 	q := url.Values{"ref": {ref}, "per_page": {"100"}}
 	var items []struct {
 		Before    string    `json:"before"`
@@ -132,7 +132,7 @@ func (g *GitHub) refPushes(ctx context.Context, repo, ref string) ([]RefPush, er
 // the repository activity API (unlike commit metadata, GitHub authenticates it). ref is a full
 // name such as refs/heads/land/x.
 func (g *GitHub) PushForTip(ctx context.Context, repo string, ref string, sha string) (Push, error) {
-	pushes, err := g.refPushes(ctx, repo, ref)
+	pushes, err := g.RefPushes(ctx, repo, ref)
 	if err != nil {
 		return Push{}, err
 	}
@@ -149,7 +149,7 @@ func (g *GitHub) PushForTip(ctx context.Context, repo string, ref string, sha st
 // update in between is still listed by the activity API; otherwise it wraps ErrActorNotVisible and
 // the caller has to fall back to the actor of the tip alone.
 func (g *GitHub) PushChain(ctx context.Context, repo, ref, stop, tip string) ([]RefPush, error) {
-	pushes, err := g.refPushes(ctx, repo, ref)
+	pushes, err := g.RefPushes(ctx, repo, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +229,10 @@ func (g *GitHub) PullApprovals(ctx context.Context, repo string, number int) ([]
 type MergedPull struct {
 	Number int
 	Head   string
+	// HeadRepo ("owner/name") and HeadRef (branch name) locate the head branch; HeadRepo is a fork for
+	// a pull request from one and empty when that repository was deleted.
+	HeadRepo string
+	HeadRef  string
 }
 
 // MergedPullForCommit returns the pull request whose merge produced mergeSHA, the commit a pr_merge
@@ -239,7 +243,11 @@ func (g *GitHub) MergedPullForCommit(ctx context.Context, repo, mergeSHA string)
 		MergedAt *string `json:"merged_at"`
 		MergeSHA string  `json:"merge_commit_sha"`
 		Head     struct {
-			SHA string `json:"sha"`
+			SHA  string `json:"sha"`
+			Ref  string `json:"ref"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
 	}
 	if err := g.getJSON(ctx, "/repos/"+repo+"/commits/"+url.PathEscape(mergeSHA)+"/pulls", &items); err != nil {
@@ -247,7 +255,11 @@ func (g *GitHub) MergedPullForCommit(ctx context.Context, repo, mergeSHA string)
 	}
 	for _, it := range items {
 		if it.MergedAt != nil && it.MergeSHA == mergeSHA && it.Head.SHA != "" {
-			return MergedPull{Number: it.Number, Head: it.Head.SHA}, true, nil
+			pr := MergedPull{Number: it.Number, Head: it.Head.SHA, HeadRef: it.Head.Ref}
+			if it.Head.Repo != nil {
+				pr.HeadRepo = it.Head.Repo.FullName
+			}
+			return pr, true, nil
 		}
 	}
 	return MergedPull{}, false, nil

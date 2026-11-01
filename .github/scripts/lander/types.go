@@ -49,6 +49,10 @@ type Forge interface {
 	// MergedPullForCommit returns the pull request of repo whose merge commit is mergeSHA and the
 	// head it merged; ok is false when there is none (pull_requests:read).
 	MergedPullForCommit(ctx context.Context, repo, mergeSHA string) (pr capy.MergedPull, ok bool, err error)
+	// BranchPushes lists, newest first, the recent updates of ref in repo with the actor of each
+	// (contents:read). The token is minted on viaRepo, so the head branch of a pull request from a
+	// public fork is read through the mirror's installation.
+	BranchPushes(ctx context.Context, viaRepo, repo, ref string) ([]capy.RefPush, error)
 	// PullApprovals returns the reviewers of pull request number of repo whose latest decisive review
 	// approves, with the commit each approval is bound to (pull_requests:read).
 	PullApprovals(ctx context.Context, repo string, number int) ([]capy.Approval, error)

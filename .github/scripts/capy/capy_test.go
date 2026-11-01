@@ -302,6 +302,42 @@ func TestCheckOwnersAdminBypassesApprovalsButNotUncoveredPaths(t *testing.T) {
 		"orphan/o.go: no OWNERS entry covers this path")
 }
 
+// With the authors of a change known, set require-review needs an owner approver outside the authors:
+// a reviewer who merged counts, an author who approved does not, and authors own nothing.
+func TestCheckOwnersRequireReviewExcludesAuthorsInsteadOfTheRequester(t *testing.T) {
+	repo := initTestRepo(t)
+	writeRepoFiles(t, repo, map[string]string{
+		"net/ivnp/OWNERS":   "set noparent\nset require-review\n@alice\n@bob\n",
+		"net/ivnp/relay.go": "package ivnp\n",
+	})
+	base := commitTree(t, repo)
+	writeRepoFiles(t, repo, map[string]string{"net/ivnp/relay.go": "package ivnp\n// edit\n"})
+	tree := commitTree(t, repo)
+	check := func(id capy.Identity) []string {
+		t.Helper()
+		v, err := capy.CheckOwners(context.Background(), repo, base, tree, id, nil)
+		if err != nil {
+			t.Fatalf("CheckOwners: %v", err)
+		}
+		return v
+	}
+
+	// alice pushed, bob approved and merged.
+	if v := check(capy.Identity{Requester: "bob", Approvers: []string{"bob"}, Authors: []string{"alice"}}); len(v) != 0 {
+		t.Fatalf("a reviewer who merged someone else's change must count: %v", v)
+	}
+	if v := check(capy.Identity{Requester: "bob", Approvers: []string{"bob"}}); len(v) != 1 {
+		t.Fatalf("without known authors the merger's own approval must not count: %v", v)
+	}
+	// bob pushed a fix-up onto alice's branch before approving it.
+	wantViolations(t, check(capy.Identity{Requester: "bob", Approvers: []string{"bob"}, Authors: []string{"alice", "bob"}}),
+		"net/ivnp/relay.go: requires review by an owner other than the authors [alice bob] (required one of [alice bob])")
+	// A non-owner merger with an author who is an owner still needs an owner principal.
+	if v := check(capy.Identity{Requester: "mallory", Authors: []string{"alice"}}); len(v) != 1 {
+		t.Fatalf("authors must not own the change: %v", v)
+	}
+}
+
 // A bot login granted one generated file by a per-file rule in that file's own directory may change that
 // file and nothing else, and only when it is the authenticated requester.
 func TestCheckOwnersPerFileBotGrantCoversOnlyItsFile(t *testing.T) {

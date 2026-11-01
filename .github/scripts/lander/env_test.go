@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -134,6 +135,13 @@ func (f *fakeForge) PushChain(_ context.Context, repo, ref, stop, tip string) ([
 		cur = all[i].Before
 	}
 	return chain, nil
+}
+func (f *fakeForge) BranchPushes(_ context.Context, _, repo, ref string) ([]capy.RefPush, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := slices.Clone(f.chains[repo+"|"+ref])
+	slices.Reverse(out)
+	return out, nil
 }
 func (f *fakeForge) ReviewApprovals(_ context.Context, repo, head string) (capy.ReviewState, error) {
 	return f.reviews[repo+"|"+head], nil

@@ -79,6 +79,13 @@ type Signing struct {
 	AllowedSigners string // allowed signers file used for tip verification
 }
 
+// isAncestor reports whether commit a is an ancestor of (or equal to) commit b. A commit missing from
+// the store is not an ancestor.
+func (s *Store) isAncestor(ctx context.Context, a, b string) bool {
+	_, err := s.Git(ctx, "merge-base", "--is-ancestor", a, b)
+	return err == nil
+}
+
 // Git runs git in the store without remote credentials.
 func (s *Store) Git(ctx context.Context, args ...string) (string, error) {
 	return s.run(ctx, nil, nil, nil, args...)

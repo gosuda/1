@@ -60,7 +60,7 @@ The first push that fails a check stops the chain and the whole range is staged 
 `refs/ws/capy/<workflow>-main`. When the API does not list every push of the range, or a commit of it
 is missing from the store, the range is judged as one change by the pusher of the tip.
 
-A `pr_merge` step also carries approvals (`mirrorPullApprovals` in `sync.go`). The lander finds the pull
+A `pr_merge` step also carries approvals (`mirrorPullReview` in `sync.go`). The lander finds the pull
 request whose merge commit is the step's commit, then takes the reviewers whose latest decisive review
 approves exactly its head (fetched from `refs/pull/*/head`). The approvals count only when
 `git patch-id --verbatim` of `before..merge` equals that of `merge-base(head, before)..head`, so a merge
@@ -68,6 +68,17 @@ that resolved conflicts or added content is judged by its merger alone. This mak
 workable for projects that merge on the mirror: another owner's approval on the mirror pull request
 lands the merge. A failed pull-request lookup counts as no approval. The landed commit records
 `Suda-Mirror-Pull: <repo>#<N>`.
+
+The authors of a counted approval come from the head branch (`headAuthors` in `sync.go`): the lander
+reads the activity API of the head repository, a fork included, with a token of the mirror, and
+follows the branch's updates back from the reviewed head until the branch held only commits the mirror
+branch already had or did not exist. Every actor on that path is an author, so a reviewer's fix-up or a
+force-pushed version makes its pusher an author too. With the authors known, `set require-review` needs
+an owner approver who is not an author (`capy.Identity.Authors`), and the merger's own approval counts
+when the merger pushed nothing: the GitHub flow where the reviewer merges. Authors never become owners
+of the change; the merger or an approver still has to be one. When the path is not covered (activity
+pruned, fork unreadable, head repository deleted), the merger is the only author, as before. Each
+author is recorded as `Suda-Mirror-Author: <login>`.
 
 ## Organization admin bypass
 
