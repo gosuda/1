@@ -302,6 +302,19 @@ func (l *Lander) reconcilePass(ctx context.Context, wf capy.Workflow, remote Rem
 		l.Log.Error("mirror diverged and no sync baseline exists; manual baseline required", "workflow", wf.Name)
 		return true, false, nil
 	}
+	// The trunk may already agree with a mirror commit between the baseline and the tip, for example
+	// after an inbound chain landed its first pushes and stopped. That commit is the real agreement
+	// point; merging the rest against the older baseline conflicts wherever a later push edits the
+	// lines an earlier one did.
+	if c, ok, err := l.agreedMirrorCommit(ctx, wf, base.Mirror, tip, M); err != nil {
+		return true, false, err
+	} else if ok {
+		l.Log.Info("trunk agrees with an intermediate mirror commit; advancing the sync baseline", "workflow", wf.Name, "mirror", c)
+		if err := l.writeBaseline(ctx, wf, base, haveBase, histTip, c); err != nil {
+			return true, false, err
+		}
+		base = capy.SyncBaseline{Workflow: wf.Name, Mono: histTip, Mirror: c}
+	}
 
 	bMonoTree, err := s.Tree(ctx, base.Mono)
 	if err != nil {
@@ -407,9 +420,17 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 		l.Log.Info("inbound landing processed", "workflow", wf.Name, "commit", st.commit, "requester", req.Requester,
 			"outcome", res.Outcome.String(), "reason", truncate(res.Reason, 200))
 		switch res.Outcome {
-		case Landed:
-			landed = true
-		case AlreadyLanded:
+		case Landed, AlreadyLanded:
+			landed = landed || res.Outcome == Landed
+			// When the trunk now exports exactly this mirror commit, it is the new agreement point, and
+			// the next pushes merge against it instead of the older baseline.
+			nb, nTree, ok, err := l.advanceBaselineTo(ctx, wf, base, st.commit)
+			if err != nil {
+				return inboundPending, err
+			}
+			if ok {
+				base, bMonoTree = nb, nTree
+			}
 		case Rejected:
 			// The later pushes contain this one, so nothing after it can land before a member lands
 			// the staged change.
@@ -422,6 +443,65 @@ func (l *Lander) inbound(ctx context.Context, wf capy.Workflow, base capy.SyncBa
 		return inboundLanded, nil
 	}
 	return inboundContained, nil
+}
+
+// mirrorExport returns the export-normalized tree of mirror commit c.
+func (l *Lander) mirrorExport(ctx context.Context, wf capy.Workflow, c string) (string, error) {
+	raw, err := l.Store.Tree(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	return capy.NormalizeMirrorTree(ctx, l.Store.Dir, raw, wf)
+}
+
+// agreedMirrorCommit returns the newest first-parent mirror commit after baseMirror and before tip whose
+// export-normalized tree equals M, the export of the current trunk. Such a commit is an agreement point
+// exactly like a mirror tip that equals M. ok is false when there is none or the range is unknown to the
+// store.
+func (l *Lander) agreedMirrorCommit(ctx context.Context, wf capy.Workflow, baseMirror, tip, M string) (string, bool, error) {
+	out, err := l.Store.Git(ctx, "rev-list", "--first-parent", "--max-count=100", tip, "^"+baseMirror)
+	if err != nil {
+		return "", false, nil
+	}
+	for _, c := range strings.Fields(out) {
+		if c == tip {
+			continue // the caller compared the tip already
+		}
+		X, err := l.mirrorExport(ctx, wf, c)
+		if err != nil {
+			return "", false, err
+		}
+		if X == M {
+			return c, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// advanceBaselineTo moves the sync baseline to mirror commit c when the current trunk exports exactly
+// c's tree, and returns the new baseline and its trunk tree.
+func (l *Lander) advanceBaselineTo(ctx context.Context, wf capy.Workflow, base capy.SyncBaseline, c string) (capy.SyncBaseline, string, bool, error) {
+	s := l.Store
+	histTip, ok := s.RevParse(ctx, trunkHistory)
+	if !ok {
+		return base, "", false, nil
+	}
+	mainTree, err := s.Tree(ctx, trunkMain)
+	if err != nil {
+		return base, "", false, err
+	}
+	M, err := capy.TransformSubtree(ctx, s.Dir, mainTree, wf)
+	if err != nil {
+		return base, "", false, err
+	}
+	X, err := l.mirrorExport(ctx, wf, c)
+	if err != nil || X != M {
+		return base, "", false, err
+	}
+	if err := l.writeBaseline(ctx, wf, base, true, histTip, c); err != nil {
+		return base, "", false, err
+	}
+	return capy.SyncBaseline{Workflow: wf.Name, Mono: histTip, Mirror: c}, mainTree, true, nil
 }
 
 // inboundStep is one mirror commit to land and the authenticated push that set the branch to it.

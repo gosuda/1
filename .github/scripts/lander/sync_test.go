@@ -199,6 +199,58 @@ func TestInboundWithoutPushChainFallsBackToTheTipPusher(t *testing.T) {
 	}
 }
 
+// A later mirror push that edits the lines an earlier push edited lands after it: once the first push
+// landed, the trunk agrees with that mirror commit and the second merges against it, not against the
+// older baseline (gosuda/portal-tunnel #710 then #709).
+func TestInboundChainWithOverlappingPushesLandsEveryPush(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	base := e.trunkRefMirror()
+	c1 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=2\n"}, "a=2")
+	c2 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=3\n"}, "a=3")
+	e.forge.chains = map[string][]capy.RefPush{"gosuda/p|refs/heads/main": {
+		{Push: capy.Push{Actor: "alice"}, Before: base, After: c1},
+		{Push: capy.Push{Actor: "alice"}, Before: c1, After: c2},
+	}}
+
+	e.cycle()
+
+	if got := e.trunkFile("refs/suda/main", "P/a.go"); !strings.Contains(got, "a=3") {
+		t.Fatalf("P/a.go = %q, want the second push", got)
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("nothing needs staging, got %v", refs)
+	}
+	if msg := git(t, e.trunk, "log", "-1", "--format=%B", "refs/suda/sync/p"); !strings.Contains(msg, "Suda-Sync-Mirror: "+c2) {
+		t.Fatalf("baseline must reach the mirror tip:\n%s", msg)
+	}
+}
+
+// A baseline left behind a mirror commit the trunk already holds exactly catches up to that commit
+// before the rest of the mirror is merged.
+func TestStaleBaselineCatchesUpToTheMirrorCommitTheTrunkHolds(t *testing.T) {
+	e := newEnv(t)
+	e.cycle()
+	base := e.trunkRefMirror()
+	c1 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=2\n"}, "a=2")
+	c2 := e.mirrorCommit(map[string]string{"a.go": "package p\n// a=3\n"}, "a=3")
+	e.forge.chains = map[string][]capy.RefPush{"gosuda/p|refs/heads/main": {
+		{Push: capy.Push{Actor: "alice"}, Before: base, After: c1},
+		{Push: capy.Push{Actor: "alice"}, Before: c1, After: c2},
+	}}
+	// The trunk receives c1's content through a workspace before the mirror is reconciled.
+	e.devWork("same-as-c1", map[string]string{"P/a.go": "package p\n// a=2\n"}, "P: a=2")
+
+	e.cycle()
+
+	if got := e.trunkFile("refs/suda/main", "P/a.go"); !strings.Contains(got, "a=3") {
+		t.Fatalf("P/a.go = %q, want the second push (staged %v)", got, e.userRefs("refs/ws/capy/"))
+	}
+	if refs := e.userRefs("refs/ws/capy/"); len(refs) != 0 {
+		t.Fatalf("nothing needs staging, got %v", refs)
+	}
+}
+
 // A push that is not authorized stops the chain: earlier pushes stay landed, the rest is staged.
 func TestInboundChainStopsAtTheFirstUnauthorizedPush(t *testing.T) {
 	e := newEnv(t)
