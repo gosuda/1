@@ -194,7 +194,7 @@ Each landing request is one `refs/heads/land/<id>` in `gosuda/1`. The lander pro
    - Publish `refs/heads/lander` when `.github/scripts/{lander,capy}` changed.
 8. **Rejection**: Set `suda/land=failure` on the tip with the reason, then delete the land ref with a lease. The workspace ref stays untouched. Rejections never block the queue.
 
-Review pull requests in `gosuda/1` are for discussion and approval only. Landing always goes through `git ws-land`. An approval counts only when its `commit_id` equals the landed tip.
+Review pull requests in `gosuda/1` are for discussion and approval only. Landing always goes through `git ws-land`. An approval counts only when its `commit_id` equals the landed tip or names a patchset of the same change whose patch to its own base snapshot is identical (see [architecture.md](./architecture.md) §3.2).
 
 ### 4.4 Control-Plane Changes
 

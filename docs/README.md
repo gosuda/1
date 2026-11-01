@@ -45,6 +45,8 @@ The topology partitions control metadata, trunk snapshots, commit history, and a
 | `gosuda/1` | `refs/ws/<actor>/<id>` | Isolated work-in-progress workspace commits | Owning member | Pushed by `git ws-save` and `git ws-pr` |
 | `gosuda/1` | `refs/heads/land/<id>` | Landing request | Owning member; deleted by the lander | Read by the lander |
 | `gosuda/1` | `refs/heads/base/<id>`, `refs/heads/review/<id>` | Review pull request pair | Owning member (`git ws-pr`); deleted by the lander | Pushed by `git ws-pr` |
+| `gosuda/1` | `refs/ws/cl/<change-id>/<tip>` | Immutable patchsets of a change sent for review | Owning member (`git ws-pr`); pruned by the lander | Read by the lander; listed by `git ws-ps` |
+| `gosuda/1` | `refs/ws/autosave/<actor>/<id>` | Private working-state backup | Owning member (`git ws-autosave`) | Restored by `git ws-resume` |
 | `gosuda/1` | `refs/ws/capy/<wf>-main`, `refs/ws/capy/<wf>-pr-<N>` | Staged external changes | `suda-lander` | Yes, with `git fetch ws` |
 | `gosuda/1` | `refs/suda/main`, `refs/suda/history` | Copies of the `gosuda/0` trunk refs (push negotiation base only) | `suda-lander` | Never |
 
@@ -59,7 +61,7 @@ Clone the control plane from `gosuda/0`, attach the trunk namespace and the `ws`
 
 1. Clone `gosuda/0` with blob filtering and sparse checkout enabled.
 2. Include the repository `.gitconfig` file to register workspace aliases.
-3. Run `git suda-init`. It registers the `ws` remote (`gosuda/1`), disables pushes to `origin`, fetches `refs/suda/*` from `origin`, and includes the aliases.
+3. Run `git suda-init`. It installs the aliases and `.github/scripts/ws.sh` into the common Git directory, registers the `ws` remote (`gosuda/1`), disables pushes to `origin`, and fetches `refs/suda/*` from `origin`. Parallel agents each work in their own worktree of this clone (`git ws-wt`, `AGENTS.md` §4.6).
 4. Configure sparse checkout for your target domain paths.
 5. Create a local workspace branch from `origin/suda/main`.
 
@@ -80,7 +82,7 @@ Every change in `gosuda/0` obeys six structural invariants:
 2. **Overlay Invariant**: Every top-level entry of `refs/heads/main` appears unchanged in `refs/suda/main`. A landing that edits a control-plane path advances `refs/heads/main` in the same atomic push as the trunk.
 3. **Dual-Pointer Trunk**: Every landing advances `refs/suda/main` (a parentless snapshot) and `refs/suda/history` (a parent-linked commit). Both commits reference the identical root tree SHA-1 hash.
 4. **Four-Tier Visibility**: Public production domains (`//web/*`, `//net/*`, `//ipc/*`, `//storage/*`, `//crypto/*`, `//ai/*`, `//devtools/*`) never import `//corp/*` or `//experimental/*`. Vendor directories (`//third_party/*`) remain self-contained, `//corp/*` never imports `//experimental/*`, and `//experimental/<actor>/*` never imports `//corp/*`. The lander resolves imports to repository paths to enforce these rules.
-5. **Hierarchical `OWNERS` and Authenticated Identity**: `capy check-owners` reads `OWNERS` files from the base trunk tree. Identities come only from GitHub: the pusher reported by the repository activity API, approvals bound to the exact tip, and organization team membership. Commit author and trailers never grant approval. A path under `//experimental/<actor>/*` is approved for a requester whose login is `<actor>`, without an `OWNERS` entry. Any other requester needs the `OWNERS` chain.
+5. **Hierarchical `OWNERS` and Authenticated Identity**: `capy check-owners` reads `OWNERS` files from the base trunk tree. Identities come only from GitHub: the pusher reported by the repository activity API, approvals bound to the exact tip or to a patch-identical patchset of the same change, and organization team membership. Commit author and trailers never grant approval. A path under `//experimental/<actor>/*` is approved for a requester whose login is `<actor>`, without an `OWNERS` entry. Any other requester needs the `OWNERS` chain.
 6. **In-Memory Atomic Landing**: The lander computes the merged tree with `git merge-tree --write-tree`, runs the visibility, `OWNERS`, and presubmit checks, and publishes the result in one `--atomic` push. Every updated reference has a lease, so a trunk ref that moved after evaluation makes the push fail instead of being overwritten.
 
 **Go module convention**: committed `go.mod` files carry no local `replace` (the lander rejects `replace x => ../y`), internal `require`s name published versions, and the root `go.work` resolves sibling modules to local code for development and presubmit. `.github/scripts/go-work-add.sh <prefix>` adds a project's modules to it; see `AGENTS.md` §2.3.
@@ -92,7 +94,8 @@ Every change in `gosuda/0` obeys six structural invariants:
    - Inspect two-dot diffs at [`https://magpie.gosuda.org/diff`](https://magpie.gosuda.org/diff) and submit with `git ws-land`.
 2. **Ephemeral GitHub Pull Request Review (`git ws-pr`)**:
    - Run `git ws-pr` to push the workspace base commit to `refs/heads/base/<id>` and the workspace tip to `refs/heads/review/<id>` on `gosuda/1`, which opens a pull request between the two branches.
-   - Approvals count only for the landed tip. Land with `git ws-land`; merging the pull request does not land anything.
+   - Every workspace has a `Change-Id` trailer and every `git ws-pr` adds an immutable patchset `refs/ws/cl/<change-id>/<tip>`. An approval counts for the landed tip and for any trivially rebased patchset of the same change. Land with `git ws-land` or by merging the review pull request.
+   - `git ws-ps` lists patchsets, `git ws-psdiff <a> <b>` shows the interdiff, and `git suda-cl <N|Change-Id>` finds the landed commit.
 3. **Experimental Sandbox and Graduation (`git ws-exp`, `git ws-graduate`)**:
    - Run `git ws-exp <actor> <project>` to create a sandboxed workspace under `//experimental/<actor>/<project>`. `<actor>` must be your GitHub login.
    - Run `git ws-graduate experimental/<actor>/<project> <domain>/<project>` to promote a package into a production domain. The destination needs `OWNERS` approval.

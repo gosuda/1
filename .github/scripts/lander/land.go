@@ -65,7 +65,10 @@ type Request struct {
 	Tip       string // commit in the store
 	Requester string
 	Approvers []string
-	Pushed    time.Time
+	// Review is the number of the review pull request of the change in the user repository, 0 when
+	// the change was never sent for review. The landed commit records it as Suda-Review.
+	Review int
+	Pushed time.Time
 	// ReviewMerged marks a request made by merging the review pull request review/<ID> on GitHub
 	// instead of pushing land/<ID>. LandRef is empty; the review pair is removed whatever the outcome,
 	// because the merged pull request cannot be reopened and a rejected pair would be tried again.
@@ -101,6 +104,7 @@ func (l *Lander) fetchUser(ctx context.Context) error {
 		"+refs/heads/land/*:"+userLand+"*",
 		"+refs/heads/review/*:"+userReview+"*",
 		"+refs/heads/base/*:"+userBase+"*",
+		"+refs/ws/cl/*:"+userCL+"*",
 		"+refs/suda/*:"+userSuda+"*"); err != nil {
 		return err
 	}
@@ -134,14 +138,7 @@ func (l *Lander) DrainLandRequests(ctx context.Context) error {
 			continue
 		}
 		req := Request{ID: id, LandRef: landRef, Tip: sha, Requester: push.Actor, Pushed: push.Time}
-		if _, ok := l.Store.RevParse(ctx, userReview+id); ok {
-			if rv, _ := l.Store.RevParse(ctx, userReview+id); rv == sha {
-				req.Approvers, err = l.Forge.ApproversForTip(ctx, l.User.Repo, "review/"+id, sha)
-				if err != nil {
-					l.Log.Warn("approvals unavailable; continuing without", "id", id, "err", err)
-				}
-			}
-		}
+		req.Approvers, req.Review = l.approvalsFor(ctx, id, sha)
 		reqs = append(reqs, req)
 	}
 	reqs = append(reqs, l.mergedReviewRequests(ctx, reqs)...)
@@ -202,9 +199,8 @@ func (l *Lander) mergedReviewRequests(ctx context.Context, have []Request) []Req
 		}
 		req := Request{ID: id, Tip: p.HeadSHA, Requester: push.Actor, Pushed: push.Time, ReviewMerged: true,
 			ExtraTrailers: []string{"Suda-Landed-From: refs/heads/review/" + id}}
-		if req.Approvers, err = l.Forge.ApproversForTip(ctx, l.User.Repo, "review/"+id, p.HeadSHA); err != nil {
-			l.Log.Warn("approvals unavailable; continuing without", "id", id, "err", err)
-		}
+		req.Approvers, _ = l.approvalsFor(ctx, id, p.HeadSHA)
+		req.Review = p.Number
 		out = append(out, req)
 	}
 	return out
@@ -404,6 +400,9 @@ func (l *Lander) landOnce(ctx context.Context, req Request) (res Result, retry b
 	}
 	for _, a := range req.Approvers {
 		msg += "Suda-Approved-By: " + a + "\n"
+	}
+	if req.Review > 0 {
+		msg += fmt.Sprintf("Suda-Review: %s#%d\n", l.User.Repo, req.Review)
 	}
 	for _, t := range req.ExtraTrailers {
 		msg += t + "\n"

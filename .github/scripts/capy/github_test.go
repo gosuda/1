@@ -111,6 +111,32 @@ func TestApproversForTipIgnoresStaleCommentedAndDismissedReviews(t *testing.T) {
 	}
 }
 
+func TestReviewApprovalsKeepsTheCommitEachApprovalIsBoundTo(t *testing.T) {
+	gh := newFakeGitHub(t, map[string]string{
+		"/repos/gosuda/1/pulls?head=gosuda%3Areview%2Fx&per_page=10&state=all": `[{"number":9},{"number":7}]`,
+		"/repos/gosuda/1/pulls/7/reviews?per_page=100&page=1": `[
+			{"user":{"login":"alice"},"state":"APPROVED","commit_id":"ps1"},
+			{"user":{"login":"carol"},"state":"APPROVED","commit_id":"ps1"}]`,
+		"/repos/gosuda/1/pulls/9/reviews?per_page=100&page=1": `[
+			{"user":{"login":"bob"},"state":"APPROVED","commit_id":"ps2"},
+			{"user":{"login":"carol"},"state":"CHANGES_REQUESTED","commit_id":"ps2"},
+			{"user":{"login":"Dave"},"state":"APPROVED","commit_id":"ps1"},
+			{"user":{"login":"Dave"},"state":"COMMENTED","commit_id":"ps2"}]`,
+	})
+	rs, err := gh.ReviewApprovals(context.Background(), "gosuda/1", "review/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := capy.ReviewState{Pull: 9, Approvals: []capy.Approval{
+		{Login: "alice", Commit: "ps1"},
+		{Login: "bob", Commit: "ps2"},
+		{Login: "dave", Commit: "ps1"},
+	}}
+	if !reflect.DeepEqual(rs, want) {
+		t.Fatalf("review state = %+v, want %+v (the newest pull request's decision supersedes an older approval; the API lists newest first)", rs, want)
+	}
+}
+
 func TestTeamResolverTreatsOnly404AsNonMember(t *testing.T) {
 	gh := newFakeGitHub(t, map[string]string{
 		"/orgs/gosuda/teams/core/memberships/carol":   `{"state":"active"}`,

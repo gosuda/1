@@ -43,6 +43,8 @@ Commit changes locally, save work-in-progress to `gosuda/1`, rebase onto the lat
 4. Rebase the branch onto the latest `origin/suda/main` snapshot with `git ws-sync`.
 5. Submit the tip with `git ws-land`. This pushes `HEAD` to `refs/heads/land/<id>` on `gosuda/1`.
 
+`git ws-save`, `git ws-pr`, and `git ws-land` first add a `Change-Id: I<40 hex>` trailer to the tip commit when it has none (`git ws-id` does so explicitly). The id identifies the change across amends, rebases, and renames.
+
 ```bash
 git add -A
 git commit -m "ipc/hqq: validate frame length before allocation"
@@ -68,10 +70,26 @@ gh api "repos/gosuda/1/commits/$(git rev-parse HEAD)/statuses" \
 
 A rejected request never blocks other requests. The lander deletes the land ref of a rejected request, so fix the reason first and then submit again. Submitting an unchanged tip repeats the same rejection.
 
+## 3a. Parallel Agents
+
+When several agents work at once, each one works in its own worktree of the same clone, never in a shared working directory (`AGENTS.md` §4.6).
+
+1. From any worktree of the clone, create the agent's worktree and branch. The new worktree gets the same sparse directories, and `.agents` and `.github` are added.
+
+   ```bash
+   git ws-wt agent-dalgona/task-403 ../task-403
+   cd ../task-403
+   git sparse-checkout add ipc/hqq    # optional: extra projects for this change
+   ```
+
+2. Give concurrent changes to the same project separate files when possible. A change that conflicts with an earlier landing is fixed with `git ws-sync`.
+3. Do not use `git stash` (shared by all worktrees) or repository-wide `git config`. Fetch only through `git suda-ws fetch <args>` or the `ws-*` aliases, which serialize fetches across worktrees.
+4. When the change has landed, remove the worktree with `git worktree remove ../task-403` from the agent that owns it.
+
 ## 4. Review Pull Request (Optional)
 
 Use a review pull request when a change needs line-by-line comments or formal approval on GitHub.
 
 1. Run `git ws-pr` on the workspace branch. It pushes the base commit to `refs/heads/base/<id>` and the tip to `refs/heads/review/<id>` on `gosuda/1`, then opens a pull request between them.
-2. Approvals count only for the exact tip. Reviewers approve the `review/<id>` tip.
-3. Land the same tip by merging the review pull request or with `git ws-land`. A merge is a landing request by the merger for the merged head, and the lander reports the result as a `suda/land` status on that head. If it is rejected, the review branches are deleted, so fix the reason and open a new pull request with `git ws-pr`.
+2. Reviewers approve the `review/<id>` tip. `git ws-pr` also pushes every tip as an immutable patchset `refs/ws/cl/<change-id>/<tip>`. An approval counts for the landed tip and for a patch-identical patchset of the same change: after the trunk moves, `git ws-sync` and `git ws-land` (or `git ws-pr` again for a new patchset) land a clean rebase without a new review. Any edit to the diff, even whitespace, needs a new approval. `git ws-ps` lists the patchsets and `git ws-psdiff <a> <b>` shows the interdiff; magpie shows both under `/changes/<change-id>`.
+3. Land the tip by merging the review pull request or with `git ws-land`. A merge is a landing request by the merger for the merged head, and the lander reports the result as a `suda/land` status on that head. If it is rejected, the review branches are deleted, so fix the reason and open a new pull request with `git ws-pr`.

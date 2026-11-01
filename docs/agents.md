@@ -47,7 +47,14 @@ Agents execute native `git` subcommands or the `.gitconfig` aliases tracked on `
 | Create experimental sandbox | `git sparse-checkout add experimental/<actor>/<name> && git switch -c ws/<actor>/exp-<name> origin/suda/main` | `git ws-exp <actor> <name>` |
 | Graduate experimental package | `git mv experimental/<actor>/<name> <domain>/<name>` | `git ws-graduate <src> <dst>` |
 | Save WIP snapshot | `git push --force-with-lease ws HEAD:refs/ws/<actor>/<id>` | `git ws-save` |
-| Open ephemeral GitHub PR | `git push --force-with-lease ws ${base}:refs/heads/base/<id> HEAD:refs/heads/review/<id>` | `git ws-pr` |
+| Open ephemeral GitHub PR or add a patchset | `git push --force-with-lease ws ${base}:refs/heads/base/<id> HEAD:refs/heads/review/<id>` and `git push ws HEAD:refs/ws/cl/<change-id>/<tip>` | `git ws-pr` |
+| Add the `Change-Id` trailer | `git commit --amend --only` with a `Change-Id: I<40 hex>` trailer | `git ws-id` |
+| List patchsets, diff two of them | `git fetch ws "+refs/ws/cl/<change-id>/*:refs/remotes/ws/ws/cl/<change-id>/*"`, `git range-diff` | `git ws-ps`, `git ws-psdiff <a> <b>` |
+| Find a landed change | `git fetch --filter=blob:none origin refs/suda/history && git log FETCH_HEAD --grep '^Change-Id: <id>$'` | `git suda-cl <N\|Change-Id>` |
+| Back up and restore the working state | write a temp-index tree, push it to `refs/ws/autosave/<actor>/<id>`; `git read-tree --reset -u` on another machine | `git ws-autosave start\|stop\|once\|status`, `git ws-resume` |
+| Extra workspace without a clone | `git worktree add -b ws/<actor>/<id> <dir> origin/suda/main` | `git ws-wt <actor>/<id>` |
+| Fetch without racing other worktrees | `git fetch <args>` while holding `suda-fetch.lock` in the common Git directory | `git suda-ws fetch <args>` |
+| Install or update the aliases and `ws.sh` | copy `.gitconfig` and `.github/scripts/ws.sh` into the common Git directory | `git suda-init` |
 | Generate diff link | `echo "https://magpie.gosuda.org/diff/$(git symbolic-ref --short HEAD)"` | `git ws-diff` |
 | Rebase onto latest trunk | `git fetch --filter=blob:none origin && git rebase --onto origin/suda/main $(git rev-list --max-parents=0 HEAD) HEAD` | `git ws-sync` |
 | Submit to landing queue | `git push --force-with-lease ws HEAD:refs/heads/land/<id>` | `git ws-land` |
@@ -62,9 +69,11 @@ The control plane on `refs/heads/main` ships the files that configure Git aliase
 
 The `.gitconfig` file defines the aliases that wrap the `refs/suda/*`, `refs/ws/*`, and `refs/heads/land/*` reference conventions. Its behavior:
 
-- `suda-init` copies the tracked `.gitconfig` into the Git directory and includes it. It adds the `ws` remote derived from the origin URL, sets `remote.origin.pushurl` to an invalid `no-push://` URL, configures the `refs/suda/*` fetch refspec on `origin`, and fetches from `origin`.
-- `ws-new`, `ws-sync`, `ws-exp`, and `suda-log` fetch from `origin`.
-- `ws-save`, `ws-land`, and `ws-pr` push to `ws`. `ws-land` pushes `HEAD` to `refs/heads/land/<id>` and does not call any API. `ws-pr` opens its pull request with `gh pr create --repo gosuda/1`.
+- `suda-init` runs `.github/scripts/ws.sh init` from the checkout, or the installed copy when the checkout has no `ws.sh`. `init` copies `.gitconfig` and `ws.sh` into the common Git directory as `suda.gitconfig` and `suda-ws.sh`. It replaces the files by rename, so a running autosave loop is not disturbed, and keeps the installed files when the checkout predates `ws.sh`. It then includes `suda.gitconfig`, adds the `ws` remote derived from the origin URL, sets `remote.origin.pushurl` to an invalid `no-push://` URL, configures the `refs/suda/*` fetch refspec on `origin`, and fetches from `origin`.
+- `suda-ws` runs the installed `suda-ws.sh`, falling back to the checkout's `ws.sh` before the first install. Every other alias that runs the tools goes through it, so all branches and worktrees of the clone use one version.
+- `ws-new`, `ws-sync`, `ws-exp`, and `suda-log` fetch from `origin` with `git suda-ws fetch`, which holds the clone-wide fetch lock (`suda-fetch.lock` in the common Git directory). A lock whose owner process is gone is removed. `SUDA_FETCH_LOCK_TIMEOUT` (default 600 seconds) bounds the wait for a live owner.
+- `ws-save`, `ws-land`, and `ws-pr` push to `ws` and first make sure the tip carries a `Change-Id` trailer. `ws-land` pushes `HEAD` to `refs/heads/land/<id>` and does not call any API. `ws-pr` also pushes the immutable patchset `refs/ws/cl/<change-id>/<tip>` (or `refs/ws/cl/sec/...` for embargoed work) and opens its pull request with `gh pr create --repo gosuda/1`, or reports the existing one.
+- `ws-id`, `ws-ps`, `ws-psdiff`, `ws-autosave`, `ws-resume`, `ws-wt`, and `suda-cl` are thin wrappers of the same script. `ws-autosave` is opt-in.
 - `ws-diff` prints the diff link for the current branch.
 
 ### 4.2 Root `AGENTS.md`
@@ -100,8 +109,19 @@ The `git-guard` hook inspects every shell command before execution and rejects p
 2. Deny `git push` with an unconditional `--force` or `-f` that does not also carry `--force-with-lease`.
 3. Deny `git push` that names `origin`. The reason names `git ws-save` and `git ws-land`.
 4. Deny `git push` that names `refs/suda/main` or `refs/suda/history`.
-5. Rewrite `git sparse-checkout set` so that `.agents` and `.github` are included.
-6. Allow every other command.
+5. Deny `git stash` except `git stash list` and `git stash show`. The stash is shared by every worktree of a clone, and the reason names `git ws-save` and `git ws-autosave once`.
+6. Rewrite every plain `git fetch` to `git suda-ws fetch`, which serializes fetches across worktrees, and rewrite `git sparse-checkout set` so that `.agents` and `.github` are included. Both rewrites apply to the same command.
+7. Allow every other command.
+
+### 4.4 Parallel Agents
+
+Run parallel agents as one blobless clone per machine with one worktree per agent, created with `git ws-wt <actor>/<id>`. `AGENTS.md` §4.6 lists the rules. The facts behind them were observed on Git 2.54:
+
+| Shared by all worktrees | Private to each worktree |
+| :--- | :--- |
+| Objects and lazily fetched blobs, branches, remote-tracking refs, `refs/stash`, repository config, installed tools (`suda.gitconfig`, `suda-ws.sh`), the fetch lock | Index, `HEAD`, `FETCH_HEAD`, rebase state, sparse-checkout list (`extensions.worktreeConfig` is enabled automatically), autosave pid and state files |
+
+Without the lock, 14 of 15 rounds of two concurrent fetches from two worktrees failed with `cannot lock ref 'refs/remotes/origin/main'`. Use separate clones only across an isolation boundary: a container, VM, or remote machine, a different GitHub identity for pushes, or agents that must not share Git state.
 
 ## 5. Verification Matrix for Agent Workflows
 

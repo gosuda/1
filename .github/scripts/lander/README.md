@@ -65,8 +65,22 @@ is missing from the store, the range is judged as one change by the pusher of th
 - The lander never executes repository code. Presubmit prepares sources in the lander process and
   runs tests in containers with `--network none`, a read-only root, no credentials and no host env.
 - Authorization comes only from GitHub-authenticated identities (activity API pusher, PR approvals
-  bound to the exact tip, org team membership). Commit author and trailers are informational.
+  bound to the exact tip or to a patch-identical patchset of the same change, org team membership).
+  Commit author and trailers are informational: a `Change-Id` only selects which pull requests are
+  consulted, never what is approved.
 - Installation tokens are minted per repository and operation with narrowed permissions.
+
+## Changes, patchsets, and approvals
+
+`git ws-pr` pushes each reviewed tip to `refs/ws/cl/<change-id>/<tip>`; the lander fetches these into
+`refs/user/cl/*` (`patchset.go`). A GitHub approval is bound to a commit. It counts for a landing tip
+when that commit is the tip, or when `git patch-id --verbatim` of its diff against its own root
+snapshot equals the tip's (`git diff-tree --binary`, no external diff or textconv). A cheap
+changed-path comparison runs first, at most 8 approvals of other commits are examined per request, and
+a commit the store does not hold, with several roots, or that changes nothing never matches. Approvals are
+read from the pull requests of `review/<id>` and of every other review branch whose tip carries the
+same `Change-Id`. The landed commit gets `Suda-Review: gosuda/1#<N>` for the newest review pull
+request. Patchsets of one change are pruned together, 14 days after the newest one.
 
 ## Presubmit Go modules
 
