@@ -1,0 +1,14 @@
+.vscode/**
+out/**
+node_modules/**
+src/**
+.gitignore
+.npmrc
+.yarnrc
+esbuild.js
+pnpm-lock.yaml
+publish.sh
+**/tsconfig.json
+**/eslint.config.mjs
+**/*.map
+**/*.ts
