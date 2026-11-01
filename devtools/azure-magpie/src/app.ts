@@ -1,355 +1,406 @@
-interface WorkspaceItem {
-  ref: string;
-  label: string;
-  sha: string;
+// Magpie UI entry: History API routing with real paths, theme and mobile menu, and delegated handlers.
+// Pages are plain HTML strings (see src/ui); this file wires navigation and interaction only.
+import { loadRefs, handOffHead, type RefsSnapshot } from "./ui/data";
+import { announce, byId, copyText, errorState, shortSha } from "./ui/dom";
+import { renderOverview, updateCliSnippet, updateSubtreeLinks, updateWorkspaceRows } from "./ui/overview";
+import { filterChangeRows, renderChangesList } from "./ui/changes-list";
+import { fillDiffBody, renderChangeDetail, setAllDiffBlocks, updateCompare } from "./ui/change-detail";
+import { renderDiffLinks, resolveExactShas, setBase, setHead, updateDiffOutputs } from "./ui/diff-links";
+
+export type ViewName = "overview" | "changes" | "change" | "diff" | "notfound";
+
+export interface Route {
+  view: ViewName;
+  param: string;
 }
 
-interface ProjectItem {
-  prefix: string;
-  mirror: string;
+const THEME_KEY = "magpie.theme";
+
+export function resolveRoute(pathname: string): Route {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  if (path === "/" || path === "/index.html") {
+    return { view: "overview", param: "" };
+  }
+  if (path === "/changes") {
+    return { view: "changes", param: "" };
+  }
+  if (path.startsWith("/changes/")) {
+    let param = "";
+    try {
+      param = decodeURIComponent(path.slice("/changes/".length));
+    } catch {
+      param = path.slice("/changes/".length);
+    }
+    return { view: "change", param };
+  }
+  if (path === "/diff") {
+    return { view: "diff", param: "" };
+  }
+  return { view: "notfound", param: "" };
 }
 
-interface ApiRefsPayload {
-  repo: string;
-  "suda/main": string;
-  "suda/history": string;
-  workspaces?: WorkspaceItem[];
-  projects?: ProjectItem[];
-}
-
-const DEFAULT_PROJECTS: ProjectItem[] = [
-  { prefix: "web/gosuda", mirror: "gosuda/website" },
-  { prefix: "web/securl", mirror: "gosuda/securl" },
-  { prefix: "net/grt", mirror: "gosuda/GRT" },
-  { prefix: "net/ivnp", mirror: "gosuda/IVNP" },
-  { prefix: "net/portalite", mirror: "gosuda/portalite" },
-  { prefix: "ipc/hqq/HQQ", mirror: "gosuda/HQQ" },
-  { prefix: "ipc/hqq/hqq-sqlite3", mirror: "gosuda/hqq-sqlite3" },
-  { prefix: "ipc/hqq/hqq-zstd", mirror: "gosuda/hqq-zstd" },
-  { prefix: "devtools/azure-magpie", mirror: "gosuda/azure-magpie" },
-];
-
-const state: {
-  repo: string;
-  mainSha: string;
-  historySha: string;
-  workspaces: WorkspaceItem[];
-  projects: ProjectItem[];
-} = {
-  repo: "gosuda/1",
-  mainSha: "",
-  historySha: "",
-  workspaces: [],
-  projects: DEFAULT_PROJECTS,
+const PAGES: Record<ViewName, (route: Route) => Promise<string>> = {
+  overview: () => renderOverview(),
+  changes: () => renderChangesList(),
+  change: (route) => renderChangeDetail(route.param),
+  diff: () => renderDiffLinks(),
+  notfound: async () =>
+    `<header class="page-head"><div><p class="eyebrow">Not found</p><h1 tabindex="-1">Page not found</h1><p class="lead">This page does not exist in Magpie. Start from the <a href="/">overview</a> or browse <a href="/changes">changes</a>.</p></div></header>`,
 };
 
-function byId<T extends HTMLElement>(id: string): T {
-  const el = document.getElementById(id);
-  if (!el) {
-    throw new Error(`Missing DOM element #${id}`);
+function titleFor(route: Route): string {
+  switch (route.view) {
+    case "overview":
+      return "Overview · Magpie";
+    case "changes":
+      return "Changes · Magpie";
+    case "change":
+      if (/^[0-9]+$/.test(route.param)) {
+        return `Review #${route.param} · Magpie`;
+      }
+      return `${route.param.slice(0, 9) || "Change"} · Magpie`;
+    case "diff":
+      return "Diff links · Magpie";
+    case "notfound":
+      return "Not found · Magpie";
   }
-  return el as T;
 }
 
-function resolveKnownSha(refSpec: string): string {
-  const clean = refSpec.trim().replace(/^\/+|\/+$/g, "");
-  if ((clean === "suda/main" || clean === "refs/suda/main" || clean === "main") && state.mainSha) {
-    return state.mainSha;
+function syncNav(route: Route, hash: string): void {
+  let active: string;
+  if (route.view === "overview") {
+    active = hash === "#workspaces" ? "workspaces" : hash === "#projects" ? "projects" : "overview";
+  } else if (route.view === "change") {
+    active = "changes";
+  } else {
+    active = route.view;
   }
-  if (
-    (clean === "suda/history" || clean === "refs/suda/history" || clean === "history") &&
-    state.historySha
-  ) {
-    return state.historySha;
-  }
-  const found = state.workspaces.find(
-    (w) => w.label === clean || w.ref === clean || w.ref === `refs/${clean}`,
-  );
-  if (found) {
-    return found.sha;
-  }
-  return clean;
+  document.querySelectorAll<HTMLAnchorElement>("[data-nav]").forEach((link) => {
+    if (link.dataset.nav === active) {
+      link.setAttribute("aria-current", "page");
+    } else {
+      link.removeAttribute("aria-current");
+    }
+  });
 }
 
-function updateDiffOutputs(): void {
-  const baseInput = byId<HTMLInputElement>("base-ref");
-  const headInput = byId<HTMLInputElement>("head-ref");
-  const modeSelect = byId<HTMLSelectElement>("diff-mode");
-
-  const baseRef = baseInput.value.trim() || "suda/main";
-  const headRef = headInput.value.trim() || "ws/agent-dalgona/task-402";
-  const op = modeSelect.value === "..." ? "..." : "..";
-
-  const shortPath =
-    baseRef === "suda/main" && op === ".."
-      ? `/diff/${headRef}`
-      : `/diff/${baseRef}${op}${headRef}`;
-  const fullShortUrl = `${window.location.origin}${shortPath}`;
-
-  const baseResolved = resolveKnownSha(baseRef);
-  const headResolved = resolveKnownSha(headRef);
-  const compareUrl = `https://github.com/${state.repo}/compare/${baseResolved}${op}${headResolved}`;
-
-  byId<HTMLElement>("short-url-output").textContent = fullShortUrl;
-  byId<HTMLElement>("github-url-output").textContent = compareUrl;
-  byId<HTMLAnchorElement>("open-github-btn").href = shortPath;
+function scrollToHash(hash: string): void {
+  let id = hash.slice(1);
+  try {
+    id = decodeURIComponent(id);
+  } catch {
+    // Keep the raw fragment when it is not valid percent-encoding.
+  }
+  document.getElementById(id)?.scrollIntoView({ block: "start" });
 }
 
-async function resolveExactShasFromWorker(): Promise<void> {
-  const baseRef = byId<HTMLInputElement>("base-ref").value.trim() || "suda/main";
-  const headRef = byId<HTMLInputElement>("head-ref").value.trim();
-  const op = byId<HTMLSelectElement>("diff-mode").value === "..." ? "..." : "..";
-  if (!headRef) {
+let renderSerial = 0;
+let renderedPath: string | null = null;
+
+async function render(options: { focus: boolean; scroll: boolean }): Promise<void> {
+  const serial = ++renderSerial;
+  const route = resolveRoute(location.pathname);
+  syncNav(route, location.hash);
+  const view = byId<HTMLElement>("view");
+  if (!view) {
     return;
   }
-  const btn = byId<HTMLButtonElement>("resolve-sha-btn");
-  const prevText = btn.textContent;
-  btn.textContent = "Resolving…";
+  view.setAttribute("aria-busy", "true");
+  let html: string;
   try {
-    const resp = await fetch(`/diff/${baseRef}${op}${headRef}?format=json`);
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-    const data = (await resp.json()) as { compareUrl?: string };
-    if (data.compareUrl) {
-      byId<HTMLElement>("github-url-output").textContent = data.compareUrl;
-      byId<HTMLAnchorElement>("open-github-btn").href = data.compareUrl;
-    }
-  } catch {
-    updateDiffOutputs();
-  } finally {
-    btn.textContent = prevText;
+    html = await PAGES[route.view](route);
+  } catch (err) {
+    html = errorState("Something went wrong.", err instanceof Error ? err.message : "Unknown error.");
   }
-}
-
-function renderWorkspacesTable(): void {
-  const tbody = byId<HTMLTableSectionElement>("workspaces-tbody");
-  const filter = byId<HTMLInputElement>("ws-filter").value.trim().toLowerCase();
-
-  const filtered = state.workspaces.filter(
-    (w) =>
-      !filter ||
-      w.ref.toLowerCase().includes(filter) ||
-      w.label.toLowerCase().includes(filter) ||
-      w.sha.toLowerCase().includes(filter),
-  );
-
-  if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" class="empty-cell">No matching <code>refs/ws/*</code> or <code>refs/heads/land/*</code> branches found.</td></tr>`;
+  if (serial !== renderSerial) {
     return;
   }
-
-  tbody.innerHTML = filtered
-    .map((item) => {
-      const ns = item.label.startsWith("land/")
-        ? "land"
-        : item.label.startsWith("review/")
-          ? "review"
-          : "ws";
-      const shortSha = item.sha.slice(0, 10);
-      const shortDiffPath = `/diff/${escapeHtml(item.label)}`;
-      return `<tr>
-        <td data-label="Namespace"><span class="badge-ns">${ns}</span></td>
-        <td data-label="Reference"><code class="ref-code">${escapeHtml(item.ref)}</code></td>
-        <td data-label="Tip Commit"><code>${escapeHtml(shortSha)}</code></td>
-        <td data-label="Actions" class="td-actions">
-          <div class="output-actions">
-            <button type="button" class="btn btn-secondary" data-load-head="${escapeHtml(item.label)}">Use as Head</button>
-            <a class="btn btn-primary" href="${shortDiffPath}" target="_blank" rel="noopener">Open Diff</a>
-          </div>
-        </td>
-      </tr>`;
-    })
-    .join("");
+  view.innerHTML = html;
+  view.removeAttribute("aria-busy");
+  document.title = titleFor(route);
+  renderedPath = location.pathname;
+  if (location.hash) {
+    scrollToHash(location.hash);
+  } else if (options.scroll) {
+    window.scrollTo(0, 0);
+  }
+  if (options.focus) {
+    document.querySelector<HTMLElement>("#view h1")?.focus({ preventScroll: true });
+  }
 }
 
-function renderProjectsGrid(): void {
-  const grid = byId<HTMLElement>("projects-grid");
-  grid.innerHTML = state.projects
-    .map((proj) => {
-      const p = escapeHtml(proj.prefix);
-      const m = escapeHtml(proj.mirror);
-      return `<div class="project-card">
-        <div>
-          <div class="project-path">//${p}</div>
-          <div class="project-mirror">${m}</div>
-        </div>
-        <div class="project-links">
-          <a href="/tree/${p}" target="_blank" rel="noopener">Tree</a>
-          <a href="/history/${p}" target="_blank" rel="noopener">History</a>
-          <a href="https://github.com/${m}" target="_blank" rel="noopener">Mirror</a>
-        </div>
-      </div>`;
-    })
-    .join("");
+function navigate(href: string, mode: "push" | "replace" = "push"): void {
+  const url = new URL(href, location.href);
+  setNavOpen(false);
+  const target = `${url.pathname}${url.search}${url.hash}`;
+  const current = `${location.pathname}${location.search}${location.hash}`;
+  if (target !== current) {
+    if (mode === "replace") {
+      history.replaceState(null, "", target);
+    } else {
+      history.pushState(null, "", target);
+    }
+  }
+  const samePage = url.pathname === location.pathname && url.search === location.search;
+  if (samePage && url.hash) {
+    syncNav(resolveRoute(url.pathname), url.hash);
+    scrollToHash(url.hash);
+    return;
+  }
+  void render({ focus: true, scroll: true });
 }
 
-function updateSubtreeJumpLinks(): void {
-  const raw = byId<HTMLInputElement>("custom-path").value.trim().replace(/^\/+|\/+$/g, "");
-  byId<HTMLAnchorElement>("jump-tree-btn").href = raw ? `/tree/${raw}` : "/tree";
-  byId<HTMLAnchorElement>("jump-history-btn").href = raw ? `/history/${raw}` : "/history";
-  byId<HTMLAnchorElement>("jump-blame-btn").href = raw ? `/blame/${raw}` : "/history";
+function setNavOpen(open: boolean): void {
+  byId<HTMLElement>("app")?.classList.toggle("nav-open", open);
+  byId<HTMLButtonElement>("nav-toggle")?.setAttribute("aria-expanded", String(open));
 }
 
-function updateCliSnippet(): void {
-  const actor = byId<HTMLInputElement>("cli-actor").value.trim() || "agent-dalgona";
-  const task = byId<HTMLInputElement>("cli-task").value.trim() || "task-402";
-  const paths = byId<HTMLInputElement>("cli-paths").value.trim() || "ipc/hqq/HQQ";
-  const wsId = `${actor}/${task}`;
-
-  const snippet = [
-    `git config include.path ../.gitconfig`,
-    `git suda-init`,
-    `git sparse-checkout set ${paths}`,
-    `git ws-new ${wsId}`,
-    `# Edit and run tests inside ${paths}`,
-    `git add -A && git commit -m "feat: update ${paths.split(/\s+/)[0]}"`,
-    `git ws-save`,
-    `git ws-diff   # or run git ws-pr to open a GitHub PR`,
-    `git ws-sync && git ws-land`,
-  ].join("\n");
-
-  byId<HTMLElement>("cli-snippet-output").textContent = snippet;
+function effectiveTheme(): "light" | "dark" {
+  const explicit = document.documentElement.getAttribute("data-theme");
+  if (explicit === "light" || explicit === "dark") {
+    return explicit;
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-async function fetchTrunkAndWorkspaces(): Promise<void> {
+function paintThemeToggle(): void {
+  const button = byId<HTMLButtonElement>("theme-toggle");
+  if (!button) {
+    return;
+  }
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  button.textContent = next === "dark" ? "Dark" : "Light";
+  button.title = `Switch to ${next} theme`;
+  button.setAttribute("aria-label", `Switch to ${next} theme`);
+}
+
+function toggleTheme(): void {
+  const next = effectiveTheme() === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
   try {
-    const resp = await fetch("/api/refs", { headers: { accept: "application/json" } });
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-    const data = (await resp.json()) as ApiRefsPayload;
-    state.repo = data.repo || "gosuda/1";
-    state.mainSha = data["suda/main"] || "";
-    state.historySha = data["suda/history"] || "";
-    if (Array.isArray(data.workspaces)) {
-      state.workspaces = data.workspaces;
-    }
-    if (Array.isArray(data.projects) && data.projects.length > 0) {
-      state.projects = data.projects;
-    }
+    localStorage.setItem(THEME_KEY, next);
   } catch {
-    // Keep client functional with unresolved ref names when running without backend token
+    // Private mode: the choice lasts for this page only.
   }
-
-  const mainLink = byId<HTMLAnchorElement>("pill-main-link");
-  const historyLink = byId<HTMLAnchorElement>("pill-history-link");
-  if (state.mainSha) {
-    mainLink.textContent = state.mainSha.slice(0, 10);
-    mainLink.href = `https://github.com/${state.repo}/tree/${state.mainSha}`;
-  } else {
-    mainLink.textContent = "refs/suda/main";
-  }
-  if (state.historySha) {
-    historyLink.textContent = state.historySha.slice(0, 10);
-    historyLink.href = `https://github.com/${state.repo}/commits/${state.historySha}`;
-  } else {
-    historyLink.textContent = "refs/suda/history";
-  }
-
-  renderWorkspacesTable();
-  renderProjectsGrid();
-  updateDiffOutputs();
+  paintThemeToggle();
 }
 
-function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function paintTrunk(refs: RefsSnapshot | null): void {
+  const main = byId<HTMLAnchorElement>("trunk-main-link");
+  const mainCopy = byId<HTMLButtonElement>("trunk-main-copy");
+  const history = byId<HTMLAnchorElement>("trunk-history-link");
+  const historyCopy = byId<HTMLButtonElement>("trunk-history-copy");
+  const repo = refs?.repo ?? "gosuda/1";
+  if (main) {
+    main.textContent = refs?.mainSha ? shortSha(refs.mainSha) : "unavailable";
+    main.href = refs?.mainSha ? `https://github.com/${repo}/tree/${refs.mainSha}` : `https://github.com/${repo}`;
+  }
+  if (mainCopy) {
+    mainCopy.disabled = !refs?.mainSha;
+    mainCopy.setAttribute("data-copy", refs?.mainSha ?? "");
+  }
+  if (history) {
+    history.textContent = refs?.historySha ? shortSha(refs.historySha) : "unavailable";
+    history.href = refs?.historySha ? `https://github.com/${repo}/commits/${refs.historySha}` : `https://github.com/${repo}`;
+  }
+  if (historyCopy) {
+    historyCopy.disabled = !refs?.historySha;
+    historyCopy.setAttribute("data-copy", refs?.historySha ?? "");
+  }
 }
 
-async function copyWithFeedback(btn: HTMLButtonElement, text: string): Promise<void> {
-  const original = btn.textContent;
-  await navigator.clipboard.writeText(text);
-  btn.textContent = "Copied";
-  setTimeout(() => {
-    btn.textContent = original;
-  }, 1400);
+async function handleCopy(button: HTMLElement): Promise<void> {
+  const text = button.getAttribute("data-copy") ?? "";
+  if (!text) {
+    return;
+  }
+  const ok = await copyText(text);
+  const original = button.textContent;
+  if (button.tagName === "BUTTON") {
+    button.textContent = ok ? "Copied" : "Copy failed";
+    window.setTimeout(() => {
+      button.textContent = original;
+    }, 1500);
+  }
+  announce(ok ? "Copied to clipboard." : "Could not copy. Select the text and copy it instead.");
 }
 
-function initAriaValidationSync(): void {
-  const syncAria = (target: EventTarget | null) => {
-    if (target instanceof HTMLInputElement) {
-      target.setAttribute("aria-invalid", target.matches(":user-invalid") ? "true" : "false");
-    }
+function cliInputs(): { actor: string; task: string; paths: string } {
+  return {
+    actor: byId<HTMLInputElement>("cli-actor")?.value ?? "",
+    task: byId<HTMLInputElement>("cli-task")?.value ?? "",
+    paths: byId<HTMLInputElement>("cli-paths")?.value ?? "",
   };
-  document.addEventListener("blur", (e) => syncAria(e.target), true);
-  document.addEventListener("input", (e) => {
-    if (e.target instanceof HTMLInputElement && e.target.hasAttribute("aria-invalid")) {
-      syncAria(e.target);
-    }
-  });
 }
 
-function init(): void {
-  initAriaValidationSync();
-  renderProjectsGrid();
-  updateSubtreeJumpLinks();
-  updateCliSnippet();
-  updateDiffOutputs();
-
-  byId<HTMLInputElement>("base-ref").addEventListener("input", updateDiffOutputs);
-  byId<HTMLInputElement>("head-ref").addEventListener("input", updateDiffOutputs);
-  byId<HTMLSelectElement>("diff-mode").addEventListener("change", updateDiffOutputs);
-
-  document.querySelectorAll<HTMLButtonElement>("[data-set-base]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      byId<HTMLInputElement>("base-ref").value = btn.dataset.setBase || "suda/main";
-      updateDiffOutputs();
-    });
-  });
-
-  byId<HTMLButtonElement>("copy-short-btn").addEventListener("click", (e) => {
-    const text = byId<HTMLElement>("short-url-output").textContent || "";
-    void copyWithFeedback(e.currentTarget as HTMLButtonElement, text);
-  });
-
-  byId<HTMLButtonElement>("copy-md-btn").addEventListener("click", (e) => {
-    const head = byId<HTMLInputElement>("head-ref").value.trim() || "workspace";
-    const url = byId<HTMLElement>("short-url-output").textContent || "";
-    void copyWithFeedback(e.currentTarget as HTMLButtonElement, `[Diff (${head})](${url})`);
-  });
-
-  byId<HTMLButtonElement>("resolve-sha-btn").addEventListener("click", () => {
-    void resolveExactShasFromWorker();
-  });
-
-  byId<HTMLTableSectionElement>("workspaces-tbody").addEventListener("click", (e) => {
-    const loadBtn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-load-head]");
-    if (loadBtn && loadBtn.dataset.loadHead) {
-      byId<HTMLInputElement>("head-ref").value = loadBtn.dataset.loadHead;
-      updateDiffOutputs();
-      window.scrollTo({ top: 0, behavior: "smooth" });
+async function handleAction(button: HTMLElement, event: Event): Promise<void> {
+  const action = button.dataset.action;
+  switch (action) {
+    case "reload":
+    case "retry":
+      event.preventDefault();
+      void render({ focus: false, scroll: false });
+      return;
+    case "use-head":
+      event.preventDefault();
+      handOffHead(button.dataset.ref ?? "");
+      navigate("/diff");
+      return;
+    case "pick-head":
+      setHead(button.dataset.ref ?? "");
+      announce(`Head set to ${button.dataset.ref ?? ""}.`);
+      return;
+    case "set-base":
+      setBase(button.dataset.ref ?? "suda/main");
+      return;
+    case "expand-diffs":
+      setAllDiffBlocks(true);
+      return;
+    case "collapse-diffs":
+      setAllDiffBlocks(false);
+      return;
+    case "resolve": {
+      event.preventDefault();
+      const status = byId<HTMLElement>("diff-status");
+      if (status) {
+        status.textContent = "Resolving…";
+      }
+      try {
+        const message = await resolveExactShas();
+        if (status) {
+          status.textContent = message;
+        }
+      } catch {
+        updateDiffOutputs();
+        if (status) {
+          status.textContent = "Could not resolve the names. The links still work; they resolve when opened.";
+        }
+      }
       return;
     }
+  }
+}
+
+function initDelegation(): void {
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0) {
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+    const copyTarget = target.closest<HTMLElement>("[data-copy]");
+    if (copyTarget) {
+      event.preventDefault();
+      void handleCopy(copyTarget);
+      return;
+    }
+    const actionTarget = target.closest<HTMLElement>("[data-action]");
+    if (actionTarget) {
+      void handleAction(actionTarget, event);
+      return;
+    }
+    const link = target.closest<HTMLAnchorElement>("a[href]");
+    if (!link || link.target || link.hasAttribute("download")) {
+      return;
+    }
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+    const url = new URL(link.href);
+    if (url.origin !== location.origin) {
+      return;
+    }
+    event.preventDefault();
+    navigate(url.href);
   });
 
-  byId<HTMLInputElement>("ws-filter").addEventListener("input", renderWorkspacesTable);
-  byId<HTMLButtonElement>("refresh-refs-btn").addEventListener("click", () => {
-    void fetchTrunkAndWorkspaces();
+  document.addEventListener("input", (event) => {
+    const field = event.target instanceof HTMLInputElement ? event.target : null;
+    if (!field) {
+      return;
+    }
+    if (field.dataset.filter === "changes") {
+      filterChangeRows(field.value);
+    } else if (field.dataset.filter === "workspaces") {
+      updateWorkspaceRows(field.value);
+    } else if (field.dataset.field === "subtree") {
+      updateSubtreeLinks(field.value);
+    } else if (field.dataset.field === "cli") {
+      updateCliSnippet(cliInputs());
+    } else if (field.id === "base-ref" || field.id === "head-ref") {
+      updateDiffOutputs();
+    }
   });
 
-  byId<HTMLInputElement>("custom-path").addEventListener("input", updateSubtreeJumpLinks);
-  byId<HTMLInputElement>("cli-actor").addEventListener("input", updateCliSnippet);
-  byId<HTMLInputElement>("cli-task").addEventListener("input", updateCliSnippet);
-  byId<HTMLInputElement>("cli-paths").addEventListener("input", updateCliSnippet);
-
-  byId<HTMLButtonElement>("copy-cli-btn").addEventListener("click", (e) => {
-    const text = byId<HTMLElement>("cli-snippet-output").textContent || "";
-    void copyWithFeedback(e.currentTarget as HTMLButtonElement, text);
+  document.addEventListener("change", (event) => {
+    const field = event.target instanceof HTMLSelectElement ? event.target : null;
+    if (!field) {
+      return;
+    }
+    if (field.id === "diff-mode") {
+      updateDiffOutputs();
+    } else if (field.dataset.compare) {
+      const from = byId<HTMLSelectElement>("cmp-from")?.value ?? "base";
+      const to = byId<HTMLSelectElement>("cmp-to")?.value ?? "";
+      updateCompare(from, to);
+    }
   });
 
-  byId<HTMLButtonElement>("theme-toggle").addEventListener("click", () => {
-    const root = document.documentElement;
-    const current = root.getAttribute("data-theme") || "light";
-    root.setAttribute("data-theme", current === "dark" ? "light" : "dark");
+  // `toggle` does not bubble; the capture listener sees diff blocks as they open.
+  document.addEventListener(
+    "toggle",
+    (event) => {
+      const block = event.target instanceof HTMLDetailsElement ? event.target : null;
+      if (block && block.classList.contains("diff-file") && block.open) {
+        fillDiffBody(block);
+      }
+    },
+    true,
+  );
+
+  window.addEventListener("popstate", () => {
+    setNavOpen(false);
+    if (location.pathname === renderedPath) {
+      syncNav(resolveRoute(location.pathname), location.hash);
+      if (location.hash) {
+        scrollToHash(location.hash);
+      }
+      return;
+    }
+    void render({ focus: false, scroll: false });
   });
 
-  void fetchTrunkAndWorkspaces();
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      setNavOpen(false);
+    }
+  });
+}
+
+function initTheme(): void {
+  byId<HTMLButtonElement>("theme-toggle")?.addEventListener("click", toggleTheme);
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", paintThemeToggle);
+  paintThemeToggle();
+}
+
+function initNav(): void {
+  byId<HTMLButtonElement>("nav-toggle")?.addEventListener("click", () => {
+    const open = byId<HTMLElement>("app")?.classList.contains("nav-open") ?? false;
+    setNavOpen(!open);
+  });
+}
+
+async function boot(): Promise<void> {
+  initTheme();
+  initNav();
+  initDelegation();
+  const refs = await loadRefs();
+  paintTrunk(refs.ok ? refs.value : null);
+  await render({ focus: false, scroll: false });
 }
 
 if (typeof document !== "undefined") {
-  init();
+  void boot();
 }
