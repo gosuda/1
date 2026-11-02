@@ -6,6 +6,21 @@ import type { ReputationVote } from "@/types/api";
 import type { BaseServer } from "@/hooks/useList";
 import { useCopy } from "@/hooks/useCopy";
 
+const PLACEHOLDER_THUMBNAILS = [
+  "/placeholders/aurora-peaks.svg",
+  "/placeholders/twilight-watchtower.svg",
+  "/placeholders/nebula-fjord.svg",
+  "/placeholders/synth-horizon.svg",
+] as const;
+
+function pickPlaceholderThumbnail(seed: string): string {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 33 + seed.charCodeAt(i)) >>> 0;
+  }
+  return PLACEHOLDER_THUMBNAILS[hash % PLACEHOLDER_THUMBNAILS.length];
+}
+
 interface ServerCardProps {
   server: BaseServer;
   isFavorite?: boolean;
@@ -34,7 +49,9 @@ export function ServerCard({
   const { copiedKey: copiedProtocol, copy } = useCopy(1500);
   const [isVoting, setIsVoting] = useState(false);
   const [voteError, setVoteError] = useState("");
-  const effectiveThumbnail = thumbnailFailed ? "" : thumbnail;
+  const effectiveThumbnail = thumbnailFailed ? "" : thumbnail.trim();
+  const resolvedThumbnail =
+    effectiveThumbnail || pickPlaceholderThumbnail(name || serverId);
   const normalizedPaymentLabel = paymentLabel.trim();
   const showPaymentBadge = paymentEnabled || normalizedPaymentLabel !== "";
   const effectivePaymentLabel = normalizedPaymentLabel || "Paid app";
@@ -84,6 +101,9 @@ export function ServerCard({
   const formattedDuration = useMemo(() => {
     if (!firstSeen) return "";
     const start = new Date(firstSeen).getTime();
+    if (Number.isNaN(start)) {
+      return firstSeen;
+    }
     const now = Date.now();
     const diff = Math.max(0, now - start);
 
@@ -102,16 +122,14 @@ export function ServerCard({
     <article
       data-hero-key={`server-bg-${serverId}`}
       className={clsx(
-        "relative w-full overflow-hidden rounded-lg group border border-border bg-card shadow-sm transition-shadow hover:shadow-md dark:border-white/10",
-        children ? "h-71.5" : "h-[174.5px]"
+        "relative w-full overflow-hidden rounded-[12px] group border border-black/10 bg-card shadow-sm dark:border-white/22 transition-shadow hover:shadow-md",
+        children ? "h-71.5" : "h-[165px]"
       )}
     >
       <div
         className="absolute inset-0 bg-cover bg-center transition-transform duration-700 group-hover:scale-105"
         style={{
-          backgroundImage: effectiveThumbnail
-            ? `url(${effectiveThumbnail})`
-            : "linear-gradient(135deg, var(--card) 0%, var(--background) 100%)",
+          backgroundImage: `url(${resolvedThumbnail})`,
         }}
       />
       {effectiveThumbnail && (
@@ -124,28 +142,28 @@ export function ServerCard({
         />
       )}
 
-      <div className="absolute inset-0 bg-linear-to-t from-black/86 via-black/58 to-black/18" />
+      <div className="absolute inset-0 bg-linear-to-t from-black/75 via-black/12 to-transparent" />
 
       <div
         className={clsx(
-          "relative flex h-full flex-col justify-between p-5",
+          "relative flex h-full flex-col justify-between p-[14px]",
           isNavigable ? "pointer-events-none z-30" : "z-10"
         )}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <div className="flex items-center gap-2 rounded-md bg-black/45 px-2.5 py-1 backdrop-blur-sm border border-white/8">
+            <div className="flex h-[32px] items-center gap-[8px] rounded-[8px] border border-white/15 bg-black/45 px-[12px] backdrop-blur-md">
               <div
                 className={clsx(
-                  "size-2 rounded-full",
+                  "size-[8px] rounded-full",
                   online
-                    ? "bg-primary"
+                    ? "bg-green-status shadow-[0_0_8px_var(--green-status)]"
                     : "bg-gray-500"
                 )}
               />
               <span
                 className={clsx(
-                  "text-[10px] font-bold uppercase tracking-wider",
+                  "text-[11px] font-bold uppercase tracking-[0.06em]",
                   online ? "text-white" : "text-white/60"
                 )}
               >
@@ -166,10 +184,10 @@ export function ServerCard({
             <button
               onClick={handleFavoriteClick}
               className={clsx(
-                "pointer-events-auto relative z-30 flex size-8 items-center justify-center rounded-md backdrop-blur-md transition-colors border border-white/8 cursor-pointer",
+                "pointer-events-auto relative z-30 flex size-[34px] items-center justify-center rounded-[8px] backdrop-blur-md transition-colors border border-white/15 cursor-pointer",
                 isFavorite
-                  ? "bg-primary text-black"
-                  : "bg-black/40 text-white/70 hover:bg-primary hover:text-black"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-black/45 text-white/85 hover:bg-primary hover:text-primary-foreground"
               )}
               aria-label={
                 isFavorite ? "Remove from favorites" : "Add to favorites"
@@ -178,7 +196,7 @@ export function ServerCard({
               <svg
                 xmlns="http://www.w3.org/2000/svg"
                 viewBox="0 0 24 24"
-                className="w-4.5 h-4.5"
+                className="w-4 h-4"
                 fill={isFavorite ? "currentColor" : "none"}
                 stroke="currentColor"
                 strokeWidth="2"
@@ -193,52 +211,10 @@ export function ServerCard({
 
         <div className="flex flex-col gap-3">
           <div className="flex items-end justify-between gap-3">
-            <div className="flex flex-col gap-1.5 flex-1 min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <h3 className="min-w-0 flex-1 truncate font-display text-xl font-bold leading-tight text-white">
-                  {name}
-                </h3>
-
-                {reputation && (
-                  <div
-                    className="pointer-events-auto relative z-30 flex shrink-0 items-center gap-1"
-                    aria-busy={isVoting}
-                  >
-                    <button
-                      type="button"
-                      onClick={handleVoteClick("up")}
-                      disabled={isVoting}
-                      aria-label="Recommend"
-                      className={clsx(
-                        "flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-bold backdrop-blur-sm transition-colors",
-                        isVoting ? "cursor-not-allowed opacity-50" : "cursor-pointer",
-                        reputation.viewer_vote === "up"
-                          ? "border-primary/60 bg-primary/90 text-black"
-                          : "border-white/16 bg-black/40 text-white/80 hover:bg-primary hover:text-black"
-                      )}
-                    >
-                      <ThumbsUp className="size-3 shrink-0" />
-                      <span>{reputation.up}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleVoteClick("down")}
-                      disabled={isVoting}
-                      aria-label="Do not recommend"
-                      className={clsx(
-                        "flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-bold backdrop-blur-sm transition-colors",
-                        isVoting ? "cursor-not-allowed opacity-50" : "cursor-pointer",
-                        reputation.viewer_vote === "down"
-                          ? "border-primary/60 bg-primary/90 text-black"
-                          : "border-white/16 bg-black/40 text-white/80 hover:bg-primary hover:text-black"
-                      )}
-                    >
-                      <ThumbsDown className="size-3 shrink-0" />
-                      <span>{reputation.down}</span>
-                    </button>
-                  </div>
-                )}
-              </div>
+            <div className="flex flex-col gap-0.5 flex-1 min-w-0">
+              <h3 className="min-w-0 truncate font-display text-[19px] font-extrabold leading-tight text-white">
+                {name}
+              </h3>
 
               {voteError && (
                 <span role="alert" className="text-[10px] text-red-400">
@@ -247,7 +223,7 @@ export function ServerCard({
               )}
 
               {description && (
-                <p className="text-xs text-white/70 line-clamp-1 font-medium">
+                <p className="text-[12px] text-white/80 line-clamp-1 font-medium">
                   {description}
                 </p>
               )}
@@ -277,7 +253,7 @@ export function ServerCard({
                       <button
                         type="button"
                         onClick={() => void copyEndpoint(endpoint.protocol, endpoint.address)}
-                        className="shrink-0 rounded-md border border-white/20 bg-black/40 px-2 py-1 text-[10px] font-bold text-white transition-colors hover:bg-primary hover:text-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                        className="shrink-0 rounded-md border border-white/20 bg-black/40 px-2 py-1 text-[10px] font-bold text-white transition-colors hover:bg-primary hover:text-primary-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
                       >
                         {copiedProtocol === endpoint.protocol
                           ? "Copied!"
@@ -295,16 +271,43 @@ export function ServerCard({
               )}
             </div>
 
-            {!children && effectiveThumbnail && (
-              <div className="shrink-0">
-                <div className="size-10 overflow-hidden rounded-md border border-white/20 shadow-sm">
-                  <img
-                    alt={`${name} avatar`}
-                    className="h-full w-full object-cover"
-                    src={effectiveThumbnail}
-                    onError={() => setThumbnailFailed(true)}
-                  />
-                </div>
+            {reputation && (
+              <div
+                className="pointer-events-auto relative z-30 flex shrink-0 items-center gap-[8px]"
+                aria-busy={isVoting}
+              >
+                <button
+                  type="button"
+                  onClick={handleVoteClick("up")}
+                  disabled={isVoting}
+                  aria-label="Recommend"
+                  className={clsx(
+                    "flex h-[28px] items-center gap-[6px] rounded-[6px] border px-[10px] text-[11px] font-bold backdrop-blur-md transition-colors",
+                    isVoting ? "cursor-not-allowed opacity-50" : "cursor-pointer",
+                    reputation.viewer_vote === "up"
+                      ? "border-primary/60 bg-primary/90 text-primary-foreground"
+                      : "border-white/15 bg-black/45 text-white/90 hover:bg-primary hover:text-primary-foreground"
+                  )}
+                >
+                  <ThumbsUp className="size-[13px] shrink-0" />
+                  <span>{reputation.up}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleVoteClick("down")}
+                  disabled={isVoting}
+                  aria-label="Do not recommend"
+                  className={clsx(
+                    "flex h-[28px] items-center gap-[6px] rounded-[6px] border px-[10px] text-[11px] font-bold backdrop-blur-md transition-colors",
+                    isVoting ? "cursor-not-allowed opacity-50" : "cursor-pointer",
+                    reputation.viewer_vote === "down"
+                      ? "border-primary/60 bg-primary/90 text-primary-foreground"
+                      : "border-white/15 bg-black/45 text-white/90 hover:bg-primary hover:text-primary-foreground"
+                  )}
+                >
+                  <ThumbsDown className="size-[13px] shrink-0" />
+                  <span>{reputation.down}</span>
+                </button>
               </div>
             )}
           </div>
@@ -326,7 +329,7 @@ export function ServerCard({
             name: server.name,
             description: server.description,
             tags: server.tags,
-            thumbnail: server.thumbnail,
+            thumbnail: resolvedThumbnail,
             owner: server.owner,
             online: server.online,
             serverUrl: server.link,
