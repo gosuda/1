@@ -1,0 +1,177 @@
+@import url("https://fonts.bunny.net/css?family=manrope:500,600,700,800|open-sans:400,500,600,700&display=swap");
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-family-display: "Manrope", sans-serif;
+  --font-family-sans: "Open Sans", sans-serif;
+
+  --radius: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-green-status: var(--green-status);
+  --color-text-muted: var(--text-muted);
+}
+
+@layer base {
+  :root {
+    --background: oklch(97% 0.005 250);
+    --foreground: oklch(25% 0.02 250);
+    --card: oklch(100% 0 0);
+    --card-foreground: oklch(25% 0.02 250);
+    --popover: oklch(100% 0 0);
+    --popover-foreground: oklch(25% 0.02 250);
+    --primary: oklch(60% 0.11 195);
+    --primary-foreground: oklch(100% 0 0);
+    --secondary: oklch(92% 0.01 250);
+    --secondary-foreground: oklch(45% 0.02 250);
+    --muted: oklch(95% 0.005 250);
+    --muted-foreground: oklch(55% 0.03 250);
+    --accent: oklch(92% 0.01 250);
+    --accent-foreground: oklch(25% 0.02 250);
+    --destructive: oklch(55% 0.2 25);
+    --destructive-foreground: oklch(100% 0 0);
+    --border: oklch(90% 0.01 250);
+    --input: oklch(95% 0.005 250);
+    --ring: oklch(60% 0.11 195);
+
+    --green-status: oklch(55% 0.16 150);
+    --text-muted: oklch(55% 0.03 250);
+
+    --hero-grid-dot: oklch(60% 0.11 195 / 0.14);
+    --hero-terminal-bg:
+      linear-gradient(180deg, oklch(19% 0.005 250 / 0.98), oklch(15% 0.006 250 / 0.98));
+    --hero-terminal-border: oklch(60% 0.11 195 / 0.22);
+    --hero-terminal-foreground: oklch(98% 0.01 0);
+    --hero-terminal-accent: var(--primary);
+    --hero-terminal-shadow: oklch(15% 0 0 / 0.12);
+  }
+
+  .dark {
+    --background: oklch(15% 0 0);
+    --foreground: oklch(98% 0.01 0);
+    --card: oklch(20% 0 0);
+    --card-foreground: oklch(98% 0.01 0);
+    --popover: oklch(20% 0 0);
+    --popover-foreground: oklch(98% 0.01 0);
+    --primary: oklch(78% 0.1 195);
+    --primary-foreground: oklch(10% 0 0);
+    --secondary: oklch(25% 0.02 195);
+    --secondary-foreground: oklch(98% 0.01 0);
+    --muted: oklch(25% 0.01 0);
+    --muted-foreground: oklch(65% 0.02 0);
+    --accent: oklch(25% 0.03 195);
+    --accent-foreground: oklch(98% 0.01 0);
+    --destructive: oklch(62% 0.22 25);
+    --destructive-foreground: oklch(98% 0 0);
+    --border: oklch(100% 0 0 / 0.1);
+    --input: oklch(22% 0.01 0);
+    --ring: oklch(78% 0.1 195);
+
+    --green-status: oklch(75% 0.16 150);
+    --text-muted: oklch(65% 0.02 0);
+
+    --hero-grid-dot: oklch(78% 0.1 195 / 0.18);
+    --hero-terminal-bg:
+      linear-gradient(180deg, oklch(18% 0 0 / 0.9), oklch(12% 0.01 250 / 0.94));
+    --hero-terminal-border: oklch(78% 0.1 195 / 0.28);
+    --hero-terminal-foreground: oklch(98% 0.01 0);
+    --hero-terminal-accent: var(--primary);
+    --hero-terminal-shadow: oklch(0% 0 0 / 0.28);
+  }
+
+  * {
+    border-color: var(--border);
+  }
+
+  html {
+    background-color: var(--background);
+    color-scheme: light;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    html {
+      scroll-behavior: smooth;
+    }
+  }
+
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at top center, oklch(75% 0.14 195 / 0.16), transparent 36%),
+      radial-gradient(circle at 12% 18%, oklch(60% 0.2 35 / 0.08), transparent 22%),
+      linear-gradient(180deg, oklch(100% 0 0) 0%, oklch(97% 0.005 250) 54%, oklch(95% 0.005 250) 100%);
+    color: var(--foreground);
+    font-family: var(--font-family-sans);
+  }
+
+  input,
+  textarea,
+  select {
+    font-family: var(--font-family-sans);
+  }
+
+  .dark {
+    color-scheme: dark;
+  }
+
+  .dark body {
+    background:
+      radial-gradient(circle at top center, oklch(80% 0.14 195 / 0.16), transparent 32%),
+      radial-gradient(circle at 82% 10%, oklch(55% 0.25 350 / 0.12), transparent 20%),
+      linear-gradient(180deg, oklch(16% 0 0) 0%, oklch(13% 0.01 250) 54%, oklch(11% 0.01 250) 100%);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: var(--font-family-display);
+    letter-spacing: 0;
+  }
+
+  button {
+    font-family: var(--font-family-display);
+  }
+
+  a {
+    color: inherit;
+  }
+}
+
+/* Live app motion, owned by ServerListView: cards stay hidden until it sets
+   data-revealed as they scroll into view (screen only, so printing shows every
+   card), and reorder transitions use this timing. */
+@media screen and (prefers-reduced-motion: no-preference) {
+  #live-servers [data-reveal]:not([data-revealed]) {
+    opacity: 0;
+  }
+
+  ::view-transition-group(*.live-app) {
+    animation-duration: 280ms;
+    animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+  }
+}
