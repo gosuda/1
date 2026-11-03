@@ -1,0 +1,1664 @@
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ops::Deref;
+
+use pki_types::ServerName;
+
+#[cfg(feature = "tls12")]
+use super::tls12;
+use super::{ResolvesClientCert, Tls12Resumption};
+use crate::SupportedCipherSuite;
+#[cfg(feature = "logging")]
+use crate::bs_debug;
+use crate::check::inappropriate_handshake_message;
+use crate::client::client_conn::ClientConnectionData;
+use crate::client::common::ClientHelloDetails;
+use crate::client::ech::EchState;
+use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
+use crate::common_state::{CommonState, HandshakeKind, KxState, State};
+use crate::conn::ConnectionRandoms;
+use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+use crate::enums::{
+    AlertDescription, CertificateType, CipherSuite, ContentType, HandshakeType, ProtocolVersion,
+};
+use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+use crate::hash_hs::HandshakeHashBuffer;
+use crate::log::{debug, trace};
+use crate::msgs::base::{Payload, PayloadU8};
+use crate::msgs::enums::{Compression, ExtensionType};
+use crate::msgs::handshake::{
+    CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
+    ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
+    HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random, ServerNamePayload,
+    SessionId, SupportedEcPointFormats, SupportedProtocolVersions, TransportParameters,
+};
+use crate::enums::CertificateCompressionAlgorithm;
+use crate::msgs::message::{Message, MessagePayload};
+use crate::msgs::persist;
+use crate::sync::Arc;
+use crate::tls13::key_schedule::KeyScheduleEarly;
+use crate::verify::ServerCertVerifier;
+
+pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
+pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
+pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
+
+struct ExpectServerHello {
+    input: ClientHelloInput,
+    transcript_buffer: HandshakeHashBuffer,
+    // The key schedule for sending early data.
+    //
+    // If the server accepts the PSK used for early data then
+    // this is used to compute the rest of the key schedule.
+    // Otherwise, it is thrown away.
+    //
+    // If this is `None` then we do not support early data.
+    early_data_key_schedule: Option<KeyScheduleEarly>,
+    offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
+    suite: Option<SupportedCipherSuite>,
+    ech_state: Option<EchState>,
+}
+
+struct ExpectServerHelloOrHelloRetryRequest {
+    next: ExpectServerHello,
+    extra_exts: ClientExtensionsInput<'static>,
+}
+
+pub(super) struct ClientHelloInput {
+    pub(super) config: Arc<ClientConfig>,
+    pub(super) resuming: Option<persist::Retrieved<ClientSessionValue>>,
+    pub(super) random: Random,
+    pub(super) sent_tls13_fake_ccs: bool,
+    pub(super) hello: ClientHelloDetails,
+    pub(super) session_id: SessionId,
+    pub(super) server_name: ServerName<'static>,
+    pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+}
+
+impl ClientHelloInput {
+    pub(super) fn new(
+        server_name: ServerName<'static>,
+        extra_exts: &ClientExtensionsInput<'_>,
+        cx: &mut ClientContext<'_>,
+        config: Arc<ClientConfig>,
+    ) -> Result<Self, Error> {
+        let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
+        let session_id = match &mut resuming {
+            Some(_resuming) => {
+                debug!("Resuming session");
+                match &mut _resuming.value {
+                    #[cfg(feature = "tls12")]
+                    ClientSessionValue::Tls12(inner) => {
+                        // If we have a ticket, we use the sessionid as a signal that
+                        // we're  doing an abbreviated handshake.  See section 3.4 in
+                        // RFC5077.
+                        if !inner.ticket().0.is_empty() {
+                            inner.session_id = SessionId::random(config.provider.secure_random)?;
+                        }
+                        Some(inner.session_id)
+                    }
+                    _ => None,
+                }
+            }
+            _ => {
+                debug!("Not resuming any session");
+                None
+            }
+        };
+
+        // https://tools.ietf.org/html/rfc8446#appendix-D.4
+        // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None if cx.common.is_quic() => SessionId::empty(),
+            None if !config.supports_version(ProtocolVersion::TLSv1_3) => SessionId::empty(),
+            None => SessionId::random(config.provider.secure_random)?,
+        };
+
+        let hello = ClientHelloDetails::new(
+            extra_exts
+                .protocols
+                .clone()
+                .unwrap_or_default(),
+            crate::rand::random_u16(config.provider.secure_random)?,
+        );
+
+        Ok(Self {
+            resuming,
+            random: Random::new(config.provider.secure_random)?,
+            sent_tls13_fake_ccs: false,
+            hello,
+            session_id,
+            server_name,
+            prev_ech_ext: None,
+            config,
+        })
+    }
+
+    pub(super) fn start_handshake(
+        self,
+        extra_exts: ClientExtensionsInput<'static>,
+        cx: &mut ClientContext<'_>,
+    ) -> NextStateOrError<'static> {
+        let mut transcript_buffer = HandshakeHashBuffer::new();
+        if self
+            .config
+            .client_auth_cert_resolver
+            .has_certs()
+        {
+            transcript_buffer.set_client_auth_enabled();
+        }
+
+        let key_share = if self.config.needs_key_share() {
+            Some(tls13::initial_key_share(
+                &self.config,
+                &self.server_name,
+                &mut cx.common.kx_state,
+            )?)
+        } else {
+            None
+        };
+
+        let ech_state = match self.config.ech_mode.as_ref() {
+            Some(EchMode::Enable(ech_config)) => {
+                Some(ech_config.state(self.server_name.clone(), &self.config)?)
+            }
+            _ => None,
+        };
+
+        emit_client_hello_for_retry(
+            transcript_buffer,
+            None,
+            key_share,
+            extra_exts,
+            None,
+            self,
+            cx,
+            ech_state,
+        )
+    }
+}
+
+/// Emits the initial ClientHello or a ClientHello in response to
+/// a HelloRetryRequest.
+///
+/// `retryreq` and `suite` are `None` if this is the initial
+/// ClientHello.
+fn emit_client_hello_for_retry(
+    mut transcript_buffer: HandshakeHashBuffer,
+    retryreq: Option<&HelloRetryRequest>,
+    key_share: Option<Box<dyn ActiveKeyExchange>>,
+    extra_exts: ClientExtensionsInput<'static>,
+    suite: Option<SupportedCipherSuite>,
+    mut input: ClientHelloInput,
+    cx: &mut ClientContext<'_>,
+    mut ech_state: Option<EchState>,
+) -> NextStateOrError<'static> {
+    let config = &input.config;
+    // Defense in depth: the ECH state should be None if ECH is disabled based on config
+    // builder semantics.
+    let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
+
+    let supported_versions = SupportedProtocolVersions {
+        tls12: config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12,
+        tls13: config.supports_version(ProtocolVersion::TLSv1_3),
+    };
+
+    // should be unreachable thanks to config builder
+    assert!(supported_versions.any(|_| true));
+
+    let mut exts = Box::new(ClientExtensions {
+        // offer groups which are usable for any offered version
+        named_groups: Some(
+            config
+                .provider
+                .kx_groups
+                .iter()
+                .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+                .map(|skxg| skxg.name())
+                .collect(),
+        ),
+        supported_versions: Some(supported_versions),
+        signature_schemes: Some(
+            config
+                .verifier
+                .supported_verify_schemes(),
+        ),
+        extended_master_secret_request: Some(()),
+        certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
+        protocols: extra_exts.protocols.clone(),
+        ..Default::default()
+    });
+
+    match extra_exts.transport_parameters.clone() {
+        Some(TransportParameters::Quic(v)) => exts.transport_parameters = Some(v),
+        Some(TransportParameters::QuicDraft(v)) => exts.transport_parameters_draft = Some(v),
+        None => {}
+    };
+
+    if supported_versions.tls13 {
+        if let Some(cas_extension) = config.verifier.root_hint_subjects() {
+            exts.certificate_authority_names = Some(cas_extension.to_owned());
+        }
+    }
+
+    // Send the ECPointFormat extension only if we are proposing ECDHE
+    if config
+        .provider
+        .kx_groups
+        .iter()
+        .any(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::ECDHE)
+    {
+        exts.ec_point_formats = Some(SupportedEcPointFormats::default());
+    }
+
+    exts.server_name = match (ech_state.as_ref(), config.enable_sni) {
+        // If we have ECH state we have a "cover name" to send in the outer hello
+        // as the SNI domain name. This happens unconditionally so we ignore the
+        // `enable_sni` value. That will be used later to decide what to do for
+        // the protected inner hello's SNI.
+        (Some(ech_state), _) => Some(ServerNamePayload::from(&ech_state.outer_name)),
+
+        // If we have no ECH state, and SNI is enabled, try to use the input server_name
+        // for the SNI domain name.
+        (None, true) => match &input.server_name {
+            ServerName::DnsName(dns_name) => Some(ServerNamePayload::from(dns_name)),
+            _ => None,
+        },
+
+        // If we have no ECH state, and SNI is not enabled, there's nothing to do.
+        (None, false) => None,
+    };
+
+    if let Some(key_share) = &key_share {
+        debug_assert!(supported_versions.tls13);
+        let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
+
+        if !retryreq
+            .map(|rr| rr.key_share.is_some())
+            .unwrap_or_default()
+        {
+            // Only for the initial client hello, or a HRR that does not specify a kx group,
+            // see if we can send a second KeyShare for "free".  We only do this if the same
+            // algorithm is also supported separately by our provider for this version
+            // (`find_kx_group` looks that up).
+            if let Some((component_group, component_share)) =
+                key_share
+                    .hybrid_component()
+                    .filter(|(group, _)| {
+                        config
+                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                            .is_some()
+                    })
+            {
+                shares.push(KeyShareEntry::new(component_group, component_share));
+            }
+        }
+
+        exts.key_shares = Some(shares);
+    }
+
+    if let Some(cookie) = retryreq.and_then(|hrr| hrr.cookie.as_ref()) {
+        exts.cookie = Some(cookie.clone());
+    }
+
+    if supported_versions.tls13 {
+        // We could support PSK_KE here too. Such connections don't
+        // have forward secrecy, and are similar to TLS1.2 resumption.
+        exts.preshared_key_modes = Some(PskKeyExchangeModes {
+            psk: false,
+            psk_dhe: true,
+        });
+    }
+
+    input.hello.offered_cert_compression =
+        if supported_versions.tls13 && !config.cert_decompressors.is_empty() {
+            exts.certificate_compression_algorithms = Some(
+                config
+                    .cert_decompressors
+                    .iter()
+                    .map(|dec| dec.algorithm())
+                    .collect(),
+            );
+            true
+        } else {
+            false
+        };
+
+    if config
+        .client_auth_cert_resolver
+        .only_raw_public_keys()
+    {
+        exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
+    }
+
+    if config
+        .verifier
+        .requires_raw_public_keys()
+    {
+        exts.server_certificate_types = Some(vec![CertificateType::RawPublicKey]);
+    }
+
+    // If this is a second client hello we're constructing in response to an HRR, and
+    // we've rejected ECH or sent GREASE ECH, then we need to carry forward the
+    // exact same ECH extension we used in the first hello.
+    if matches!(cx.data.ech_status, EchStatus::Rejected | EchStatus::Grease) & retryreq.is_some() {
+        if let Some(prev_ech_ext) = input.prev_ech_ext.take() {
+            exts.encrypted_client_hello = Some(prev_ech_ext);
+        }
+    }
+
+    // Do we have a SessionID or ticket cached for this host?
+    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+
+    // Extensions MAY be randomized
+    // but they also need to keep the same order as the previous ClientHello
+    exts.order_seed = input.hello.extension_order_seed;
+
+    // === ZeroProxy JA3 phase 2: Chrome 134 ClientHello shaping ===
+    //
+    // Always emit the extensions Chrome ships that rustls otherwise omits
+    // (renegotiation_info, certificate_compression_algorithms), and force a
+    // fixed extension layout via `contiguous_extensions` so JA3's extension
+    // list — order-significant in the hash — matches a browser fingerprint
+    // rather than rustls's random-by-seed default. NAVER's nid WAF gates on
+    // JA3 hash; phase 1 (cipher reorder via CryptoProvider) flips part of
+    // the hash but extension layout was still rustls-shaped.
+    //
+    // `contiguous_extensions` is `pub(crate)` and documented as appearing
+    // *after* the random-order pool — but the random pool's `retain` clause
+    // (handshake.rs ~L1033) drops anything that's also in
+    // `contiguous_extensions`, so if we list every extension we set here,
+    // the random pool becomes empty and the encoding order *is* our list.
+    apply_chrome_ja3_shape(&mut exts, retryreq.is_none());
+    // Phase 5.10 follow-up (2026-06-03 gosuda.org regression):
+    // `apply_chrome_ja3_shape` may have written an ECH GREASE outer
+    // hello extension into `exts.encrypted_client_hello`. If we leave
+    // `cx.data.ech_status` at `NotOffered`, a server that responds
+    // with an ECH-aware `encrypted_client_hello_ack` (Cloudflare's
+    // edge does this for any ECH attempt — failed-decrypt → retry
+    // configs in the EE) is treated as misbehaving and rustls aborts
+    // the handshake with `UnsolicitedEchExtension`. Real Chrome marks
+    // its own GREASE attempts as `EchStatus::Grease` so the same EE
+    // is silently dropped (the retry-config path is only taken on a
+    // genuine ECH `Rejected` status). Mirror that — the GREASE-bit
+    // check matches `apply_chrome_ja3_shape`'s precondition
+    // (`exts.encrypted_client_hello.is_none()`), so a real
+    // `EchMode::Enable` config that populated the field earlier
+    // never reaches this branch.
+    if exts.encrypted_client_hello.is_some() && cx.data.ech_status == EchStatus::NotOffered {
+        cx.data.ech_status = EchStatus::Grease;
+    }
+
+    let mut cipher_suites: Vec<_> = config
+        .provider
+        .cipher_suites
+        .iter()
+        .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
+            true => Some(cs.suite()),
+            false => None,
+        })
+        .collect();
+
+    // Phase 5.8: skip the SCSV pseudo-cipher when a captured spec is
+    // installed — Chrome 134+ relies on the renegotiation_info extension
+    // (id 65281) for the same purpose and does NOT advertise the SCSV.
+    // Emitting both is a rustls tell (visible as extra cipher `0x00ff` in
+    // JA3 / JA4 cipher count). The renegotiation_info extension is
+    // unconditionally emitted by apply_chrome_ja3_shape below.
+    let has_captured = crate::ja3::with_current(|s| s.is_some());
+    if supported_versions.tls12 && !has_captured {
+        // We don't do renegotiation at all, in fact.
+        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+    }
+
+    // Phase 5.8: Override the wire-emitted cipher list with the captured
+    // spec when available. Rustls's negotiation logic on ServerHello
+    // looks up the chosen cipher in `config.provider.cipher_suites`
+    // (unchanged), so emitting "decoy" RSA/CBC fallback ciphers that
+    // rustls-rustcrypto doesn't implement is safe — a modern server
+    // will pick a TLS 1.3 suite or an ECDHE_*_GCM/CHACHA20 that rustls
+    // does support. The decoys exist only to make the on-wire cipher
+    // tuple match Chrome's 15-entry list (and therefore the JA3 hash).
+    //
+    // Without this override, only the 9 ciphers rustls-rustcrypto
+    // actually implements get emitted, and the JA3 cipher component
+    // diverges from any real Chrome.
+    let captured_ciphers = crate::ja3::with_current(|s| {
+        s.map(|s| s.cipher_suites.clone()).unwrap_or_default()
+    });
+    if !captured_ciphers.is_empty() {
+        // Captured spec is authoritative — emit only what Chrome 148
+        // sends on the wire. No SCSV append (Chrome relies on the
+        // renegotiation_info extension instead; see SCSV-skip comment
+        // above where the non-captured path adds it).
+        cipher_suites = captured_ciphers;
+        // A config that must not offer what it cannot negotiate (`advertise_unimplemented_suites`) keeps only the captured suites the
+        // provider implements, in their captured order, so a server with a CBC preference picks a suite the handshake can complete.
+        if !config.advertise_unimplemented_suites {
+            cipher_suites.retain(|cs| {
+                config
+                    .provider
+                    .cipher_suites
+                    .iter()
+                    .any(|implemented| implemented.suite() == *cs)
+            });
+        }
+    }
+
+    // Phase 5.6: GREASE cipher inject (RFC 8701). cipher_suites is a
+    // Vec<CipherSuite> emitted verbatim — the `Unknown` variant carries
+    // the GREASE u16 to the wire with no special encoder path. JA3
+    // strips GREASE before hashing so the hash doesn't change; this is
+    // purely for browser-mimicking the on-wire layout.
+    //
+    // (Extension and group GREASE channels remain disabled — they
+    // tripped a sent_extensions consistency check inside rustls during
+    // ServerHello processing. See bisection notes in the trap notebook.)
+    cipher_suites.insert(0, CipherSuite::Unknown(crate::ja3::random_grease()));
+
+    let mut chp_payload = ClientHelloPayload {
+        client_version: ProtocolVersion::TLSv1_2,
+        random: input.random,
+        session_id: input.session_id,
+        cipher_suites,
+        compression_methods: vec![Compression::Null],
+        extensions: exts,
+    };
+
+    let ech_grease_ext = config
+        .ech_mode
+        .as_ref()
+        .and_then(|mode| match mode {
+            EchMode::Grease(cfg) => Some(cfg.grease_ext(
+                config.provider.secure_random,
+                input.server_name.clone(),
+                &chp_payload,
+            )),
+            _ => None,
+        });
+
+    match (cx.data.ech_status, &mut ech_state) {
+        // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
+        // we need to replace the client hello payload with an ECH client hello payload.
+        (EchStatus::NotOffered | EchStatus::Offered, Some(ech_state)) => {
+            // Replace the client hello payload with an ECH client hello payload.
+            chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
+            cx.data.ech_status = EchStatus::Offered;
+            // Store the ECH extension in case we need to carry it forward in a subsequent hello.
+            input.prev_ech_ext = chp_payload
+                .encrypted_client_hello
+                .clone();
+        }
+        // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
+        // ECH.
+        (EchStatus::NotOffered, None) => {
+            if let Some(grease_ext) = ech_grease_ext {
+                // Add the GREASE ECH extension.
+                let grease_ext = grease_ext?;
+                chp_payload.encrypted_client_hello = Some(grease_ext.clone());
+                cx.data.ech_status = EchStatus::Grease;
+                // Store the GREASE ECH extension in case we need to carry it forward in a
+                // subsequent hello.
+                input.prev_ech_ext = Some(grease_ext);
+            }
+        }
+        _ => {}
+    }
+
+    // Note what extensions we sent.
+    input.hello.sent_extensions = chp_payload.collect_used();
+
+    let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
+
+    let tls13_early_data_key_schedule = match (ech_state.as_mut(), tls13_session) {
+        // If we're performing ECH and resuming, then the PSK binder will have been dealt with
+        // separately, and we need to take the early_data_key_schedule computed for the inner hello.
+        (Some(ech_state), Some(tls13_session)) => ech_state
+            .early_data_key_schedule
+            .take()
+            .map(|schedule| (tls13_session.suite(), schedule)),
+
+        // When we're not doing ECH and resuming, then the PSK binder need to be filled in as
+        // normal.
+        (_, Some(tls13_session)) => Some((
+            tls13_session.suite(),
+            tls13::fill_in_psk_binder(&tls13_session, &transcript_buffer, &mut chp),
+        )),
+
+        // No early key schedule in other cases.
+        _ => None,
+    };
+
+    let ch = Message {
+        version: match retryreq {
+            // <https://datatracker.ietf.org/doc/html/rfc8446#section-5.1>:
+            // "This value MUST be set to 0x0303 for all records generated
+            //  by a TLS 1.3 implementation ..."
+            Some(_) => ProtocolVersion::TLSv1_2,
+            // "... other than an initial ClientHello (i.e., one not
+            // generated after a HelloRetryRequest), where it MAY also be
+            // 0x0301 for compatibility purposes"
+            //
+            // (retryreq == None means we're in the "initial ClientHello" case)
+            None => ProtocolVersion::TLSv1_0,
+        },
+        payload: MessagePayload::handshake(chp),
+    };
+
+    if retryreq.is_some() {
+        // send dummy CCS to fool middleboxes prior
+        // to second client hello
+        tls13::emit_fake_ccs(&mut input.sent_tls13_fake_ccs, cx.common);
+    }
+
+    trace!("Sending ClientHello {ch:#?}");
+
+    transcript_buffer.add_message(&ch);
+    cx.common.send_msg(ch, false);
+
+    // Calculate the hash of ClientHello and use it to derive EarlyTrafficSecret
+    let early_data_key_schedule =
+        tls13_early_data_key_schedule.map(|(resuming_suite, schedule)| {
+            if !cx.data.early_data.is_enabled() {
+                return schedule;
+            }
+
+            let (transcript_buffer, random) = match &ech_state {
+                // When using ECH the early data key schedule is derived based on the inner
+                // hello transcript and random.
+                Some(ech_state) => (
+                    &ech_state.inner_hello_transcript,
+                    &ech_state.inner_hello_random.0,
+                ),
+                None => (&transcript_buffer, &input.random.0),
+            };
+
+            tls13::derive_early_traffic_secret(
+                &*config.key_log,
+                cx,
+                resuming_suite.common.hash_provider,
+                &schedule,
+                &mut input.sent_tls13_fake_ccs,
+                transcript_buffer,
+                random,
+            );
+            schedule
+        });
+
+    let next = ExpectServerHello {
+        input,
+        transcript_buffer,
+        early_data_key_schedule,
+        offered_key_share: key_share,
+        suite,
+        ech_state,
+    };
+
+    Ok(if supported_versions.tls13 && retryreq.is_none() {
+        Box::new(ExpectServerHelloOrHelloRetryRequest {
+            next,
+            extra_exts: extra_exts.into_owned(),
+        })
+    } else {
+        Box::new(next)
+    })
+}
+
+/// ZeroProxy JA3 phase 2 — apply Chrome 134 ClientHello shape to `exts`
+/// after rustls's normal extension setup. Two concerns:
+///
+/// 1. **Add the extensions Chrome ships that rustls otherwise omits.**
+///    Chrome 134 always emits `renegotiation_info` (empty) and
+///    `certificate_compression_algorithms` (Brotli). rustls's default
+///    client doesn't set either unless a cert decompressor is registered.
+///    Both are TLS-level no-ops on the receive side (servers accept
+///    them and may negotiate cert compression), but they're observable
+///    on the wire and JA3 hashes the extension *list* (sorted by id,
+///    with GREASE filtered) — adding extensions changes the hash.
+///
+/// 2. **Force a fixed extension layout** via `contiguous_extensions`.
+///    rustls randomises extension order with a per-session seed (see
+///    `order_insensitive_extensions_in_random_order`), but browsers
+///    don't randomise — they emit a consistent layout per build.
+///    Populating `contiguous_extensions` with every extension we set
+///    leaves the random-order pool empty (the random pool's `retain`
+///    clause drops anything also listed in `contiguous_extensions`),
+///    so the encoding becomes exactly our list.
+///
+/// The order below matches what Chrome 134 stable sends on a fresh
+/// TLS 1.3 ClientHello. Extensions Chrome includes that rustls doesn't
+/// expose as struct fields (e.g. `record_size_limit` / id 28, ALPS / id
+/// 17613, `signed_certificate_timestamp` request / id 18) are simply
+/// absent from our list — the JA3 hash will differ from Chrome by
+/// those entries but should no longer match the rustls fingerprint.
+fn apply_chrome_ja3_shape(exts: &mut ClientExtensions<'_>, initial_hello: bool) {
+    // (1) Always emit an empty `renegotiation_info` — Chrome does this
+    // even when TLS 1.3 is the chosen version (extension is harmless on
+    // TLS 1.3 servers since they negotiate via `supported_versions`).
+    exts.renegotiation_info = Some(PayloadU8::empty());
+
+    // (2) Always offer cert compression. rustls only sets this when at
+    // least one `CertDecompressor` is registered on the config; without
+    // one, a negotiated `compress_certificate` response from the server
+    // will fail (decompressor not found). That's fine — the server's
+    // response is a *choice*; if the server doesn't pick this extension
+    // we never decompress anything. Browsers send it as a hint.
+    // Chrome 148 advertises ONLY Brotli (id 2) in
+    // certificate_compression_algorithms. Sending Brotli+Zlib made
+    // peetprint's cert-compression field read `2-1` vs Chrome's `2`
+    // — a fingerprint tell NAVER's WAF weights. Brotli-only matches.
+    //
+    // FORCE (not `is_none()`-guarded): rustls already populated this from
+    // `config.cert_decompressors` (Brotli+Zlib) at the cert-compression
+    // setup above, which runs BEFORE us — so a guard would always skip.
+    // We overwrite the advertised list to Brotli-only. `offered_cert_
+    // compression` (the validation source of truth) keeps its superset,
+    // and the server can only pick from the Brotli-only wire list, so the
+    // narrower advertisement never causes a chosen-algo validation miss.
+    exts.certificate_compression_algorithms =
+        Some(vec![CertificateCompressionAlgorithm::Brotli]);
+
+    // (3) Phase 5 additions: extensions rustls didn't have struct
+    // fields for before this commit. We always populate them when the
+    // captured spec (or our hardcoded fallback) lists them, because
+    // they're the ones that visibly differ from Chrome on the wire.
+    // Without them, NAVER's WAF kept the 60s slow lane on even with
+    // a Chrome-shaped extension *order* — these three are the remaining
+    // browser-vs-rustls fingerprint diff.
+    let spec_has = |id: u16| -> bool {
+        crate::ja3::with_current(|s| {
+            s.map(|s| s.extensions.iter().any(|e| u16::from(*e) == id))
+                .unwrap_or(true) // fallback path: assume Chrome sends all three
+        })
+    };
+    if spec_has(0x0012) {
+        // SCT request (id 18) — empty body.
+        exts.signed_certificate_timestamp_request = Some(());
+    }
+    if spec_has(0x001c) {
+        // record_size_limit (id 28) — Chrome 134 sends 16385.
+        exts.record_size_limit = Some(16385);
+    }
+    if spec_has(0x44cd) {
+        // ApplicationSettings (id 17613) — Chrome sends ["h2"] only.
+        exts.application_settings = Some(vec![ProtocolName::from(b"h2".to_vec())]);
+    }
+    if spec_has(0xca34) {
+        // trust_anchors (id 0xca34, TLS Trust Expressions) — every Chrome since 140 sends this fixed list; its absence is
+        // what separates a WebView2/Edge hello from a Chrome one while the UA says Chrome.
+        exts.trust_anchors = Some(Payload::new(crate::ja3::CHROME_TRUST_ANCHORS.to_vec()));
+    }
+    if spec_has(0x0023) && exts.session_ticket.is_none() {
+        // SessionTicket (id 35) — Chrome always emits this even on
+        // first contact, signaling "I support session tickets, here's
+        // an empty placeholder". rustls only sets it via
+        // `prepare_resumption` when a previous session exists, which is
+        // a fingerprint giveaway on first connect. Force an empty
+        // ticket ("Request" variant emits a zero-length body).
+        exts.session_ticket = Some(ClientSessionTicket::Request);
+    }
+
+    // Override signature_schemes with the captured spec's order if
+    // available. rustls sets `signature_schemes` from
+    // `verifier.supported_verify_schemes()`, which gives a list and
+    // order driven by what the crypto backend supports — for
+    // rustls-rustcrypto that includes schemes Chrome doesn't (e.g.
+    // brainpoolP384) and the order leads with ECDSA-P384-SHA384, while
+    // Chrome leads with ECDSA-P256-SHA256. Anti-bot tools (peetprint)
+    // include the sig_algs *contents* in their hash, so this matters.
+    if let Some(sig) = crate::ja3::with_current(|s| {
+        s.map(|s| s.signature_schemes.clone())
+    }) {
+        if !sig.is_empty() {
+            use crate::enums::SignatureScheme;
+            let mut schemes: Vec<SignatureScheme> = sig
+                .into_iter()
+                .filter(|s| !crate::ja3::is_grease_value(*s))
+                .map(SignatureScheme::from)
+                .collect();
+            // Chrome puts one GREASE signature algorithm in front (RFC 8701; `0x1a1a` in the sample that showed it). Its
+            // absence leaves a list one entry short of every current Chrome's, which a full-hello fingerprint (not JA3/JA4,
+            // which strip GREASE) can read.
+            schemes.insert(0, SignatureScheme::Unknown(crate::ja3::random_grease()));
+            exts.signature_schemes = Some(schemes);
+        }
+    }
+
+    // (4) Extension order. Prefer the captured spec from the user's
+    // real browser → ZeroProxy handshake (phase 4); fall back to a
+    // hardcoded Chrome 134 layout if no spec was installed (phase 2
+    // fallback, e.g. plain-HTTP dev without `-tls-addr`).
+    let captured_order = crate::ja3::with_current(|spec| {
+        spec.map(|s| s.extensions.clone())
+    });
+    let mut order = match captured_order {
+        Some(order) if !order.is_empty() => order,
+        _ => chrome134_fallback_extension_order(),
+    };
+
+    // Include ECH GREASE (65037) in the extension shuffle pool. Captured specs
+    // already list it, whereas the hardcoded fallback list omits it; adding it
+    // here keeps both paths consistent (if the field is None, the encoder skips it).
+    {
+        let ech = crate::msgs::enums::ExtensionType::EncryptedClientHello;
+        if !order.contains(&ech) {
+            order.push(ech);
+        }
+    }
+
+    // Permute extension order once per connection using `order_seed`, matching
+    // BoringSSL's `ssl_setup_extension_permutation`. Sorting deterministically
+    // by `order_seed` (rather than drawing fresh randomness per `encode()` call)
+    // ensures PSK binder calculation, final wire encoding, HelloRetryRequest,
+    // and ECH inner/outer extension compression all observe the same order.
+    order.sort_by_cached_key(|ext| {
+        crate::msgs::handshake::low_quality_integer_hash(
+            ((exts.order_seed as u32) << 16) | (u16::from(*ext) as u32),
+        )
+    });
+
+    // Phase 5.6: GREASE-inject the extension list. Chrome 134 always
+    // brackets the wire layout with two distinct GREASE IDs (RFC 8701).
+    // JA3 strips them so the hash doesn't change; we still need them
+    // because anti-bot signal also includes "no GREASE = not a real
+    // browser". The encoder's catch-arm in macros.rs emits a zero-byte
+    // body for any GREASE ID, so the wire shape is correct.
+    //
+    // The two values MUST DIFFER. Chrome brackets with two *distinct* GREASE
+    // IDs, and more importantly TLS forbids a duplicate extension type in a
+    // ClientHello — a strict peer answers `decode_error`. Two independent
+    // `random_grease()` draws collide 1 in 16, which showed up as an
+    // intermittent `received fatal alert: DecodeError` against
+    // cologger.shopping.naver.com while every other host handshaked fine.
+    order.retain(|e| !crate::ja3::is_grease_value(u16::from(*e)));
+    let grease_first = crate::ja3::random_grease();
+    let mut grease_last = crate::ja3::random_grease();
+    if grease_last == grease_first {
+        // Walk to the neighbouring GREASE code point — still a valid RFC 8701
+        // value, just guaranteed distinct.
+        let idx = crate::ja3::GREASE_VALUES
+            .iter()
+            .position(|v| *v == grease_first)
+            .unwrap_or(0);
+        grease_last = crate::ja3::GREASE_VALUES[(idx + 1) % crate::ja3::GREASE_VALUES.len()];
+    }
+    order.insert(0, crate::msgs::enums::ExtensionType::Unknown(grease_first));
+    order.push(crate::msgs::enums::ExtensionType::Unknown(grease_last));
+
+    // Phase 5.7 / 5.8: ensure ExtensionType::Padding (id 21, RFC 7685)
+    // is the last contiguous extension before the trailing GREASE entry,
+    // BUT only when:
+    //   (a) the captured spec / hardcoded fallback explicitly listed it,
+    //       OR
+    //   (b) no captured spec is installed at all (legacy fallback path).
+    //
+    // Rationale: Chrome 148 with MLKEM768 key_share already produces a
+    // >512-byte ClientHello (the post-quantum key share alone is ~1184
+    // bytes), so it does NOT emit padding. ZP can't currently produce
+    // the MLKEM key share (rustls-rustcrypto doesn't implement MLKEM),
+    // so our ClientHello is much smaller — adding padding "to be safe"
+    // would push id 21 into the JA3 extension tuple where Chrome 148
+    // has nothing. Captured-spec mode honours the captured layout
+    // verbatim; only the no-captured fallback synthesises padding.
+    let captured_has_padding = crate::ja3::with_current(|s| {
+        s.map(|s| s.extensions.iter().any(|e| u16::from(*e) == 0x0015))
+            .unwrap_or(false)
+    });
+    let no_captured = crate::ja3::with_current(|s| s.is_none());
+    if !order.iter().any(|e| u16::from(*e) == 0x0015)
+        && (captured_has_padding || no_captured)
+    {
+        let pos = order.len().saturating_sub(1);
+        order.insert(pos, crate::msgs::enums::ExtensionType::Padding);
+    }
+    exts.contiguous_extensions = order;
+
+    // Phase 5.10 ECH GREASE — RE-ARMED (2026-06-03) with the
+    // BoringSSL-compatible discriminators that Phase 5.7's random-
+    // config_id attempt missed.
+    //
+    // Wire format (draft-ietf-tls-esni-24 §5):
+    //     ECHClientHelloType=outer || HpkeSymmetricCipherSuite
+    //     || config_id || enc<u16> || payload<u16>
+    //
+    // Discriminators vs. Phase 5.7:
+    //   1. `config_id = 0` (was: random). Real Chrome / BoringSSL
+    //      `SSL_set_enable_ech_grease` writes a literal `0x00` to the
+    //      config_id slot — it's the documented "no known ECHConfig"
+    //      signal a server uses to distinguish GREASE from a real
+    //      client that mis-remembers its ECHConfig. The Phase 5.7
+    //      attempt used `random_grease() & 0xff` which on most
+    //      handshakes produced a non-zero value that NAVER mail's
+    //      Akamai treated as a real ECH offer, tried to decrypt
+    //      against the deployed ECHConfig, failed AEAD-auth, and
+    //      aborted instead of falling back.
+    //   2. `payload` length is 192 B (was: 176). Matches Chrome 148's
+    //      typical inner-CH-encrypted size (≈176 inner CH + 16-byte
+    //      AEAD tag) — fingerprinters that bucket on payload length
+    //      see the same envelope as Chrome.
+    //   3. `cipher_suite = HKDF-SHA256 + AES-128-GCM`, `enc = 32B`
+    //      → DHKEM(X25519, HKDF-SHA256) -shape wire (the KEM ID
+    //      itself isn't on the wire; servers infer it from the
+    //      32-byte length). Matches Chrome 148.
+    //
+    // Why we set the field directly rather than going through
+    // `ClientConfig::with_ech(EchMode::Grease(...))`:
+    //   - rustls's built-in `EchGreaseConfig` hardcodes the HPKE
+    //     KEM to `DHKEM_P256_HKDF_SHA256` (65-byte enc), which is
+    //     visibly NOT what Chrome 148 emits.
+    //   - rustls-rustcrypto doesn't ship an HPKE provider, so the
+    //     normal path doesn't compile in our build either.
+    // Direct field-set avoids both: the extension encoder emits
+    // `EncryptedClientHelloOuter` byte-equivalent to Chrome's GREASE,
+    // and we never invoke real HPKE.
+    //
+    // If a server validates GREASE as a real ECH attempt (Akamai's
+    // mail.naver.com policy was the historic regression case), bisect
+    // by flipping `enable_ech_grease` to `false` below — leaves
+    // every other Phase 5.x fingerprint shaping untouched.
+    // Set to `false` if a server reverts to ECH-bad-attempt behaviour
+    // and starts rejecting handshakes. Bisect on a per-host basis with
+    // tls.peet.ws (JA4 must read t13d1516h2_ when true, t13d1515h2_
+    // when false) before broader changes.
+    let enable_ech_grease = true;
+    if enable_ech_grease && exts.encrypted_client_hello.is_none() {
+        use crate::msgs::base::PayloadU16;
+        use crate::msgs::enums::{HpkeAead, HpkeKdf};
+        use crate::msgs::handshake::{
+            EncryptedClientHello, EncryptedClientHelloOuter, HpkeSymmetricCipherSuite,
+        };
+        // 32-byte `enc` — random bytes. BoringSSL uses a real X25519
+        // ephemeral keypair, but a fingerprint observer only sees 32
+        // bytes; a server that tries DHKEM(X25519) decap will fail
+        // anyway (random vs. real public key) and SHOULD fall back to
+        // outer SNI per draft-ietf-tls-esni §5. Real X25519 keygen
+        // would need x25519-dalek inside the rustls fork — extra deps
+        // we avoid here for one wire bit of difference.
+        let enc_bytes = crate::ja3::random_bytes(32);
+        // Chrome's GREASE ECH draws a fresh config id and one of four payload sizes, 144 + 32·k bytes (k in 0..=3), per
+        // connection — measured on the same machine's Chrome (config ids 17..193, sizes 144/176/208/240, ten hellos). A
+        // fixed 192 with config id 0 was the same in every hello of every user.
+        let draw = crate::ja3::random_bytes(2);
+        let config_id = draw[0];
+        let payload_len = 144 + 32 * usize::from(draw[1] & 0x03);
+        let payload_bytes = crate::ja3::random_bytes(payload_len);
+        exts.encrypted_client_hello = Some(EncryptedClientHello::Outer(
+            EncryptedClientHelloOuter {
+                cipher_suite: HpkeSymmetricCipherSuite {
+                    kdf_id: HpkeKdf::HKDF_SHA256,
+                    aead_id: HpkeAead::AES_128_GCM,
+                },
+                config_id,
+                enc: PayloadU16::new(enc_bytes),
+                payload: PayloadU16::new(payload_bytes),
+            },
+        ));
+        // Keep ECH GREASE in `contiguous_extensions` so it participates in the
+        // per-connection extension permutation alongside other non-PSK extensions,
+        // matching Chrome's placement rather than pinning 0xfe0d to the tail.
+        let ech_typ = crate::msgs::enums::ExtensionType::EncryptedClientHello;
+        if !exts.contiguous_extensions.contains(&ech_typ) {
+            exts.contiguous_extensions.push(ech_typ);
+        }
+    }
+
+    // Phase 5.9: override named_groups (supported_groups extension body
+    // = JA3 "Curves" field) from the captured spec — Chrome 148 sends
+    // [GREASE, X25519MLKEM768, X25519, P-256, P-384]. With our real
+    // MLKEM impl registered in provider.kx_groups the override is now
+    // wire-functionally identical to the default path; we still apply
+    // it so spec changes (e.g. swapping in a different captured browser)
+    // take effect without rebuilding the provider's KX list.
+    // Phase 5.9 override + diagnostic dump. Records what we got from the
+    // captured spec and the default rustls vec side-by-side so the next
+    // diag trace shows whether the captured values are degenerate.
+    let captured_groups = crate::ja3::with_current(|s| {
+        s.map(|s| s.named_groups.clone()).unwrap_or_default()
+    });
+    crate::ja3::set_last_named_groups_dump(
+        exts.named_groups.as_ref()
+            .map(|g| g.iter().map(|n| u16::from(*n)).collect())
+            .unwrap_or_default(),
+        captured_groups.iter().map(|n| u16::from(*n)).collect(),
+    );
+    if !captured_groups.is_empty() {
+        exts.named_groups = Some(captured_groups);
+    }
+
+    // Phase 5.8 NOTE — captured spec's named_groups (Chrome 148 advertises
+    // X25519MLKEM768 = group 4588) is INTENTIONALLY NOT applied to the wire
+    // supported_groups extension. Rationale: empirical regression — nid.naver.com
+    // immediately fails TLS handshake (<3s TARGET_CONNECT_FAILED) when we
+    // advertise MLKEM without a matching key_share entry. The server prefers
+    // MLKEM, sends a HelloRetryRequest demanding an MLKEM key_share, and we
+    // can't generate one (rustls_rustcrypto has no MLKEM implementation).
+    // tls.peet.ws survives because its server picks X25519 from the list, but
+    // NAVER nid prefers post-quantum and refuses to fall back.
+    //
+    // Trade-off accepted: JA3 curves field diverges from Chrome 148
+    // (`29-23-24` instead of `4588-29-23-24`) — one cosmetic JA3 diff vs.
+    // blowing up TLS to deep-WAF sites. Re-enable only after implementing
+    // a real MLKEM key_share generator (or after isolating which servers
+    // demand it vs. tolerate "advertise but no key share").
+    //
+    // Phase 5.6: GREASE-inject the named_groups (supported_groups
+    // body). Chrome 134 puts a single GREASE NamedGroup at position 0.
+    // The client-side `find_kx_group` lookup uses the kx_groups list
+    // (live keypair generation), not named_groups, so an Unknown here
+    // is wire-only — server-side it's silently skipped per RFC 8701.
+    if let Some(groups) = exts.named_groups.as_mut() {
+        groups.retain(|g| !crate::ja3::is_grease_value(u16::from(*g)));
+        groups.insert(0, crate::msgs::enums::NamedGroup::Unknown(crate::ja3::random_grease()));
+    }
+    // Chrome's first hello offers a GREASE key share — the same GREASE group as the one in supported_groups, with the one
+    // byte `00` for a share — in front of the real ones. (A hello retry carries the one share the server asked for.) The
+    // server never selects it, so nothing downstream sees it: the real share is held separately.
+    if initial_hello {
+        if let (Some(groups), Some(shares)) = (exts.named_groups.as_ref(), exts.key_shares.as_mut()) {
+            if let Some(grease) = groups.first().copied() {
+                if crate::ja3::is_grease_value(u16::from(grease))
+                    && !shares.iter().any(|s| crate::ja3::is_grease_value(u16::from(s.group)))
+                {
+                    shares.insert(0, KeyShareEntry::new(grease, alloc::vec![0u8]));
+                }
+            }
+        }
+    }
+}
+
+/// Hardcoded Chrome 134 extension order, used when no captured spec is
+/// installed. List every extension we might emit; the encoder drops
+/// `None` ones, so the wire layout is exactly the subset that's
+/// present, in this order. The random-order pool is emptied (see
+/// retain clause in handshake.rs's
+/// `order_insensitive_extensions_in_random_order`), so the encoding
+/// is `contiguous_extensions ++ [ECH, PSK]` in this order.
+fn chrome134_fallback_extension_order() -> Vec<ExtensionType> {
+    vec![
+        ExtensionType::ServerName,              // 0
+        ExtensionType::ExtendedMasterSecret,    // 23
+        ExtensionType::RenegotiationInfo,       // 65281 (set above)
+        ExtensionType::EllipticCurves,          // 10 (supported_groups)
+        ExtensionType::ECPointFormats,          // 11
+        ExtensionType::SessionTicket,           // 35
+        ExtensionType::ALProtocolNegotiation,   // 16
+        ExtensionType::StatusRequest,           // 5
+        ExtensionType::SignatureAlgorithms,     // 13
+        ExtensionType::KeyShare,                // 51
+        ExtensionType::PSKKeyExchangeModes,     // 45
+        ExtensionType::SupportedVersions,       // 43
+        ExtensionType::CompressCertificate,     // 27 (set above)
+        // The following are rustls-internal extensions we don't want to
+        // omit by accident, even though Chrome doesn't always send them:
+        ExtensionType::ClientCertificateType,
+        ExtensionType::ServerCertificateType,
+        ExtensionType::CertificateAuthorities,
+        ExtensionType::Cookie,
+        ExtensionType::EarlyData,
+        ExtensionType::TransportParameters,
+        ExtensionType::TransportParametersDraft,
+    ]
+}
+
+/// Prepares `exts` and `cx` with TLS 1.2 or TLS 1.3 session
+/// resumption.
+///
+/// - `suite` is `None` if this is the initial ClientHello, or
+///   `Some` if we're retrying in response to
+///   a HelloRetryRequest.
+///
+/// This function will push onto `exts` to
+///
+/// (a) request a new ticket if we don't have one,
+/// (b) send our TLS 1.2 ticket after retrieving an 1.2 session,
+/// (c) send a request for 1.3 early data if allowed and
+/// (d) send a 1.3 preshared key if we have one.
+///
+/// It returns the TLS 1.3 PSKs, if any, for further processing.
+fn prepare_resumption<'a>(
+    resuming: &'a Option<persist::Retrieved<ClientSessionValue>>,
+    exts: &mut ClientExtensions<'_>,
+    suite: Option<SupportedCipherSuite>,
+    cx: &mut ClientContext<'_>,
+    config: &ClientConfig,
+) -> Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>> {
+    // Check whether we're resuming with a non-empty ticket.
+    let resuming = match resuming {
+        Some(resuming) if !resuming.ticket().is_empty() => resuming,
+        _ => {
+            if config.supports_version(ProtocolVersion::TLSv1_2)
+                && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
+            {
+                // If we don't have a ticket, request one.
+                exts.session_ticket = Some(ClientSessionTicket::Request);
+            }
+            return None;
+        }
+    };
+
+    let Some(tls13) = resuming.map(|csv| csv.tls13()) else {
+        // TLS 1.2; send the ticket if we have support this protocol version
+        if config.supports_version(ProtocolVersion::TLSv1_2)
+            && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
+        {
+            exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
+        }
+        return None; // TLS 1.2, so nothing to return here
+    };
+
+    if !config.supports_version(ProtocolVersion::TLSv1_3) {
+        return None;
+    }
+
+    // If the server selected TLS 1.2, we can't resume.
+    let suite = match suite {
+        Some(SupportedCipherSuite::Tls13(suite)) => Some(suite),
+        #[cfg(feature = "tls12")]
+        Some(SupportedCipherSuite::Tls12(_)) => return None,
+        None => None,
+    };
+
+    // If the selected cipher suite can't select from the session's, we can't resume.
+    if let Some(suite) = suite {
+        suite.can_resume_from(tls13.suite())?;
+    }
+
+    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some());
+    Some(tls13)
+}
+
+pub(super) fn process_alpn_protocol(
+    common: &mut CommonState,
+    offered_protocols: &[ProtocolName],
+    selected: Option<&ProtocolName>,
+    check_selected_offered: bool,
+) -> Result<(), Error> {
+    common.alpn_protocol = selected.map(ToOwned::to_owned);
+
+    if let Some(alpn_protocol) = &common.alpn_protocol {
+        if check_selected_offered && !offered_protocols.contains(alpn_protocol) {
+            return Err(common.send_fatal_alert(
+                AlertDescription::IllegalParameter,
+                PeerMisbehaved::SelectedUnofferedApplicationProtocol,
+            ));
+        }
+    }
+
+    // RFC 9001 says: "While ALPN only specifies that servers use this alert, QUIC clients MUST
+    // use error 0x0178 to terminate a connection when ALPN negotiation fails." We judge that
+    // the user intended to use ALPN (rather than some out-of-band protocol negotiation
+    // mechanism) if and only if any ALPN protocols were configured. This defends against badly-behaved
+    // servers which accept a connection that requires an application-layer protocol they do not
+    // understand.
+    if common.is_quic() && common.alpn_protocol.is_none() && !offered_protocols.is_empty() {
+        return Err(common.send_fatal_alert(
+            AlertDescription::NoApplicationProtocol,
+            Error::NoApplicationProtocol,
+        ));
+    }
+
+    debug!(
+        "ALPN protocol is {:?}",
+        common
+            .alpn_protocol
+            .as_ref()
+            .map(|v| bs_debug::BsDebug(v.as_ref()))
+    );
+    Ok(())
+}
+
+pub(super) fn process_server_cert_type_extension(
+    common: &mut CommonState,
+    config: &ClientConfig,
+    server_cert_extension: Option<&CertificateType>,
+) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
+    process_cert_type_extension(
+        common,
+        config
+            .verifier
+            .requires_raw_public_keys(),
+        server_cert_extension.copied(),
+        ExtensionType::ServerCertificateType,
+    )
+}
+
+pub(super) fn process_client_cert_type_extension(
+    common: &mut CommonState,
+    config: &ClientConfig,
+    client_cert_extension: Option<&CertificateType>,
+) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
+    process_cert_type_extension(
+        common,
+        config
+            .client_auth_cert_resolver
+            .only_raw_public_keys(),
+        client_cert_extension.copied(),
+        ExtensionType::ClientCertificateType,
+    )
+}
+
+impl State<ClientConnectionData> for ExpectServerHello {
+    fn handle<'m>(
+        mut self: Box<Self>,
+        cx: &mut ClientContext<'_>,
+        m: Message<'m>,
+    ) -> NextStateOrError<'m>
+    where
+        Self: 'm,
+    {
+        let server_hello =
+            require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
+        trace!("We got ServerHello {server_hello:#?}");
+
+        use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
+        let config = &self.input.config;
+        let tls13_supported = config.supports_version(TLSv1_3);
+
+        let server_version = if server_hello.legacy_version == TLSv1_2 {
+            server_hello
+                .selected_version
+                .unwrap_or(server_hello.legacy_version)
+        } else {
+            server_hello.legacy_version
+        };
+
+        let version = match server_version {
+            TLSv1_3 if tls13_supported => TLSv1_3,
+            TLSv1_2 if config.supports_version(TLSv1_2) => {
+                if cx.data.early_data.is_enabled() && cx.common.early_traffic {
+                    // The client must fail with a dedicated error code if the server
+                    // responds with TLS 1.2 when offering 0-RTT.
+                    return Err(PeerMisbehaved::OfferedEarlyDataWithOldProtocolVersion.into());
+                }
+
+                if server_hello.selected_version.is_some() {
+                    return Err({
+                        cx.common.send_fatal_alert(
+                            AlertDescription::IllegalParameter,
+                            PeerMisbehaved::SelectedTls12UsingTls13VersionExtension,
+                        )
+                    });
+                }
+
+                TLSv1_2
+            }
+            _ => {
+                let reason = match server_version {
+                    TLSv1_2 | TLSv1_3 => PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig,
+                    _ => PeerIncompatible::ServerDoesNotSupportTls12Or13,
+                };
+                return Err(cx
+                    .common
+                    .send_fatal_alert(AlertDescription::ProtocolVersion, reason));
+            }
+        };
+
+        if server_hello.compression_method != Compression::Null {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::SelectedUnofferedCompression,
+                )
+            });
+        }
+
+        let allowed_unsolicited = [ExtensionType::RenegotiationInfo];
+        if self
+            .input
+            .hello
+            .server_sent_unsolicited_extensions(server_hello, &allowed_unsolicited)
+        {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::UnsupportedExtension,
+                PeerMisbehaved::UnsolicitedServerHelloExtension,
+            ));
+        }
+
+        cx.common.negotiated_version = Some(version);
+
+        // Extract ALPN protocol
+        if !cx.common.is_tls13() {
+            process_alpn_protocol(
+                cx.common,
+                &self.input.hello.alpn_protocols,
+                server_hello
+                    .selected_protocol
+                    .as_ref()
+                    .map(|s| s.as_ref()),
+                self.input.config.check_selected_alpn,
+            )?;
+        }
+
+        // If ECPointFormats extension is supplied by the server, it must contain
+        // Uncompressed.  But it's allowed to be omitted.
+        if let Some(point_fmts) = &server_hello.ec_point_formats {
+            if !point_fmts.uncompressed {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints,
+                ));
+            }
+        }
+
+        let suite = config
+            .find_cipher_suite(server_hello.cipher_suite)
+            .ok_or_else(|| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::HandshakeFailure,
+                    PeerMisbehaved::SelectedUnofferedCipherSuite,
+                )
+            })?;
+
+        if version != suite.version().version {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::SelectedUnusableCipherSuiteForVersion,
+                )
+            });
+        }
+
+        match self.suite {
+            Some(prev_suite) if prev_suite != suite => {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::SelectedDifferentCipherSuiteAfterRetry,
+                    )
+                });
+            }
+            _ => {
+                debug!("Using ciphersuite {suite:?}");
+                self.suite = Some(suite);
+                cx.common.suite = Some(suite);
+            }
+        }
+
+        // Start our handshake hash, and input the server-hello.
+        let mut transcript = self
+            .transcript_buffer
+            .start_hash(suite.hash_provider());
+        transcript.add_message(&m);
+
+        let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
+        // For TLS1.3, start message encryption using
+        // handshake_traffic_secret.
+        match suite {
+            SupportedCipherSuite::Tls13(suite) => {
+                tls13::handle_server_hello(
+                    cx,
+                    server_hello,
+                    randoms,
+                    suite,
+                    transcript,
+                    self.early_data_key_schedule,
+                    // We always send a key share when TLS 1.3 is enabled.
+                    self.offered_key_share.unwrap(),
+                    &m,
+                    self.ech_state,
+                    self.input,
+                )
+            }
+            #[cfg(feature = "tls12")]
+            SupportedCipherSuite::Tls12(suite) => tls12::CompleteServerHelloHandling {
+                randoms,
+                transcript,
+                input: self.input,
+            }
+            .handle_server_hello(cx, suite, server_hello, tls13_supported),
+        }
+    }
+
+    fn into_owned(self: Box<Self>) -> NextState<'static> {
+        self
+    }
+}
+
+impl ExpectServerHelloOrHelloRetryRequest {
+    fn into_expect_server_hello(self) -> NextState<'static> {
+        Box::new(self.next)
+    }
+
+    fn handle_hello_retry_request(
+        mut self,
+        cx: &mut ClientContext<'_>,
+        m: Message<'_>,
+    ) -> NextStateOrError<'static> {
+        let hrr = require_handshake_msg!(
+            m,
+            HandshakeType::HelloRetryRequest,
+            HandshakePayload::HelloRetryRequest
+        )?;
+        trace!("Got HRR {hrr:?}");
+
+        cx.common.check_aligned_handshake()?;
+
+        // We always send a key share when TLS 1.3 is enabled.
+        let offered_key_share = self.next.offered_key_share.unwrap();
+
+        // A retry request is illegal if it contains no cookie and asks for
+        // retry of a group we already sent.
+        let config = &self.next.input.config;
+
+        if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
+            let offered_hybrid = offered_key_share
+                .hybrid_component()
+                .and_then(|(group_name, _)| {
+                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
+                })
+                .map(|skxg| skxg.name());
+
+            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
+                    )
+                });
+            }
+        }
+
+        // Or has an empty cookie.
+        if let Some(cookie) = &hrr.cookie {
+            if cookie.0.is_empty() {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithEmptyCookie,
+                    )
+                });
+            }
+        }
+
+        // Or asks us to change nothing.
+        if hrr.cookie.is_none() && hrr.key_share.is_none() {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithNoChanges,
+                )
+            });
+        }
+
+        // Or does not echo the session_id from our ClientHello:
+        //
+        // > the HelloRetryRequest has the same format as a ServerHello message,
+        // > and the legacy_version, legacy_session_id_echo, cipher_suite, and
+        // > legacy_compression_method fields have the same meaning
+        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.4>
+        //
+        // and
+        //
+        // > A client which receives a legacy_session_id_echo field that does not
+        // > match what it sent in the ClientHello MUST abort the handshake with an
+        // > "illegal_parameter" alert.
+        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.3>
+        if hrr.session_id != self.next.input.session_id {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId,
+                )
+            });
+        }
+
+        // Or asks us to talk a protocol we didn't offer, or doesn't support HRR at all.
+        match hrr.supported_versions {
+            Some(ProtocolVersion::TLSv1_3) => {
+                cx.common.negotiated_version = Some(ProtocolVersion::TLSv1_3);
+            }
+            _ => {
+                return Err({
+                    cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithUnsupportedVersion,
+                    )
+                });
+            }
+        }
+
+        // Or asks us to use a ciphersuite we didn't offer.
+        let Some(cs) = config.find_cipher_suite(hrr.cipher_suite) else {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
+                )
+            });
+        };
+
+        // Or offers ECH related extensions when we didn't offer ECH.
+        if cx.data.ech_status == EchStatus::NotOffered && hrr.encrypted_client_hello.is_some() {
+            return Err({
+                cx.common.send_fatal_alert(
+                    AlertDescription::UnsupportedExtension,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithInvalidEch,
+                )
+            });
+        }
+
+        // HRR selects the ciphersuite.
+        cx.common.suite = Some(cs);
+        cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
+
+        // If we offered ECH, we need to confirm that the server accepted it.
+        match (self.next.ech_state.as_ref(), cs.tls13()) {
+            // If the server did not confirm, then note the new ECH status but
+            // continue the handshake. We will abort with an ECH required error
+            // at the end.
+            (Some(ech_state), Some(tls13_cs))
+                if !ech_state.confirm_hrr_acceptance(hrr, tls13_cs, cx.common)? =>
+            {
+                cx.data.ech_status = EchStatus::Rejected
+            }
+            (Some(_), None) => {
+                unreachable!("ECH state should only be set when TLS 1.3 was negotiated")
+            }
+            _ => {}
+        };
+
+        // This is the draft19 change where the transcript became a tree
+        let transcript = self
+            .next
+            .transcript_buffer
+            .start_hash(cs.hash_provider());
+        let mut transcript_buffer = transcript.into_hrr_buffer();
+        transcript_buffer.add_message(&m);
+
+        // If we offered ECH and the server accepted, we also need to update the separate
+        // ECH transcript with the hello retry request message.
+        if let Some(ech_state) = self.next.ech_state.as_mut() {
+            ech_state.transcript_hrr_update(cs.hash_provider(), &m);
+        }
+
+        // Early data is not allowed after HelloRetryrequest
+        if cx.data.early_data.is_enabled() {
+            cx.data.early_data.rejected();
+        }
+
+        let key_share = match hrr.key_share {
+            Some(group) if group != offered_key_share.group() => {
+                let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
+                    return Err(cx.common.send_fatal_alert(
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
+                    ));
+                };
+
+                cx.common.kx_state = KxState::Start(skxg);
+                skxg.start()?
+            }
+            _ => offered_key_share,
+        };
+
+        emit_client_hello_for_retry(
+            transcript_buffer,
+            Some(hrr),
+            Some(key_share),
+            self.extra_exts,
+            Some(cs),
+            self.next.input,
+            cx,
+            self.next.ech_state,
+        )
+    }
+}
+
+impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
+    fn handle<'m>(
+        self: Box<Self>,
+        cx: &mut ClientContext<'_>,
+        m: Message<'m>,
+    ) -> NextStateOrError<'m>
+    where
+        Self: 'm,
+    {
+        match m.payload {
+            MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
+                ..
+            } => self
+                .into_expect_server_hello()
+                .handle(cx, m),
+            MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
+                ..
+            } => self.handle_hello_retry_request(cx, m),
+            payload => Err(inappropriate_handshake_message(
+                &payload,
+                &[ContentType::Handshake],
+                &[HandshakeType::ServerHello, HandshakeType::HelloRetryRequest],
+            )),
+        }
+    }
+
+    fn into_owned(self: Box<Self>) -> NextState<'static> {
+        self
+    }
+}
+
+fn process_cert_type_extension(
+    common: &mut CommonState,
+    client_expects: bool,
+    server_negotiated: Option<CertificateType>,
+    extension_type: ExtensionType,
+) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
+    match (client_expects, server_negotiated) {
+        (true, Some(CertificateType::RawPublicKey)) => {
+            Ok(Some((extension_type, CertificateType::RawPublicKey)))
+        }
+        (true, _) => Err(common.send_fatal_alert(
+            AlertDescription::HandshakeFailure,
+            Error::PeerIncompatible(PeerIncompatible::IncorrectCertificateTypeExtension),
+        )),
+        (_, Some(CertificateType::RawPublicKey)) => {
+            unreachable!("Caught by `PeerMisbehaved::UnsolicitedEncryptedExtension`")
+        }
+        (_, _) => Ok(None),
+    }
+}
+
+pub(super) enum ClientSessionValue {
+    Tls13(persist::Tls13ClientSessionValue),
+    #[cfg(feature = "tls12")]
+    Tls12(persist::Tls12ClientSessionValue),
+}
+
+impl ClientSessionValue {
+    fn retrieve(
+        server_name: &ServerName<'static>,
+        config: &ClientConfig,
+        cx: &mut ClientContext<'_>,
+    ) -> Option<persist::Retrieved<Self>> {
+        let found = config
+            .resumption
+            .store
+            .take_tls13_ticket(server_name)
+            .map(ClientSessionValue::Tls13)
+            .or_else(|| {
+                #[cfg(feature = "tls12")]
+                {
+                    config
+                        .resumption
+                        .store
+                        .tls12_session(server_name)
+                        .map(ClientSessionValue::Tls12)
+                }
+
+                #[cfg(not(feature = "tls12"))]
+                None
+            })
+            .and_then(|resuming| {
+                resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
+            })
+            .and_then(|resuming| {
+                let now = config
+                    .current_time()
+                    .map_err(|_err| debug!("Could not get current time: {_err}"))
+                    .ok()?;
+
+                let retrieved = persist::Retrieved::new(resuming, now);
+                match retrieved.has_expired() {
+                    false => Some(retrieved),
+                    true => None,
+                }
+            })
+            .or_else(|| {
+                debug!("No cached session for {server_name:?}");
+                None
+            });
+
+        if let Some(resuming) = &found {
+            if cx.common.is_quic() {
+                cx.common.quic.params = resuming
+                    .tls13()
+                    .map(|v| v.quic_params());
+            }
+        }
+
+        found
+    }
+
+    fn common(&self) -> &persist::ClientSessionCommon {
+        match self {
+            Self::Tls13(inner) => &inner.common,
+            #[cfg(feature = "tls12")]
+            Self::Tls12(inner) => &inner.common,
+        }
+    }
+
+    fn tls13(&self) -> Option<&persist::Tls13ClientSessionValue> {
+        match self {
+            Self::Tls13(v) => Some(v),
+            #[cfg(feature = "tls12")]
+            Self::Tls12(_) => None,
+        }
+    }
+
+    fn compatible_config(
+        self,
+        server_cert_verifier: &Arc<dyn ServerCertVerifier>,
+        client_creds: &Arc<dyn ResolvesClientCert>,
+    ) -> Option<Self> {
+        match &self {
+            Self::Tls13(v) => v
+                .compatible_config(server_cert_verifier, client_creds)
+                .then_some(self),
+            #[cfg(feature = "tls12")]
+            Self::Tls12(v) => v
+                .compatible_config(server_cert_verifier, client_creds)
+                .then_some(self),
+        }
+    }
+}
+
+impl Deref for ClientSessionValue {
+    type Target = persist::ClientSessionCommon;
+
+    fn deref(&self) -> &Self::Target {
+        self.common()
+    }
+}
