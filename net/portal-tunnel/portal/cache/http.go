@@ -1,0 +1,237 @@
+package cache
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+	"github.com/gosuda/portal-tunnel/v2/utils"
+)
+
+func (c *Manager) Handle(w http.ResponseWriter, req *http.Request, leaseID string, generation uint64) {
+	if c == nil {
+		utils.WriteAPIError(w, http.StatusServiceUnavailable, types.APIErrorCodeFeatureUnavailable, "cache unavailable")
+		return
+	}
+	if req.Method != http.MethodPost && req.Method != http.MethodPut && req.Method != http.MethodDelete {
+		w.Header().Set("Allow", "POST, PUT, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	c.mu.Lock()
+	lease := c.leases[leaseID]
+	allowed := c.eligibleLocked(leaseID) && lease.generation == generation
+	c.mu.Unlock()
+	if !allowed {
+		utils.WriteAPIError(w, http.StatusForbidden, types.APIErrorCodeUnauthorized, "cache lease unavailable")
+		return
+	}
+	site := &cachedSite{host: lease.Hostname, owner: lease.Owner, leaseID: lease.ID, ttl: lease.ttl, expiresAt: lease.cacheExpiry(), usedAt: time.Now()}
+	if req.Method == http.MethodDelete {
+		c.mu.Lock()
+		if existing := c.entries[site.host]; existing != nil && existing.leaseID == site.leaseID && c.eligibleLocked(site.leaseID) && c.leases[site.leaseID].generation == generation {
+			c.retireLocked(existing)
+		}
+		c.mu.Unlock()
+		utils.WriteAPIData(w, http.StatusOK, types.StaticCacheStatus{})
+		return
+	}
+	// One service identity may hold one of the two upload slots. Checks
+	// have their own capacity; neither operation queues requests.
+	readTimeout := 10 * time.Second
+	if req.Method == http.MethodPut {
+		c.mu.Lock()
+		_, active := c.uploads[site.owner]
+		if active || len(c.uploads) >= 2 {
+			c.mu.Unlock()
+			http.Error(w, "relay cache upload limit reached; use origin tunnel", http.StatusServiceUnavailable)
+			return
+		}
+		c.uploads[site.owner] = struct{}{}
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			delete(c.uploads, site.owner)
+			c.mu.Unlock()
+		}()
+		readTimeout = 2 * time.Minute
+	} else {
+		select {
+		case c.checks <- struct{}{}:
+			defer func() { <-c.checks }()
+		default:
+			http.Error(w, "relay cache request limit reached; use origin tunnel", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	controller := http.NewResponseController(w)
+	deadline := time.Now().Add(readTimeout)
+	_ = controller.SetReadDeadline(deadline)
+	var manifest types.StaticCacheManifest
+	var err error
+	defer func() {
+		// Keep a failed read's deadline so net/http's unread-body drain
+		// cannot extend a stalled upload after its slot has been released.
+		if err == nil {
+			_ = controller.SetReadDeadline(time.Time{})
+		}
+	}()
+	var parts *multipart.Reader
+	var manifestReader io.Reader = http.MaxBytesReader(w, req.Body, types.StaticCacheManifestLimit)
+	if req.Method == http.MethodPut {
+		// Includes multipart framing and manifest bytes, with a fixed bound.
+		req.Body = &idleUploadBody{
+			ReadCloser:  http.MaxBytesReader(w, req.Body, c.limits.MaxExposureBytes+2*types.StaticCacheManifestLimit),
+			controller:  controller,
+			maxDeadline: deadline,
+		}
+		parts, err = req.MultipartReader()
+		if err == nil {
+			var part *multipart.Part
+			part, err = parts.NextRawPart()
+			if err == nil {
+				manifestReader = io.LimitReader(part, types.StaticCacheManifestLimit+1)
+			}
+		}
+	}
+	if err == nil {
+		var raw []byte
+		raw, err = io.ReadAll(manifestReader)
+		if err == nil && len(raw) > types.StaticCacheManifestLimit {
+			err = errors.New("cache manifest is too large")
+		}
+		if err == nil {
+			err = json.Unmarshal(raw, &manifest)
+		}
+	}
+	if err == nil {
+		site.digest, site.bytes, err = manifestDigest(manifest, c.limits.MaxObjectSize, c.limits.MaxExposureBytes)
+	}
+	if err != nil {
+		utils.InvalidRequestError(err).Write(w)
+		return
+	}
+	if req.Method == http.MethodPost {
+		c.mu.Lock()
+		if !c.eligibleLocked(site.leaseID) || c.leases[site.leaseID].generation != generation {
+			c.mu.Unlock()
+			utils.WriteAPIError(w, http.StatusForbidden, types.APIErrorCodeUnauthorized, "cache lease unavailable")
+			return
+		}
+		existing := c.entries[site.host]
+		status := types.StaticCacheStatus{Present: existing != nil && existing.leaseID == site.leaseID && existing.digest == site.digest && time.Now().Before(existing.expiresAt)}
+		if status.Present {
+			status.ExpiresAt = existing.expiresAt
+		} else if existing != nil && existing.leaseID == site.leaseID {
+			// A changed snapshot falls back to the live origin until its
+			// replacement is complete, including when admission later fails.
+			c.retireLocked(existing)
+		}
+		c.mu.Unlock()
+		utils.WriteAPIData(w, http.StatusOK, status)
+		return
+	}
+	if err := c.reserve(site.bytes); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	published := false
+	defer func() {
+		if !published {
+			c.mu.Lock()
+			c.retired = append(c.retired, site)
+			c.mu.Unlock()
+			c.collect(time.Now())
+		}
+	}()
+	site.dir, err = os.MkdirTemp(c.dir, "portal-cache-")
+	var root *os.Root
+	if err == nil {
+		root, err = os.OpenRoot(site.dir)
+	}
+	if err == nil {
+		defer root.Close()
+		site.index = manifest.Index
+		site.files = make(map[string]types.StaticCacheFile, len(manifest.Files))
+		for _, file := range manifest.Files {
+			part, partErr := parts.NextRawPart()
+			if partErr != nil {
+				err = partErr
+				break
+			}
+			// Disk filenames are content hashes, never uploaded paths. Distinct
+			// URLs may share a digest within this snapshot.
+			output, createErr := root.Create(file.SHA256)
+			if createErr != nil {
+				err = createErr
+				break
+			}
+			hash := sha256.New()
+			_, copyErr := io.CopyN(io.MultiWriter(output, hash), part, file.Size)
+			closeErr := output.Close()
+			var extra [1]byte
+			n, endErr := part.Read(extra[:])
+			if copyErr != nil || closeErr != nil || n != 0 || !errors.Is(endErr, io.EOF) || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
+				err = errors.New("cache object is truncated, oversized, or has an invalid SHA-256")
+				break
+			}
+			site.files[file.Path] = file
+		}
+	}
+	if err == nil {
+		_, endErr := parts.NextRawPart()
+		if !errors.Is(endErr, io.EOF) {
+			err = errors.New("unexpected cache upload parts")
+		}
+	}
+	if err != nil {
+		utils.InvalidRequestError(err).Write(w)
+		return
+	}
+	c.mu.Lock()
+	var status types.StaticCacheStatus
+	if c.eligibleLocked(site.leaseID) && c.leases[site.leaseID].generation == generation {
+		active := c.leases[site.leaseID]
+		if previous := c.entries[site.host]; previous != nil {
+			c.retireLocked(previous)
+		}
+		site.expiresAt = active.cacheExpiry()
+		c.entries[site.host] = site
+		published = true
+		status = types.StaticCacheStatus{Present: true, ExpiresAt: site.expiresAt}
+	}
+	c.mu.Unlock()
+	if !published {
+		utils.WriteAPIError(w, http.StatusForbidden, types.APIErrorCodeUnauthorized, "cache lease unavailable")
+		return
+	}
+	c.collect(time.Now())
+	utils.WriteAPIData(w, http.StatusOK, status)
+}
+
+const uploadIdleTimeout = 10 * time.Second
+
+// idleUploadBody limits blocking reads while retaining the absolute upload deadline.
+type idleUploadBody struct {
+	io.ReadCloser
+	controller  *http.ResponseController
+	maxDeadline time.Time
+}
+
+func (b *idleUploadBody) Read(p []byte) (int, error) {
+	deadline := time.Now().Add(uploadIdleTimeout)
+	if deadline.After(b.maxDeadline) {
+		deadline = b.maxDeadline
+	}
+	if err := b.controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return 0, err
+	}
+	return b.ReadCloser.Read(p)
+}
