@@ -1,0 +1,72 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    pad: 24
+  }
+}
+
+host_sandbox: "Restricted Host Sandbox (uid=1000, no_new_privs=1, unshare=EPERM, no /dev/fuse)" {
+  style.fill: "#f8fafc"
+  style.stroke: "#334155"
+  style.stroke-width: 2
+
+  blocked: "Blocked Traditional Container Paths" {
+    style.fill: "#fef2f2"
+    style.stroke: "#dc2626"
+    err1: "Host dockerd: /var/run/docker.sock missing"
+    err2: "sudo / setuid: blocked by PR_SET_NO_NEW_PRIVS"
+    err3: "Rootless Docker / Podman: unshare(CLONE_NEWUSER) -> EPERM"
+    err4: "runc / bwrap: mount(/proc) -> EPERM"
+    err5: "fuse-overlayfs: /dev/fuse missing"
+  }
+
+  cli: "Unmodified Host Docker CLI" {
+    style.fill: "#eff6ff"
+    style.stroke: "#2563eb"
+    cmd: "docker build / docker run / docker compose up"
+    sock: 'DOCKER_HOST=unix://$HOME/.gvx/docker.sock'
+    cmd -> sock
+  }
+
+  rungv: "Single Unprivileged Process: rungv (--docker-PersistVolume)" {
+    style.fill: "#f0fdf4"
+    style.stroke: "#16a34a"
+
+    proxy: "Unix Socket Proxy -> Guest 127.0.0.1:2375"
+
+    guest: "Guest Linux User Space (Virtual UID 0, Full Virtual Capabilities)" {
+      style.fill: "#ffffff"
+      style.stroke: "#15803d"
+      dockerd: "dockerd (storage-driver=overlay2, iptables-legacy)"
+      containerd: "containerd + runc + BuildKit"
+      inner: "Nested Workload Containers"
+      dockerd -> containerd -> inner
+    }
+
+    sentry: "gvx User-Space Kernel (Sentry)" {
+      style.fill: "#fefce8"
+      style.stroke: "#ca8a04"
+      ext4: "ext4lite: /var/lib/docker on ~/.cache/gvx/volumes/gvx-docker.ext4"
+      net: "netstack: docker0 Bridge + veth Pairs + NAT Chains"
+      vfs: "In-Memory procfs, sysfs, cgroupfs Mounts"
+    }
+
+    proxy -> guest.dockerd: "Forwards Docker API"
+    guest.dockerd -> sentry.ext4: "Native overlay2 upperdir/workdir"
+    guest.dockerd -> sentry.net: "Bridge + iptables-legacy rules"
+    guest.containerd -> sentry.vfs: "Unprivileged guest mount(2)"
+  }
+
+  host_reqs: "Minimal Host Kernel Primitives Required by rungv" {
+    style.fill: "#f3e8ff"
+    style.stroke: "#7e22ce"
+    req1: "1. ptrace(PTRACE_ATTACH) once at startup on self-child"
+    req2: "2. seccomp(SECCOMP_SET_MODE_FILTER)"
+    req3: "3. mmap(PROT_EXEC)"
+  }
+
+  cli.sock -> rungv.proxy: "Connects without root"
+  rungv -> host_reqs: "Uses only 3 unprivileged primitives"
+}

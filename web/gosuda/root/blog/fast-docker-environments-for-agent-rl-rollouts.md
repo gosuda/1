@@ -1,0 +1,248 @@
+---
+id: 48916d04a1044b009c11d2e3f4a50004
+author: Goldberg
+title: Fast Isolated Docker Environments for AI Agent RL Rollouts with gvx
+description: How to run hundreds of parallel unprivileged Docker and Kubernetes environments for SWE-bench and coding agent reinforcement learning rollouts with 100-millisecond copy-on-write ext4lite volume resets.
+language: en
+date: 2026-11-06T09:30:00Z
+path: /blog/posts/fast-docker-environments-for-agent-rl-rollouts-z48916d04
+go_package: z.gfire.dev/gvx
+go_repourl: https://github.com/gfire-sigs/gvx.git
+category: ai
+---
+
+## The Infrastructure Bottleneck in Coding Agent RL Rollouts
+
+Training and evaluating software engineering agents across benchmarks and reinforcement learning (RL) frameworks such as **SWE-bench**, **SWE-ReX**, **R2E-Gym**, **SWE-Gym**, **Verl**, and **OpenHands** requires executing thousands of concurrent environment rollouts. In real-world software engineering tasks, an agent does not merely edit text files: it runs `docker build`, spins up databases and microservices via `docker compose`, executes integration test suites, and inspects container logs.
+
+At rollout scale (128 to 1,024 concurrent episodes per cluster), existing container infrastructure hits four systemic bottlenecks:
+
+1. **Host `dockerd` Lock Contention and State Leakage**: Pointing hundreds of concurrent RL workers at a single host `/var/run/docker.sock` serializes image layer extraction, exhausts `docker0` subnet allocations, triggers `Another app is currently holding the xtables lock` errors in host `iptables`, and leaks orphan containers, networks, and volumes across episodes.
+2. **Privileged DinD Security Exposure**: Running standard `docker:dind` containers requires `--privileged` (`CAP_SYS_ADMIN`), which grants untrusted LLM-generated code root-equivalent access to the host kernel.
+3. **Hardware Virtualization (`/dev/kvm`) Constraints**: MicroVM runtimes (`Firecracker`, `QEMU`, `Kata Containers`) isolate inner kernels cleanly, but they require `/dev/kvm`. Standard Kubernetes pods without nested virtualization, bare-metal cloud instances where KVM is disabled, and existing `gVisor` (`runsc`) sandboxes cannot launch KVM microVMs.
+4. **Slow Episode Reset (`env.reset()`) Latency**: Starting a fresh `docker:dind` environment and pulling or unpacking base images for every RL episode takes 10 to 60 seconds, leaving GPU training workers idle while waiting for environment resets.
+
+**[gvx](https://github.com/gfire-sigs/gvx)** (`rungv` CLI and `z.gfire.dev/gvx/pkg/gvx` Go SDK) resolves all four bottlenecks by running each rollout environment as **a single unprivileged user-space process** whose entire `/var/lib/docker` state resides inside **a single copy-on-write `.ext4` file (`ext4lite`)**.
+
+---
+
+## Rollout Architecture: Parallel Unprivileged Instances + Reflink Snapshots
+
+In `gvx`, every rollout worker is an ordinary unprivileged OS process with its own gVisor `Sentry` kernel, its own user-space `netstack` (`10.0.2.15/24`), and its own `ext4lite` block volume (`ep-N.ext4`), while sharing a read-only content-addressable `erofs` OCI image cache across the host page cache.
+
+![Parallel Agent RL Rollout Architecture with gvx](/assets/images/gvx/gvx-rl-rollout-snapshot.svg)
+
+```d2
+direction: down
+
+worker_node: "Agent RL Rollout Worker Node (Unprivileged User Process Space, No KVM / No Root)" {
+  golden: "1. Golden State Preparation (Built Once Per Benchmark Dataset)" {
+    erofs_cache: "Shared Read-Only OCI Layer Cache (~/.cache/gvx/blobs/*.erofs)"
+    golden_ext4: "golden-docker.ext4 (Pre-Pulled Base Images + Language Toolchains)"
+  }
+
+  clone: "2. Per-Episode Instant Reset (~100 ms CoW Clone)" {
+    reflink: "cp --reflink=always golden-docker.ext4 ep-N.ext4 (XFS / Btrfs / APFS)"
+  }
+
+  episodes: "3. Parallel Unprivileged Rollout Workers (pkg/gvx Go SDK or rungv CLI)" {
+    ep1: "Episode #1 (gvx Instance)" {
+      vol1: "Mount: ep-001.ext4 -> /var/lib/docker"
+      net1: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dind1: "docker:dind (docker build / pytest / compose)"
+    }
+
+    ep2: "Episode #2 (gvx Instance)" {
+      vol2: "Mount: ep-002.ext4 -> /var/lib/docker"
+      net2: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dind2: "docker:dind (docker build / pytest / compose)"
+    }
+
+    epn: "Episode #N (gvx Instance)" {
+      voln: "Mount: ep-N.ext4 -> /var/lib/docker"
+      netn: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dindn: "docker:dind (docker build / pytest / compose)"
+    }
+  }
+
+  teardown: "4. Episode Teardown (~10 ms)" {
+    rm: "runner.Close() + rm -f ep-N.ext4 (Zero Orphan Cgroups or Mounts)"
+  }
+
+  golden.golden_ext4 -> clone.reflink: "Zero-copy block sharing"
+  clone.reflink -> episodes.ep1.vol1
+  clone.reflink -> episodes.ep2.vol2
+  clone.reflink -> episodes.epn.voln
+  golden.erofs_cache -> episodes.ep1: "Shared pagecache"
+  golden.erofs_cache -> episodes.ep2: "Shared pagecache"
+  golden.erofs_cache -> episodes.epn: "Shared pagecache"
+  episodes -> teardown.rm: "Reward computed"
+}
+```
+
+### Why Single-File `ext4lite` Volumes Change RL Reset Economics
+
+Because `gvx`'s `ext4lite` filesystem stores an entire `ext4` volume (including Docker's `overlay2` layer directories, `trusted.overlay.*` extended attributes, whiteout device nodes, and image metadata) inside one regular host file, episode lifecycle management becomes a single file operation:
+
+1. **100-Millisecond `env.reset()` via `cp --reflink=always`**:
+   - You build a `golden-docker.ext4` file once containing pre-pulled base images (`python:3.11`, `postgres:16`, `redis:7`, or task-specific `SWE-bench` base images).
+   - At the start of each RL episode, `cp --reflink=always golden-docker.ext4 ep-042.ext4` (on XFS, Btrfs, ZFS, or macOS APFS) creates an independent Copy-on-Write clone in under 100 milliseconds without copying underlying disk blocks.
+   - Only the 4 KiB blocks dirtied during that specific episode consume additional disk space.
+2. **Hard Per-Episode Disk Quotas Without Root**:
+   - In standard Docker or Kubernetes `emptyDir`, a runaway agent loop that writes 100 GB of build artifacts or logs can exhaust the worker node's disk.
+   - With `ext4lite`, the fixed logical size of `ep-042.ext4` (for example, `8G` sparse) acts as a hard per-episode disk quota. If an agent fills `/var/lib/docker`, only that episode receives `ENOSPC`; the host filesystem and sibling episodes are unaffected.
+3. **Zero-Residue Teardown (`env.close()`)**:
+   - Terminating the `rungv` process and unlinking `ep-042.ext4` reclaims 100% of the episode's processes, network sockets, mounts, and storage in ~10 milliseconds. Nothing is ever mounted in the host kernel's mount table or registered in host cgroups.
+
+---
+
+## Step-by-Step Workflow: Golden `.ext4` Snapshot and Fast Episode Reset
+
+### Step 1: Create the Golden `docker:dind` Volume Once
+
+```bash
+# 1. Start a seed docker:dind instance with a 10 GiB sparse ext4lite file
+mkdir -p /srv/rl-snapshots /srv/rl-episodes
+rungv -d --name seed-dind \
+  -v /srv/rl-snapshots/golden-docker.ext4:/var/lib/docker \
+  -p 12375:2375 \
+  -e DOCKER_TLS_CERTDIR="" \
+  docker:dind
+
+# 2. Pre-populate base images and build cache inside golden-docker.ext4
+export DOCKER_HOST="tcp://127.0.0.1:12375"
+until docker info >/dev/null 2>&1; do sleep 0.5; done
+
+docker pull python:3.11-slim
+docker pull redis:7-alpine
+docker pull postgres:16-alpine
+
+# 3. Gracefully stop the seed instance so ext4lite flushes all dirty blocks
+rungv kill seed-dind
+```
+
+### Step 2: Spawn Parallel RL Episodes in 100 Milliseconds
+
+Each parallel rollout worker clones `golden-docker.ext4` via reflink and boots an isolated `docker:dind` instance with all images already present in `/var/lib/docker`:
+
+```bash
+EPISODE_ID="ep-0042"
+PORT="22042"
+
+# Instant Copy-on-Write clone (~100 ms on XFS/Btrfs/APFS)
+cp --reflink=always \
+  /srv/rl-snapshots/golden-docker.ext4 \
+  "/srv/rl-episodes/${EPISODE_ID}.ext4"
+
+# Launch isolated unprivileged episode
+rungv -d --name "${EPISODE_ID}" \
+  -memory=4g -cpus=2 \
+  -v "/srv/rl-episodes/${EPISODE_ID}.ext4:/var/lib/docker" \
+  -p "${PORT}:2375" \
+  -e DOCKER_TLS_CERTDIR="" \
+  docker:dind
+
+# Inside the rollout worker, images are immediately available without network pull
+DOCKER_HOST="tcp://127.0.0.1:${PORT}" docker images
+
+# Episode teardown after reward calculation (~10 ms)
+rungv kill "${EPISODE_ID}"
+rm -f "/srv/rl-episodes/${EPISODE_ID}.ext4"
+```
+
+---
+
+## Programmatic Rollout Pool Using the `z.gfire.dev/gvx/pkg/gvx` Go SDK
+
+If your RL environment server or evaluation harness is written in Go (or calls a Go rollout daemon over gRPC), you can manage parallel container episodes directly through `z.gfire.dev/gvx/pkg/gvx` with strict CPU, memory, and wall-clock timeouts:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	"z.gfire.dev/gvx/pkg/gvx"
+)
+
+func runEpisode(ctx context.Context, runner *gvx.Runner, goldenExt4, scratchDir string, epID int) error {
+	epExt4 := filepath.Join(scratchDir, fmt.Sprintf("ep-%04d.ext4", epID))
+	defer os.Remove(epExt4)
+
+	// 1. Reflink clone the golden ext4lite volume
+	cpCmd := exec.CommandContext(ctx, "cp", "--reflink=always", goldenExt4, epExt4)
+	if err := cpCmd.Run(); err != nil {
+		return fmt.Errorf("clone golden volume: %w", err)
+	}
+
+	// 2. Run the isolated episode with hard resource limits and timeout
+	res, err := runner.Run(ctx, gvx.RunConfig{
+		ID:       fmt.Sprintf("rollout-%04d", epID),
+		Image:    "docker:dind",
+		Args:     []string{"sh", "-c", "dockerd-entrypoint.sh & until docker info >/dev/null 2>&1; do sleep 0.2; done && docker run --rm python:3.11-slim python -c 'print(6 * 7)'"},
+		Env:      []string{"DOCKER_TLS_CERTDIR=", "GVX_DOCKER_IPTABLES=legacy"},
+		Platform: gvx.PlatformAuto,
+		Network:  gvx.NetworkNAT,
+		Mounts: []gvx.Mount{
+			{
+				Source: epExt4,
+				Target: "/var/lib/docker",
+			},
+		},
+		Resources: gvx.ResourceConfig{
+			MemoryBytes: 4 << 30, // 4 GiB cap
+			CPUs:        2,
+		},
+		Timeout: 2 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("episode %d finished: exit=%d duration=%s stdout=%q",
+		epID, res.ExitCode, res.Duration, string(res.Stdout))
+	return nil
+}
+
+func main() {
+	runner, err := gvx.NewRunner(gvx.RunnerOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer runner.Close()
+
+	ctx := context.Background()
+	if err := runEpisode(ctx, runner, "/srv/rl-snapshots/golden-docker.ext4", "/srv/rl-episodes", 1); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+---
+
+## Comparison of Agent RL Sandbox Runtimes
+
+| Metric / Requirement                                      | Shared Host `dockerd`             | Privileged `docker:dind` | Firecracker / KVM MicroVM      | Standard `gVisor` (`runsc`)       | `gvx` (`rungv` / `pkg/gvx`)                 |
+| :-------------------------------------------------------- | :-------------------------------- | :----------------------- | :----------------------------- | :-------------------------------- | :------------------------------------------ |
+| **Host `root` or `--privileged` required**                | Yes (`docker.sock` = root)        | Yes (`--privileged`)     | Needs `/dev/kvm` + `TAP` setup | Yes (or `userns` + `mount`)       | **No (single unprivileged process)**        |
+| **Works inside unprivileged K8s Pods / existing `runsc`** | No                                | No                       | No (no `/dev/kvm`)             | Fails (`EBUSY` on nested seccomp) | **Yes (automatic futex loop fallback)**     |
+| **Supports inner `docker build` & `docker compose`**      | Shares host daemon                | Yes                      | Yes                            | Fails without host DinD tuning    | **Yes (`overlay2` on `ext4lite`)**          |
+| **Per-episode network isolation**                         | Shared `docker0` / `xtables` lock | Separate namespace       | Separate VM NIC                | Separate netns                    | **Isolated in-process `netstack`**          |
+| **Per-episode disk quota enforcement**                    | Requires XFS `prjquota`           | Requires host loop mount | VM block file size             | Requires host quota               | **Built-in (`.ext4` file size cap)**        |
+| **Warm episode reset latency (`env.reset()`)**            | 5s to 30s (container/vol prune)   | 10s to 60s (cold daemon) | ~150 ms (VM snapshot)          | 5s to 20s                         | **~100 ms (`cp --reflink=always` `.ext4`)** |
+| **Cross-platform local dev (Windows / macOS / Linux)**    | Requires Linux VM                 | Requires Linux VM        | Linux KVM only                 | Linux only                        | **Native on Windows, macOS, and Linux**     |
+
+---
+
+## Further Reading in This Series
+
+1. **[gvx: Running Linux Containers, Docker, and Kubernetes in One Unprivileged Process](/blog/posts/gvx-cross-platform-linux-containers-z48916d01)**: Complete architectural walkthrough of `gvx` across Windows (`whpx`, `systrap`), macOS (`hvf`), and Linux (`systrap`).
+2. **[Running Docker, docker build, and docker compose Without Root or User Namespaces](/blog/posts/run-docker-without-root-or-userns-gvx-z48916d02)**: Quick 3-command bootstrap and troubleshooting guide when `sudo`, `unshare(CLONE_NEWUSER)`, `mount(2)`, and `/dev/fuse` are blocked.
+3. **[Running Docker-in-Docker Inside gVisor and Nested Sandboxes with gvx](/blog/posts/docker-in-docker-inside-gvisor-with-gvx-z48916d03)**: Deep dive into why `docker.io` and nested `runsc` fail inside `gVisor` (`runsc`) and how `gvx` falls back to the `_RUN_SYSCALL_LOOP` futex loop on `EBUSY`.
+4. **[Fast Isolated Docker Environments for AI Agent RL Rollouts with gvx](/blog/posts/fast-docker-environments-for-agent-rl-rollouts-z48916d04)** (this post)

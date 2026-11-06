@@ -1,0 +1,71 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    pad: 24
+  }
+}
+
+worker_node: "Agent RL Rollout Worker Node (Unprivileged User Process Space, No KVM / No Root)" {
+  style.fill: "#f8fafc"
+  style.stroke: "#334155"
+  style.stroke-width: 2
+
+  golden: "1. Golden State Preparation (Built Once Per Benchmark Dataset)" {
+    style.fill: "#f3e8ff"
+    style.stroke: "#7e22ce"
+    erofs_cache: "Shared Read-Only OCI Layer Cache (~/.cache/gvx/blobs/*.erofs)"
+    golden_ext4: "golden-docker.ext4 (Pre-Pulled Base Images + Language Toolchains)"
+  }
+
+  clone: "2. Per-Episode Instant Reset (~100 ms CoW Clone)" {
+    style.fill: "#fefce8"
+    style.stroke: "#ca8a04"
+    reflink: "cp --reflink=always golden-docker.ext4 ep-N.ext4 (XFS / Btrfs / APFS)"
+  }
+
+  episodes: "3. Parallel Unprivileged Rollout Workers (pkg/gvx Go SDK or rungv CLI)" {
+    style.fill: "#f0fdf4"
+    style.stroke: "#16a34a"
+
+    ep1: "Episode #1 (gvx Instance)" {
+      style.fill: "#ffffff"
+      style.stroke: "#15803d"
+      vol1: "Mount: ep-001.ext4 -> /var/lib/docker"
+      net1: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dind1: "docker:dind (docker build / pytest / compose)"
+    }
+
+    ep2: "Episode #2 (gvx Instance)" {
+      style.fill: "#ffffff"
+      style.stroke: "#15803d"
+      vol2: "Mount: ep-002.ext4 -> /var/lib/docker"
+      net2: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dind2: "docker:dind (docker build / pytest / compose)"
+    }
+
+    epn: "Episode #N (gvx Instance)" {
+      style.fill: "#ffffff"
+      style.stroke: "#15803d"
+      voln: "Mount: ep-N.ext4 -> /var/lib/docker"
+      netn: "netstack: Isolated 10.0.2.15/24 + docker0"
+      dindn: "docker:dind (docker build / pytest / compose)"
+    }
+  }
+
+  teardown: "4. Episode Teardown (~10 ms)" {
+    style.fill: "#eff6ff"
+    style.stroke: "#2563eb"
+    rm: "runner.Close() + rm -f ep-N.ext4 (Zero Orphan Cgroups or Mounts)"
+  }
+
+  golden.golden_ext4 -> clone.reflink: "Zero-copy block sharing"
+  clone.reflink -> episodes.ep1.vol1
+  clone.reflink -> episodes.ep2.vol2
+  clone.reflink -> episodes.epn.voln
+  golden.erofs_cache -> episodes.ep1: "Shared pagecache"
+  golden.erofs_cache -> episodes.ep2: "Shared pagecache"
+  golden.erofs_cache -> episodes.epn: "Shared pagecache"
+  episodes -> teardown.rm: "Reward computed"
+}
