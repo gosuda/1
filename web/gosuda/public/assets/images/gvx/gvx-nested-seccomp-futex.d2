@@ -1,0 +1,60 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    pad: 24
+  }
+}
+
+outer_gvisor: "Outer gVisor Sandbox (runsc / Virtual Kernel 4.4.0)" {
+  style.fill: "#f8fafc"
+  style.stroke: "#334155"
+  style.stroke-width: 2
+
+  outer_limits: "Why Direct docker.io and Nested runsc Fail Inside Outer gVisor" {
+    style.fill: "#fef2f2"
+    style.stroke: "#dc2626"
+    fail1: "1. modprobe overlay / br_netfilter -> FATAL: /lib/modules/4.4.0 missing"
+    fail2: "2. iptables-nft -> Could not fetch rule set generation id: Invalid argument"
+    fail3: "3. overlay2 on gofer/9p -> EINVAL (vfs fallback causes disk exhaustion)"
+    fail4: "4. runc init -> mount cgroup / proc: operation not permitted"
+    fail5: "5. Nested SECCOMP_FILTER_FLAG_NEW_LISTENER -> EBUSY (device or resource busy)"
+  }
+
+  inner_gvx: "Inner gvx Process (rungv Running Inside Outer gVisor)" {
+    style.fill: "#f0fdf4"
+    style.stroke: "#16a34a"
+
+    detect: "systrap Seccomp Initialization (pkg/sentry/platform/systrap)" {
+      style.fill: "#fefce8"
+      style.stroke: "#ca8a04"
+      step1: "1. Call seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)"
+      step2: "2. Outer Sentry returns EBUSY (listener slot already occupied)"
+      step3: "3. Install plain SECCOMP_RET_TRAP filter + set stubCallMode = _RUN_SYSCALL_LOOP (1)"
+      step1 -> step2 -> step3
+    }
+
+    loop: "Shared-Memory Futex Syscall Loop (Zero Nested User-Notify FD)" {
+      style.fill: "#eff6ff"
+      style.stroke: "#2563eb"
+      stub: "Container Stub Thread: SIGSYS / Trampoline -> state = THREAD_STATE_PREPARE -> FUTEX_WAIT"
+      sentry_loop: "Inner gvx Sentry Thread: Polls sysmsg -> Executes Syscall -> FUTEX_WAKE"
+      stub -> sentry_loop: "Shared memory + FUTEX_WAKE"
+      sentry_loop -> stub: "Writes SyscallRegs + FUTEX_WAKE"
+    }
+
+    subsystems: "Inner gvx Subsystems (Bypass Outer gVisor Limits)" {
+      style.fill: "#ffffff"
+      style.stroke: "#15803d"
+      ext4lite: "ext4lite: /var/lib/docker on 1 file + fsuid/fsgid inode_init_owner (PR #70)"
+      netstack: "netstack: User-space docker0 bridge + veth + iptables-legacy"
+      dind: "Inner docker:dind: overlay2 + docker build + docker compose succeed"
+      ext4lite -> dind
+      netstack -> dind
+    }
+
+    detect.step3 -> loop.stub: "Switches stub execution mode"
+    loop.sentry_loop -> subsystems: "Services inner container syscalls"
+  }
+}

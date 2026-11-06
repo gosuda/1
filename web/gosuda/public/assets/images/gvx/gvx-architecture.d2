@@ -1,0 +1,73 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    pad: 24
+  }
+}
+
+host_process: "Single Unprivileged Host Process (rungv CLI / pkg/gvx Go SDK)" {
+  style.fill: "#f8fafc"
+  style.stroke: "#334155"
+  style.stroke-width: 2
+
+  lockdown: "pkg/hostlockdown (Applied Before Container Execution)" {
+    style.fill: "#fef2f2"
+    style.stroke: "#dc2626"
+    win_lock: "Windows: Restricted Token + Job Object + Mitigation Policies"
+    mac_lock: "macOS: Seatbelt sandbox_init (deny default)"
+    lin_lock: "Linux: PR_SET_NO_NEW_PRIVS + BPF seccomp Filter"
+  }
+
+  workloads: "Unmodified Linux Guest Workloads (ELF Binaries)" {
+    style.fill: "#eff6ff"
+    style.stroke: "#2563eb"
+    app: "OCI Containers (alpine, ubuntu, python, go)"
+    dind: "docker:dind (dockerd + containerd + runc + BuildKit)"
+    k3s: "Multi-Node HA k3s + Calico CNI + etcd"
+  }
+
+  platforms: "Platform Syscall Interception (pkg/sentry/platform)" {
+    style.fill: "#fefce8"
+    style.stroke: "#ca8a04"
+    whpx: "Windows whpx (Ring 0 Hyper-V Partition)"
+    win_systrap: "Windows systrap (Ring 3 VEH + Nirvana Callback)"
+    hvf: "macOS hvf (Hypervisor.framework vCPU)"
+    lin_systrap: "Linux systrap (SECCOMP_RET_USER_NOTIF / Trampoline / Futex Loop)"
+  }
+
+  sentry: "User-Space Linux Kernel (gVisor Sentry: ~370 Syscalls)" {
+    style.fill: "#f0fdf4"
+    style.stroke: "#16a34a"
+
+    vfs2: "VFS2 Virtual Filesystem Layer" {
+      erofs: "erofs: Immutable OCI Layers (Shared Page Cache)"
+      ext4lite: "ext4lite: Single-File .ext4 Volume (fsuid/fsgid, xattr, CoW)"
+      hostfs: "hostfs v2: Capability-Scoped Bind Mounts (os.Root)"
+      tmpfs: "tmpfs / procfs / sysfs / cgroupfs (In-Memory)"
+    }
+
+    netstack: "User-Space TCP/IP Network Stack (netstack)" {
+      vnics: "Virtual NICs: eth0, docker0 Bridge, veth, tun/tap, vxlan"
+      netfilter: "iptables-legacy: nat, filter, raw Tables"
+      nat_mode: "-net=nat: 10.0.2.15/24 -> Host TCP/UDP Dialer"
+      wg_mode: "-net=wg: 10.200.0.x/24 In-Memory WireGuard Mesh"
+    }
+  }
+
+  handles: "Pre-Opened Host Handles (Only Host Kernel Boundary)" {
+    style.fill: "#f3e8ff"
+    style.stroke: "#7e22ce"
+    cache_fd: "CacheDirRoot (~/.cache/gvx/blobs, volumes/*.ext4)"
+    bind_fd: "os.Root Bind Mounts (-v host:guest)"
+    udp_fd: "Single UDP Socket (-net=wg) or Host Socket Dialer (-net=nat)"
+  }
+
+  lockdown -> workloads: "Restricts host OS access before guest start"
+  workloads -> platforms: "Linux syscalls / page faults"
+  platforms -> sentry: "Dispatches SyscallRegs"
+  sentry.vfs2 -> handles.cache_fd: "pread / pwrite on pre-opened FDs"
+  sentry.vfs2 -> handles.bind_fd: "Openat2-style scoped file ops"
+  sentry.netstack -> handles.udp_fd: "User-space packet / stream I/O"
+}
