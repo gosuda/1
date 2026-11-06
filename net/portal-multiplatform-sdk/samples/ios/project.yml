@@ -1,0 +1,47 @@
+name: PortalSample
+options:
+  bundleIdPrefix: org.gosuda.portal
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  PortalSample:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: PortalSampleApp.swift
+      - path: PortalHomeView.swift
+      - path: Contents.swift
+      - path: ModelStore.swift
+      - path: LocalLlmServer.swift
+      - path: WorkbenchStyle.swift
+      - path: LaunchScreen.storyboard
+      - path: Assets.xcassets
+      - path: ../shared/common/site
+        type: folder
+        buildPhase: resources
+      - path: ../shared/common/llm
+        type: folder
+        buildPhase: resources
+      - path: ../shared/common/models.json
+        buildPhase: resources
+      - path: ../local-llm/NOTICE
+        buildPhase: resources
+    dependencies:
+      - framework: ../../dist/PortalSDK.xcframework
+        embed: false
+      - framework: ../../build/sample-llm/ios/PortalSampleLlm.xcframework
+        embed: false
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UILaunchStoryboardName: LaunchScreen
+        PRODUCT_BUNDLE_IDENTIFIER: org.gosuda.portal.sample
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: $(inherited) -framework Security
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_CFBundleDisplayName: Portal Sample
+        SWIFT_VERSION: "5.0"
