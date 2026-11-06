@@ -1,0 +1,516 @@
+import { expect, test, type Page } from '@playwright/test';
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import {
+  CreateEnvelopeRequestSchema,
+  ErrorResponseSchema,
+  SafeBrowsingFullHashSchema,
+  SafeBrowsingLookupResponseSchema
+} from '../src/lib/gen/securl/v1/api_pb.js';
+import { hashSafeBrowsingUrl } from '../src/lib/safe-browsing/url-hash.js';
+
+declare global {
+  interface Window {
+    __solveCaptcha: () => void;
+    __failCaptcha: () => void;
+    __expireCaptcha: () => void;
+    __captchaRenderCount: number;
+  }
+}
+
+const safeLookupPattern = '**/api/v1/safe-browsing/lookup';
+const turnstileScriptPattern = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+
+function lookupResponse(fullHashes: Uint8Array[] = []): Buffer {
+  const response = create(SafeBrowsingLookupResponseSchema, {
+    fullHashes: fullHashes.map((fullHash) =>
+      create(SafeBrowsingFullHashSchema, {
+        fullHash,
+        threatType: 'SOCIAL_ENGINEERING',
+        attributes: [],
+        cacheSeconds: 60
+      })
+    )
+  });
+  return Buffer.from(toBinary(SafeBrowsingLookupResponseSchema, response));
+}
+
+async function createProtectedLink(
+  page: Page,
+  destination: string,
+  options: { password?: string; captcha?: boolean; burn?: boolean; ttl?: number } = {}
+): Promise<{ link: string; requestBody: Buffer }> {
+  let requestBody = Buffer.alloc(0);
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/v1/envelopes')) {
+      requestBody = request.postDataBuffer() ?? Buffer.alloc(0);
+    }
+  });
+  await mockTurnstile(page);
+  await page.goto('/');
+  await page.getByLabel('Destination URL').fill(destination);
+  if (options.password !== undefined) {
+    await page.getByRole('checkbox', { name: /Password/ }).check();
+    await page.getByLabel('Password', { exact: true }).fill(options.password);
+  }
+  if (options.captcha) await page.getByRole('checkbox', { name: /CAPTCHA/ }).check();
+  if (options.burn) await page.getByRole('checkbox', { name: /Burn after reading/ }).check();
+  if (options.ttl !== undefined) await page.getByLabel('Time to live').selectOption(String(options.ttl));
+  await page.getByRole('button', { name: 'Create protected link' }).click();
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+  return { link: (await page.locator('code').textContent())!, requestBody };
+}
+
+function turnstileMockScript(autoSolve = true): string {
+  return `window.turnstile={render:function(_,options){window.__captchaRenderCount=(window.__captchaRenderCount||0)+1;window.__solveCaptcha=function(){options.callback('e2e-token')};window.__failCaptcha=function(){options['error-callback']()};window.__expireCaptcha=function(){options['expired-callback']()};${autoSolve ? 'setTimeout(window.__solveCaptcha,0);' : ''}return 'e2e-widget'},remove:function(){}};`;
+}
+
+async function mockTurnstile(page: Page, autoSolve = true): Promise<void> {
+  await page.route(turnstileScriptPattern, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/javascript',
+      body: turnstileMockScript(autoSolve)
+    });
+  });
+}
+
+test('creator CAPTCHA blocks submission until the challenge is solved', async ({ page }) => {
+  await mockTurnstile(page, false);
+  await page.goto('/');
+  await page.getByLabel('Destination URL').fill('https://example.com/creator-captcha');
+  const createButton = page.getByRole('button', { name: 'Create protected link' });
+  await expect(createButton).toBeDisabled();
+  await page.waitForFunction(() => typeof window.__solveCaptcha === 'function');
+  await page.evaluate(() => window.__solveCaptcha());
+  await expect(createButton).toBeEnabled();
+  await createButton.click();
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+});
+
+for (const scenario of [
+  { name: 'provider error', trigger: 'error', message: 'Verification failed. Try again.' },
+  { name: 'expiry', trigger: 'expired', message: 'Verification expired. Complete it again.' }
+] as const) {
+  test(`creator CAPTCHA recovers from ${scenario.name}`, async ({ page }) => {
+    await mockTurnstile(page, false);
+    await page.goto('/');
+    await page.getByLabel('Destination URL').fill(`https://example.com/captcha-${scenario.trigger}`);
+    await page.waitForFunction(() => window.__captchaRenderCount === 1);
+    await page.evaluate((trigger) => {
+      if (trigger === 'error') window.__failCaptcha();
+      else window.__expireCaptcha();
+    }, scenario.trigger);
+
+    const createButton = page.getByRole('button', { name: 'Create protected link' });
+    await expect(page.getByRole('alert')).toHaveText(scenario.message);
+    await expect(createButton).toBeDisabled();
+    await page.getByRole('button', { name: 'Try verification again' }).click();
+    await page.waitForFunction(() => window.__captchaRenderCount === 2);
+    await page.evaluate(() => window.__solveCaptcha());
+    await expect(createButton).toBeEnabled();
+    await createButton.click();
+    await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+  });
+}
+
+test('creator CAPTCHA retries after the provider script fails to load', async ({ page }) => {
+  let scriptRequests = 0;
+  await page.route(turnstileScriptPattern, async (route) => {
+    scriptRequests += 1;
+    if (scriptRequests === 1) {
+      await route.abort('failed');
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/javascript',
+      body: turnstileMockScript(false)
+    });
+  });
+  await page.goto('/');
+  await page.getByLabel('Destination URL').fill('https://example.com/captcha-script-retry');
+  await expect(page.getByRole('alert')).toHaveText('Verification couldn’t load.');
+  const createButton = page.getByRole('button', { name: 'Create protected link' });
+  await expect(createButton).toBeDisabled();
+  await page.getByRole('button', { name: 'Try verification again' }).click();
+  await page.waitForFunction(() => window.__captchaRenderCount === 1);
+  await page.evaluate(() => window.__solveCaptcha());
+  await expect(createButton).toBeEnabled();
+  await createButton.click();
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+});
+
+test('clean lookup redirects without an artificial delay or leaking secrets', async ({
+  page,
+  context
+}) => {
+  const destinationInput = 'example.com/clean?a=1';
+  const destination = 'https://example.com/clean?a=1';
+  const { link, requestBody } = await createProtectedLink(page, destinationInput);
+  const match = link.match(/\/#([0-9A-Za-z]{11})$/);
+  expect(match).not.toBeNull();
+  const fragment = match![1];
+  expect(requestBody.includes(Buffer.from(fragment))).toBe(false);
+  expect(requestBody.includes(Buffer.from(destination))).toBe(false);
+  expect(requestBody.includes(Buffer.from(destinationInput))).toBe(false);
+  const createRequest = fromBinary(CreateEnvelopeRequestSchema, requestBody);
+  expect(createRequest.storageKey).toHaveLength(16);
+  expect(createRequest.envelope?.ciphertext.length).toBeGreaterThan(16);
+  expect(createRequest.captchaToken).toBe('e2e-token');
+
+  const openPage = await context.newPage();
+  let scanRequestedAt = 0;
+  let destinationRequestedAt = 0;
+  await openPage.route(safeLookupPattern, async (route) => {
+    scanRequestedAt = Date.now();
+    await route.fulfill({ status: 200, contentType: 'application/x-protobuf', body: lookupResponse() });
+  });
+  await openPage.route(destination, async (route) => {
+    destinationRequestedAt = Date.now();
+    await route.fulfill({ status: 200, contentType: 'text/html', body: '<title>clean destination</title>' });
+  });
+  const navigationStartedAt = Date.now();
+  await openPage.goto(link);
+  await expect(openPage).toHaveURL(destination, { timeout: 4000 });
+  // Argon2d root-key derivation dominates; the former five-second gate is gone.
+  expect(destinationRequestedAt - navigationStartedAt).toBeLessThan(4000);
+  expect(scanRequestedAt).toBeGreaterThan(0);
+  expect(destinationRequestedAt).toBeGreaterThanOrEqual(scanRequestedAt);
+  expect(destinationRequestedAt - scanRequestedAt).toBeLessThan(1000);
+});
+
+test('clean redirect waits for a slow safety lookup', async ({ page, context }) => {
+  const destination = 'https://example.com/clean?a=1';
+  const { link } = await createProtectedLink(page, destination);
+  const openPage = await context.newPage();
+  const lookup = Promise.withResolvers<void>();
+  await openPage.route(safeLookupPattern, async (route) => {
+    await lookup.promise;
+    await route.fulfill({ status: 200, contentType: 'application/x-protobuf', body: lookupResponse() });
+  });
+  await openPage.route(destination, (route) =>
+    route.fulfill({ status: 200, contentType: 'text/html', body: '<title>slow destination</title>' })
+  );
+  await openPage.goto(link);
+  await expect(openPage.locator('code.hostname')).toHaveText('example.com');
+  await expect(openPage.getByText('Checking the destination…')).toBeVisible();
+  await openPage.waitForTimeout(300);
+  expect(openPage.url()).toBe(link);
+  lookup.resolve();
+  await expect(openPage).toHaveURL(destination);
+});
+
+test('New link leaves the open-link state and returns to the creator', async ({ page, context }) => {
+  const destination = 'https://example.com/new-link-navigation';
+  const password = 'new-link-navigation';
+  const { link } = await createProtectedLink(page, destination, { password });
+  const openPage = await context.newPage();
+
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Password required' })).toBeVisible();
+  await openPage.getByRole('link', { name: 'New link' }).click();
+
+  await expect(openPage).toHaveURL('/');
+  await expect(openPage.getByRole('heading', { name: 'Create a protected link' })).toBeVisible();
+  await expect(openPage.getByRole('heading', { name: 'Open a protected link' })).toHaveCount(0);
+});
+
+test('wrong password retries locally without refetching a non-burn envelope', async ({ page, context }) => {
+  const destination = 'https://example.com/password-retry';
+  const password = 'local-retry-password';
+  const { link } = await createProtectedLink(page, destination, { password });
+  const openPage = await context.newPage();
+  let envelopeRequests = 0;
+  openPage.on('request', (request) => {
+    if (
+      request.method() === 'GET' &&
+      request.url().includes('/api/v1/envelopes/') &&
+      !request.url().endsWith('/metadata')
+    ) {
+      envelopeRequests += 1;
+    }
+  });
+
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Password required' })).toBeVisible();
+  await openPage.getByLabel('Password', { exact: true }).fill('wrong password');
+  await openPage.getByRole('button', { name: 'Continue' }).click();
+  await expect(openPage.getByRole('alert')).toHaveText('Incorrect password. Try again.');
+  expect(envelopeRequests).toBe(1);
+
+  await openPage.getByLabel('Password', { exact: true }).fill(password);
+  await openPage.getByRole('button', { name: 'Continue' }).click();
+  await expect(openPage).toHaveURL(destination, { timeout: 20_000 });
+  expect(envelopeRequests).toBe(1);
+});
+
+test('password worker load failure falls back before burn access', async ({ page, context }) => {
+  const password = 'burn-after-read-password';
+  const { link } = await createProtectedLink(page, 'https://example.com/burn-after-read', {
+    password,
+    burn: true
+  });
+  const fallbackPage = await context.newPage();
+  let accessRequests = 0;
+  fallbackPage.on('request', (request) => {
+    if (request.url().endsWith('/access')) accessRequests += 1;
+  });
+  await fallbackPage.route('**/workers/password.worker-*.js', (route) => route.abort('failed'));
+
+  await fallbackPage.goto(link);
+  await expect(fallbackPage.getByRole('heading', { name: 'Password required' })).toBeVisible();
+  await fallbackPage.getByLabel('Password', { exact: true }).fill(password);
+  await fallbackPage.getByRole('button', { name: 'Continue' }).click();
+  await expect(fallbackPage).toHaveURL('https://example.com/burn-after-read', { timeout: 20_000 });
+  expect(accessRequests).toBe(1);
+});
+
+test('changing between non-empty fragments opens the new protected link', async ({ page, context }) => {
+  const firstPassword = 'first-fragment-password';
+  const secondPassword = 'second-fragment-password';
+  const first = await createProtectedLink(page, 'https://example.com/first-fragment', {
+    password: firstPassword
+  });
+  const second = await createProtectedLink(page, 'https://example.com/second-fragment', {
+    password: secondPassword
+  });
+  const openPage = await context.newPage();
+  const metadataRequests: string[] = [];
+  openPage.on('request', (request) => {
+    if (request.url().endsWith('/metadata')) metadataRequests.push(request.url());
+  });
+
+  await openPage.goto(first.link);
+  await expect(openPage.getByRole('heading', { name: 'Password required' })).toBeVisible();
+  await expect.poll(() => metadataRequests.length).toBe(1);
+  await openPage.evaluate((hash) => {
+    window.location.hash = hash;
+  }, new URL(second.link).hash);
+  await expect.poll(() => metadataRequests.length).toBe(2);
+  expect(metadataRequests[1]).not.toBe(metadataRequests[0]);
+
+  await openPage.getByLabel('Password', { exact: true }).fill(secondPassword);
+  await openPage.getByRole('button', { name: 'Continue' }).click();
+  await expect(openPage.getByRole('heading', { name: 'Checking destination safety' })).toBeVisible({
+    timeout: 20_000
+  });
+});
+
+
+test('forever TTL is encoded as zero and creates a non-expiring link', async ({ page }) => {
+  const { requestBody } = await createProtectedLink(page, 'https://example.com/forever', { ttl: 0 });
+  const createRequest = fromBinary(CreateEnvelopeRequestSchema, requestBody);
+  expect(createRequest.envelope?.metadata?.ttlSeconds).toBe(0);
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+});
+
+test('threat response blocks every redirect', async ({ page, context }) => {
+  const destination = 'https://example.com/clean?a=1';
+  const { link } = await createProtectedLink(page, destination);
+  const hashes = await hashSafeBrowsingUrl(destination);
+  const openPage = await context.newPage();
+  let destinationRequests = 0;
+  await openPage.route(safeLookupPattern, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/x-protobuf',
+      body: lookupResponse([hashes[0].fullHash])
+    })
+  );
+  await openPage.route(destination, async (route) => {
+    destinationRequests++;
+    await route.abort();
+  });
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Deceptive site ahead' })).toBeVisible();
+  await openPage.waitForTimeout(500);
+  expect(openPage.url()).toBe(link);
+  expect(destinationRequests).toBe(0);
+});
+
+test('503 remains gated until explicit unscanned choice', async ({ page, context }) => {
+  const destination = 'https://example.com/clean?a=1';
+  const { link } = await createProtectedLink(page, destination);
+  const openPage = await context.newPage();
+  await openPage.route(safeLookupPattern, (route) =>
+    route.fulfill({ status: 503, contentType: 'application/x-protobuf', body: Buffer.alloc(0) })
+  );
+  await openPage.route(destination, (route) =>
+    route.fulfill({ status: 200, contentType: 'text/html', body: '<title>unscanned destination</title>' })
+  );
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Safety check unavailable' })).toBeVisible();
+  await openPage.waitForTimeout(500);
+  expect(openPage.url()).toBe(link);
+  await openPage.getByRole('button', { name: 'Open without safety check' }).click();
+  await expect(openPage).toHaveURL(destination);
+});
+
+test('only the first burn-link client can retry a wrong password locally', async ({ page, context }) => {
+  const destination = 'https://example.com/protected';
+  const password = 'correct horse battery staple';
+  const { link } = await createProtectedLink(page, destination, {
+    password,
+    captcha: true,
+    burn: true
+  });
+  const openPage = await context.newPage();
+  await mockTurnstile(openPage);
+  await openPage.route(safeLookupPattern, (route) =>
+    route.fulfill({ status: 200, contentType: 'application/x-protobuf', body: lookupResponse() })
+  );
+  let accessRequests = 0;
+  openPage.on('request', (request) => {
+    if (request.url().endsWith('/access')) accessRequests += 1;
+  });
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Password required' })).toBeVisible();
+  await openPage.getByLabel('Password', { exact: true }).fill('wrong password');
+  const consumed = openPage.waitForResponse(
+    (response) =>
+      response.url().endsWith('/access') &&
+      response.request().method() === 'POST' &&
+      response.status() === 200
+  );
+  await openPage.getByRole('button', { name: 'Continue' }).click();
+  await consumed;
+  await expect(openPage.getByRole('alert')).toHaveText('Incorrect password. Try again.');
+  expect(accessRequests).toBe(1);
+
+  await openPage.getByLabel('Password', { exact: true }).fill(password);
+  await openPage.getByRole('button', { name: 'Continue' }).click();
+  await expect(openPage).toHaveURL(destination, { timeout: 20_000 });
+  expect(accessRequests).toBe(1);
+
+  const secondClient = await context.newPage();
+  await secondClient.goto(link);
+  await expect(secondClient.getByText('This link is no longer available.')).toBeVisible();
+});
+
+async function createPaste(page: Page, markdown: string, options: { burn?: boolean } = {}): Promise<string> {
+  await mockTurnstile(page);
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Markdown paste' }).check();
+  await page.getByLabel('Markdown', { exact: true }).fill(markdown);
+  if (options.burn) await page.getByRole('checkbox', { name: /Burn after reading/ }).check();
+  await page.getByRole('button', { name: 'Create encrypted paste' }).click();
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+  return (await page.locator('code').textContent())!;
+}
+
+// Playwright's fill() types through the input pipeline and is too slow for 100+ KiB bodies.
+async function fillLarge(page: Page, value: string): Promise<void> {
+  await page.getByLabel('Markdown', { exact: true }).evaluate((element, text) => {
+    const textarea = element as HTMLTextAreaElement;
+    textarea.value = text;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }, value);
+}
+
+test('Markdown paste is compressed, encrypted, and rendered without leaking content', async ({ page, context }) => {
+  const secret = 'pastebin-secret-marker';
+  const markdown = `# Notes\n\n${secret}\n\n[docs](https://example.com/docs)\n\n<img src=x onerror="window.xssFired=1">\n\n${'- item\n'.repeat(400)}`;
+  let requestBody = Buffer.alloc(0);
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/v1/envelopes')) {
+      requestBody = request.postDataBuffer() ?? Buffer.alloc(0);
+    }
+  });
+  const link = await createPaste(page, markdown);
+  expect(requestBody.includes(Buffer.from(secret))).toBe(false);
+  const envelope = fromBinary(CreateEnvelopeRequestSchema, requestBody).envelope!;
+  // 400 repeated list items deflate to well under one 1 KiB padding bucket.
+  expect(envelope.ciphertext.length).toBeLessThan(2 * 1024 + 64);
+
+  const openPage = await context.newPage();
+  let lookupRequests = 0;
+  await openPage.route(safeLookupPattern, (route) => {
+    lookupRequests += 1;
+    return route.abort();
+  });
+  await openPage.goto(link);
+  await expect(openPage.getByRole('heading', { name: 'Encrypted paste', exact: true })).toBeVisible();
+  await expect(openPage.locator('article.markdown-body h1')).toHaveText('Notes');
+  await expect(openPage.locator('article.markdown-body')).toContainText(secret);
+  await expect(openPage.locator('article.markdown-body a')).toHaveAttribute('rel', 'noopener noreferrer nofollow');
+  await expect(openPage.locator('article.markdown-body img')).toHaveCount(0);
+  expect(await openPage.evaluate(() => 'xssFired' in window)).toBe(false);
+  expect(lookupRequests).toBe(0);
+
+  await openPage.getByRole('button', { name: 'Show Markdown' }).click();
+  await expect(openPage.locator('pre.paste-source')).toContainText('<img src=x onerror="window.xssFired=1">');
+});
+
+test('burn-after-read paste opens once', async ({ page, context }) => {
+  const link = await createPaste(page, 'one-time **paste**', { burn: true });
+  const first = await context.newPage();
+  await first.goto(link);
+  await expect(first.locator('article.markdown-body strong')).toHaveText('paste');
+  await expect(first.getByText('deleted from the server')).toBeVisible();
+  const second = await context.newPage();
+  await second.goto(link);
+  await expect(second.getByText('This link is no longer available.')).toBeVisible();
+});
+
+test('oversized paste reports its compressed size before anything is uploaded', async ({ page }) => {
+  let createRequests = 0;
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && request.url().endsWith('/api/v1/envelopes')) createRequests += 1;
+  });
+  await mockTurnstile(page);
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Markdown paste' }).check();
+  await expect(page.getByText('Up to 64.0 KiB after compression.')).toBeVisible();
+  // Random base64 barely compresses, so ~120 KiB of it stays far above the 64 KiB limit.
+  await fillLarge(page, await page.evaluate(() => {
+    const bytes = new Uint8Array(90_000);
+    for (let offset = 0; offset < bytes.length; offset += 65_536) {
+      crypto.getRandomValues(bytes.subarray(offset, offset + 65_536));
+    }
+    return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+  }));
+  await page.getByRole('button', { name: 'Create encrypted paste' }).click();
+  await expect(page.getByRole('alert')).toHaveText(
+    /^This paste is \d+\.\d KiB after compression; the limit is 64\.0 KiB\. Shorten it and try again\.$/
+  );
+  expect(createRequests).toBe(0);
+});
+
+test('compressible paste larger than the limit before compression is accepted', async ({ page, context }) => {
+  const markdown = '| key | value |\n|---|---|\n' + '| repeated row | same value |\n'.repeat(10_000);
+  expect(markdown.length).toBeGreaterThan(256 * 1024);
+  await mockTurnstile(page);
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Markdown paste' }).check();
+  await fillLarge(page, markdown);
+  await page.getByRole('button', { name: 'Create encrypted paste' }).click();
+  await expect(page.getByRole('heading', { name: 'Protected link ready' })).toBeVisible();
+  const link = (await page.locator('code').textContent())!;
+  const openPage = await context.newPage();
+  await openPage.goto(link);
+  await expect(openPage.locator('article.markdown-body tbody tr')).toHaveCount(10_000);
+});
+
+test('server-side envelope limit surfaces as a size error', async ({ page }) => {
+  await mockTurnstile(page);
+  await page.route('**/api/v1/envelopes', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    await route.fulfill({
+      status: 413,
+      contentType: 'application/x-protobuf',
+      body: Buffer.from(
+        toBinary(ErrorResponseSchema, create(ErrorResponseSchema, {
+          code: 'envelope_too_large',
+          message: 'The encrypted content is too large.'
+        }))
+      )
+    });
+  });
+  await page.goto('/');
+  await page.getByRole('radio', { name: 'Markdown paste' }).check();
+  await page.getByLabel('Markdown', { exact: true }).fill('small');
+  await page.getByRole('button', { name: 'Create encrypted paste' }).click();
+  await expect(page.getByRole('alert')).toHaveText(
+    'This paste is over the 64.0 KiB compressed limit. Shorten it and try again.'
+  );
+});

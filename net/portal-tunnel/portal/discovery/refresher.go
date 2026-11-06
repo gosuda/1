@@ -1,0 +1,290 @@
+package discovery
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net/http"
+	"net/url"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog/log"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+	"github.com/gosuda/portal-tunnel/v2/utils"
+)
+
+const (
+	defaultRequestTimeout   = 15 * time.Second
+	DiscoveryPollInterval   = 30 * time.Second
+	defaultRecoveryFailures = 5
+	maxConcurrentRefresh    = 8
+	maxConcurrentAnnounce   = 8
+)
+
+type Refresher struct {
+	relaySet               *RelaySet
+	httpClient             *http.Client
+	publicHTTPClient       *http.Client
+	directRecoveryFailures int
+	lastAnnounceSuccess    map[string]bool
+	lastAnnounceMu         sync.Mutex
+}
+
+func NewRefresher(relaySet *RelaySet) *Refresher {
+	client := utils.NewHTTPClient(
+		utils.WithHTTPTLSConfig(&tls.Config{
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"http/1.1"},
+		}),
+		utils.WithoutHTTP2(),
+		utils.WithHTTPTimeout(defaultRequestTimeout),
+		utils.WithHTTPCheckRedirect(rejectDiscoveryRedirect),
+	)
+	// Untrusted descriptors must never use a proxy that can resolve or dial
+	// their hostname on our behalf. Resolve and pin only public IPs ourselves.
+	publicTransport := client.Transport.(*http.Transport).Clone()
+	publicTransport.Proxy = nil
+	publicTransport.DialContext = dialPublicRelay
+
+	return &Refresher{
+		relaySet:   relaySet,
+		httpClient: client,
+		publicHTTPClient: &http.Client{
+			Transport:     publicTransport,
+			CheckRedirect: rejectDiscoveryRedirect,
+			Timeout:       defaultRequestTimeout,
+		},
+		directRecoveryFailures: defaultRecoveryFailures,
+		lastAnnounceSuccess:    make(map[string]bool),
+	}
+}
+
+func (r *Refresher) Refresh(ctx context.Context, self *types.RelayDescriptor) error {
+	if err := r.refreshHTTPS(ctx); err != nil {
+		return err
+	}
+	if self != nil {
+		if err := r.announceSelf(ctx, *self); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Refresher) announceSelf(ctx context.Context, descriptor types.RelayDescriptor) error {
+	req := types.DiscoveryAnnounceRequest{
+		ProtocolVersion: types.DiscoveryVersion,
+		Descriptor:      descriptor,
+	}
+
+	targets := r.relaySet.BootstrapRelayURLs()
+	if len(targets) == 0 {
+		return nil
+	}
+
+	return parallel(targets, maxConcurrentAnnounce, func(relayURL string) error {
+		if relayURL == descriptor.APIHTTPSAddr {
+			return nil
+		}
+		baseURL, err := url.Parse(relayURL)
+		if err != nil {
+			if r.shouldLogAnnounce(relayURL, false) {
+				log.Warn().Err(err).Str("relay", relayURL).Msg("relay discovery announce target skipped")
+			}
+			return nil
+		}
+		if err := utils.HTTPDoAPIPath(ctx, r.httpClient, baseURL, http.MethodPost, types.PathDiscoveryAnnounce, req, nil, nil); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if r.shouldLogAnnounce(relayURL, false) {
+				log.Warn().Err(err).Str("relay", relayURL).Msg("relay discovery announce failed")
+			}
+			return nil
+		}
+		if r.shouldLogAnnounce(relayURL, true) {
+			log.Info().Str("relay", relayURL).Msg("relay discovery announce succeeded")
+		}
+		return nil
+	})
+}
+
+func (r *Refresher) shouldLogAnnounce(relayURL string, success bool) bool {
+	r.lastAnnounceMu.Lock()
+	defer r.lastAnnounceMu.Unlock()
+	previous, ok := r.lastAnnounceSuccess[relayURL]
+	if ok && previous == success {
+		return false
+	}
+	r.lastAnnounceSuccess[relayURL] = success
+	return true
+}
+
+// sortRefreshCandidates orders relays so that the most important sources are
+// refreshed first under concurrency limits: bootstrap, then discovered
+// healthy relays, and finally recovery/backoff candidates.
+func sortRefreshCandidates(states []RelayState) []RelayState {
+	slices.SortFunc(states, func(a, b RelayState) int {
+		if a.Bootstrap != b.Bootstrap {
+			if a.Bootstrap {
+				return -1
+			}
+			return 1
+		}
+		if a.discoveryFailures != b.discoveryFailures {
+			return a.discoveryFailures - b.discoveryFailures
+		}
+		if !a.nextDiscoveryRefreshAt.Equal(b.nextDiscoveryRefreshAt) {
+			if a.nextDiscoveryRefreshAt.IsZero() {
+				return -1
+			}
+			if b.nextDiscoveryRefreshAt.IsZero() {
+				return 1
+			}
+			if a.nextDiscoveryRefreshAt.Before(b.nextDiscoveryRefreshAt) {
+				return -1
+			}
+			return 1
+		}
+		return 0
+	})
+	return states
+}
+
+func (r *Refresher) refreshHTTPS(ctx context.Context) error {
+	now := time.Now().UTC()
+	candidates := r.relaySet.refreshCandidates(now)
+	if len(candidates) == 0 {
+		return nil
+	}
+	candidates = sortRefreshCandidates(candidates)
+
+	return parallel(candidates, maxConcurrentRefresh, func(state RelayState) error {
+		return r.refreshOneHTTPS(ctx, state)
+	})
+}
+
+func (r *Refresher) refreshOneHTTPS(ctx context.Context, state RelayState) error {
+	relayURL := state.Descriptor.APIHTTPSAddr
+
+	recoveryFailures := r.directRecoveryFailures
+	if state.Bootstrap {
+		recoveryFailures = 0
+	}
+
+	baseURL, err := url.Parse(relayURL)
+	if err != nil {
+		if recoveryFailures > 0 {
+			r.logDiscoveryFailure(relayURL, relayURL, recoveryFailures, err)
+		}
+		return nil
+	}
+	client := r.httpClient
+	if !state.Bootstrap {
+		if err := requirePublicRelayURL(relayURL); err != nil {
+			if recoveryFailures > 0 {
+				r.logDiscoveryFailure(relayURL, relayURL, recoveryFailures, err)
+			}
+			return nil
+		}
+		client = r.publicHTTPClient
+	} else if utils.IsLocalRelayHost(baseURL.Hostname()) {
+		// Local TLS trust is only permitted for explicitly configured peers.
+		_, localClient, transport, err := utils.NewHTTPTLSClient(ctx, baseURL, defaultRequestTimeout)
+		if err != nil {
+			if recoveryFailures > 0 {
+				r.logDiscoveryFailure(relayURL, relayURL, recoveryFailures, err)
+			}
+			return nil
+		}
+		localClient.CheckRedirect = rejectDiscoveryRedirect
+		client = localClient
+		defer transport.CloseIdleConnections()
+	}
+
+	startedAt := time.Now()
+	var resp types.DiscoveryResponse
+	if err := utils.HTTPDoAPIPath(ctx, client, baseURL, http.MethodGet, types.PathDiscovery, nil, nil, &resp); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if recoveryFailures > 0 {
+			r.logDiscoveryFailure(relayURL, relayURL, recoveryFailures, err)
+		}
+		return nil
+	}
+	measuredAt := time.Now().UTC()
+
+	if _, err := r.relaySet.ApplyRelayDiscoveryResponse(relayURL, resp, measuredAt); err != nil {
+		if errors.Is(err, ErrProtocolMismatch) {
+			// The relay answered; protocol incompatibility is visibility
+			// metadata, not a health failure. Keep polling it without
+			// accumulating discovery failures or pool bans.
+			log.Debug().Err(err).Str("relay", relayURL).Msg("discovery protocol mismatch; relay kept visible as incompatible")
+			return nil
+		}
+		if recoveryFailures > 0 {
+			r.logDiscoveryFailure(relayURL, relayURL, recoveryFailures, err)
+		}
+		return nil
+	}
+	r.relaySet.RecordDiscoveryRTT(relayURL, time.Since(startedAt), measuredAt)
+	return nil
+}
+
+func parallel[T any](items []T, limit int, fn func(T) error) error {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, limit)
+	errs := make(chan error, 1)
+	for _, item := range items {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(item T) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := fn(item); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+			}
+		}(item)
+	}
+	wg.Wait()
+	select {
+	case err := <-errs:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (r *Refresher) logDiscoveryFailure(targetRelayURL, sourceURL string, recoveryFailures int, err error) {
+	backedOff, backoffReason, failureCount := r.relaySet.RecordDiscoveryFailure(targetRelayURL, recoveryFailures)
+	if !backedOff {
+		return
+	}
+
+	event := log.Debug().
+		Err(err).
+		Str("relay", sourceURL).
+		Bool("backed_off", true).
+		Str("reason", backoffReason)
+	if failureCount > 0 {
+		event = event.Int("discovery_failures", failureCount)
+	}
+	if backoffReason == "unhealthy" {
+		log.Warn().
+			Err(err).
+			Str("relay", sourceURL).
+			Bool("backed_off", true).
+			Str("reason", backoffReason).
+			Int("discovery_failures", failureCount).
+			Msg("discovery source removed from relay pool")
+		return
+	}
+	event.Msg("discovery source retry delayed")
+}
