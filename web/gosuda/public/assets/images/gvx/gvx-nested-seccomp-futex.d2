@@ -1,0 +1,71 @@
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: dagre
+    theme-id: 4
+    pad: 20
+  }
+}
+
+grid-columns: 1
+vertical-gap: 24
+
+outer_barriers: "1. Why Direct docker.io & Nested runsc Fail in Outer gVisor" {
+  style.fill: "#fef2f2"
+  style.stroke: "#b91c1c"
+  style.stroke-width: 2
+  style.border-radius: 8
+  grid-columns: 1
+  vertical-gap: 8
+
+  b1: "Barrier 1 (Kernel Modules)\nmodprobe overlay / br_netfilter / ip_tables ->\nFATAL: /lib/modules/4.4.0 missing"
+  b2: "Barrier 2 (Netfilter)\niptables-nft -> Could not fetch rule set\ngeneration id: Invalid argument"
+  b3: "Barrier 3 (Storage)\noverlay2 on outer gofer/9p rootfs -> EINVAL\n(vfs fallback copies full rootfs on every RUN step)"
+  b4: "Barrier 4 (Cgroups & /proc)\nnested runc init -> mount(cgroup) and\nmount(proc) fail with EPERM"
+  b5: "Barrier 5 (Nested Seccomp Listener)\nseccomp(SECCOMP_FILTER_FLAG_NEW_LISTENER) -> EBUSY\n(outer runsc already holds the single listener slot)"
+}
+
+seccomp_fallback: "2. Inner gvx systrap: Automatic EBUSY Fallback (PR #71)" {
+  style.fill: "#fefce8"
+  style.stroke: "#b45309"
+  style.stroke-width: 2
+  style.border-radius: 8
+  grid-columns: 1
+  vertical-gap: 8
+
+  s1: "Step 1: subprocess_linux.go calls\nseccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)"
+  s2: "Step 2: Outer gVisor Sentry returns -EBUSY because\nthe task filter chain already has a user-notify listener"
+  s3: "Step 3: Inner gvx installs a plain SECCOMP_RET_TRAP\nBPF filter (no listener FD) and sets\n__export_stub_call_mode = _RUN_SYSCALL_LOOP (1)"
+}
+
+futex_loop: "3. Runtime Syscall Dispatch via Futex Loop (sysmsg_lib.c)" {
+  style.fill: "#eff6ff"
+  style.stroke: "#1d4ed8"
+  style.stroke-width: 2
+  style.border-radius: 8
+  grid-columns: 1
+  vertical-gap: 8
+
+  l1: "1. Guest dockerd / runc thread executes syscall ->\ntraps via SIGSYS or binary-patched jmp rel32 (syshandler)"
+  l2: "2. Stub thread writes registers to shared struct sysmsg,\nsets state = THREAD_STATE_PREPARE, and calls FUTEX_WAKE"
+  l3: "3. Stub thread sleeps on\nsys_futex(&sysmsg->state, FUTEX_WAIT, THREAD_STATE_PREPARE)"
+  l4: "4. Inner gvx Sentry thread reads sysmsg, executes\nsyscall in Go, writes return regs, and calls FUTEX_WAKE"
+}
+
+inner_subsystems: "4. Inner gvx Subsystems Serving Nested docker:dind" {
+  style.fill: "#f0fdf4"
+  style.stroke: "#15803d"
+  style.stroke-width: 2
+  style.border-radius: 8
+  grid-columns: 1
+  vertical-gap: 8
+
+  sub_ext4: "ext4lite Volume (-v gvx-docker:/var/lib/docker)\n1 regular file on outer gofer; provides native overlayfs\nwith fsuid/fsgid inode_init_owner (PR #70)"
+  sub_net: "In-Process netstack\nProvides virtual docker0 bridge, veth pairs, and\niptables-legacy (nat, filter, addrtype, conntrack)"
+  sub_vfs: "In-Memory VFS2 Mount Table\nServes nested runc mount(proc, sysfs, cgroup2) and\npivot_root without calling outer runsc mount(2)"
+}
+
+outer_barriers -> seccomp_fallback: "rungv launched inside outer gVisor container"
+seccomp_fallback -> futex_loop: "Switches stub-to-Sentry IPC to _RUN_SYSCALL_LOOP"
+futex_loop -> inner_subsystems: "Dispatches all nested docker:dind syscalls"
