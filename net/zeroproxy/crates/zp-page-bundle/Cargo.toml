@@ -1,0 +1,17 @@
+[package]
+name = "zp-page-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Page-realm WASM bundle: JS script rewriting (`zp-rewriter`) and shared URL
+# primitives (`zp-shared`). Excludes the transport stack, HTML transformer, and
+# CSS parser, which run exclusively in the Service Worker (`zp-bundle` and
+# `zp-kernel-bundle`).
+[dependencies]
+zp-shared = { workspace = true }
+zp-rewriter = { workspace = true }
+wasm-bindgen = { workspace = true }

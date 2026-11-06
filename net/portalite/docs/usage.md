@@ -1,0 +1,329 @@
+# Usage
+
+## Requirements
+
+- Go 1.27 or newer
+- A local TCP service for CLI proxying, or a Go server that accepts a `net.Listener`
+- Outbound HTTPS access to the selected relays
+
+## Fault-tolerant virtual listener
+
+`portalite.Expose` starts one independent supervisor per relay and returns immediately. The returned `*portalite.Exposure` implements `net.Listener`; pass it directly to `http.Server.Serve`, `grpc.Server.Serve`, or any server that accepts a listener.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net"
+	"net/http"
+	"os/signal"
+	"syscall"
+
+	"gosuda.org/portalite"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	identity, err := portalite.GenerateIdentity("demo")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
+		Identity: identity,
+		Relays:   portalite.DefaultRelays(),
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+
+	ready, err := listener.WaitReady(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, relay := range ready {
+		log.Printf("ready: %s via %s", relay.PublicURL, relay.RelayURL)
+	}
+
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello from portalite\n"))
+	})}
+	if err := server.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+}
+```
+
+### Runnable HTTP server
+
+`cmd/http-demo` is a complete server that passes the virtual listener directly to `http.Server.Serve`:
+
+```sh
+go run ./cmd/http-demo
+```
+
+It prints one URL for each ready relay:
+
+```text
+URL https://http-demo-0123456789ab.relay.example
+```
+
+Use any printed URL while the process is running:
+
+```sh
+curl https://http-demo-0123456789ab.relay.example/hello
+```
+
+Limit the demo to explicit relays or choose an identity name:
+
+```sh
+go run ./cmd/http-demo \
+  --relay https://gosunuts.xyz \
+  --relay https://s-h.day \
+  --name my-http-demo
+```
+
+The demo generates an ephemeral private key on every run and never writes it to disk. Without `--name`, it also generates a unique identity name.
+
+For a long-running server, start `Serve` immediately and observe `Updates` in another goroutine instead of blocking on `WaitReady`. `WaitReady` does not consume the update stream.
+
+```go
+go func() {
+	for status := range listener.Updates() {
+		log.Printf("relay=%s state=%s public=%s err=%v",
+			status.RelayURL, status.State, status.PublicURL, status.Err)
+	}
+}()
+```
+
+Only one goroutine should consume `Updates`. Use `Relays` for sorted point-in-time snapshots.
+
+### Relay state semantics
+
+- `connecting`: registration, renewal, or reverse-session setup is still in progress.
+- `ready`: the relay passed Protocol 10 and tenant-certificate checks and accepted at least one reverse HTTP/1.1 session. Tenant TLS is terminated locally through `keyless_tls`: each routed connection carries a relay-minted 16-byte binding, and the CertificateVerify signature for its handshake is produced remotely by the relay's transcript-bound `/v1/sign` endpoint. Key possession is therefore proven per handshake instead of by a registration-time probe.
+- `udp_ready`: the relay also authenticated a QUIC datagram backhaul and returned a public UDP address.
+- `failed`: that relay reached a terminal protocol, certificate, authentication, or transport error.
+
+`ready` validates the SDK-to-relay control path and the reverse-session path. Transcript-bound signing is exercised by the first tenant connection rather than at registration, because Protocol 10 removed the digest-signing oracle. `ready` does not actively send a request through the relay's public ingress, so an external routing or firewall fault can still make an individual public URL unreachable.
+
+### Relay retry contract
+
+A relay API failure is classified by its error code, not by its HTTP status:
+
+- Terminal for that relay: `hostname_conflict`, `feature_unavailable`, `transport_mismatch`, `udp_disabled`, `tcp_port_disabled`, and any control response that is not HTTP/1.1. The relay is marked `failed` and its lease is released.
+- Retried: `rate_limited` (HTTP 429), the transient capacity responses that share HTTP 503 (`udp_port_exhausted`, `udp_capacity_exceeded`, `tcp_port_exhausted`, `tcp_port_capacity_exceeded`), lost leases (`lease_not_found`, `unauthorized`), and transport errors.
+
+When a relay throttles, the supervisor waits for the relay's `Retry-After` when present, capped at five minutes, instead of the default retry interval, and it reuses the registration challenge it already signed rather than asking for a new one. A throttled relay therefore recovers on its own while every other relay keeps serving.
+
+Each relay owns its lease, token, signer, reverse sessions, retries, and shutdown. A terminal failure changes only that relay to `failed`; connections from other relays continue through the same listener. `Accept` returns `portalite.ErrNoRelays` only after every configured relay has failed. Calling `Close`, or canceling the parent context, returns `net.ErrClosed` to blocked accept calls and unregisters each live lease.
+
+## Identity persistence
+
+Generate an identity once and persist its JSON with mode `0600`:
+
+```go
+identity, err := portalite.GenerateIdentity("my-service")
+data, err := identity.MarshalJSON()
+```
+
+Load it on the next run:
+
+```go
+identity, err := portalite.ParseIdentity(data)
+```
+
+Identity names are lowercase single DNS labels, 1–63 characters, using only ASCII letters, digits, and interior hyphens. The JSON contains the private key; do not publish or share it.
+
+## CLI
+
+Build the command:
+
+```sh
+go build -o portalite ./cmd/portalite
+```
+
+Expose a local HTTP service on port 3000 through all default relays:
+
+```sh
+./portalite expose 3000
+```
+
+Use explicit relays instead of the defaults:
+
+```sh
+./portalite expose \
+  --relay https://relay-a.example \
+  --relay https://relay-b.example \
+  --identity ./identity.json \
+  --name my-service \
+  127.0.0.1:3000
+```
+
+Expose a UDP service without a TCP target:
+
+```sh
+./portalite expose \
+  --udp-target 127.0.0.1:5353
+```
+
+Expose TCP and UDP targets under the same relay lease:
+
+```sh
+./portalite expose \
+  --udp-target 127.0.0.1:5353 \
+  127.0.0.1:3000
+```
+
+Flags must appear before the optional TCP target. Repeating `--relay` replaces the built-in relay set; canonical duplicates are removed while preserving input order. Without `--relay`, the CLI uses `portalite.DefaultRelays()`. At least one TCP target or `--udp-target` is required.
+
+The full flag set is `--relay`, `--identity`, `--name`, `--ephemeral`, `--no-discovery`, and `--udp-target`. `--identity` defaults to `identity.json` and names the file the CLI reads or creates; `--ephemeral` replaces that file with an in-memory identity and cannot be combined with an explicit `--identity`. See [Ephemeral identity](#ephemeral-identity) for the `--name` reuse caveat.
+
+Relays passed with `--relay` are always used, and by default the exposure also adopts relays advertised through [relay discovery](#relay-discovery). `--no-discovery` disables that, so only the relays you named are used.
+
+The command writes one line per ready relay to stdout:
+
+```text
+URL https://my-service.relay.example
+UDP relay.example:40000
+```
+
+Terminal relay failures are written to stderr. One failed relay does not terminate the command while another relay remains live or retrying. `SIGINT` and `SIGTERM` cancel sessions, unregister leases, and exit successfully after cleanup.
+
+If the identity file does not exist, the CLI creates it with mode `0600` and creates missing parent directories with mode `0700`. An existing identity is never overwritten.
+
+### Ephemeral identity
+
+`--ephemeral` keeps the identity in memory and never writes it to disk, so the command works on read-only filesystems and leaves no private key behind:
+
+```sh
+./portalite expose --ephemeral 3000
+```
+
+Without `--name` the CLI generates a fresh random name, so the public URL changes on every run. `--name` may be combined with `--ephemeral` to pin the hostname; the relay binds that hostname to the identity, so a name whose lease is still live (an unclean shutdown, or a concurrent run) fails registration with a hostname conflict. `--ephemeral` and `--identity` are mutually exclusive.
+
+## Target formats
+
+The CLI accepts:
+
+- `3000`
+- `:3000`
+- `127.0.0.1:3000`
+- `hostname:3000`
+- `[::1]:3000`
+
+A bare port binds either proxy target to `127.0.0.1`. URL schemes, paths, bare hosts, and ports outside 1–65535 are rejected.
+
+## Default relays
+
+`portalite.DefaultRelays()` returns a defensive copy of the built-in bootstrap registry. It is the union of relays currently published by the network's `/discovery` endpoint, each validated against the tunnel protocol this SDK speaks:
+
+1. `https://gosunuts.xyz`
+2. `https://kakashit.org`
+3. `https://korokorok.com`
+4. `https://portal.damn.it.com`
+5. `https://portal.dawnfullstack.com`
+6. `https://portal.naratteu.dynv6.net`
+7. `https://portal.rabbitson87.dev`
+8. `https://portal.thumbgo.kr`
+9. `https://rly.best`
+10. `https://s-h.day`
+
+Relay availability is operational state, not a static guarantee. Consume `Updates`, call `WaitReady`, or inspect `Relays` instead of assuming every configured relay is reachable.
+
+## Relay discovery
+
+Discovery is **on by default**. Each exposure polls `/discovery` on its current relays and adds the relays they advertise, so the exposed set tracks the network instead of a frozen list. Relays passed in `Relays` are always retained and are never removed.
+
+```go
+listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
+	Identity:        identity,
+	Relays:          portalite.DefaultRelays(),
+	MaxActiveRelays: 4, // optional cap on discovered additions
+})
+```
+
+```sh
+# only the relays named with --relay
+./portalite expose --no-discovery --relay https://relay.example 3000
+```
+
+- `DisableDiscovery` restores fixed membership: exactly the relays you passed, with no `/discovery` requests.
+- `MaxActiveRelays` caps how many relays discovery may add on top of the explicit set. Zero selects a default. Explicit relays are never subject to the cap, so a large `Relays` list cannot make discovery inert.
+- `UDPEnabled` exposures only adopt relays whose descriptor advertises a UDP backhaul, so discovery cannot hand them a relay that would fail with `udp_disabled`.
+
+### Discovery trust
+
+A relay descriptor is a **self-signed** advertisement: the exposure verifies that the signature recovers to the address inside the descriptor, and that the descriptor is unexpired. That proves the advertiser controls the address it claims, and nothing more.
+
+In particular, a verified relay vouches only for itself. Its mention of another relay is not evidence about that relay, so every adopted candidate is verified on its own and then has to pass the same tunnel-protocol and tenant-certificate checks as an explicit relay before it can serve. A relay that answers with an unsupported discovery revision, or with descriptors that do not verify, contributes nothing.
+
+Adoption is additive and failure-isolated: a relay that fails terminally is never re-adopted, and the other relays keep serving. Because membership is dynamic, a total relay failure is recoverable while discovery is enabled, so `Accept` waits for a new candidate instead of reporting `ErrNoRelays`; `WaitReady` reports `ErrNoRelays` only once discovery has refreshed and produced no usable candidate.
+
+## UDP support
+
+Set `UDPEnabled` when creating an exposure. Each supporting relay allocates a public UDP address and authenticates a separate QUIC DATAGRAM backhaul with the current lease token.
+
+```go
+listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
+	Identity:   identity,
+	Relays:     portalite.DefaultRelays(),
+	UDPEnabled: true,
+})
+
+udpRelays, err := listener.WaitDatagramReady(ctx)
+frame, err := listener.AcceptDatagram()
+frame.Payload = []byte("response")
+err = listener.SendDatagram(frame)
+```
+
+`RelayURL` and `FlowID` together identify a datagram's return path. Do not replace either field before calling `SendDatagram`. Payloads are copied at the SDK boundary.
+
+For a local UDP service, use `ProxyUDP`. Use `ProxyWithConfig` to proxy TCP and UDP concurrently:
+
+```go
+err := portalite.ProxyWithConfig(ctx, listener, portalite.ProxyConfig{
+	TCPTarget: "127.0.0.1:3000",
+	UDPTarget: "127.0.0.1:5353",
+})
+```
+
+The proxy maintains one connected local UDP socket per relay/flow pair, expires idle flows after five minutes, and caps active flows at 1024. QUIC token rotation reconnects the backhaul without changing the public UDP address.
+
+UDP availability is relay-dependent and can change at runtime. A relay that returns `udp_disabled`, exhausts its UDP port pool, or rejects the datagram transport fails independently; other UDP-capable relays continue. Use `WaitDatagramReady`, `Updates`, or `Relays` to observe current capability instead of inferring it from the default registry.
+
+Portalite still excludes raw TCP port allocation, multi-hop, and alternate reverse-endpoint hosts. Receiving the raw stream marker remains a terminal protocol error for that relay; an incomplete TLS activation frame is treated as a stalled session and retried.
+
+## Protocol 10 compatibility
+
+- The SDK speaks relay SDK protocol `10` and refuses a relay whose `/sdk/domain` reports any other version.
+- Tenant TLS terminates through `keyless_tls`'s `t13server`. The relay's reverse-session activation frame is `0x02` followed by 16 bytes of per-connection binding; the SDK presents that binding on every `/v1/sign` request, whose payload is the TLS 1.3 handshake transcript.
+- Public URLs are derived from the configured relay origin. `sni_port` is no longer used for URL derivation (it remains required for the UDP backhaul), so re-registration never changes an advertised URL.
+- A relay that refuses transcript signing fails that relay terminally; other relays continue.
+- `/sdk/reverse` endpoint refresh is not implemented: Portalite requires the reverse endpoint to match the configured relay origin, so an alternate-host endpoint is rejected at registration instead of refreshed.
+
+## API summary
+
+```go
+func Expose(context.Context, ExposeConfig) (*Exposure, error)
+func (e *Exposure) Accept() (net.Conn, error)
+func (e *Exposure) AcceptDatagram() (DatagramFrame, error)
+func (e *Exposure) SendDatagram(DatagramFrame) error
+func (e *Exposure) WaitReady(context.Context) ([]RelayStatus, error)
+func (e *Exposure) WaitDatagramReady(context.Context) ([]RelayStatus, error)
+func (e *Exposure) Updates() <-chan RelayStatus
+func (e *Exposure) Relays() []RelayStatus
+func (e *Exposure) Addr() net.Addr
+func (e *Exposure) Close() error
+func Proxy(context.Context, *Exposure, string) error
+func ProxyUDP(context.Context, *Exposure, string) error
+func ProxyWithConfig(context.Context, *Exposure, ProxyConfig) error
+```
+
+Each proxy helper owns the corresponding exposure consumer and closes the exposure on exit. Do not call `Accept` alongside `Proxy`, `AcceptDatagram` alongside `ProxyUDP`, or either accept API alongside `ProxyWithConfig`.
