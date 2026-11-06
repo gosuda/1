@@ -14,6 +14,7 @@ import (
 	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/gateway"
 	"github.com/gosuda/portal-tunnel/v2/portal/identity"
 	"github.com/gosuda/portal-tunnel/v2/sdk"
+	"github.com/gosuda/portal-tunnel/v2/sdk/appauth"
 	"github.com/gosuda/portal-tunnel/v2/types"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
@@ -73,7 +74,7 @@ type UDPConfig struct {
 type HTTPConfig struct {
 	Routes  []HTTPRoute
 	Serve   string
-	Auth    *gateway.ApplicationAuthConfig
+	Auth    *appauth.ApplicationAuthConfig
 	Payment gateway.X402Payment
 	Cache   *CacheConfig
 	// StripRequestHeaders lists client request headers removed before
@@ -163,7 +164,7 @@ func (spec Spec) Validate() error {
 		return errCasperPaymentsRequireAnAsset
 	}
 	if auth := httpConfig.Auth; auth != nil {
-		if err := gateway.ValidateApplicationAuthConfig(*auth); err != nil {
+		if err := appauth.ValidateApplicationAuthConfig(*auth); err != nil {
 			return err
 		}
 	}
@@ -251,7 +252,7 @@ func Start(ctx context.Context, spec Spec) (*Runtime, error) {
 
 	handler, err := gateway.ComposeHTTPRoutes(routes, spec.HTTP.Payment)
 	if err == nil && spec.HTTP.Auth != nil {
-		handler, err = gateway.NewApplicationAuth(handler, listenerIdentity, *spec.HTTP.Auth)
+		handler, err = appauth.NewApplicationAuth(handler, listenerIdentity, *spec.HTTP.Auth, runtime.publicURLs)
 	}
 	if err == nil && len(spec.HTTP.StripRequestHeaders) > 0 {
 		handler, err = gateway.NewStripRequestHeaders(handler, spec.HTTP.StripRequestHeaders)
@@ -265,7 +266,7 @@ func Start(ctx context.Context, spec Spec) (*Runtime, error) {
 		// Only a warning: the provider may come back, and every login retries it.
 		// A tunnel stopped during the check cancels it, which is not an outage.
 		go func() {
-			err := gateway.CheckApplicationAuthProvider(ctx, *spec.HTTP.Auth)
+			err := appauth.CheckApplicationAuthProvider(ctx, *spec.HTTP.Auth)
 			if ctx.Err() != nil {
 				return
 			}
@@ -278,10 +279,24 @@ func Start(ctx context.Context, spec Spec) (*Runtime, error) {
 	return runtime, nil
 }
 
+// publicURLs lists the URLs the tunnel is reachable at now: the canonical URL of
+// each relay, which always routes to this tunnel, and the alias its lease holds.
+// The SDK clears an alias as soon as the lease may be gone, because the relay may
+// then give the name to another identity, so the alias itself is the signal. The
+// relay state is not: every visitor connection takes an idle reverse session, so
+// a relay reports connecting while it serves a burst of requests on that alias.
+func (runtime *Runtime) publicURLs() []string {
+	var urls []string
+	for _, relay := range runtime.Exposure.Relays() {
+		urls = append(urls, relay.PublicURL, relay.AliasURL)
+	}
+	return urls
+}
+
 // AuthProviderCheck reports whether the startup check of the application auth
 // provider has finished and, if it failed, why the provider is not usable.
-// Only the oidc and saml providers depend on anything outside the tunnel; the
-// check passes at once for the others.
+// Only the oidc, saml and email providers depend on anything outside the
+// tunnel; the check passes at once for the others.
 func (runtime *Runtime) AuthProviderCheck() (checked bool, err error) {
 	if check := runtime.authProvider.Load(); check != nil {
 		return true, check.err

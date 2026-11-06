@@ -1,4 +1,4 @@
-package gateway
+package appauth
 
 import (
 	"bytes"
@@ -269,7 +269,7 @@ func newSAMLTestGate(t *testing.T, idp *samlTestIdP, next http.Handler, configur
 	if next == nil {
 		next = http.NotFoundHandler()
 	}
-	handler, err := NewApplicationAuth(next, applicationAuthTestIdentity(), cfg)
+	handler, err := NewApplicationAuth(next, applicationAuthTestIdentity(), cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

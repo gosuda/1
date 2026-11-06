@@ -1,4 +1,4 @@
-package gateway
+package appauth
 
 import (
 	"bytes"
@@ -187,7 +187,7 @@ func TestApplicationAuthCredential(t *testing.T) {
 		upstreamUser, upstreamAuth = r.Header.Get(types.HeaderPortalUser), r.Header.Get(types.HeaderPortalAuth)
 		upstreamCredential = r.Header.Get(types.HeaderAccessCredential)
 		w.WriteHeader(http.StatusNoContent)
-	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential, IdentityHeaders: true})
+	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential, IdentityHeaders: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,6 +243,152 @@ func TestApplicationAuthCredential(t *testing.T) {
 	}
 }
 
+// A session is for the application's own origin: an upgrade or a write from any
+// other origin is refused before the application sees the visitor's identity.
+func TestApplicationSessionRefusesOtherOrigins(t *testing.T) {
+	t.Parallel()
+
+	tunnelIdentity := applicationAuthTestIdentity()
+	upstreamRequests := 0
+	handler, err := NewApplicationAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		w.WriteHeader(http.StatusNoContent)
+	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := IssueApplicationCredential(tunnelIdentity, "app.example", "alice", time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(applicationAuthRedeemRequest{Credential: credential})
+	redeem := httptest.NewRequest(http.MethodPost, "https://app.example"+applicationAuthRedeemPath, bytes.NewReader(body))
+	redeem.Header.Set("Origin", "https://app.example")
+	redeemRec := httptest.NewRecorder()
+	handler.ServeHTTP(redeemRec, redeem)
+	if redeemRec.Code != http.StatusOK || len(redeemRec.Result().Cookies()) != 1 {
+		t.Fatalf("redeem status = %d, cookies = %#v", redeemRec.Code, redeemRec.Result().Cookies())
+	}
+	session := redeemRec.Result().Cookies()[0]
+
+	const self, other = "https://app.example", "https://other.example"
+	upgrade := func(origin string) http.Header {
+		return http.Header{"Connection": {"Upgrade"}, "Upgrade": {"websocket"}, "Origin": {origin}}
+	}
+	from := func(origin string) http.Header { return http.Header{"Origin": {origin}} }
+	fetched := func(origin, site string) http.Header {
+		return http.Header{"Origin": {origin}, "Sec-Fetch-Site": {site}}
+	}
+	for _, tt := range []struct {
+		name       string
+		method     string
+		headers    http.Header
+		wantStatus int
+	}{
+		{"upgrade from own origin", http.MethodGet, upgrade(self), http.StatusNoContent},
+		{"upgrade from another origin", http.MethodGet, upgrade(other), http.StatusForbidden},
+		{"upgrade with another port", http.MethodGet, upgrade(self + ":8443"), http.StatusForbidden},
+		{"upgrade from plain http", http.MethodGet, upgrade("http://app.example"), http.StatusForbidden},
+		{"upgrade from opaque origin", http.MethodGet, upgrade("null"), http.StatusForbidden},
+		{"upgrade without origin", http.MethodGet, http.Header{"Connection": {"Upgrade"}, "Upgrade": {"websocket"}}, http.StatusNoContent},
+		{"post from own origin", http.MethodPost, from(self), http.StatusNoContent},
+		{"post from another origin", http.MethodPost, from(other), http.StatusForbidden},
+		{"post from opaque origin", http.MethodPost, from("null"), http.StatusForbidden},
+		{"post without origin", http.MethodPost, http.Header{}, http.StatusNoContent},
+		{"form post from a no-referrer page of the own origin", http.MethodPost, fetched("null", "same-origin"), http.StatusNoContent},
+		{"form post from a no-referrer page elsewhere", http.MethodPost, fetched("null", "cross-site"), http.StatusForbidden},
+		{"same-origin mark on a real origin", http.MethodPost, fetched(other, "same-origin"), http.StatusForbidden},
+		{"same-origin mark on an upgrade", http.MethodGet, http.Header{"Upgrade": {"websocket"}, "Origin": {"null"}, "Sec-Fetch-Site": {"same-origin"}}, http.StatusForbidden},
+		{"post from a sibling host", http.MethodPost, fetched(other, "same-site"), http.StatusForbidden},
+		{"post from a sandboxed frame", http.MethodPost, fetched("null", "same-site"), http.StatusForbidden},
+		{"put from another origin", http.MethodPut, from(other), http.StatusForbidden},
+		{"patch from another origin", http.MethodPatch, from(other), http.StatusForbidden},
+		{"delete from another origin", http.MethodDelete, from(other), http.StatusForbidden},
+		{"get from another origin", http.MethodGet, from(other), http.StatusNoContent},
+		{"head from another origin", http.MethodHead, from(other), http.StatusNoContent},
+		{"options from another origin", http.MethodOptions, from(other), http.StatusNoContent},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "https://app.example/private", nil)
+			req.Header = tt.headers.Clone()
+			req.AddCookie(session)
+			before := upstreamRequests
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d; want %d", rec.Code, tt.wantStatus)
+			}
+			if reached := upstreamRequests > before; reached != (tt.wantStatus == http.StatusNoContent) {
+				t.Fatalf("upstream reached = %v with status %d", reached, rec.Code)
+			}
+		})
+	}
+}
+
+// A credential header is not a cookie: a browser does not attach it on its own,
+// so the page that sends it holds the credential and its origin proves nothing.
+func TestApplicationCredentialHeaderPassesFromAnyOrigin(t *testing.T) {
+	t.Parallel()
+
+	tunnelIdentity := applicationAuthTestIdentity()
+	handler, err := NewApplicationAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := IssueApplicationCredential(tunnelIdentity, "app.example", "alice", time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://app.example/private", nil)
+	req.Header.Set("Origin", "https://other.example")
+	req.Header.Set(types.HeaderAccessCredential, credential)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusNoContent)
+	}
+}
+
+// Without a session a request from another origin is simply not signed in: the
+// origin check adds nothing and must not change the answer a visitor gets.
+func TestApplicationAuthWithoutSessionIgnoresOrigin(t *testing.T) {
+	t.Parallel()
+
+	handler, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgrade := httptest.NewRequest(http.MethodGet, "https://app.example/private", nil)
+	upgrade.Header = http.Header{"Connection": {"Upgrade"}, "Upgrade": {"websocket"}, "Origin": {"https://other.example"}}
+	upgradeRec := httptest.NewRecorder()
+	handler.ServeHTTP(upgradeRec, upgrade)
+	if upgradeRec.Code != http.StatusSeeOther {
+		t.Fatalf("upgrade status = %d; want %d", upgradeRec.Code, http.StatusSeeOther)
+	}
+	post := httptest.NewRequest(http.MethodPost, "https://app.example/private", nil)
+	post.Header.Set("Origin", "https://other.example")
+	postRec := httptest.NewRecorder()
+	handler.ServeHTTP(postRec, post)
+	if postRec.Code != http.StatusUnauthorized {
+		t.Fatalf("post status = %d; want %d", postRec.Code, http.StatusUnauthorized)
+	}
+}
+
+// portalHeaderNames lists the headers of h that a gateway reading underscores as
+// hyphens takes for a Portal header, in whatever spelling they arrived.
+func portalHeaderNames(h http.Header) []string {
+	var names []string
+	for key := range h {
+		if strings.HasPrefix(strings.ToLower(strings.ReplaceAll(key, "_", "-")), "x-portal-") {
+			names = append(names, key)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
 func TestSameApplicationHost(t *testing.T) {
 	t.Parallel()
 
@@ -283,7 +429,7 @@ func TestApplicationSessionFollowsTheHostNotItsSpelling(t *testing.T) {
 	tunnelIdentity := applicationAuthTestIdentity()
 	handler, err := NewApplicationAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
-	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential})
+	}), tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +508,7 @@ func TestApplicationAuthIdentityProof(t *testing.T) {
 				reached = true
 				gotProof = r.Header.Values(types.HeaderPortalProof)
 				w.WriteHeader(http.StatusNoContent)
-			}), tunnelIdentity, tt.cfg)
+			}), tunnelIdentity, tt.cfg, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -390,44 +536,6 @@ func TestApplicationAuthIdentityProof(t *testing.T) {
 	}
 }
 
-// The router in front of the upstream removes Portal identity headers the gate
-// did not verify, so the proof set by the gate must survive it.
-func TestApplicationAuthIdentityProofReachesRoutedUpstream(t *testing.T) {
-	t.Parallel()
-
-	gotProof := make(chan []string, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotProof <- r.Header.Values(types.HeaderPortalProof)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
-	routes, err := ComposeHTTPRoutes([]ExposedHTTPRoute{{Prefix: "/", Upstream: upstream.URL}}, X402Payment{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tunnelIdentity := applicationAuthTestIdentity()
-	handler, err := NewApplicationAuth(routes, tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderCredential, IdentityHeaders: true, IdentityProof: identityProofTestValue})
-	if err != nil {
-		t.Fatal(err)
-	}
-	credential, err := IssueApplicationCredential(tunnelIdentity, "app.example", "alice", time.Now().UTC().Add(time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "https://app.example/api", nil)
-	req.Header.Set(types.HeaderAccessCredential, credential)
-	req.Header.Set(types.HeaderPortalProof, "forged-proof-value")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d; want %d", rec.Code, http.StatusNoContent)
-	}
-	if got := <-gotProof; !slices.Equal(got, []string{identityProofTestValue}) {
-		t.Fatalf("upstream %s = %q; want the configured proof only", types.HeaderPortalProof, got)
-	}
-}
-
 func TestApplicationAuthCredentialAllowlistAndRevocation(t *testing.T) {
 	tunnelIdentity := applicationAuthTestIdentity()
 	aliceCredential, err := IssueApplicationCredential(tunnelIdentity, "app.example", "alice", time.Now().UTC().Add(time.Hour))
@@ -446,7 +554,7 @@ func TestApplicationAuthCredentialAllowlistAndRevocation(t *testing.T) {
 		Provider:        ApplicationAuthProviderCredential,
 		AllowedWallets:  []string{"alice", "bob"},
 		IdentityHeaders: true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +575,7 @@ func TestApplicationAuthCredentialAllowlistAndRevocation(t *testing.T) {
 		Provider:        ApplicationAuthProviderCredential,
 		AllowedWallets:  []string{"bob"},
 		IdentityHeaders: true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +697,7 @@ func TestApplicationAuthOIDCPKCEAndRevocation(t *testing.T) {
 		AllowedWallets:  []string{"alice@example.com"},
 		IdentityHeaders: true,
 		OIDCConfig:      OIDCConfig{OIDCIssuerURL: issuerURL, OIDCClientID: "portal-client", OIDCClientSecret: "portal-secret"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +768,7 @@ func TestApplicationAuthOIDCPKCEAndRevocation(t *testing.T) {
 		AllowedWallets:  []string{"bob@example.com"},
 		IdentityHeaders: true,
 		OIDCConfig:      OIDCConfig{OIDCIssuerURL: issuerURL, OIDCClientID: "portal-client", OIDCClientSecret: "portal-secret"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,7 +791,7 @@ func TestApplicationAuthOIDCPrincipalMatching(t *testing.T) {
 			cfg.OIDCIssuerURL = "https://idp.example"
 			cfg.OIDCClientID = "portal-client"
 		}
-		handler, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), cfg)
+		handler, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -894,7 +1002,7 @@ func TestApplicationCredentialHostIgnoresTheDefaultPort(t *testing.T) {
 func newApplicationAuthTestHandler(t *testing.T, allowed []string, identityHeaders bool, next http.Handler) http.Handler {
 	t.Helper()
 	tunnelIdentity := applicationAuthTestIdentity()
-	handler, err := NewApplicationAuth(next, tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderSIWE, AllowedWallets: allowed, IdentityHeaders: identityHeaders})
+	handler, err := NewApplicationAuth(next, tunnelIdentity, ApplicationAuthConfig{Provider: ApplicationAuthProviderSIWE, AllowedWallets: allowed, IdentityHeaders: identityHeaders}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,10 +1070,10 @@ func TestApplicationAuthOIDCRequiresAllowlist(t *testing.T) {
 	t.Parallel()
 
 	cfg := ApplicationAuthConfig{Provider: ApplicationAuthProviderOIDC, OIDCConfig: OIDCConfig{OIDCIssuerURL: "https://idp.example", OIDCClientID: oidcTestClientID}}
-	if err := ValidateApplicationAuthConfig(cfg); err == nil || !strings.Contains(err.Error(), "--auth-allow") {
-		t.Fatalf("ValidateApplicationAuthConfig without an allowlist = %v; want an error naming --auth-allow", err)
+	if err := ValidateApplicationAuthConfig(cfg); err == nil || !strings.Contains(err.Error(), "--auth-email-list") {
+		t.Fatalf("ValidateApplicationAuthConfig without an allowlist = %v; want an error naming --auth-email-list", err)
 	}
-	if _, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), cfg); err == nil {
+	if _, err := NewApplicationAuth(http.NotFoundHandler(), applicationAuthTestIdentity(), cfg, nil); err == nil {
 		t.Fatal("NewApplicationAuth started OIDC without an allowlist")
 	}
 	cfg.AllowedWallets = []string{"alice@example.com"}
@@ -1090,7 +1198,7 @@ func TestResolveApplicationAuthConfig(t *testing.T) {
 		{
 			name:    "oidc without an allowlist",
 			cfg:     ApplicationAuthConfig{Provider: ApplicationAuthProviderOIDC, OIDCConfig: OIDCConfig{OIDCIssuerURL: "https://idp.example", OIDCClientID: oidcTestClientID}},
-			wantErr: "--auth-allow",
+			wantErr: "--auth-email-list",
 		},
 		{
 			name:    "oidc without an issuer",
@@ -1140,7 +1248,7 @@ func TestResolveApplicationAuthConfig(t *testing.T) {
 		{
 			name:    "saml without an allowlist",
 			cfg:     ApplicationAuthConfig{Provider: ApplicationAuthProviderSAML, SAMLConfig: SAMLConfig{SAMLMetadataURL: "https://idp.example/metadata"}},
-			wantErr: "--auth-allow",
+			wantErr: "--auth-email-list",
 		},
 		{
 			name:    "saml without metadata",
@@ -1196,7 +1304,7 @@ func TestApplicationAuthOIDCLongSubSurvivesRevalidation(t *testing.T) {
 		Provider:       ApplicationAuthProviderOIDC,
 		AllowedWallets: []string{"sub:" + sub},
 		OIDCConfig:     OIDCConfig{OIDCIssuerURL: "https://idp.example", OIDCClientID: oidcTestClientID},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1231,7 +1339,7 @@ func TestApplicationAuthOIDCSessionIsBoundToIssuerAndClient(t *testing.T) {
 			Provider:       ApplicationAuthProviderOIDC,
 			AllowedWallets: []string{"alice@example.com"},
 			OIDCConfig:     OIDCConfig{OIDCIssuerURL: issuer, OIDCClientID: clientID, OIDCClientSecret: clientSecret},
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

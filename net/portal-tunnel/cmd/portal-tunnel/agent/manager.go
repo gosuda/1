@@ -14,9 +14,9 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/gateway"
 	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/tunnel"
 	"github.com/gosuda/portal-tunnel/v2/sdk"
+	"github.com/gosuda/portal-tunnel/v2/sdk/appauth"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
 
@@ -582,10 +582,12 @@ func (t *managedTunnel) Snapshot() AgentTunnelStatus {
 		Metadata:                spec.Metadata,
 		ApplicationAuthConfig:   auth.Public(),
 		AuthOIDCClientSecretSet: auth.OIDCClientSecret != "",
+		AuthSMTPPasswordSet:     auth.SMTPPassword != "",
 		X402Config:              cfg.X402Config,
 	}
 	status.Endpoints = slices.Clone(status.Endpoints)
-	if runtime != nil && (cfg.Provider == gateway.ApplicationAuthProviderOIDC || cfg.Provider == gateway.ApplicationAuthProviderSAML) {
+	hasProviderCheck := cfg.Provider == appauth.ApplicationAuthProviderOIDC || cfg.Provider == appauth.ApplicationAuthProviderSAML || cfg.Provider == appauth.ApplicationAuthProviderEmail
+	if runtime != nil && hasProviderCheck {
 		checked, err := runtime.AuthProviderCheck()
 		status.AuthProviderChecked = checked
 		if err != nil {
@@ -638,6 +640,7 @@ func agentRelayStatuses(relays []sdk.RelayStatus) []AgentRelayStatus {
 			TCPAddr:    relay.TCPAddr,
 			Version:    relay.Version,
 			Connecting: relay.State == sdk.RelayConnecting,
+			Approval:   string(relay.Approval),
 		})
 	}
 	return statuses
