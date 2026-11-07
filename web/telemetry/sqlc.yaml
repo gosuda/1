@@ -1,0 +1,10 @@
+version: "2"
+sql:
+  - engine: "mysql"
+    queries: "internal/persistence/database/queries/*.sql"
+    schema: "internal/persistence/database/schema.sql"
+    gen:
+      go:
+        package: "database"
+        out: "internal/persistence/database"
+        emit_json_tags: true
