@@ -1,0 +1,222 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/typography';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Self-hosted fonts — no external CDN dependency */
+@font-face {
+	font-family: 'Manrope';
+	font-style: normal;
+	font-weight: 500 800;
+	font-display: swap;
+	src: url('/fonts/manrope-latin.woff2') format('woff2');
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+		U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+		U+FEFF, U+FFFD;
+}
+
+@font-face {
+	font-family: 'Open Sans';
+	font-style: normal;
+	font-weight: 400 700;
+	font-display: swap;
+	src: url('/fonts/opensans-latin.woff2') format('woff2');
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+		U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+		U+FEFF, U+FFFD;
+}
+
+@theme {
+	/* Fonts — Tailwind v4 tokens: --font-* maps to font-* utility */
+	--font-display: 'Manrope', sans-serif;
+	--font-sans: 'Open Sans', sans-serif;
+
+	/* Radius — match React frontend tokens (only xl needed; lg/base omitted to avoid doc page breakage) */
+	--radius-xl: 1.75rem;
+
+	/* Primary: cyan/teal from relay */
+	--color-primary: oklch(75% 0.14 195);
+	--color-primary-light: oklch(80% 0.14 195);
+
+	/* Map CSS custom properties to Tailwind color tokens for opacity modifier support */
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-secondary: var(--secondary);
+	--color-border: var(--border);
+	--color-text-muted: var(--text-muted);
+}
+
+/* Layout tokens */
+:root {
+	--header-h: 6.5rem; /* 104px — matches sticky header outer height (py-5 + py-2 + content) */
+	--gradient-primary-fade: linear-gradient(to right, oklch(75% 0.14 195 / 0.55), transparent);
+}
+
+/* Hero & landing page custom properties (not in @theme — used via var() in inline styles) */
+:root {
+	--background: oklch(97% 0.005 250);
+	--foreground: oklch(25% 0.02 250);
+	--secondary: oklch(92% 0.01 250);
+	--border: oklch(90% 0.01 250);
+	--text-muted: oklch(55% 0.03 250);
+	--accent-orange: oklch(60% 0.2 35);
+	--accent-magenta: oklch(50% 0.22 350);
+	--neon-cyan: oklch(75% 0.14 195);
+	--hero-grid-dot: oklch(75% 0.14 195 / 0.18);
+	--hero-gradient-start: var(--accent-orange);
+	--hero-gradient-mid: var(--neon-cyan);
+	--hero-gradient-end: var(--accent-magenta);
+	--hero-terminal-bg: linear-gradient(160deg, oklch(19% 0.005 250 / 0.98), oklch(14% 0.008 250 / 0.98));
+	--hero-terminal-border: oklch(75% 0.14 195 / 0.22);
+	--hero-terminal-foreground: oklch(98% 0.01 0);
+	--hero-terminal-accent: var(--neon-cyan);
+	--hero-terminal-shadow: oklch(15% 0 0 / 0.18);
+}
+
+.dark {
+	--background: oklch(15% 0 0);
+	--foreground: oklch(98% 0.01 0);
+	--secondary: oklch(25% 0.02 195);
+	--border: oklch(100% 0 0 / 0.1);
+	--text-muted: oklch(65% 0.02 0);
+	--accent-orange: oklch(65% 0.2 35);
+	--accent-magenta: oklch(55% 0.25 350);
+	--neon-cyan: oklch(80% 0.14 195);
+	--hero-grid-dot: oklch(80% 0.14 195 / 0.22);
+	--hero-gradient-start: var(--neon-cyan);
+	--hero-gradient-mid: var(--accent-magenta);
+	--hero-gradient-end: var(--accent-orange);
+	--hero-terminal-bg: linear-gradient(160deg, oklch(19% 0 0 / 0.78), oklch(12% 0.01 250 / 0.88));
+	--hero-terminal-border: oklch(80% 0.14 195 / 0.3);
+	--hero-terminal-foreground: oklch(98% 0.01 0);
+	--hero-terminal-accent: var(--neon-cyan);
+	--hero-terminal-shadow: oklch(0% 0 0 / 0.28);
+}
+
+/* Global border color reset (matches React frontend) */
+@layer base {
+	* {
+		border-color: var(--border);
+	}
+}
+
+/* Base styles */
+body {
+	font-family: var(--font-sans);
+	color: oklch(25% 0.02 250);
+	background:
+		radial-gradient(circle at top center, oklch(75% 0.14 195 / 0.16), transparent 36%),
+		radial-gradient(circle at 12% 18%, oklch(60% 0.2 35 / 0.08), transparent 22%),
+		linear-gradient(180deg, oklch(100% 0 0) 0%, oklch(97% 0.005 250) 54%, oklch(95% 0.005 250) 100%);
+	background-attachment: fixed;
+}
+
+.dark body {
+	color: oklch(90% 0.005 250);
+	background:
+		radial-gradient(circle at top center, oklch(80% 0.14 195 / 0.16), transparent 32%),
+		radial-gradient(circle at 82% 10%, oklch(55% 0.25 350 / 0.12), transparent 20%),
+		linear-gradient(180deg, oklch(16% 0 0) 0%, oklch(13% 0.01 250) 54%, oklch(11% 0.01 250) 100%);
+	background-attachment: fixed;
+}
+
+h1, h2, h3, h4, h5, h6 {
+	font-family: var(--font-display);
+	letter-spacing: -0.03em;
+}
+
+/* Prose overrides */
+.prose {
+	font-family: var(--font-sans);
+}
+
+.prose :where(h1, h2, h3, h4, h5, h6):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	font-family: var(--font-display);
+	letter-spacing: -0.03em;
+}
+
+/* Prose links — primary cyan */
+.prose :where(a):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	color: var(--color-primary);
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+.dark .prose :where(a):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	color: var(--color-primary-light);
+}
+
+/* Inline code */
+.prose :where(code):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	background-color: oklch(92% 0.02 195 / 0.3);
+	padding: 0.125rem 0.375rem;
+	border-radius: 0.25rem;
+	font-size: 0.875em;
+	border: 1px solid oklch(75% 0.14 195 / 0.15);
+}
+
+.dark .prose :where(code):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	background-color: oklch(75% 0.14 195 / 0.1);
+	border-color: oklch(75% 0.14 195 / 0.2);
+}
+
+/* Reset inline code styles inside code blocks */
+.prose :where(pre code):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	background-color: transparent;
+	padding: 0;
+	border-radius: 0;
+	border: none;
+	font-size: inherit;
+}
+
+/* Code blocks — relay terminal aesthetic */
+.prose :where(pre):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	background-color: oklch(20% 0.005 250);
+	border-radius: 0.75rem;
+	overflow-x: auto;
+	padding: 0.75rem 1rem;
+	border: 1px solid oklch(100% 0 0 / 0.05);
+}
+
+/* When wrapped by copy-code action, move radius/border to wrapper */
+[data-copy-wrapper] {
+	border-radius: 0.75rem;
+	overflow: hidden;
+	border: 1px solid oklch(100% 0 0 / 0.05);
+	background-color: oklch(20% 0.005 250);
+}
+
+.dark [data-copy-wrapper] {
+	border-color: oklch(100% 0 0 / 0.1);
+	background-color: oklch(14% 0.008 250);
+}
+
+[data-copy-wrapper] pre {
+	border-radius: 0 !important;
+	border: none !important;
+}
+
+.dark .prose :where(pre):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	background-color: oklch(14% 0.008 250);
+	border-color: oklch(100% 0 0 / 0.1);
+}
+
+/* Blockquote — primary cyan left border */
+.prose :where(blockquote):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	border-left-color: var(--color-primary);
+}
+
+/* Dark mode table borders */
+.dark .prose :where(th, td):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
+	border-color: oklch(100% 0 0 / 0.1);
+}
+
+/* Code block scrollbar */
+.prose pre::-webkit-scrollbar {
+	height: 6px;
+}
+
+.prose pre::-webkit-scrollbar-thumb {
+	background: oklch(50% 0.02 250);
+	border-radius: 3px;
+}

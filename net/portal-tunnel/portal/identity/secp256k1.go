@@ -1,0 +1,395 @@
+package identity
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"golang.org/x/crypto/sha3"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+)
+
+var (
+	errAddressIsRequired                     = errors.New("address is required")
+	errAddressMustStartWith0x                = errors.New("address must start with 0x")
+	errAddressMustBe20Bytes                  = errors.New("address must be 20 bytes")
+	errAddressMustBeHexEncoded               = errors.New("address must be hex encoded")
+	errAddressChecksumIsInvalid              = errors.New("address checksum is invalid")
+	errInvalidUncompressedSecp256k1PublicKey = errors.New("invalid uncompressed secp256k1 public key")
+	errInvalidCompactSignatureLength         = errors.New("invalid compact signature length")
+	errInvalidEs256kSignatureLength          = errors.New("invalid es256k signature length")
+	errInvalidCompactSignatureHeader         = errors.New("invalid compact signature header")
+	errInvalidEs256kSignatureR               = errors.New("invalid es256k signature r")
+	errInvalidEs256kSignatureS               = errors.New("invalid es256k signature s")
+	errSignatureIsRequired                   = errors.New("signature is required")
+	errPublicKeyIsRequired                   = errors.New("public key is required")
+	errPublicKeyMustHexEncoded               = errors.New("public key must be hex encoded")
+	errInvalidSecp256k1PublicKey             = errors.New("invalid secp256k1 public key")
+	errPrivateKeyIsRequired                  = errors.New("private key is required")
+	errSecp256k1PrivateKeyMustHexEncoded     = errors.New("secp256k1 private key must be hex encoded")
+	errInvalidSecp256k1PrivateKey            = errors.New("invalid secp256k1 private key")
+	errSecp256k1PrivateKeyMustNotZero        = errors.New("secp256k1 private key must not be zero")
+)
+
+const (
+	// compactSecp256k1SignatureSize is the byte length of a compact
+	// recoverable secp256k1 ECDSA signature.
+	compactSecp256k1SignatureSize = 65
+	// rawSecp256k1SignatureSize is the byte length of the JOSE ES256K
+	// signature form, r || s with no recovery header.
+	rawSecp256k1SignatureSize = 64
+)
+
+// ErrSecp256k1SignatureInvalid marks a well-formed signature that does not
+// verify for the payload and public key.
+var ErrSecp256k1SignatureInvalid = errors.New("signature is invalid")
+
+type Secp256k1Signature struct {
+	compact []byte
+}
+
+func newSecp256k1SignatureFromCompact(compact []byte) (Secp256k1Signature, error) {
+	normalized, err := copySecp256k1CompactSignature(compact)
+	if err != nil {
+		return Secp256k1Signature{}, err
+	}
+	return Secp256k1Signature{compact: normalized}, nil
+}
+
+func (s Secp256k1Signature) Compact() ([]byte, error) {
+	return copySecp256k1CompactSignature(s.compact)
+}
+
+func (s Secp256k1Signature) Raw64() ([]byte, error) {
+	compact, err := copySecp256k1CompactSignature(s.compact)
+	if err != nil {
+		return nil, err
+	}
+
+	signature := make([]byte, rawSecp256k1SignatureSize)
+	copy(signature[:32], compact[1:33])
+	copy(signature[32:], compact[33:65])
+	return signature, nil
+}
+
+func NormalizeEVMAddress(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errAddressIsRequired
+	}
+	hexPart := trimHexPrefix(trimmed)
+	if hexPart == trimmed {
+		return "", errAddressMustStartWith0x
+	}
+	if len(hexPart) != 40 {
+		return "", errAddressMustBe20Bytes
+	}
+	if _, err := hex.DecodeString(hexPart); err != nil {
+		return "", fmt.Errorf("%w: %w", errAddressMustBeHexEncoded, err)
+	}
+
+	lowerHex := strings.ToLower(hexPart)
+	hasher := sha3.NewLegacyKeccak256()
+	_, _ = hasher.Write([]byte(lowerHex))
+	hash := hasher.Sum(nil)
+
+	var builder strings.Builder
+	builder.Grow(len(lowerHex))
+	for idx, ch := range lowerHex {
+		if ch >= '0' && ch <= '9' {
+			builder.WriteRune(ch)
+			continue
+		}
+
+		nibble := hash[idx/2]
+		if idx%2 == 0 {
+			nibble >>= 4
+		} else {
+			nibble &= 0x0f
+		}
+		if nibble > 7 {
+			builder.WriteRune(ch - ('a' - 'A'))
+			continue
+		}
+		builder.WriteRune(ch)
+	}
+
+	checksummed := builder.String()
+	if hexPart != lowerHex && hexPart != strings.ToUpper(hexPart) && hexPart != checksummed {
+		return "", errAddressChecksumIsInvalid
+	}
+	return "0x" + checksummed, nil
+}
+
+func AddressFromCompressedPublicKeyHex(rawPublicKey string) (string, error) {
+	publicKey, err := ParseSecp256k1PublicKeyHex(rawPublicKey)
+	if err != nil {
+		return "", err
+	}
+
+	uncompressed := publicKey.SerializeUncompressed()
+	if len(uncompressed) != 65 || uncompressed[0] != 0x04 {
+		return "", errInvalidUncompressedSecp256k1PublicKey
+	}
+
+	hasher := sha3.NewLegacyKeccak256()
+	_, _ = hasher.Write(uncompressed[1:])
+	hash := hasher.Sum(nil)
+
+	return NormalizeEVMAddress("0x" + hex.EncodeToString(hash[len(hash)-20:]))
+}
+
+func signEthereumPersonalMessage(message, privateKeyHex string) (string, error) {
+	privateKey, _, err := parseSecp256k1PrivateKeyHex(privateKeyHex, false)
+	if err != nil {
+		return "", err
+	}
+
+	compactSignature := ecdsa.SignCompact(privateKey, ethereumPersonalMessageHash(message), false)
+	if len(compactSignature) != 65 {
+		return "", errInvalidCompactSignatureLength
+	}
+
+	signature := make([]byte, 65)
+	copy(signature[:32], compactSignature[1:33])
+	copy(signature[32:64], compactSignature[33:65])
+	signature[64] = compactSignature[0]
+	return "0x" + hex.EncodeToString(signature), nil
+}
+
+// ethereumPersonalMessageHash is the shared EIP-191 personal-sign digest for
+// both signing and recovery. The prefix counts UTF-8 bytes, not characters.
+func ethereumPersonalMessageHash(message string) []byte {
+	hasher := sha3.NewLegacyKeccak256()
+	_, _ = fmt.Fprintf(hasher, "\x19Ethereum Signed Message:\n%d", len(message))
+	_, _ = hasher.Write([]byte(message))
+	return hasher.Sum(nil)
+}
+
+func recoverEthereumPersonalMessage(message, signature string) (string, error) {
+	encoded := strings.TrimSpace(signature)
+	if len(encoded) != 2+compactSecp256k1SignatureSize*2 || !strings.HasPrefix(strings.ToLower(encoded), "0x") {
+		return "", ErrSecp256k1SignatureInvalid
+	}
+	raw, err := hex.DecodeString(encoded[2:])
+	if err != nil {
+		return "", ErrSecp256k1SignatureInvalid
+	}
+	// Ethereum signatures are r || s || v. Accept the personal_sign recovery
+	// values 27/28 and their normalized 0/1 forms, not transaction chain IDs.
+	v := raw[64]
+	switch v {
+	case 0, 1:
+		v += 27
+	case 27, 28:
+	default:
+		return "", ErrSecp256k1SignatureInvalid
+	}
+	compact := make([]byte, compactSecp256k1SignatureSize)
+	compact[0] = v
+	copy(compact[1:], raw[:64])
+	publicKey, _, err := ecdsa.RecoverCompact(compact, ethereumPersonalMessageHash(message))
+	if err != nil {
+		return "", ErrSecp256k1SignatureInvalid
+	}
+	return AddressFromCompressedPublicKeyHex(hex.EncodeToString(publicKey.SerializeCompressed()))
+}
+
+func ResolveSecp256k1Identity(rawPrivateKey string) (types.Identity, error) {
+	privateKeyHex := strings.TrimSpace(rawPrivateKey)
+	if privateKeyHex == "" {
+		privateKey, err := secp256k1.GeneratePrivateKey()
+		if err != nil {
+			return types.Identity{}, fmt.Errorf("generate secp256k1 private key: %w", err)
+		}
+		privateKeyHex = hex.EncodeToString(privateKey.Serialize())
+	}
+
+	privateKey, normalizedKeyHex, err := parseSecp256k1PrivateKeyHex(privateKeyHex, true)
+	if err != nil {
+		return types.Identity{}, err
+	}
+
+	publicKeyHex := hex.EncodeToString(privateKey.PubKey().SerializeCompressed())
+	address, err := AddressFromCompressedPublicKeyHex(publicKeyHex)
+	if err != nil {
+		return types.Identity{}, err
+	}
+
+	return types.Identity{
+		Address:    address,
+		PublicKey:  publicKeyHex,
+		PrivateKey: normalizedKeyHex,
+	}, nil
+}
+
+func signSHA256Secp256k1(payload []byte, privateKey *secp256k1.PrivateKey) (Secp256k1Signature, error) {
+	if privateKey == nil {
+		return Secp256k1Signature{}, errSigningKeyIsRequired
+	}
+	hash := sha256.Sum256(payload)
+	return newSecp256k1SignatureFromCompact(ecdsa.SignCompact(privateKey, hash[:], true))
+}
+
+// RecoverSHA256Secp256k1Compact recovers the public key from a compact
+// recoverable signature over the SHA-256 digest of payload.
+func RecoverSHA256Secp256k1Compact(payload, signature []byte) (*secp256k1.PublicKey, error) {
+	if len(signature) != compactSecp256k1SignatureSize {
+		return nil, errInvalidCompactSignatureLength
+	}
+
+	hash := sha256.Sum256(payload)
+	publicKey, _, err := ecdsa.RecoverCompact(signature, hash[:])
+	if err != nil {
+		return nil, err
+	}
+	if publicKey == nil {
+		return nil, ErrSecp256k1SignatureInvalid
+	}
+	return publicKey, nil
+}
+
+// VerifySHA256Secp256k1Raw64 verifies an ES256K raw r || s signature over the
+// SHA-256 digest of payload.
+func VerifySHA256Secp256k1Raw64(payload, signature []byte, publicKey *secp256k1.PublicKey) error {
+	if publicKey == nil {
+		return errVerificationKeyIsRequired
+	}
+	if len(signature) != rawSecp256k1SignatureSize {
+		return errInvalidEs256kSignatureLength
+	}
+
+	parsed, err := secp256k1SignatureFromRaw64(signature)
+	if err != nil {
+		return err
+	}
+
+	return verifySHA256Secp256k1Signature(payload, parsed, publicKey)
+}
+
+func copySecp256k1CompactSignature(compact []byte) ([]byte, error) {
+	if len(compact) != compactSecp256k1SignatureSize {
+		return nil, errInvalidCompactSignatureLength
+	}
+	if _, err := secp256k1CompactRecoveryID(compact[0]); err != nil {
+		return nil, err
+	}
+	if _, err := secp256k1SignatureFromRaw64(compact[1:]); err != nil {
+		return nil, err
+	}
+
+	normalized := make([]byte, compactSecp256k1SignatureSize)
+	copy(normalized, compact)
+	return normalized, nil
+}
+
+func secp256k1CompactRecoveryID(header byte) (byte, error) {
+	switch {
+	case header >= 27 && header <= 30:
+		return header - 27, nil
+	case header >= 31 && header <= 34:
+		return header - 31, nil
+	default:
+		return 0, errInvalidCompactSignatureHeader
+	}
+}
+
+func secp256k1SignatureFromRaw64(signature []byte) (*ecdsa.Signature, error) {
+	if len(signature) != rawSecp256k1SignatureSize {
+		return nil, errInvalidEs256kSignatureLength
+	}
+
+	var r, s secp256k1.ModNScalar
+	if overflow := r.SetByteSlice(signature[:32]); overflow || r.IsZero() {
+		return nil, errInvalidEs256kSignatureR
+	}
+	if overflow := s.SetByteSlice(signature[32:]); overflow || s.IsZero() {
+		return nil, errInvalidEs256kSignatureS
+	}
+	return ecdsa.NewSignature(&r, &s), nil
+}
+
+func verifySHA256Secp256k1Signature(payload []byte, signature *ecdsa.Signature, publicKey *secp256k1.PublicKey) error {
+	if signature == nil {
+		return errSignatureIsRequired
+	}
+	if publicKey == nil {
+		return errVerificationKeyIsRequired
+	}
+	hash := sha256.Sum256(payload)
+	if !signature.Verify(hash[:], publicKey) {
+		return ErrSecp256k1SignatureInvalid
+	}
+	return nil
+}
+
+func ParseSecp256k1PublicKeyHex(raw string) (*secp256k1.PublicKey, error) {
+	publicKeyHex := strings.TrimSpace(raw)
+	if publicKeyHex == "" {
+		return nil, errPublicKeyIsRequired
+	}
+	publicKeyHex = trimHexPrefix(publicKeyHex)
+
+	decoded, err := hex.DecodeString(publicKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errPublicKeyMustHexEncoded, err)
+	}
+
+	publicKey, err := secp256k1.ParsePubKey(decoded)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errInvalidSecp256k1PublicKey, err)
+	}
+	return publicKey, nil
+}
+
+func parseSecp256k1PrivateKeyHex(raw string, requireNonZero bool) (*secp256k1.PrivateKey, string, error) {
+	privateKeyHex := strings.TrimSpace(raw)
+	if privateKeyHex == "" {
+		return nil, "", errPrivateKeyIsRequired
+	}
+	privateKeyHex = trimHexPrefix(privateKeyHex)
+
+	decoded, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %w", errSecp256k1PrivateKeyMustHexEncoded, err)
+	}
+	if len(decoded) != secp256k1.PrivKeyBytesLen {
+		return nil, "", fmt.Errorf("secp256k1 private key must be %d bytes", secp256k1.PrivKeyBytesLen)
+	}
+	if !requireNonZero {
+		key := secp256k1.PrivKeyFromBytes(decoded)
+		if key == nil {
+			return nil, "", errInvalidSecp256k1PrivateKey
+		}
+		return key, privateKeyHex, nil
+	}
+
+	isZero := true
+	for _, b := range decoded {
+		if b != 0 {
+			isZero = false
+			break
+		}
+	}
+	if isZero {
+		return nil, "", errSecp256k1PrivateKeyMustNotZero
+	}
+	key := secp256k1.PrivKeyFromBytes(decoded)
+	if key == nil {
+		return nil, "", errInvalidSecp256k1PrivateKey
+	}
+	return key, privateKeyHex, nil
+}
+
+func trimHexPrefix(raw string) string {
+	hasHexPrefix := len(raw) >= 2 && raw[0] == '0'
+	if hasHexPrefix && (raw[1] == 'x' || raw[1] == 'X') {
+		return raw[2:]
+	}
+	return raw
+}
