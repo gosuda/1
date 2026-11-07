@@ -1,0 +1,7 @@
+# Build artifacts
+server/build/
+build/
+*.o
+*.a
+.ninja_*
+cmake-build-*
