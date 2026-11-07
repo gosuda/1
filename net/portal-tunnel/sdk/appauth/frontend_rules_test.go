@@ -1,4 +1,4 @@
-package gateway
+package appauth
 
 import (
 	"encoding/json"
@@ -13,7 +13,7 @@ import (
 // the frontend.
 func loadFrontendFile(t *testing.T, name string, into any) {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "..", "frontend", "src", "lib", name))
+	data, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "lib", name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +37,14 @@ type frontendAuthRules struct {
 		Value string `json:"value"`
 		Valid bool   `json:"valid"`
 	} `json:"samlMetadata"`
+	SMTPAddr []struct {
+		Value string `json:"value"`
+		Valid bool   `json:"valid"`
+	} `json:"emailSMTPAddr"`
+	SMTPFrom []struct {
+		Value string `json:"value"`
+		Valid bool   `json:"valid"`
+	} `json:"emailFrom"`
 	Host []struct {
 		Address string `json:"address"`
 		Host    string `json:"host"`
@@ -48,15 +56,23 @@ func TestFrontendAuthRulesMatchTheGateway(t *testing.T) {
 
 	var rules frontendAuthRules
 	loadFrontendFile(t, "authRuleVectors.json", &rules)
-	if len(rules.Allow) == 0 || len(rules.Issuer) == 0 || len(rules.SAMLMetadata) == 0 || len(rules.Host) == 0 {
-		t.Fatalf("authRuleVectors.json has %d allow, %d issuer, %d samlMetadata and %d host rows; want all four",
-			len(rules.Allow), len(rules.Issuer), len(rules.SAMLMetadata), len(rules.Host))
+	for name, rows := range map[string]int{
+		"allow":         len(rules.Allow),
+		"issuer":        len(rules.Issuer),
+		"samlMetadata":  len(rules.SAMLMetadata),
+		"emailSMTPAddr": len(rules.SMTPAddr),
+		"emailFrom":     len(rules.SMTPFrom),
+		"host":          len(rules.Host),
+	} {
+		if rows == 0 {
+			t.Fatalf("authRuleVectors.json has no %s rows", name)
+		}
 	}
 
 	t.Run("allowlist entries", func(t *testing.T) {
 		t.Parallel()
 		for _, row := range rules.Allow {
-			got, err := NormalizeApplicationAuthAllowed(row.Method, []string{row.Typed})
+			got, err := normalizeAllowed(row.Method, []string{row.Typed})
 			if (err == nil) != row.Valid {
 				t.Errorf("%s entry %q: error = %v; the frontend says valid = %v", row.Method, row.Typed, err, row.Valid)
 				continue
@@ -71,10 +87,10 @@ func TestFrontendAuthRulesMatchTheGateway(t *testing.T) {
 	t.Run("OIDC issuers", func(t *testing.T) {
 		t.Parallel()
 		for _, row := range rules.Issuer {
-			err := ValidateApplicationAuthConfig(ApplicationAuthConfig{
-				Provider:       ApplicationAuthProviderOIDC,
-				AllowedWallets: []string{"alice@example.com"},
-				OIDCConfig:     OIDCConfig{OIDCIssuerURL: row.Value, OIDCClientID: "client"},
+			err := Validate(Config{
+				Provider:   ProviderOIDC,
+				Allow:      []string{"alice@example.com"},
+				OIDCConfig: OIDCConfig{OIDCIssuerURL: row.Value, OIDCClientID: "client"},
 			})
 			if (err == nil) != row.Valid {
 				t.Errorf("issuer %q: error = %v; the frontend says valid = %v", row.Value, err, row.Valid)
@@ -85,10 +101,10 @@ func TestFrontendAuthRulesMatchTheGateway(t *testing.T) {
 	t.Run("SAML metadata URLs", func(t *testing.T) {
 		t.Parallel()
 		for _, row := range rules.SAMLMetadata {
-			err := ValidateApplicationAuthConfig(ApplicationAuthConfig{
-				Provider:       ApplicationAuthProviderSAML,
-				AllowedWallets: []string{"alice@example.com"},
-				SAMLConfig:     SAMLConfig{SAMLMetadataURL: row.Value},
+			err := Validate(Config{
+				Provider:   ProviderSAML,
+				Allow:      []string{"alice@example.com"},
+				SAMLConfig: SAMLConfig{SAMLMetadataURL: row.Value},
 			})
 			if (err == nil) != row.Valid {
 				t.Errorf("metadata URL %q: error = %v; the frontend says valid = %v", row.Value, err, row.Valid)
@@ -96,10 +112,38 @@ func TestFrontendAuthRulesMatchTheGateway(t *testing.T) {
 		}
 	})
 
+	t.Run("email SMTP addresses", func(t *testing.T) {
+		t.Parallel()
+		for _, row := range rules.SMTPAddr {
+			err := Validate(Config{
+				Provider:    ProviderEmail,
+				EmailList:   []string{"alice@example.com"},
+				EmailConfig: EmailConfig{SMTPAddr: row.Value, SMTPFrom: "login@example.com"},
+			})
+			if (err == nil) != row.Valid {
+				t.Errorf("SMTP address %q: error = %v; the frontend says valid = %v", row.Value, err, row.Valid)
+			}
+		}
+	})
+
+	t.Run("email senders", func(t *testing.T) {
+		t.Parallel()
+		for _, row := range rules.SMTPFrom {
+			err := Validate(Config{
+				Provider:    ProviderEmail,
+				EmailList:   []string{"alice@example.com"},
+				EmailConfig: EmailConfig{SMTPAddr: "smtp.example.com:587", SMTPFrom: row.Value},
+			})
+			if (err == nil) != row.Valid {
+				t.Errorf("sender %q: error = %v; the frontend says valid = %v", row.Value, err, row.Valid)
+			}
+		}
+	})
+
 	t.Run("hosts of a private link", func(t *testing.T) {
 		t.Parallel()
 		for _, row := range rules.Host {
-			got, err := NormalizeApplicationAuthHost(row.Address)
+			got, err := normalizeHost(row.Address)
 			if row.Host == "" {
 				if err == nil {
 					t.Errorf("address %q is accepted as %q; the frontend says it is unusable", row.Address, got)

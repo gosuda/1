@@ -36,6 +36,7 @@ func TestReputationHTTPValidationAndRateLimit(t *testing.T) {
 	api := newTestReputationAPI(t)
 	post := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, pathReputationVote, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
 		req.RemoteAddr = "203.0.113.11:2000"
 		rec := httptest.NewRecorder()
 		api.Handler().ServeHTTP(rec, req)
@@ -107,7 +108,7 @@ func TestLegacyIPBanMigrationPreservesIdentityPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !api.access.Snapshot().IsBanned(types.NewServiceIdentityKey("blocked", "addr")) || !api.access.Snapshot().Routable(types.NewServiceIdentityKey("allowed", "addr")) {
+	if !api.access.Snapshot().IsBanned(types.NewServiceIdentityKey("blocked", "addr")) || api.access.Snapshot().Access(types.NewServiceIdentityKey("allowed", "addr")) != types.LeaseRoutable {
 		t.Fatal("identity policy lost during migration")
 	}
 	data, err := os.ReadFile(path)
@@ -143,7 +144,7 @@ func TestPolicyLoadNormalizesUnnormalizedIdentityKeys(t *testing.T) {
 	if !api.access.Snapshot().IsBanned(types.NewServiceIdentityKey("blocked", "addr")) {
 		t.Fatal("unnormalized ban not applied to canonical key")
 	}
-	if !api.access.Snapshot().Routable(types.NewServiceIdentityKey("allowed", "addr")) {
+	if api.access.Snapshot().Access(types.NewServiceIdentityKey("allowed", "addr")) != types.LeaseRoutable {
 		t.Fatal("unnormalized approval not effective for canonical key")
 	}
 	if !api.access.Snapshot().IsDenied(types.NewServiceIdentityKey("denied", "key")) {
