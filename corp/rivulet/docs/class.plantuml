@@ -1,0 +1,66 @@
+@startuml pebble
+
+class Node {
+    +init_address: String
+    +cluster_address: String
+    +is_active: Boolean
+}
+
+class Flowlet {
+    +name: String
+    +subject: String
+    +next: []Flowlet
+}
+
+class ChainDefinition {
+    +name: String
+    +entry_point: Flowlet
+    +flowlets: []Flowlet
+}
+
+enum State {
+    STAND_BY
+    RUNNING
+    COMPLETED
+    FAILED
+}
+
+class ChainHistory {
+    +chain: ChainDefinition
+    +check_time: time.Time
+    +current_stage: Flowlet
+    +state: State
+    +error_messages: []String
+}
+
+class ChainRequest {
+    +chain_name: String
+    +event_type: time.Time
+    +payload: []byte
+}
+
+class FlowletRequest {
+    +flowlet_name: String
+    +event_type: time.Time
+    +payload: []byte
+    +request_id: String
+}
+
+class FlowletResponse {
+    +flowlet_name: String
+    +event_type: time.Time
+    +payload: []byte
+    +request_id: String
+}
+
+Node <|-- ChainDefinition
+Node <|-- ChainHistory
+Node <|-- ChainRequest
+ChainHistory --> ChainDefinition
+State <|-- ChainHistory
+Flowlet <-- FlowletRequest
+Flowlet --> FlowletResponse
+Node --> FlowletRequest
+Node <-- FlowletResponse
+
+@enduml

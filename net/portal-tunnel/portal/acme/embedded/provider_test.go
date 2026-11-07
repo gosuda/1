@@ -1,0 +1,413 @@
+package embedded
+
+import (
+	"context"
+	"net"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/go-acme/lego/v4/challenge/dns01"
+	"github.com/miekg/dns"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+)
+
+const testZone = "portal.example.com"
+
+func newTestProvider(t *testing.T, mutate func(*Config)) *Provider {
+	t.Helper()
+	cfg := Config{BaseDomain: testZone, ListenAddr: "127.0.0.1:0", KeyPath: filepath.Join(t.TempDir(), types.DNSSECKeyFileName)}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	p, err := New(cfg)
+	if err != nil {
+		t.Fatalf("new embedded provider: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := p.Stop(); err != nil {
+			t.Fatalf("stop embedded provider: %v", err)
+		}
+	})
+	return p
+}
+
+func exchange(t *testing.T, p *Provider, network string, qtype uint16, name string) *dns.Msg {
+	t.Helper()
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), qtype)
+	if network == "udp" {
+		m.SetEdns0(1232, false)
+	}
+	client := &dns.Client{Net: network}
+	resp, _, err := client.Exchange(m, p.Addr())
+	if err != nil {
+		t.Fatalf("exchange %s %s %s: %v", network, dns.TypeToString[qtype], name, err)
+	}
+	return resp
+}
+
+func requireRcode(t *testing.T, resp *dns.Msg, rcode int) {
+	t.Helper()
+	if resp.Rcode != rcode {
+		t.Fatalf("unexpected rcode %s, want %s", dns.RcodeToString[resp.Rcode], dns.RcodeToString[rcode])
+	}
+}
+
+func TestASynthesisFollowsCurrentPublicIP(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+
+	if err := p.EnsureAddressRecords(ctx, testZone, "203.0.113.10"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+	for _, name := range []string{testZone, "tunnel." + testZone, "deep.a.b." + testZone} {
+		resp := exchange(t, p, "tcp", dns.TypeA, name)
+		requireRcode(t, resp, dns.RcodeSuccess)
+		if !resp.Authoritative {
+			t.Fatalf("%s: response is not authoritative", name)
+		}
+		if resp.RecursionAvailable {
+			t.Fatalf("%s: recursion must not be advertised", name)
+		}
+		if len(resp.Answer) != 1 {
+			t.Fatalf("%s: got %d answers, want 1", name, len(resp.Answer))
+		}
+		a, ok := resp.Answer[0].(*dns.A)
+		if !ok {
+			t.Fatalf("%s: got %T answer, want A", name, resp.Answer[0])
+		}
+		if !a.A.Equal(net.ParseIP("203.0.113.10")) {
+			t.Fatalf("%s: got %s, want 203.0.113.10", name, a.A)
+		}
+		if a.Hdr.Ttl != recordTTL {
+			t.Fatalf("%s: got ttl %d, want %d", name, a.Hdr.Ttl, recordTTL)
+		}
+	}
+
+	// Explicit per-hostname A records must never override synthesis, so a
+	// public IP change propagates to every hostname immediately.
+	if err := p.EnsureAddressRecord(ctx, "tunnel."+testZone, "198.51.100.7"); err != nil {
+		t.Fatalf("ensure a record: %v", err)
+	}
+	if err := p.EnsureAddressRecords(ctx, testZone, "198.51.100.99"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+	resp := exchange(t, p, "tcp", dns.TypeA, "tunnel."+testZone)
+	a := resp.Answer[0].(*dns.A)
+	if !a.A.Equal(net.ParseIP("198.51.100.99")) {
+		t.Fatalf("stale explicit answer %s after ip change, want 198.51.100.99", a.A)
+	}
+	if err := p.DeleteAddressRecords(ctx, "tunnel."+testZone); err != nil {
+		t.Fatalf("delete a record: %v", err)
+	}
+	resp = exchange(t, p, "tcp", dns.TypeA, "tunnel."+testZone)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("delete removed synthesized answer")
+	}
+}
+
+func TestAddressSynthesisPreservesOtherFamily(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	var ipv4, ipv6 string
+	for _, publicIP := range []string{"2001:db8::10", "203.0.113.10", "2001:db8::20", "203.0.113.20"} {
+		if err := p.EnsureAddressRecords(ctx, testZone, publicIP); err != nil {
+			t.Fatal(err)
+		}
+		if net.ParseIP(publicIP).To4() != nil {
+			ipv4 = publicIP
+		} else {
+			ipv6 = publicIP
+		}
+		for _, tc := range []struct {
+			typ uint16
+			ip  string
+		}{{dns.TypeA, ipv4}, {dns.TypeAAAA, ipv6}} {
+			for _, name := range []string{testZone, "tunnel." + testZone, "deep.child." + testZone} {
+				response := exchange(t, p, "tcp", tc.typ, name)
+				requireRcode(t, response, dns.RcodeSuccess)
+				if tc.ip == "" {
+					if len(response.Answer) != 0 {
+						t.Fatalf("%s %s before publication returned %v", name, dns.TypeToString[tc.typ], response.Answer)
+					}
+					continue
+				}
+				if len(response.Answer) != 1 {
+					t.Fatalf("%s %s after updating %s: %v", name, dns.TypeToString[tc.typ], publicIP, response.Answer)
+				}
+				var got net.IP
+				switch record := response.Answer[0].(type) {
+				case *dns.A:
+					got = record.A
+				case *dns.AAAA:
+					got = record.AAAA
+				}
+				if response.Answer[0].Header().Rrtype != tc.typ || !got.Equal(net.ParseIP(tc.ip)) {
+					t.Fatalf("%s %s after updating %s = %v, want %s", name, dns.TypeToString[tc.typ], publicIP, response.Answer, tc.ip)
+				}
+			}
+		}
+	}
+	// Explicit hostname changes cannot override the zone-wide address.
+	if err := p.EnsureAddressRecord(ctx, "tunnel."+testZone, "2001:db8::99"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.DeleteAddressRecords(ctx, "tunnel."+testZone); err != nil {
+		t.Fatal(err)
+	}
+	response := exchange(t, p, "tcp", dns.TypeAAAA, "tunnel."+testZone)
+	if len(response.Answer) != 1 {
+		t.Fatalf("explicit mutation removed synthesized AAAA: %v", response.Answer)
+	}
+	if record, ok := response.Answer[0].(*dns.AAAA); !ok || !record.AAAA.Equal(net.ParseIP(ipv6)) {
+		t.Fatalf("explicit mutation changed synthesized AAAA: %v", response.Answer)
+	}
+}
+
+func TestAWithoutPublicIPIsNodata(t *testing.T) {
+	p := newTestProvider(t, nil)
+	resp := exchange(t, p, "tcp", dns.TypeA, testZone)
+	requireRcode(t, resp, dns.RcodeSuccess)
+	if len(resp.Answer) != 0 {
+		t.Fatalf("got %d answers without a public ip, want 0", len(resp.Answer))
+	}
+	if len(resp.Ns) != 1 {
+		t.Fatalf("got %d authority records, want SOA", len(resp.Ns))
+	}
+	if _, ok := resp.Ns[0].(*dns.SOA); !ok {
+		t.Fatalf("got %T authority record, want SOA", resp.Ns[0])
+	}
+}
+
+func TestAWithoutPublicIPRefusesMissingNames(t *testing.T) {
+	p := newTestProvider(t, nil)
+
+	// Missing names are refused without an SOA while the public address is
+	// still pending, so resolvers cannot negative-cache them (issue #516).
+	for _, name := range []string{"tunnel." + testZone, "deep.a.b." + testZone} {
+		resp := exchange(t, p, "tcp", dns.TypeA, name)
+		requireRcode(t, resp, dns.RcodeRefused)
+		if len(resp.Answer) != 0 {
+			t.Fatalf("%s: got %d answers without a public ip, want 0", name, len(resp.Answer))
+		}
+		if len(resp.Ns) != 0 {
+			t.Fatalf("%s: got %d authority records, want no SOA on REFUSED", name, len(resp.Ns))
+		}
+	}
+
+	// Once the address is synced the same names resolve.
+	if err := p.EnsureAddressRecords(context.Background(), testZone, "203.0.113.10"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+	resp := exchange(t, p, "tcp", dns.TypeA, "tunnel."+testZone)
+	requireRcode(t, resp, dns.RcodeSuccess)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("got %d answers after the address synced, want 1", len(resp.Answer))
+	}
+}
+
+func TestTXTRecordLifecycle(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	name := "tunnel." + testZone
+
+	if err := p.EnsureTXTRecord(ctx, name, "ENS1 0x238a8f792dfa6033814b18618ad4100654aeef01 0xabc"); err != nil {
+		t.Fatalf("ensure txt: %v", err)
+	}
+	if err := p.EnsureTXTRecord(ctx, name, "dns-01-value"); err != nil {
+		t.Fatalf("ensure txt: %v", err)
+	}
+	if err := p.EnsureTXTRecord(ctx, name, "dns-01-value"); err != nil {
+		t.Fatalf("ensure duplicate txt: %v", err)
+	}
+
+	resp := exchange(t, p, "tcp", dns.TypeTXT, name)
+	requireRcode(t, resp, dns.RcodeSuccess)
+	if len(resp.Answer) != 2 {
+		t.Fatalf("got %d txt answers, want 2", len(resp.Answer))
+	}
+	seen := map[string]bool{}
+	for _, rr := range resp.Answer {
+		txt, ok := rr.(*dns.TXT)
+		if !ok {
+			t.Fatalf("got %T answer, want TXT", rr)
+		}
+		seen[strings.Join(txt.Txt, "")] = true
+	}
+	if !seen["ENS1 0x238a8f792dfa6033814b18618ad4100654aeef01 0xabc"] || !seen["dns-01-value"] {
+		t.Fatalf("missing txt values: %v", seen)
+	}
+
+	// Prefix deletion removes only matching values.
+	if err := p.DeleteTXTRecords(ctx, name, "ENS1 "); err != nil {
+		t.Fatalf("delete txt records: %v", err)
+	}
+	resp = exchange(t, p, "tcp", dns.TypeTXT, name)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("got %d txt answers after prefix delete, want 1", len(resp.Answer))
+	}
+	if got := strings.Join(resp.Answer[0].(*dns.TXT).Txt, ""); got != "dns-01-value" {
+		t.Fatalf("kept wrong txt value %q", got)
+	}
+}
+
+func TestDNS01ChallengePresentAndCleanup(t *testing.T) {
+	p := newTestProvider(t, nil)
+	keyAuth := "token.example-key-authorization"
+
+	if err := p.Present(testZone, "token", keyAuth); err != nil {
+		t.Fatalf("present: %v", err)
+	}
+	info := dns01.GetChallengeInfo(testZone, keyAuth)
+	resp := exchange(t, p, "tcp", dns.TypeTXT, info.EffectiveFQDN)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("got %d txt answers, want 1", len(resp.Answer))
+	}
+	if got := strings.Join(resp.Answer[0].(*dns.TXT).Txt, ""); got != info.Value {
+		t.Fatalf("got txt %q, want %q", got, info.Value)
+	}
+
+	if err := p.CleanUp(testZone, "token", keyAuth); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	// Without a public address the deleted challenge name is refused, not
+	// negative-cached as a name error.
+	resp = exchange(t, p, "tcp", dns.TypeTXT, info.EffectiveFQDN)
+	requireRcode(t, resp, dns.RcodeRefused)
+	if len(resp.Answer) != 0 {
+		t.Fatalf("txt survived cleanup")
+	}
+}
+
+func TestApexMetadata(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	if err := p.EnsureAddressRecords(ctx, testZone, "203.0.113.10"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+
+	nsResp := exchange(t, p, "tcp", dns.TypeNS, testZone)
+	requireRcode(t, nsResp, dns.RcodeSuccess)
+	if len(nsResp.Answer) != 1 {
+		t.Fatalf("got %d ns answers, want 1", len(nsResp.Answer))
+	}
+	ns, ok := nsResp.Answer[0].(*dns.NS)
+	if !ok || ns.Ns != "ns."+testZone+"." {
+		t.Fatalf("got %v, want ns.%s.", nsResp.Answer[0], testZone)
+	}
+	if len(nsResp.Extra) != 1 {
+		t.Fatalf("got %d additional records, want in-bailiwick glue A", len(nsResp.Extra))
+	}
+	if glue, ok := nsResp.Extra[0].(*dns.A); !ok || !glue.A.Equal(net.ParseIP("203.0.113.10")) {
+		t.Fatalf("got %v glue, want A 203.0.113.10", nsResp.Extra[0])
+	}
+
+	soaResp := exchange(t, p, "tcp", dns.TypeSOA, testZone)
+	soa, ok := soaResp.Answer[0].(*dns.SOA)
+	if !ok {
+		t.Fatalf("got %T answer, want SOA", soaResp.Answer[0])
+	}
+	if soa.Ns != "ns."+testZone+"." || soa.Mbox != "hostmaster."+testZone+"." {
+		t.Fatalf("got soa ns %q mbox %q", soa.Ns, soa.Mbox)
+	}
+	if soa.Minttl != recordTTL {
+		t.Fatalf("got soa minttl %d, want %d", soa.Minttl, recordTTL)
+	}
+
+	// Mutations advance the SOA serial.
+	before := soa.Serial
+	if err := p.EnsureTXTRecord(ctx, testZone, "value"); err != nil {
+		t.Fatalf("ensure txt: %v", err)
+	}
+	after := exchange(t, p, "tcp", dns.TypeSOA, testZone).Answer[0].(*dns.SOA).Serial
+	if after <= before {
+		t.Fatalf("soa serial did not advance: %d -> %d", before, after)
+	}
+}
+
+func TestQueryBoundaries(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	if err := p.EnsureAddressRecords(ctx, testZone, "203.0.113.10"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+
+	if resp := exchange(t, p, "tcp", dns.TypeA, "example.com."); resp.Rcode != dns.RcodeRefused {
+		t.Fatalf("outside-zone query rcode %s, want REFUSED", dns.RcodeToString[resp.Rcode])
+	}
+	if resp := exchange(t, p, "tcp", dns.TypeAAAA, testZone); resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
+		t.Fatalf("aaaa must be NODATA, got rcode %s with %d answers", dns.RcodeToString[resp.Rcode], len(resp.Answer))
+	}
+	if resp := exchange(t, p, "tcp", dns.TypeNS, "child."+testZone); resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
+		t.Fatalf("non-apex ns must be NODATA")
+	}
+
+	anyResp := new(dns.Msg)
+	anyResp.SetQuestion(dns.Fqdn(testZone), dns.TypeANY)
+	client := &dns.Client{Net: "tcp"}
+	resp, _, err := client.Exchange(anyResp, p.Addr())
+	if err != nil {
+		t.Fatalf("exchange ANY: %v", err)
+	}
+	if resp.Rcode != dns.RcodeNotImplemented {
+		t.Fatalf("ANY rcode %s, want NOTIMP", dns.RcodeToString[resp.Rcode])
+	}
+}
+
+func TestUnsupportedEDNSVersionContainsOnlyOPT(t *testing.T) {
+	p := newTestProvider(t, nil)
+	if err := p.EnsureAddressRecords(context.Background(), testZone, "203.0.113.10"); err != nil {
+		t.Fatal(err)
+	}
+	for _, network := range []string{"tcp", "udp"} {
+		for _, do := range []bool{false, true} {
+			query := new(dns.Msg)
+			query.SetQuestion(dns.Fqdn(testZone), dns.TypeNS)
+			query.SetEdns0(1232, do)
+			query.IsEdns0().SetVersion(1)
+			response, _, err := (&dns.Client{Net: network}).Exchange(query, p.Addr())
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireRcode(t, response, dns.RcodeBadVers)
+			if len(response.Answer) != 0 || len(response.Ns) != 0 || len(response.Extra) != 1 || response.Truncated {
+				t.Fatalf("%s DO=%t: BADVERS must contain only OPT: %v", network, do, response)
+			}
+			opt := response.IsEdns0()
+			if opt == nil || opt.Version() != 0 || opt.ExtendedRcode() != dns.RcodeBadVers || opt.Do() != do {
+				t.Fatalf("%s DO=%t: invalid BADVERS OPT: %v", network, do, opt)
+			}
+		}
+	}
+}
+
+func TestUDPExchangeWithEDNS(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	if err := p.EnsureAddressRecords(ctx, testZone, "203.0.113.10"); err != nil {
+		t.Fatalf("ensure a records: %v", err)
+	}
+	resp := exchange(t, p, "udp", dns.TypeA, "tunnel."+testZone)
+	requireRcode(t, resp, dns.RcodeSuccess)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("udp got %d answers, want 1", len(resp.Answer))
+	}
+	if resp.IsEdns0() == nil {
+		t.Fatalf("edns query did not get an edns response")
+	}
+}
+
+// The embedded server is authoritative for exactly one zone: record mutations
+// outside that zone must be rejected, never silently served.
+func TestMutationsOutsideZoneRejected(t *testing.T) {
+	p := newTestProvider(t, nil)
+	ctx := context.Background()
+	if err := p.EnsureTXTRecord(ctx, "other.example.com", "value"); err == nil {
+		t.Fatalf("outside-zone txt accepted")
+	}
+	if err := p.EnsureAddressRecords(ctx, "other.example.com", "203.0.113.10"); err == nil {
+		t.Fatalf("outside-zone base domain accepted")
+	}
+}

@@ -1,0 +1,206 @@
+---
+title: Getting Started
+description: Install Portal and expose your first local service to the internet.
+---
+
+# Getting Started
+
+This guide installs the `portal` CLI and exposes a local service through a
+public relay.
+
+## Prerequisites
+
+- macOS, Linux, or Windows
+- Internet connectivity
+- A local service to expose, such as a web app on port `3000`
+
+## Install The CLI
+
+### macOS / Linux
+
+```bash
+curl -fsSL https://github.com/gosuda/portal-tunnel/releases/latest/download/install.sh | bash
+```
+
+### Windows PowerShell
+
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+irm https://github.com/gosuda/portal-tunnel/releases/latest/download/install.ps1 | iex
+```
+
+The installer downloads the `portal` binary and adds it to your `PATH`. It does
+not create a config file. Portal works out of the box because relay discovery is
+enabled by default.
+
+## Run With Docker Compose
+
+The tunnel image supports `linux/amd64` and `linux/arm64`. Clone the repository
+and start the tunnel-specific Compose project:
+
+```bash
+git clone https://github.com/gosuda/portal-tunnel.git
+cd portal-tunnel/cmd/portal-tunnel
+mkdir -p identity
+# Linux only: Docker Desktop on macOS and Windows maps host ownership for you.
+if [ "$(uname)" = Linux ]; then sudo chown -R 65532:65532 identity; fi
+PORTAL_TUNNEL_TARGET=host.docker.internal:3000 \
+PORTAL_TUNNEL_NAME=my-app \
+docker compose up -d
+```
+
+`PORTAL_TUNNEL_TARGET` is the service address as seen from the tunnel
+container. The included Compose file maps `host.docker.internal` to the Docker
+host, so the example reaches port `3000` on the host. If the target is another
+container, attach it to the same Docker network and use its service name and
+port instead.
+
+The host `./identity` directory persists `/identity/identity.json`, preserving
+the public tunnel identity across container restarts and upgrades. The image
+runs as the distroless `nonroot` user (UID/GID `65532`), so on Linux the host
+directory must be writable by that user. Set
+`PORTAL_TUNNEL_IDENTITY_DIR` to use another host path. Follow or stop the tunnel
+with:
+
+```bash
+docker compose logs -f portal-tunnel
+docker compose down
+```
+
+Compose uses `ghcr.io/gosuda/portal-tunnel:latest` by default. Run `docker
+compose pull` to refresh it, set `PORTAL_TUNNEL_IMAGE` to pin a release tag, or
+use `docker compose up -d --build` to build the image from the current checkout.
+
+## Expose Your First App
+
+Start your local app, then run:
+
+```bash
+portal expose 3000 --name myapp
+```
+
+Portal accepts:
+
+| Input | Example | Meaning |
+|-------|---------|---------|
+| Bare port | `3000` | `127.0.0.1:3000` |
+| Host and port | `localhost:8080` | that exact local address |
+| URL host | `http://127.0.0.1:3000` | parsed as `127.0.0.1:3000` |
+
+When the name is available, Portal prints a short public HTTPS URL without an
+Ethereum address, labelled `short URL` in the readiness message:
+
+```text
+https://myapp.relay.example.com/
+```
+
+Open the URL in a browser. The relay routes the connection, but tenant TLS
+terminates in the tunnel process running on your machine.
+
+The same message also includes an identity-bound URL containing your Ethereum
+address. Use the short URL for sharing; use the identity-bound URL when you need
+an origin tied to your identity or opt-in relay caching. If the name is already
+taken, Portal provides only the identity-bound URL. An existing identity keeps
+its saved name; use a new `--identity-path` to choose a different name.
+
+## Share A Static Site
+
+No local web server is needed for a directory or HTML file:
+
+```bash
+portal expose --serve ./dist
+```
+
+See [static serving and optional relay caching](/cli-reference#serve-a-static-site)
+for SPA fallback, offline TTL, and the cache TLS trust boundary.
+
+## What Happened
+
+When you ran `portal expose`:
+
+1. Portal loaded or created a local identity at `identity.json`.
+2. Portal selected relay URLs from the public registry and discovery.
+3. The tunnel process registered a lease with one or more relays.
+4. The tunnel process opened reverse sessions to those relays.
+5. A public HTTPS hostname was assigned.
+6. Incoming connections were routed by the relay and handled by your tunnel
+   process.
+
+The relay provides routing and keyless certificate signing, but it does not
+receive tenant TLS session keys on the default stream path.
+
+## Choose The Right Mode
+
+Most web apps use the default stream mode:
+
+```bash
+portal expose 3000 --name myapp
+```
+
+Use routed HTTP mode when one public URL should mount multiple local HTTP
+services:
+
+```bash
+portal expose --name myapp \
+  --http-route /api=http://127.0.0.1:3001 \
+  --http-route /=http://127.0.0.1:5173
+```
+
+Use dedicated raw TCP mode for non-HTTP servers such as Minecraft:
+
+```bash
+portal expose localhost:25565 --name minecraft --tcp
+```
+
+Use UDP mode for datagram services:
+
+```bash
+portal expose localhost:8080 --udp --udp-addr localhost:19132 --name game
+```
+
+## Use A Specific Relay
+
+```bash
+portal expose 3000 --relays https://portal.example.com --discovery=false
+```
+
+`--discovery=false` limits the tunnel to the explicit relay URLs you supplied.
+
+## Keep A Stable Identity
+
+By default, Portal writes `identity.json` in the current working directory. Use a
+fixed path when you want stable identity across projects or restarts:
+
+```bash
+portal expose 3000 \
+  --name myapp \
+  --identity-path ~/.config/portal/myapp.identity.json
+```
+
+When `--name` is omitted, the service does not claim a friendly public name and
+publishes an address-only canonical hostname (`<address>.<relay-domain>`).
+When `--name` is provided and available, share the short URL
+`https://<name>.<relay-domain>/`. Portal also publishes the identity-bound
+canonical hostname (`<name>-<address>.<relay-domain>`). If the short name is
+unavailable, the tunnel continues with only its identity-bound URL.
+An existing identity file or `--identity-json` supplies the saved name as well
+as the key. `--name` applies only when creating a new identity; it does not
+rename an existing one. Use a separate `--identity-path` for a new identity.
+
+## Update The CLI
+
+```bash
+portal update
+portal version
+```
+
+`portal update` checks the latest GitHub release, downloads the matching asset,
+verifies its SHA256 checksum, and replaces the current executable.
+
+## Next Steps
+
+- [Concepts](/concepts): understand Portal's relay and transport model
+- [Portal Agent](/portal-agent): keep multiple tunnels running from config
+- [CLI Reference](/cli-reference): complete command and flag documentation
+- [TCP and UDP Tunneling](/tcp-udp-tunneling): raw TCP and UDP examples
+- [Deployment](/deployment): run your own public relay
