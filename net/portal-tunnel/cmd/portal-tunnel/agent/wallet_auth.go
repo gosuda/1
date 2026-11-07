@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/siweauth"
+	"github.com/gosuda/portal-tunnel/v2/internal/siweauth"
 	"github.com/gosuda/portal-tunnel/v2/types"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
@@ -68,7 +68,8 @@ func (a *walletAuthenticator) login(req types.WalletAuthLoginRequest, domain str
 	if a == nil {
 		return "", "", siweauth.ErrUnauthorized
 	}
-	address, err := a.siwe.Verify(req.ChallengeID, req.SIWEMessage, req.SIWESignature, domain, now)
+	// The control API is never served on an alias, so no hold dates its challenges.
+	address, err := a.siwe.Verify(req.ChallengeID, req.SIWEMessage, req.SIWESignature, domain, time.Time{}, now)
 	if err != nil {
 		return "", "", err
 	}

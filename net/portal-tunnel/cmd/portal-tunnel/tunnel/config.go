@@ -8,6 +8,7 @@ import (
 
 	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/gateway"
 	"github.com/gosuda/portal-tunnel/v2/portal/discovery"
+	"github.com/gosuda/portal-tunnel/v2/sdk/appauth"
 	"github.com/gosuda/portal-tunnel/v2/types"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
@@ -46,9 +47,14 @@ type Config struct {
 	BanMITM         *bool    `toml:"ban_mitm,omitempty"`
 
 	types.LeaseMetadata
-	gateway.ApplicationAuthConfig
+	AuthConfig
 	gateway.X402Config
 }
+
+// AuthConfig is the application auth component of a tunnel. It has a name of its
+// own because agent types embed both this component and Config, and two embedded
+// fields called Config would shadow each other without a word.
+type AuthConfig = appauth.Config
 
 // Normalize puts c in the form a config stores: values without surrounding
 // spaces, relay URLs in their canonical form, the methods of an HTTP route in
@@ -81,7 +87,7 @@ func (c *Config) Normalize() error {
 	c.Owner = strings.TrimSpace(c.Owner)
 	c.Thumbnail = strings.TrimSpace(c.Thumbnail)
 	c.Tags = utils.CompactStrings(c.Tags)
-	if c.ApplicationAuthConfig, err = c.ApplicationAuthConfig.Normalize(); err != nil {
+	if c.AuthConfig, err = c.AuthConfig.Normalize(); err != nil {
 		return err
 	}
 	c.X402Config = c.X402Config.Normalize()
@@ -123,7 +129,7 @@ func (c Config) Spec() (Spec, error) {
 	if c.UDPEnabled {
 		spec.Transport.UDP = &UDPConfig{Target: c.UDPAddr}
 	}
-	auth := c.ApplicationAuthConfig
+	auth := c.AuthConfig
 	if c.Serve != "" || len(c.HTTPRoutes) > 0 || !auth.IsZero() || c.Cache != nil || len(c.StripRequestHeaders) > 0 {
 		payment := gateway.X402Payment{X402Config: c.X402Config}
 		payment.FacilitatorToken = cmp.Or(payment.FacilitatorToken, strings.TrimSpace(os.Getenv("CSPR_CLOUD_API_KEY")))
