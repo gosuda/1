@@ -25,11 +25,15 @@ type identityState struct {
 // Limiter is safe for concurrent use. Every successful TryAcquire must be
 // paired with exactly one Release using the same identity.
 type Limiter struct {
-	mu         sync.Mutex
-	limits     Limits
-	active     int
+	mu sync.Mutex
+	// +checklocks:mu
+	limits Limits
+	// +checklocks:mu
+	active int
+	// +checklocks:mu
 	identities map[string]*identityState
-	rejected   uint64
+	// +checklocks:mu
+	rejected uint64
 }
 
 func New(limits Limits) *Limiter {

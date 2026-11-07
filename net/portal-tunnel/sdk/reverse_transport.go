@@ -23,7 +23,8 @@ import (
 type leaseReverseTransport struct {
 	listener *listener
 
-	mu  sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	mux *transport.ReverseMux
 }
 

@@ -283,8 +283,10 @@ type oidcAuthenticator struct {
 type providerCache[T any] struct {
 	flight singleflight.Group
 
-	mu        sync.Mutex
-	value     T
+	mu sync.Mutex
+	// +checklocks:mu
+	value T
+	// +checklocks:mu
 	fetchedAt time.Time
 }
 

@@ -20,17 +20,22 @@ var (
 // Manager owns both staging and published bytes. Registry operations only
 // mutate metadata; disk work never holds the registry's lock.
 type Manager struct {
-	mu         sync.Mutex
-	cfg        Config
-	dir        string
-	limits     types.StaticCacheLimits
-	leases     map[string]leaseState
-	entries    map[string]*cachedSite
-	retired    []*cachedSite
-	used       int64
-	snapshots  int
-	uploads    map[types.ServiceIdentityKey]struct{}
-	checks     chan struct{}
+	mu     sync.Mutex
+	cfg    Config
+	dir    string
+	limits types.StaticCacheLimits
+	// +checklocks:mu
+	leases map[string]leaseState
+	// +checklocks:mu
+	entries map[string]*cachedSite
+	// +checklocks:mu
+	retired   []*cachedSite
+	used      int64
+	snapshots int
+	// +checklocks:mu
+	uploads map[types.ServiceIdentityKey]struct{}
+	checks  chan struct{}
+	// +checklocks:mu
 	generation uint64
 }
 
@@ -91,6 +96,8 @@ func New(cfg Config, dir string) (*Manager, error) {
 
 // retireLocked removes routing immediately, while readers and failed disk
 // cleanup keep their bytes charged until the directory is actually removed.
+//
+// +checklocks:c.mu
 func (c *Manager) retireLocked(site *cachedSite) {
 	if site == nil || c.entries[site.host] != site {
 		return
@@ -245,6 +252,7 @@ func (c *Manager) Eligible(id string) bool {
 	return c.eligibleLocked(id)
 }
 
+// +checklocks:c.mu
 func (c *Manager) eligibleLocked(id string) bool {
 	lease, ok := c.leases[id]
 	return ok && time.Now().Before(lease.ExpiresAt)
@@ -365,6 +373,7 @@ func (c *Manager) Has(host string) bool {
 	return c.lookupLocked(host) != nil
 }
 
+// +checklocks:c.mu
 func (c *Manager) lookupLocked(host string) *cachedSite {
 	site := c.entries[host]
 	if site == nil || !time.Now().Before(site.expiresAt) {

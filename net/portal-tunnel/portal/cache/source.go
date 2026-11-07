@@ -36,11 +36,14 @@ type Source struct {
 	root, index string
 	ttl         time.Duration
 	mu          sync.Mutex
-	limits      map[*Syncer]types.StaticCacheLimits
-	snapshot    *sourceSnapshot
-	changed     chan struct{}
-	wake        chan struct{}
-	done        chan struct{}
+	// +checklocks:mu
+	limits map[*Syncer]types.StaticCacheLimits
+	// +checklocks:mu
+	snapshot *sourceSnapshot
+	// +checklocks:mu
+	changed chan struct{}
+	wake    chan struct{}
+	done    chan struct{}
 }
 
 type sourceSnapshot struct {

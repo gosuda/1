@@ -108,7 +108,8 @@ type relayStandIn struct {
 	url      string
 	bindings *BindingRegistry
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	serving relayCertificate
 	keys    map[string]crypto.Signer
 }

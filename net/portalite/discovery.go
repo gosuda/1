@@ -146,10 +146,13 @@ func verifyRelayDescriptor(descriptor relayDescriptor, now time.Time) error {
 
 // discoveryCandidates holds the verified relays learned from /discovery.
 type discoveryCandidates struct {
-	mu      sync.Mutex
-	relays  map[string]time.Time // relay URL -> descriptor expiry
-	udpOnly map[string]bool      // relay URL -> advertises a UDP backhaul
-	seen    map[string]struct{}  // relay URLs ever accepted, so a failure is not retried blindly
+	mu sync.Mutex
+	// +checklocks:mu
+	relays map[string]time.Time // relay URL -> descriptor expiry
+	// +checklocks:mu
+	udpOnly map[string]bool // relay URL -> advertises a UDP backhaul
+	// +checklocks:mu
+	seen map[string]struct{} // relay URLs ever accepted, so a failure is not retried blindly
 }
 
 func newDiscoveryCandidates() *discoveryCandidates {

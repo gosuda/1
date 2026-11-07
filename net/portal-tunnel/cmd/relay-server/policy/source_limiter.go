@@ -17,14 +17,19 @@ const (
 // SourceLimiter owns weighted source and global admission budgets. State is
 // bounded, expires on demand, and never becomes durable authorization policy.
 type SourceLimiter struct {
-	mu                      sync.Mutex
-	buckets                 map[netip.Addr]*sourceBucket
-	ratePerMinute, burst    float64
+	mu sync.Mutex
+	// +checklocks:mu
+	buckets map[netip.Addr]*sourceBucket
+	// +checklocks:mu
+	ratePerMinute, burst float64
+	// +checklocks:mu
 	globalRate, globalBurst float64
-	global                  sourceBucket
-	lastPrune               time.Time
-	clock                   func() time.Time
-	maxBucketCount          int
+	// +checklocks:mu
+	global sourceBucket
+	// +checklocks:mu
+	lastPrune      time.Time
+	clock          func() time.Time
+	maxBucketCount int
 }
 
 type sourceBucket struct {

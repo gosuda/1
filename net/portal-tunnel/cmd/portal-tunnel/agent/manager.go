@@ -24,9 +24,13 @@ var (
 	errTunnelUpdateRequiresLeastOneField  = errors.New("tunnel update requires at least one field")
 	errMaxActiveRelaysMustPositiveInteger = errors.New("max_active_relays must be a positive integer")
 	errAuthEmptyWhichTurnsSignOff         = errors.New("auth is empty, which turns sign-in off: leave out the other auth fields")
+	// +checklocksignore
 	errTunnelNameIsRequired               = errors.New("tunnel name is required")
+	// +checklocksignore
 	errTargetCannotCombinedHTTPRoutes     = errors.New("target cannot be combined with http_routes")
+	// +checklocksignore
 	errMaxActiveRelaysCannotNegative      = errors.New("max_active_relays cannot be negative")
+	// +checklocksignore
 	errTunnelIDIsRequired                 = errors.New("tunnel id is required")
 )
 
@@ -37,11 +41,14 @@ type manager struct {
 
 	configMu sync.Mutex
 
-	mu      sync.RWMutex
-	cfg     Config
+	mu sync.RWMutex
+	// +checklocks:mu
+	cfg Config
+	// +checklocks:mu
 	tunnels map[string]*managedTunnel
 	// rootCtx is the context tunnels run under; Start replaces it with the
 	// agent's context.
+	// +checklocks:mu
 	rootCtx context.Context
 }
 
@@ -428,15 +435,22 @@ func (m *manager) Snapshot() AgentStatusResponse {
 }
 
 type managedTunnel struct {
-	mu  sync.RWMutex
+	mu sync.RWMutex
+	// +checklocks:mu
 	cfg TunnelConfig
 
-	cancel    context.CancelFunc
-	done      chan struct{}
-	runtime   *tunnel.Runtime
+	// +checklocks:mu
+	cancel context.CancelFunc
+	// +checklocks:mu
+	done chan struct{}
+	// +checklocks:mu
+	runtime *tunnel.Runtime
+	// +checklocks:mu
 	lastError string
-	address   string
-	relays    []AgentRelayStatus
+	// +checklocks:mu
+	address string
+	// +checklocks:mu
+	relays []AgentRelayStatus
 }
 
 func (t *managedTunnel) Start(parent context.Context) {

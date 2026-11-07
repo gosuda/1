@@ -77,11 +77,15 @@ func (l Limits) withDefaults() (Limits, error) {
 
 type connectionLimitListener struct {
 	net.Listener
-	mu          sync.Mutex
-	active      int
+	mu sync.Mutex
+	// +checklocks:mu
+	active int
+	// +checklocks:mu
 	connections map[netip.Addr]int
-	maxTotal    int
-	maxPerIP    int
+	// +checklocks:mu
+	maxTotal int
+	// +checklocks:mu
+	maxPerIP int
 }
 
 func newConnectionLimitListener(listener net.Listener, limits Limits) *connectionLimitListener {

@@ -49,17 +49,21 @@ type oidcTestIdP struct {
 	discoveryEntered chan struct{}
 	discoveryRelease chan struct{}
 
-	mu            sync.Mutex
-	jwk           jose.JSONWebKey
-	extraJWKs     []jose.JSONWebKey
-	challenge     string
-	nonce         string
-	mutate        func(*oidcIDTokenClaims)
-	signWith      jose.Signer
+	mu        sync.Mutex
+	jwk       jose.JSONWebKey
+	extraJWKs []jose.JSONWebKey
+	// +checklocks:mu
+	challenge string
+	// +checklocks:mu
+	nonce    string
+	mutate   func(*oidcIDTokenClaims)
+	signWith jose.Signer
+	// +checklocks:mu
 	rawToken      func(valid string) string
 	emailVerified json.RawMessage // sent verbatim as the email_verified claim when non-nil
 	omitToken     bool
 	tokenStatus   int
+	// +checklocks:mu
 	tokenRequests []oidcTokenCredentials
 }
 
@@ -303,7 +307,11 @@ func TestApplicationAuthOIDCCallbackRefusals(t *testing.T) {
 		{name: "id token uses a symmetric algorithm", configure: func(p *oidcTestIdP) {
 			p.signWith = newOIDCTestSigner(t, jose.HS256, []byte("shared-secret-of-sufficient-length"), "k1")
 		}, want: http.StatusUnauthorized},
-		{name: "id token is unsigned", configure: func(p *oidcTestIdP) { p.rawToken = unsigned }, want: http.StatusUnauthorized},
+		{name: "id token is unsigned", configure: func(p *oidcTestIdP) {
+			p.mu.Lock()
+			p.rawToken = unsigned
+			p.mu.Unlock()
+		}, want: http.StatusUnauthorized},
 		{name: "id token has no subject", configure: func(p *oidcTestIdP) {
 			p.mutate = func(c *oidcIDTokenClaims) { c.Subject = "" }
 		}, want: http.StatusUnauthorized},

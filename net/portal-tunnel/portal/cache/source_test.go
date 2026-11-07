@@ -33,9 +33,10 @@ func TestSubscriptionLimitsSurviveReplacedListenerClose(t *testing.T) {
 	// The late Close of the replaced generation must leave exactly the live
 	// replacement registered, keyed by its own subscription instance.
 	source.mu.Lock()
-	owned := len(source.limits) == 1 && source.limits[replacement] == replacement.limits
+	remaining := len(source.limits)
+	owned := remaining == 1 && source.limits[replacement] == replacement.limits
 	source.mu.Unlock()
 	if !owned {
-		t.Fatalf("replaced listener's Close disturbed the live registration: %d entries remain", len(source.limits))
+		t.Fatalf("replaced listener's Close disturbed the live registration: %d entries remain", remaining)
 	}
 }

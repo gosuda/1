@@ -150,7 +150,8 @@ type listener struct {
 	doneCh    <-chan struct{}
 	closeOnce sync.Once
 
-	metadataMu        sync.RWMutex
+	metadataMu sync.RWMutex
+	// +checklocks:metadataMu
 	metadata          types.LeaseMetadata
 	identity          types.Identity
 	overlay           bool
@@ -167,11 +168,13 @@ type listener struct {
 	statusUpdates chan listenerStatus
 	readySessions atomic.Int32
 
-	api           *apiClient
-	reverseTLSMu  sync.Mutex
+	api          *apiClient
+	reverseTLSMu sync.Mutex
+	// +checklocks:reverseTLSMu
 	reverseTLSURL string
-	reverseTLS    *tls.Config
-	reverseMu     sync.Mutex
+	// +checklocks:reverseTLSMu
+	reverseTLS *tls.Config
+	reverseMu  sync.Mutex
 
 	lease *utils.Snapshot[listenerSnapshot]
 }

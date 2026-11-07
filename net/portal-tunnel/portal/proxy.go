@@ -17,10 +17,12 @@ import (
 )
 
 type proxy struct {
-	activeConns  atomic.Int64
-	tcpBytes     atomic.Int64
-	tcpLoadMu    sync.Mutex
-	tcpLoadAt    time.Time
+	activeConns atomic.Int64
+	tcpBytes    atomic.Int64
+	tcpLoadMu   sync.Mutex
+	// +checklocks:tcpLoadMu
+	tcpLoadAt time.Time
+	// +checklocks:tcpLoadMu
 	tcpLoadBytes int64
 }
 
@@ -141,7 +143,8 @@ func closeWrite(conn net.Conn) {
 }
 
 type BPSManager struct {
-	identityBPS      *utils.Snapshot[map[types.ServiceIdentityKey]int64]
+	identityBPS *utils.Snapshot[map[types.ServiceIdentityKey]int64]
+	// +checklocks:mu
 	identityLimiters map[types.ServiceIdentityKey]*bpsLimiter
 	mu               sync.RWMutex
 }
@@ -335,8 +338,10 @@ func bpsChunkSize(length int, bps int64) int {
 }
 
 type bpsLimiter struct {
-	mu        sync.Mutex
-	tokens    float64
+	mu sync.Mutex
+	// +checklocks:mu
+	tokens float64
+	// +checklocks:mu
 	updatedAt time.Time
 }
 

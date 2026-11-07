@@ -15,7 +15,8 @@ import (
 )
 
 var (
-	errHostnameIsRequired   = errors.New("hostname is required")
+	errHostnameIsRequired = errors.New("hostname is required")
+	// +checklocksignore
 	errACMEManagerIsStopped = errors.New("acme manager is stopped")
 )
 

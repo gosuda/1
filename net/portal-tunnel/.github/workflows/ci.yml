@@ -43,6 +43,9 @@ jobs:
       - name: Install CI tools
         run: make install
 
+      - name: Install checklocks
+        run: go install gvisor.dev/gvisor/tools/checklocks/cmd/checklocks@v0.0.0-20261024223036-c3e0783a533c
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci

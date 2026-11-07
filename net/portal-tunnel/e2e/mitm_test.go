@@ -33,7 +33,8 @@ func captureSDKLogs(t *testing.T) *logCapture {
 }
 
 type logCapture struct {
-	mu  sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	buf *bytes.Buffer
 }
 

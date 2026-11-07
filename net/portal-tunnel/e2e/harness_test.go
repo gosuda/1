@@ -234,7 +234,8 @@ func (h *harness) tryGet(publicURL string) (string, bool) {
 
 var (
 	harnessPortsMu sync.Mutex
-	harnessPorts   = map[int]struct{}{}
+	// +checklocks:harnessPortsMu
+	harnessPorts = map[int]struct{}{}
 )
 
 // harnessPort allocates an explicit listener port outside the kernel's

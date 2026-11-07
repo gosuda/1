@@ -70,7 +70,8 @@ type ReverseMux struct {
 // interrupts readers; a later deadline reset cannot reopen a revoked stream.
 type reverseMuxConn struct {
 	*yamux.Stream
-	mu     sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	closed bool
 }
 

@@ -93,7 +93,9 @@ func TestRelayDatagramFlowIDWrapPreservesLiveMappings(t *testing.T) {
 	now := time.Now()
 	firstAddr := netip.MustParseAddrPort("127.0.0.1:1")
 	first, _, _ := d.touchFlow(firstAddr, now)
+	d.mu.Lock()
 	d.nextFlow = math.MaxUint32
+	d.mu.Unlock()
 	for port := uint16(2); port <= 4; port++ {
 		addr := netip.AddrPortFrom(firstAddr.Addr(), port)
 		id, _, ok := d.touchFlow(addr, now)

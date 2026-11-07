@@ -23,9 +23,12 @@ var localToRelayBuffers = sync.Pool{New: func() any {
 }}
 
 type proxyPair struct {
-	mu     sync.Mutex
-	relay  net.Conn
-	local  net.Conn
+	mu sync.Mutex
+	// +checklocks:mu
+	relay net.Conn
+	// +checklocks:mu
+	local net.Conn
+	// +checklocks:mu
 	closed bool
 }
 
@@ -68,7 +71,8 @@ func (p *proxyPair) close() {
 }
 
 type activeProxyPairs struct {
-	mu    sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	pairs map[*proxyPair]struct{}
 }
 

@@ -37,6 +37,7 @@ var (
 	ErrInvalidRequest    = errors.New("invalid request")
 	ErrInvalidLeaseID    = errors.New("invalid lease id")
 	ErrLeaseNotFound     = errors.New("lease identity not found")
+	// +checklocksignore
 	ErrIdentityExists    = errors.New("lease identity already exists")
 	ErrCorruptStore      = errors.New("identity store is corrupted")
 	ErrChallengeRequired = errors.New("challenge proof is required")
@@ -76,7 +77,8 @@ type Manager struct {
 	issuerKey   crypto.Signer
 	issuerChain []byte
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	reissuedAt map[string]time.Time
 }
 

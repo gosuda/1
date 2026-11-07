@@ -236,7 +236,9 @@ func TestLeaseEventsBoundOfflineLifetime(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
+	c.mu.Lock()
 	site := c.entries[l.Hostname]
+	c.mu.Unlock()
 	if site.expiresAt != l.LastSeenAt.Add(observationWindow+c.cfg.MaxTTL) {
 		t.Fatal("long lease bypassed offline ceiling")
 	}
@@ -267,7 +269,9 @@ func TestFallbackReleasesSnapshotAndDiskFailureRequestsReupload(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatal(w.Body.String())
 			}
+			c.mu.Lock()
 			site := c.entries[l.Hostname]
+			c.mu.Unlock()
 			for _, name := range []string{"second", "third", "fourth"} {
 				other := testLease(c, name)
 				fill := httptest.NewRecorder()
@@ -406,7 +410,9 @@ func TestReadFailureAfterHeadersInvalidatesSnapshot(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
+	c.mu.Lock()
 	site := c.entries[l.Hostname]
+	c.mu.Unlock()
 	path := filepath.Join(site.dir, site.files[site.index].SHA256)
 	response := &failingDiskResponse{ResponseRecorder: httptest.NewRecorder(), truncate: func() {
 		if err := os.Truncate(path, 0); err != nil {

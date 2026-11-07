@@ -16,8 +16,10 @@ import (
 
 // Client owns Sui endpoint failover, gRPC transport calls, and response conversion.
 type Client struct {
-	mu        sync.RWMutex
-	url       string
+	mu sync.RWMutex
+	// +checklocks:mu
+	url string
+	// +checklocks:mu
 	endpoints []string
 	grpc      *suigrpc.GRPCClient
 }

@@ -25,8 +25,10 @@ type Conn struct {
 	server           *Server
 	handshakeTimeout time.Duration
 
-	deadlineMu    sync.Mutex
-	readDeadline  time.Time
+	deadlineMu sync.Mutex
+	// +checklocks:deadlineMu
+	readDeadline time.Time
+	// +checklocks:deadlineMu
 	writeDeadline time.Time
 
 	// sess is the single published handshake result. The handshake builds it
@@ -41,9 +43,11 @@ type Conn struct {
 	// in is the only reader of raw: the handshake reads through it first,
 	// and Read only after ensureHandshake, under readMu. readErr is the first
 	// Read failure other than a timeout; every later Read returns it.
-	readMu  sync.Mutex
-	in      recordReader
+	readMu sync.Mutex
+	in     recordReader
+	// +checklocks:readMu
 	readErr error
+	// +checklocks:readMu
 	readBuf []byte
 
 	writeMu sync.Mutex
@@ -343,16 +347,21 @@ func (c *Conn) Close() error {
 	c.stateMu.Unlock()
 
 	if sess != nil && sess.outCipher != nil {
-		if c.writeMu.TryLock() {
-			closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
-			if rec, err := sess.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
-				_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				_, _ = c.raw.Write(rec)
-			}
-			c.writeMu.Unlock()
-		}
+		c.sendCloseNotifyBestEffort(sess)
 	}
 	return c.raw.Close()
+}
+
+// +checklocksignore
+func (c *Conn) sendCloseNotifyBestEffort(sess *session) {
+	if c.writeMu.TryLock() {
+		closeNotifyAlert := []byte{0x01, 0x00} // warning, close_notify
+		if rec, err := sess.outCipher.encryptRecord(recordTypeAlert, closeNotifyAlert); err == nil {
+			_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			_, _ = c.raw.Write(rec)
+		}
+		c.writeMu.Unlock()
+	}
 }
 
 func (c *Conn) LocalAddr() net.Addr  { return c.raw.LocalAddr() }

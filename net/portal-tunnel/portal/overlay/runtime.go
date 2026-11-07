@@ -151,13 +151,17 @@ type Runtime struct {
 	inbound       chan struct{}
 	offers        chan ReverseOffer
 	sourceLimiter *sourceLimiter
-	admissionMu   sync.Mutex
-	outbound      int
+	admissionMu sync.Mutex
+	// +checklocks:admissionMu
+	outbound int
+	// +checklocks:admissionMu
 	activeSources map[netip.Addr]int
 
 	assignmentMu sync.Mutex
-	assignments  map[string]string
-	failures     map[string]map[string]time.Time
+	// +checklocks:assignmentMu
+	assignments map[string]string
+	// +checklocks:assignmentMu
+	failures map[string]map[string]time.Time
 }
 
 func New(config Config) (*Runtime, error) {

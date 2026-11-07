@@ -230,7 +230,8 @@ func bytesRepeat(v byte, n int) []byte {
 }
 
 type testClock struct {
-	mu  sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	now time.Time
 }
 

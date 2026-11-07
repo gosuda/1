@@ -802,17 +802,26 @@ type cliTestRelay struct {
 	descriptors   []map[string]any
 	certPEM       []byte
 
-	mu              sync.Mutex
-	identityName    string
+	mu sync.Mutex
+	// +checklocks:mu
+	identityName string
+	// +checklocks:mu
 	identityAddress string
-	registrations   int
-	discoveries     int
-	unregisters     int
-	failure         error
-	failConnect     bool
-	connections     map[net.Conn]struct{}
-	bindings        map[string]struct{}
-	connectReady    chan net.Conn
+	// +checklocks:mu
+	registrations int
+	// +checklocks:mu
+	discoveries int
+	// +checklocks:mu
+	unregisters int
+	// +checklocks:mu
+	failure error
+	// +checklocks:mu
+	failConnect bool
+	// +checklocks:mu
+	connections map[net.Conn]struct{}
+	// +checklocks:mu
+	bindings     map[string]struct{}
+	connectReady chan net.Conn
 }
 
 func newCLITestRelay(t *testing.T) *cliTestRelay {

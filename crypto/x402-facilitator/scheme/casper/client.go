@@ -31,8 +31,10 @@ const (
 // deliberately depends only on the standard library so that deployments do
 // not have to pull in a Casper SDK to settle payments.
 type Client struct {
-	mu         sync.RWMutex
-	url        string
+	mu sync.RWMutex
+	// +checklocks:mu
+	url string
+	// +checklocks:mu
 	endpoints  []string
 	httpClient *http.Client
 }

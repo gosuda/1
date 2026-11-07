@@ -37,12 +37,17 @@ var errRelayIncompatible = errors.New("relay is incompatible")
 type apiClient struct {
 	relayURL *url.URL
 
-	mu             sync.RWMutex
-	http           *http.Client
-	transport      *http.Transport
-	tls            *tls.Config
+	mu sync.RWMutex
+	// +checklocks:mu
+	http *http.Client
+	// +checklocks:mu
+	transport *http.Transport
+	// +checklocks:mu
+	tls *tls.Config
+	// +checklocks:mu
 	releaseVersion string
-	cache          *types.StaticCacheLimits
+	// +checklocks:mu
+	cache *types.StaticCacheLimits
 }
 
 // resetTransport tears down the cached HTTP client and TLS config so the next

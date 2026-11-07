@@ -95,40 +95,53 @@ type fakeRelay struct {
 
 	options fakeRelayOptions
 
-	mu                       sync.Mutex
-	changed                  chan struct{}
-	errors                   chan error
-	tlsHandshakes            int
-	domainCount              int
-	discoveryCount           int
-	challengeCount           int
-	registerCount            int
-	renewCount               int
-	challengeID              string
-	challengeMessage         string
-	challengeIdentity        identityRef
-	currentToken             string
-	currentCapability        string
-	capabilities             map[string]string
+	mu               sync.Mutex
+	changed          chan struct{}
+	errors           chan error
+	tlsHandshakes    int
+	domainCount      int
+	discoveryCount   int
+	challengeCount   int
+	registerCount    int
+	renewCount       int
+	// +checklocks:mu
+	challengeID string
+	// +checklocks:mu
+	challengeMessage string
+	// +checklocks:mu
+	challengeIdentity identityRef
+	currentToken      string
+	// +checklocks:mu
+	currentCapability string
+	// +checklocks:mu
+	capabilities map[string]string
+	// +checklocks:mu
 	challengeUDPEnabled      bool
 	rateLimitedRegistersSent int
 	leaseNotFoundSent        bool
 	transientRenewSent       bool
-	connectLeaseLost         bool
-	connectLeaseLossCount    int
-	terminalConnect          bool
-	signRequestHeld          bool
-	nextSessionID            int
-	sessions                 map[int]*fakeRelaySession
-	bindings                 map[string]struct{}
-	connectTokens            []string
-	signTokens               []string
-	quicListener             *quic.Listener
-	quicDone                 chan error
-	quicConn                 *quic.Conn
-	quicTokens               []string
-	unregisterTokens         []string
-	closed                   bool
+	// +checklocks:mu
+	connectLeaseLost      bool
+	connectLeaseLossCount int
+	// +checklocks:mu
+	terminalConnect bool
+	// +checklocks:mu
+	signRequestHeld bool
+	// +checklocks:mu
+	nextSessionID int
+	// +checklocks:mu
+	sessions map[int]*fakeRelaySession
+	// +checklocks:mu
+	bindings         map[string]struct{}
+	connectTokens    []string
+	signTokens       []string
+	quicListener     *quic.Listener
+	quicDone         chan error
+	quicConn         *quic.Conn
+	quicTokens       []string
+	unregisterTokens []string
+	// +checklocks:mu
+	closed bool
 }
 
 // fakeSignRequest mirrors the protocol-10 transcript-bound /v1/sign contract.
@@ -919,6 +932,7 @@ func (r *fakeRelay) waitFor(t *testing.T, description string, condition func() b
 	}
 }
 
+// +checklocksignore
 func (r *fakeRelay) waitForIdleToken(t *testing.T, token string, count int) {
 	t.Helper()
 	r.waitFor(t, fmt.Sprintf("%d idle sessions using %s", count, token), func() bool {
@@ -1168,6 +1182,7 @@ func (r *fakeRelay) observeRemoteSessionClosures() {
 	}
 }
 
+// +checklocksignore
 func (r *fakeRelay) waitForNoSessions(t *testing.T) {
 	t.Helper()
 	r.waitFor(t, "all hijacked sessions to close", func() bool { return len(r.sessions) == 0 })

@@ -108,7 +108,8 @@ type samlStateClaims struct {
 // state it answered expires; after that, the state check alone refuses it. A
 // full set refuses new logins instead of forgetting an assertion early.
 type samlReplaySet struct {
-	mu   sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	seen map[string]time.Time
 }
 

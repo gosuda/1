@@ -29,8 +29,9 @@ type Refresher struct {
 	httpClient             *http.Client
 	publicHTTPClient       *http.Client
 	directRecoveryFailures int
-	lastAnnounceSuccess    map[string]bool
-	lastAnnounceMu         sync.Mutex
+	// +checklocks:lastAnnounceMu
+	lastAnnounceSuccess map[string]bool
+	lastAnnounceMu      sync.Mutex
 }
 
 func NewRefresher(relaySet *RelaySet) *Refresher {

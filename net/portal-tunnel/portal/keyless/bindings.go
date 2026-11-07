@@ -11,15 +11,22 @@ import (
 )
 
 var (
-	errClientHelloSpanIsRequired            = errors.New("client hello span is required")
-	errBindingIsUnknown                     = errors.New("binding is unknown")
-	errBindingIsExpired                     = errors.New("binding is expired")
-	errBindingHelloIsAlreadyFixed           = errors.New("binding hello is already fixed")
-	errBindingMustBe16Bytes                 = errors.New("binding must be 16 bytes")
-	errClientHelloTranscriptIsRequired      = errors.New("client hello transcript is required")
-	errBindingIsUnknownOrExpired            = errors.New("binding is unknown or expired")
-	errBindingDoesNotBelongSigningLease     = errors.New("binding does not belong to the signing lease")
-	errBindingHelloWasNeverFixed            = errors.New("binding hello was never fixed")
+	errClientHelloSpanIsRequired = errors.New("client hello span is required")
+	// +checklocksignore
+	errBindingIsUnknown = errors.New("binding is unknown")
+	// +checklocksignore
+	errBindingIsExpired = errors.New("binding is expired")
+	// +checklocksignore
+	errBindingHelloIsAlreadyFixed      = errors.New("binding hello is already fixed")
+	errBindingMustBe16Bytes            = errors.New("binding must be 16 bytes")
+	errClientHelloTranscriptIsRequired = errors.New("client hello transcript is required")
+	// +checklocksignore
+	errBindingIsUnknownOrExpired = errors.New("binding is unknown or expired")
+	// +checklocksignore
+	errBindingDoesNotBelongSigningLease = errors.New("binding does not belong to the signing lease")
+	// +checklocksignore
+	errBindingHelloWasNeverFixed = errors.New("binding hello was never fixed")
+	// +checklocksignore
 	errClientHelloDoesNotMatchRouted        = errors.New("client hello does not match the routed connection")
 	errClientHelloContainsNonHandshakeTLS   = errors.New("client hello contains a non-handshake TLS record")
 	errClientHelloTLSRecordHasInvalid       = errors.New("client hello TLS record has invalid length")
@@ -30,9 +37,11 @@ var (
 
 // BindingRegistry owns Portal's connection-binding policy for keyless transcript signing.
 type BindingRegistry struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	entries map[[16]byte]*bindingEntry
-	ttl     time.Duration
+	// +checklocks:mu
+	ttl time.Duration
 }
 
 type bindingEntry struct {
@@ -203,12 +212,17 @@ func (b *BindingRegistry) FixHelloOnWrite(conn net.Conn, binding [16]byte) net.C
 }
 
 type helloFixingConn struct {
+	// +checklocks:mu
 	net.Conn
-	mu       sync.Mutex
-	capture  clientHelloAccumulator
-	fixed    bool
+	mu sync.Mutex
+	// +checklocks:mu
+	capture clientHelloAccumulator
+	// +checklocks:mu
+	fixed bool
+	// +checklocks:mu
 	bindings *BindingRegistry
-	binding  [16]byte
+	// +checklocks:mu
+	binding [16]byte
 }
 
 func (c *helloFixingConn) Write(p []byte) (int, error) {

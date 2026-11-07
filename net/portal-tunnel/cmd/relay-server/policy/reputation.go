@@ -61,6 +61,7 @@ type ReputationSummary struct {
 }
 
 var (
+	// +checklocksignore
 	ErrReputationUnknownHostname = errors.New("hostname is not in the public directory")
 	ErrReputationCapacity        = errors.New("reputation capacity exhausted")
 )

@@ -66,7 +66,8 @@ const (
 // quicBackhaulPendingLimit slots. Entries exist only while a connection
 // holds a pending-auth slot, so the map is bounded by the global limit.
 type backhaulPendingSources struct {
-	mu     sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	counts map[netip.Prefix]int
 }
 
@@ -269,13 +270,17 @@ type Server struct {
 	group        *errgroup.Group
 	shutdownOnce sync.Once
 
-	ingressCtx        context.Context
-	ingressMu         sync.Mutex
-	ingressClosed     bool
-	ingressConns      map[net.Conn]struct{}
+	ingressCtx context.Context
+	ingressMu  sync.Mutex
+	// +checklocks:ingressMu
+	ingressClosed bool
+	// +checklocks:ingressMu
+	ingressConns map[net.Conn]struct{}
+	// +checklocks:ingressMu
 	ingressInspecting int
-	ingressTenants    int
-	ingressWorkers    sync.WaitGroup
+	// +checklocks:ingressMu
+	ingressTenants int
+	ingressWorkers sync.WaitGroup
 
 	cfg         *utils.Snapshot[ServerConfig]
 	identity    identity.RelayIdentity

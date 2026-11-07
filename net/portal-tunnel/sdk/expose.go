@@ -104,18 +104,23 @@ type Exposure struct {
 
 	identity types.Identity
 	options  options
+	// +checklocks:reconcileMu
 	metadata types.LeaseMetadata
 	cache    *cache.Source
 
 	accepted  chan net.Conn
 	datagrams chan types.DatagramFrame
 
-	mu             sync.RWMutex
-	reconcileMu    sync.Mutex
-	relayURLs      []string
+	mu          sync.RWMutex
+	reconcileMu sync.Mutex
+	// +checklocks:mu
+	relayURLs []string
+	// +checklocks:mu
 	relayListeners map[string]*listener
-	blockedRelays  map[string]error
-	statuses       map[string]RelayStatus
+	// +checklocks:mu
+	blockedRelays map[string]error
+	// +checklocks:mu
+	statuses     map[string]RelayStatus
 	stateChanged   chan struct{}
 	updates        chan RelayStatus
 	updatesMu      sync.Mutex

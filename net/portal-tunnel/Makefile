@@ -1,4 +1,4 @@
-.PHONY: help install fmt vet lint lint-auto test tidy all run build build-frontend build-docs build-tunnel build-server build-server-bin clean check-env-example env-reference
+.PHONY: help install fmt vet checklocks lint lint-auto test tidy all run build build-frontend build-docs build-tunnel build-server build-server-bin clean check-env-example env-reference
 
 .DEFAULT_GOAL := help
 
@@ -8,6 +8,8 @@ GO_TOOLCHAIN_VERSION := $(shell awk '/^go / { print "go" $$2; exit }' go.mod)
 GOIMPORTS_VERSION := v0.52.0
 GOLANGCI_LINT_VERSION := v2.15.0
 GOJGP_VERSION := v1.3.0
+CHECKLOCKS_PKG := gvisor.dev/gvisor/tools/checklocks/cmd/checklocks
+CHECKLOCKS_VERSION := v0.0.0-20261024223036-c3e0783a533c
 GOIMPORTS_LOCAL := github.com/gosuda/portal-tunnel/v2
 
 export GOTOOLCHAIN := $(GO_TOOLCHAIN_VERSION)
@@ -15,6 +17,8 @@ export GOTOOLCHAIN := $(GO_TOOLCHAIN_VERSION)
 help:
 	@echo "Available targets:"
 	@echo "  make install           - Install Go developer tools used by this repo"
+	@echo "  make vet               - Run go vet and checklocks"
+	@echo "  make checklocks        - Run checklocks static lock analysis"
 	@echo "  make lint              - Run golangci-lint and gojgp"
 	@echo "  make fmt               - Apply gofmt/goimports"
 	@echo "  make lint-auto         - Run autofix lint/format pipeline"
@@ -33,13 +37,18 @@ install:
 	go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	go install github.com/gosuda/JustGoodPractices/cmd/gojgp@$(GOJGP_VERSION)
+	go install $(CHECKLOCKS_PKG)@$(CHECKLOCKS_VERSION)
 
 fmt:
 	gofmt -w .
 	goimports -local $(GOIMPORTS_LOCAL) -w .
 
+checklocks:
+	go vet -vettool="$(shell go env GOPATH)/bin/checklocks" $(GO_PACKAGES)
+
 vet:
 	go vet $(GO_PACKAGES)
+	go vet -vettool="$(shell go env GOPATH)/bin/checklocks" $(GO_PACKAGES)
 
 lint:
 	golangci-lint run $(GO_PACKAGES)

@@ -50,14 +50,21 @@ type Controller struct {
 	published bool
 	refreshAt time.Time
 
-	mu              sync.Mutex
-	explicitRelays  []string
-	activeRelays    []string
+	mu sync.Mutex
+	// +checklocks:mu
+	explicitRelays []string
+	// +checklocks:mu
+	activeRelays []string
+	// +checklocks:mu
 	maxActiveRelays int
-	requireUDP      bool
-	requireTCP      bool
-	localAddress    string
-	selectionKey    []byte
+	// +checklocks:mu
+	requireUDP bool
+	// +checklocks:mu
+	requireTCP bool
+	// +checklocks:mu
+	localAddress string
+	// +checklocks:mu
+	selectionKey []byte
 }
 
 // NewController creates a discovery controller from bootstrap relay URLs.

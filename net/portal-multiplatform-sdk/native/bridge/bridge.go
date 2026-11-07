@@ -119,10 +119,12 @@ type tunnel struct {
 
 var (
 	tunnelsMu sync.Mutex
-	tunnels   = map[string]*tunnel{}
+	// +checklocks:tunnelsMu
+	tunnels = map[string]*tunnel{}
 
 	callbackMu sync.RWMutex
-	callback   C.PortalEventCallback
+	// +checklocks:callbackMu
+	callback C.PortalEventCallback
 )
 
 func emitEvent(tunnelID, eventType string, payload any) {

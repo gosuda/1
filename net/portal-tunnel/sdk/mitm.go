@@ -115,11 +115,13 @@ type mitmManager struct {
 	// responderCapable reports whether terminated tenant connections can
 	// export keying material. Only then can the listener answer initiator
 	// probes; the manager stays dormant otherwise.
+	// +checklocks:mu
 	responderCapable bool
 	listener         *listener
 	ban              bool
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	pending map[mitmProbeNonce]*mitmProbePending
 }
 

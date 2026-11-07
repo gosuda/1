@@ -15,10 +15,15 @@ import (
 )
 
 var (
-	errTargetRelayDescriptorMissingRelays                 = errors.New("target relay descriptor missing from relays")
-	errTargetRelayDescriptorConflictsRetainedSigned       = errors.New("target relay descriptor conflicts with retained signed contents at the same issued_at")
-	errRelayBannedFromPool                                = errors.New("relay banned from pool")
-	errAnnouncedDescriptorRejectedRollbackOrTakeover      = errors.New("announced descriptor rejected by rollback or takeover guard")
+	// +checklocksignore
+	errTargetRelayDescriptorMissingRelays = errors.New("target relay descriptor missing from relays")
+	// +checklocksignore
+	errTargetRelayDescriptorConflictsRetainedSigned = errors.New("target relay descriptor conflicts with retained signed contents at the same issued_at")
+	// +checklocksignore
+	errRelayBannedFromPool = errors.New("relay banned from pool")
+	// +checklocksignore
+	errAnnouncedDescriptorRejectedRollbackOrTakeover = errors.New("announced descriptor rejected by rollback or takeover guard")
+	// +checklocksignore
 	errAnnouncedDescriptorConflictsRetainedSignedContents = errors.New("announced descriptor conflicts with retained signed contents at the same issued_at")
 	errRelayDescriptorMissingIssuedAt                     = errors.New("relay descriptor missing issued_at")
 	errRelayDescriptorAlreadyExpired                      = errors.New("relay descriptor already expired")
@@ -56,8 +61,9 @@ var (
 // (notably from ApplyRelayDiscoveryResponse, which holds the write lock for
 // the entire batch).
 type RelaySet struct {
-	mu              sync.RWMutex
-	relays          map[string]RelayState
+	mu     sync.RWMutex
+	relays map[string]RelayState
+	// +checklocks:mu
 	keyIndex        map[string]keyIndexEntry
 	incompatible    map[string]types.IncompatibleRelayEntry
 	releaseVersions map[string]relayReleaseObservation
@@ -157,6 +163,7 @@ func (s *RelaySet) refreshCandidates(now time.Time) []RelayState {
 	return out
 }
 
+// +checklocks:s.mu
 func (s *RelaySet) clearExpiredPoolBansLocked(now time.Time) {
 	for relayURL, state := range s.relays {
 		if !state.Banned || state.suppressActiveUntil.IsZero() || state.suppressActiveUntil.After(now) {
@@ -173,6 +180,7 @@ func (s *RelaySet) clearExpiredPoolBansLocked(now time.Time) {
 	}
 }
 
+// +checklocks:s.mu
 func (s *RelaySet) banFromPoolLocked(relayURL string, now time.Time) {
 	if relayURL == "" {
 		return
@@ -233,6 +241,7 @@ func markDiscoveryVerified(state RelayState) RelayState {
 	return state
 }
 
+// +checklocks:s.mu
 func (s *RelaySet) descriptorRollbackResultLocked(
 	record RelayState,
 	relayURL string,
@@ -266,6 +275,7 @@ func (s *RelaySet) descriptorRollbackResultLocked(
 	return upsertRejected, true
 }
 
+// +checklocks:s.mu
 func (s *RelaySet) crossIdentityTakeoverBlockedLocked(relayURL, address string, now time.Time) bool {
 	existing, ok := s.relays[relayURL]
 	if !ok {
@@ -301,6 +311,8 @@ func (s *RelaySet) crossIdentityTakeoverBlockedLocked(relayURL, address string, 
 // Equal IssuedAt values at the same URL and signing identity must carry the
 // same canonical signed contents. Idempotent re-broadcasts may refresh local
 // telemetry, but conflicting statements cannot replace the retained observation.
+//
+// +checklocks:s.mu
 func (s *RelaySet) upsertDescriptorLocked(record RelayState, now time.Time, allowCrossIdentityTakeover bool) upsertResult {
 	relayURL := record.Descriptor.APIHTTPSAddr
 	if relayURL == "" {
@@ -532,6 +544,8 @@ func (s *RelaySet) EnsureRelayURL(relayURL string) {
 
 // discoveryRelayStateLocked enforces signature and public-address policy for
 // discovery responses. The caller must hold s.mu for bootstrap and ban state.
+//
+// +checklocks:s.mu
 func (s *RelaySet) discoveryRelayStateLocked(
 	descriptor types.RelayDescriptor,
 	now time.Time,
@@ -659,6 +673,8 @@ func (s *RelaySet) ApplyRelayDiscoveryResponse(targetURL string, resp types.Disc
 // recordIncompatibleRelayLocked remembers a directly contacted relay whose
 // discovery protocol version does not match ours. Banned relays stay hidden.
 // The caller must hold s.mu for writing.
+//
+// +checklocks:s.mu
 func (s *RelaySet) recordIncompatibleRelayLocked(relayURL, protocolVersion string, now time.Time) {
 	if relayURL == "" {
 		return
@@ -705,6 +721,8 @@ func olderObservation(url string, observedAt time.Time, oldestURL string, oldest
 // observation is older than AnnounceMaxValidity, matching the window in which
 // descriptors from that observation could still matter. The caller must hold
 // s.mu for writing.
+//
+// +checklocks:s.mu
 func (s *RelaySet) pruneIncompatibleLocked(now time.Time) {
 	for relayURL, entry := range s.incompatible {
 		if now.Sub(entry.LastSeenAt) > AnnounceMaxValidity {
@@ -716,6 +734,8 @@ func (s *RelaySet) pruneIncompatibleLocked(now time.Time) {
 // pruneReleaseVersionsLocked drops release observations whose last direct
 // poll is older than AnnounceMaxValidity, so the map cannot grow without
 // bound as polled relay URLs churn. The caller must hold s.mu for writing.
+//
+// +checklocks:s.mu
 func (s *RelaySet) pruneReleaseVersionsLocked(now time.Time) {
 	for relayURL, observation := range s.releaseVersions {
 		if now.Sub(observation.observedAt) > AnnounceMaxValidity {
@@ -731,6 +751,8 @@ func (s *RelaySet) pruneReleaseVersionsLocked(now time.Time) {
 // match (#512: the protocol label is only a fallback when no release is
 // known). An empty value — an older build that stopped reporting — drops
 // the observation: latest direct observation wins.
+//
+// +checklocks:s.mu
 func (s *RelaySet) recordReleaseObservationLocked(relayURL, releaseVersion string, now time.Time) {
 	if relayURL == "" {
 		return
@@ -901,6 +923,8 @@ func (s *RelaySet) InsertCandidate(desc types.RelayDescriptor, now time.Time) er
 // banned, and verified entries are never evicted here;
 // the keyIndex rollback anchors survive eviction by design. The caller MUST
 // already hold s.mu as a write lock.
+//
+// +checklocks:s.mu
 func (s *RelaySet) enforceIdentityCapLocked(address string) {
 	address = strings.ToLower(strings.TrimSpace(address))
 	if address == "" {
@@ -965,6 +989,8 @@ func validateRelayDescriptorFreshness(desc types.RelayDescriptor, now time.Time)
 // operator intent. Tombstone keyIndex entries whose replay window has
 // closed are swept opportunistically. The caller MUST already hold s.mu
 // as a write lock.
+//
+// +checklocks:s.mu
 func (s *RelaySet) enforceCapLocked() {
 	now := time.Now().UTC()
 	s.clearExpiredPoolBansLocked(now)

@@ -53,12 +53,15 @@ type ClientConfig struct {
 // without rebuilding the client, and RefreshChain pins a renewed relay
 // certificate without one.
 type Client struct {
-	mu          sync.RWMutex
+	mu sync.RWMutex
+	// +checklocks:mu
 	accessToken string
-	pin         *pinnedChain
-	closed      bool // guarded by mu, so that no pin is installed after Close
-	closeOnce   sync.Once
-	closeErr    error
+	// +checklocks:mu
+	pin *pinnedChain
+	// +checklocks:mu
+	closed    bool // guarded by mu, so that no pin is installed after Close
+	closeOnce sync.Once
+	closeErr  error
 
 	// Fixed when the client is created; RefreshChain reuses them to pin another
 	// chain.

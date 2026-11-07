@@ -13,7 +13,8 @@ type KeyStore interface {
 }
 
 type StaticKeyStore struct {
-	mu      sync.RWMutex
+	mu sync.RWMutex
+	// +checklocks:mu
 	signers map[string]crypto.Signer
 }
 

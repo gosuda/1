@@ -56,9 +56,10 @@ type Config struct {
 }
 
 type Manager struct {
-	stopCh       chan struct{}
-	stopCtx      context.Context
-	stopErr      error
+	stopCh  chan struct{}
+	stopCtx context.Context
+	stopErr error
+	// +checklocks:commandMu
 	workerCancel context.CancelFunc
 	cfg          Config
 	wg           sync.WaitGroup
@@ -71,6 +72,7 @@ type Manager struct {
 	material     *utils.Snapshot[servedMaterial]
 
 	// pendingDNSAddress is guarded by commandMu and cleared only after address-record synchronization.
+	// +checklocks:commandMu
 	pendingDNSAddress bool
 }
 

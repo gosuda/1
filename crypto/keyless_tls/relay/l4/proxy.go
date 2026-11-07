@@ -138,10 +138,14 @@ func (p *Proxy) handleConn(ctx context.Context, clientConn net.Conn) {
 }
 
 type admissionLimits struct {
-	mu        sync.Mutex
-	maxTotal  int
-	maxPerIP  int
-	total     int
+	mu sync.Mutex
+	// +checklocks:mu
+	maxTotal int
+	// +checklocks:mu
+	maxPerIP int
+	// +checklocks:mu
+	total int
+	// +checklocks:mu
 	perSource map[string]int
 }
 
@@ -190,10 +194,13 @@ func sourceKey(addr net.Addr) string {
 }
 
 type idlePair struct {
-	mu       sync.Mutex
-	client   net.Conn
+	mu sync.Mutex
+	// +checklocks:mu
+	client net.Conn
+	// +checklocks:mu
 	upstream net.Conn
-	timeout  time.Duration
+	// +checklocks:mu
+	timeout time.Duration
 }
 
 // touch refreshes both directions so a one-way stream is not deemed idle.

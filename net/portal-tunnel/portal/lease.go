@@ -74,9 +74,12 @@ type leaseRegistry struct {
 	// Access revisions describe complete relay snapshots, so the newest
 	// observed revision fences older publications for every identity. Keep
 	// this watermark when idle blocked entries expire to prevent stale replay.
+	// +checklocks:mu
 	accessRevision uint64
 
+	// +checklocks:mu
 	udpEnabled, tcpPortEnabled bool
+	// +checklocks:mu
 	udpMaxLeases, tcpMaxLeases int
 
 	mu sync.RWMutex

@@ -70,13 +70,17 @@ type Provider struct {
 	nsName     string
 	listenAddr string
 
-	mu     sync.RWMutex
-	ipv4   net.IP
-	ipv6   net.IP
+	mu sync.RWMutex
+	// +checklocks:mu
+	ipv4 net.IP
+	// +checklocks:mu
+	ipv6 net.IP
+	// +checklocks:mu
 	txt    map[string][]string
 	serial uint32
 	key    *dns.DNSKEY
 	signer crypto.Signer
+	// +checklocks:mu
 	signed *signedZone
 
 	udpServer *dns.Server
@@ -88,8 +92,10 @@ type Provider struct {
 	// started marks a provider created through New, the only caller allowed
 	// to arm the delegated-path self-check: direct constructions (unit tests)
 	// must not launch external resolver lookups as a side effect.
-	started       bool
+	started bool
+	// +checklocks:mu
 	selfCheckIPv4 sync.Once
+	// +checklocks:mu
 	selfCheckIPv6 sync.Once
 }
 

@@ -20,6 +20,7 @@ var (
 	errPortalSDKExposureIsNil       = errors.New("portal sdk: exposure is nil")
 	errPortalSDKLeastOneProxyTarget = errors.New("portal sdk: at least one proxy target is required")
 	errRelayDidNotExposeAnyUDP      = errors.New("relay did not expose any UDP listeners")
+	// +checklocksignore
 	errUDPFlowCapacityReached       = errors.New("UDP flow capacity reached")
 )
 
@@ -384,12 +385,15 @@ type udpFlowEntry struct {
 }
 
 type udpFlowManager struct {
+	// +checklocks:mu
 	target   *net.UDPAddr
 	exposure *Exposure
 	mu       sync.Mutex
+	// +checklocks:mu
 	flows    map[udpFlowKey]*udpFlowEntry
 	done     chan struct{}
 	workers  sync.WaitGroup
+	// +checklocks:mu
 	readers  int
 }
 

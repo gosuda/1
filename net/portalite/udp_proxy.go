@@ -24,10 +24,13 @@ type udpProxyFlow struct {
 type udpProxyFlowManager struct {
 	ctx      context.Context
 	exposure *Exposure
-	target   *net.UDPAddr
+	// +checklocks:mu
+	target *net.UDPAddr
 
-	mu     sync.Mutex
-	flows  map[udpProxyFlowKey]*udpProxyFlow
+	mu sync.Mutex
+	// +checklocks:mu
+	flows map[udpProxyFlowKey]*udpProxyFlow
+	// +checklocks:mu
 	closed bool
 	wg     sync.WaitGroup
 }

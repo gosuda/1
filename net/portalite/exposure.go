@@ -62,11 +62,14 @@ type Exposure struct {
 	updates   chan RelayStatus
 	datagrams chan DatagramFrame
 
-	mu           sync.RWMutex
-	statuses     map[string]RelayStatus
-	relayCount   int
-	failedCount  int
-	udpEnabled   bool
+	mu       sync.RWMutex
+	statuses map[string]RelayStatus
+	// +checklocks:mu
+	relayCount int
+	// +checklocks:mu
+	failedCount int
+	udpEnabled  bool
+	// +checklocks:mu
 	closing      bool
 	allFailed    chan struct{}
 	stateChanged chan struct{}
@@ -76,9 +79,11 @@ type Exposure struct {
 	// never re-adds a relay this exposure already gave up on.
 	rejectedRelays map[string]struct{}
 
-	supervisors      sync.WaitGroup
-	cleanupMu        sync.Mutex
-	cleanupErrs      []error
+	supervisors sync.WaitGroup
+	cleanupMu   sync.Mutex
+	// +checklocks:cleanupMu
+	cleanupErrs []error
+	// +checklocks:mu
 	relaySupervisors map[string]*relaySupervisor
 
 	identity Identity
@@ -87,8 +92,10 @@ type Exposure struct {
 	discoveryEnabled bool
 	// maxDiscoveredRelays bounds relays discovery may add; explicit relays
 	// are never subject to it.
+	// +checklocks:mu
 	maxDiscoveredRelays int
-	discoveredCount     int
+	// +checklocks:mu
+	discoveredCount int
 	candidates          *discoveryCandidates
 	discoveryClient     *discoveryClient
 	discoveryPoll       time.Duration

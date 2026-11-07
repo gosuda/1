@@ -30,15 +30,18 @@ type RelayDatagram struct {
 	identityKey types.ServiceIdentityKey
 	port        int
 	session     *DatagramSession
-	flowTable   map[uint32]*flowState
-	addrIndex   map[netip.AddrPort]uint32
-	nextFlow    uint32
-	enabled     atomic.Bool
-	newFlows    *rate.Limiter
-	dropLogs    *rate.Limiter
+	flowTable map[uint32]*flowState
+	addrIndex map[netip.AddrPort]uint32
+	// +checklocks:mu
+	nextFlow uint32
+	enabled  atomic.Bool
+	// +checklocks:mu
+	newFlows *rate.Limiter
+	dropLogs *rate.Limiter
 
 	conn *net.UDPConn
 
+	// +checklocks:mu
 	started bool
 	mu      sync.Mutex
 }

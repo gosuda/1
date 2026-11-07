@@ -10,21 +10,28 @@ import (
 
 var errReverseConnectionIsRequired = errors.New("reverse connection is required")
 
+// +checklocksignore
 var errPoolFull = errors.New("reverse ready queue full")
 
 // ReversePool owns idle connections until Acquire transfers them to a caller.
 // Idle keepalives detect disconnected peers; activation framing and carriers
 // belong to the caller.
 type ReversePool struct {
-	mu           sync.Mutex
-	cond         *sync.Cond
-	notify       chan struct{}
+	mu sync.Mutex
+	// +checklocks:mu
+	cond *sync.Cond
+	// +checklocks:mu
+	notify chan struct{}
+	// +checklocks:mu
 	ready        []*pooledConn
 	idleInterval time.Duration
-	readyLimit   int
-	reserved     int
-	closing      bool
-	closeOnce    sync.Once
+	// +checklocks:mu
+	readyLimit int
+	// +checklocks:mu
+	reserved int
+	// +checklocks:mu
+	closing   bool
+	closeOnce sync.Once
 }
 
 // pooledConn coordinates the idle writer with acquisition and shutdown. It
@@ -180,6 +187,7 @@ func (p *ReversePool) ReadyCount() int {
 	return len(p.ready)
 }
 
+// +checklocks:p.mu
 func (p *ReversePool) signalLocked() {
 	close(p.notify)
 	p.notify = make(chan struct{})

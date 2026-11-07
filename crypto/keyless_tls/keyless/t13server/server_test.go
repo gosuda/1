@@ -1632,7 +1632,8 @@ func TestConn_NonTimeoutReadErrorIsSticky(t *testing.T) {
 // blockingSigner records whether it received a context carrying a deadline,
 // then blocks until that context is done and returns its error.
 type blockingSigner struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	sawDeadline bool
 }
 
@@ -1656,9 +1657,12 @@ func (b *blockingSigner) observedDeadline() bool {
 type deadlineRecorder struct {
 	net.Conn
 
-	mu       sync.Mutex
-	reads    []time.Time
-	writes   []time.Time
+	mu sync.Mutex
+	// +checklocks:mu
+	reads []time.Time
+	// +checklocks:mu
+	writes []time.Time
+	// +checklocks:mu
 	combined []time.Time
 }
 

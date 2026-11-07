@@ -159,7 +159,8 @@ func (t *tenantTLS) close() error {
 type leaseTranscriptSigner struct {
 	signer *keyless.RemoteSigner
 
-	mu   sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	errs map[string]error
 }
 
@@ -223,11 +224,14 @@ type relaySupervisor struct {
 	controlTransport *http.Transport
 	controlClient    *http.Client
 
-	leaseMu             sync.RWMutex
-	lease               relayLease
+	leaseMu sync.RWMutex
+	// +checklocks:leaseMu
+	lease relayLease
+	// +checklocks:leaseMu
 	nextLeaseGeneration uint64
 
-	datagramMu   sync.RWMutex
+	datagramMu sync.RWMutex
+	// +checklocks:datagramMu
 	datagramConn *quic.Conn
 }
 

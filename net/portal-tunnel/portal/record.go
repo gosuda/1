@@ -45,11 +45,15 @@ type leaseRecord struct {
 	tcpListener net.Listener
 	reverse     *transport.ReversePool
 
-	mu         sync.Mutex
-	closed     bool
-	closeDone  chan struct{}
+	mu sync.Mutex
+	// +checklocks:mu
+	closed bool
+	// +checklocks:mu
+	closeDone chan struct{}
+	// +checklocks:mu
 	reverseMux *transport.ReverseMux
-	bridges    map[*leaseBridge]struct{}
+	// +checklocks:mu
+	bridges map[*leaseBridge]struct{}
 }
 
 // cacheLease adapts registry facts to the cache's canonical hostname key while
@@ -112,7 +116,8 @@ func (r *leaseRecord) Close() {
 		return
 	}
 	r.closed = true
-	r.closeDone = make(chan struct{})
+	closeDone := make(chan struct{})
+	r.closeDone = closeDone
 	r.revokeBridgesLocked()
 	bridges := make([]*leaseBridge, 0, len(r.bridges))
 	for bridge := range r.bridges {
@@ -139,7 +144,7 @@ func (r *leaseRecord) Close() {
 	for _, bridge := range bridges {
 		r.releaseBridge(bridge)
 	}
-	close(r.closeDone)
+	close(closeDone)
 }
 
 // leaseBridge owns a public connection from reverse acquisition through the
@@ -172,6 +177,8 @@ func (r *leaseRecord) releaseBridge(bridge *leaseBridge) {
 // interrupt current I/O, but a subsequent framing write can replace its write
 // deadline with the helper's five-second limit. Workers close endpoints outside
 // these locks and cannot copy application data with the canceled context.
+//
+// +checklocks:r.mu
 func (r *leaseRecord) revokeBridgesLocked() {
 	for bridge := range r.bridges {
 		bridge.cancel()

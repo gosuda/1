@@ -17,10 +17,13 @@ const (
 // overlay resources only: the resolved source value is supplied by the relay
 // ingress, and no IP history is persisted or promoted to authorization policy.
 type sourceLimiter struct {
-	mu                   sync.Mutex
-	buckets              map[netip.Addr]*sourceBucket
+	mu sync.Mutex
+	// +checklocks:mu
+	buckets map[netip.Addr]*sourceBucket
+	// +checklocks:mu
 	ratePerMinute, burst float64
-	lastPrune            time.Time
+	// +checklocks:mu
+	lastPrune time.Time
 }
 
 type sourceBucket struct {

@@ -15,7 +15,8 @@ import (
 // payment binds to one resource exactly once. It forgets on restart: use FileClaimStore (or any Claimer) when a
 // restart must not make a spent block spendable again.
 type ClaimStore struct {
-	mu    sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	spent map[string]struct{}
 }
 
@@ -71,7 +72,8 @@ var (
 // a torn final line (a crash mid-write) is ignored, any other unreadable line
 // is an error rather than a silently shorter history.
 type FileClaimStore struct {
-	mu    sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	spent map[string]struct{}
 	f     *os.File
 }

@@ -21,9 +21,11 @@ import (
 // and route53. DNS-01 depends on that, and it is also what lets ENS records
 // pile up, so a fake that replaced instead would hide the bug under test.
 type fakeZone struct {
-	mu  sync.Mutex
+	mu sync.Mutex
+	// +checklocks:mu
 	txt map[string][]string
-	a   map[string]string
+	// +checklocks:mu
+	a map[string]string
 }
 
 func newFakeZone() *fakeZone {
