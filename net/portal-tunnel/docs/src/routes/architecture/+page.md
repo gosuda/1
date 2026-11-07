@@ -1,0 +1,534 @@
+---
+title: Architecture
+description: Portal system architecture, transport model, and protocol details.
+priority: P1
+---
+
+<script>
+import Mermaid from '$lib/components/Mermaid.svelte'
+
+const overviewDiagram = `flowchart TD
+    CB[Client Browser]
+    ETC[External TCP Client]
+    EUC[External UDP Client]
+
+    subgraph Relay["Relay Server"]
+        SNI["SNI Router :443"]
+        API["API Server / Control Plane"]
+        TCP["TCP Port Listener"]
+        QUIC["QUIC Datagram Listener"]
+    end
+
+    subgraph SDK["SDK / portal-tunnel"]
+        RC["Reverse Connect Handler"]
+        TLS["Tenant TLS Terminator"]
+        SDKUDP["UDP Forwarder"]
+    end
+
+    LS["Local Service"]
+    LU["Local UDP Service"]
+
+    CB -- TLS ClientHello --> SNI
+    SNI -- SNI route + 0x02 marker + 16B binding --> RC
+    RC --> TLS --> LS
+
+    ETC -- raw TCP --> TCP
+    TCP -- 0x01 marker + bridge --> RC
+
+    EUC -- UDP packet --> QUIC
+    QUIC -- QUIC DATAGRAM frame --> SDKUDP --> LU
+
+    SDK -- POST /sdk/register, GET /sdk/connect --> API`
+
+const tlsStreamDiagram = `sequenceDiagram
+    participant SDK as SDK / portal-tunnel
+    participant Relay as Relay Server
+    participant Client as Client Browser
+
+    SDK->>Relay: POST /sdk/register/challenge
+    Relay->>SDK: SIWE challenge message
+    SDK->>Relay: POST /sdk/register (signed)
+    Relay->>SDK: access_token + reverse_endpoint + lease info
+
+    SDK->>Relay: GET reverse_endpoint.url (reverse capability)
+    Relay->>SDK: connection hijacked, 0x00 keepalives
+    Note over Relay: Session queued in per-lease stream ready queue
+
+    Client->>Relay: TLS ClientHello (SNI: name.relay.host)
+    Note over Relay: SNI peek, resolve lease, claim reverse session
+    Relay->>SDK: write 0x02 + 16-byte binding (TLS activation)
+    Note over SDK: Terminates tenant TLS via keyless_tls t13server, signing transcripts through /v1/sign with the binding
+    Relay->>Client: bridges raw encrypted bytes bidirectionally
+    Note over Client,SDK: End-to-end TLS, relay never sees plaintext`
+
+const tcpPortDiagram = `sequenceDiagram
+    participant SDK as SDK / portal-tunnel
+    participant Relay as Relay Server
+    participant ExtClient as External TCP Client
+
+    SDK->>Relay: POST /sdk/register (tcp_enabled=true, signed SIWE)
+    Note over Relay: Validates TCP plane enabled, allocates port from MIN_PORT-MAX_PORT
+    Relay->>SDK: tcp_addr + access_token + reverse_endpoint
+
+    SDK->>Relay: GET /sdk/connect (reverse session, HTTP/1.1 hijack)
+    Note over Relay: Session queued in per-lease stream ready queue
+
+    ExtClient->>Relay: TCP connect to tcp_addr
+    Note over Relay: Accepts connection, claims reverse session
+    Relay->>SDK: write 0x01 (raw TCP activation marker)
+    Note over SDK: Receives 0x01, passes raw connection without TLS handshake
+    Relay->>ExtClient: bridges data bidirectionally (raw TCP)
+    Note over ExtClient,SDK: No TLS, pure raw TCP passthrough`
+
+const udpQuicDiagram = `sequenceDiagram
+    participant SDK as SDK / portal-tunnel
+    participant Relay as Relay Server
+    participant UDPClient as External UDP Client
+
+    SDK->>Relay: POST /sdk/register (udp_enabled=true, signed SIWE)
+    Note over Relay: Allocates UDP port from MIN_PORT-MAX_PORT
+    Relay->>SDK: udp_addr + access_token
+
+    SDK->>Relay: QUIC connect to relay URL authority (default HTTPS port 443; ALPN: portal-tunnel, DATAGRAM enabled)
+    SDK->>Relay: Send access_token on first QUIC stream
+    Note over Relay: Validates token, registers QUIC tunnel for lease
+
+    UDPClient->>Relay: UDP packet to udp_addr
+    Note over Relay: Assigns flow ID, wraps in QUIC DATAGRAM frame
+    Relay->>SDK: QUIC DATAGRAM frame (flowID + payload)
+    Note over SDK: Decodes frame, forwards to local UDP service
+
+    SDK->>Relay: QUIC DATAGRAM frame (flowID + response)
+    Relay->>UDPClient: WriteToUDP back to original client address`
+
+const registrationDiagram = `sequenceDiagram
+    participant SDK as SDK / portal-tunnel
+    participant Relay as Relay Server
+
+    SDK->>Relay: POST /sdk/register/challenge (address)
+    Relay->>SDK: SIWE challenge message
+
+    Note over SDK: Signs SIWE message with secp256k1 identity key (personal_sign)
+
+    SDK->>Relay: POST /sdk/register (message, signature, name, tcp_enabled?, udp_enabled?)
+    Note over Relay: Validates SIWE signature, checks name availability
+    Note over Relay: Creates lease, publishes route at name.relay-host
+    Note over Relay: Allocates TCP/UDP ports if requested
+    Relay->>SDK: access_token + reverse_endpoint + lease info (tcp_addr?, udp_addr?)`
+
+const overlayPathDiagram = `flowchart TD
+    Client["Public client"] --> Ingress["Portal public ingress"]
+    Ingress <-->|Direct reverse session: default / fallback| SDK["Portal tunnel / SDK"]
+    Ingress <-->|Overlay path: opt-in| IVNP["IVNP overlay network<br/>Opaque internal routers, tunnels, and hop ordering"]
+    IVNP <--> Gateway["Selected overlay gateway"]
+    Gateway <--> SDK
+    SDK --> Local["Local service"]`
+
+const overlayDiagram = `sequenceDiagram
+    participant SDK as SDK / portal-tunnel
+    participant Gateway as Selected gateway
+    participant Ingress as Public ingress relay
+
+    Ingress->>SDK: reverse_endpoint (gateway URL + delegated capability)
+    SDK->>Gateway: GET /sdk/connect (capability)
+    Note over Gateway: Verify ingress signature and gateway binding
+    Gateway->>Ingress: IVNP stream (same capability, opaque internal path)
+    Note over Gateway,Ingress: IVNP owns routers, tunnels, and hop ordering (opaque to Portal)
+    Note over Ingress: Verify IVNP peer, capability, and lease instance
+    Ingress->>Gateway: Admit stream to existing lease queue
+    Gateway->>SDK: HTTP 101, bridge SDK socket to IVNP
+    Note over SDK,Ingress: SDK contract and public lease stay unchanged`
+</script>
+
+<div class="not-prose mb-8 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300">
+  <strong>Advanced Documentation</strong>: This page covers internal architecture details for contributors and advanced users.
+</div>
+
+# Architecture
+
+## Overview
+
+Portal publishes local services on public subdomains, optional dedicated TCP ports, and optional UDP ports through a relay.
+Backends connect outward to the relay. Uncached stream traffic is routed by SNI,
+and tenant TLS remains end-to-end between the client and the tunnel endpoint.
+Opt-in static caches terminate browser TLS at the relay.
+
+With [IVNP-backed overlay networking](/concepts#ivnp-backed-overlay-networking),
+Portal can publish through that same ingress while delegating the
+gateway-to-ingress network path to IVNP. Identity, leases, and authorization stay
+in Portal; internal routers and hop ordering stay in IVNP. The detailed
+[overlay architecture](#ivnp-backed-overlay-networking) describes this boundary
+and the unchanged SDK contract.
+
+High-level paths with direct reverse transport:
+
+```text
+Stream client
+  -> Relay SNI listener (:443 by default)
+  -> Claimed reverse session
+  -> SDK / portal-tunnel
+  -> Local service
+
+TCP port client
+  -> Relay lease TCP port (within configured MIN_PORT-MAX_PORT)
+  -> Claimed reverse session (raw TCP, no TLS)
+  -> SDK / portal-tunnel
+  -> Local service
+
+UDP client
+  -> Relay lease UDP port (within configured MIN_PORT-MAX_PORT)
+  -> Internal QUIC tunnel
+  -> SDK / portal-tunnel
+  -> Local UDP service
+```
+
+<Mermaid code={overviewDiagram} />
+
+## Architecture Invariants
+
+### Transport and Routing
+
+- Raw TCP reverse-connect is the canonical stream transport.
+- Do not introduce websocket or legacy compatibility paths by default.
+- Derive lease hostnames from the full normalized `PORTAL_URL` host, not from apex extraction.
+- Preserve explicit root-host fallback through SNI no-route handling to the admin/API handler.
+- Stream ingress is TLS-only. UDP exposure, when enabled, is raw UDP.
+- Portal endpoint policy stops at endpoint selection; IVNP owns the network path. Discovery routes and leases carry no IVNP-internal topology.
+
+### TLS and Identity
+
+- Relay terminates admin/API TLS on the root host and exposes `/v1/sign` for tenant-side keyless signing.
+- Control-plane HTTP (`/sdk/*`), reverse-session establishment (`/sdk/connect`), and tenant TLS are separate connections with different trust boundaries.
+- Relay API TLS, SDK relay-client TLS, SDK tenant-server TLS, and QUIC tunnel TLS are distinct configs even when they reuse the same relay certificate material.
+- For uncached HTTPS tunnels, the relay peeks ClientHello for SNI and bridges encrypted bytes; tenant TLS terminates at the tunnel. Opt-in static caches terminate browser TLS at the relay.
+- SDK/tunnel endpoints terminate tenant TLS locally with a keyless-backed signer that calls the relay.
+- In keyless TLS, the relay performs certificate private-key signing through `/v1/sign`, but the SDK/tunnel endpoint still runs the TLS server handshake and derives tenant TLS session keys locally.
+- Lease operations require a relay-issued access token whose identity and lease ID both match the active lease instance. `/sdk/connect` uses a separate reverse-only capability returned as part of a generic reverse endpoint.
+- `/sdk/register` is authenticated by a SIWE challenge/response flow using the SDK identity secp256k1 key. On success, the relay issues separate signed credentials for lease operations and reverse connection establishment.
+- Relay URLs must use `https://`.
+- HTTP/2 stays disabled on the admin/API TLS route. Keyless TLS certificate sharing and `/sdk/connect` both depend on the current HTTP/1.1-only transport contract.
+
+### Reverse Session Protocol
+
+- SNI wildcard matching is one level only. `*.parent.example.com` matches `foo.parent.example.com`, not deeper labels.
+- Reverse TCP marker bytes remain protocol state:
+  - `0x00` = idle keepalive
+  - `0x01` = raw TCP activation (non-TLS port routing)
+  - `0x02` = TLS activation (followed by a 16-byte binding that every `/v1/sign` request must echo)
+- `/sdk/connect` remains HTTP/1.1 only.
+
+### JSON and Shared Contract
+
+- Portal JSON control-plane responses use `APIEnvelope`: `{ ok, data?, error? }`. Delegated facilitator responses, streams, installers, and some cache HTTP errors use their endpoint-specific formats.
+- JSON handlers should write responses through the shared API helpers.
+- `types/` is reserved for shared wire/public types and cross-package constants only.
+- Shared control-plane and public route constants belong in `types/paths.go`.
+- Relay-local frontend asset filenames stay local to `cmd/relay-server`.
+- Do not import `portal` from `cmd/*` or `sdk` just to reach shared DTOs or constants.
+
+### Operational Constraints
+
+- For non-localhost deployments, relay TLS can run from manual certificate files in the relay `IDENTITY_PATH` directory or from managed ACME.
+- The canonical/default managed DNS provider is `embedded`: NS-delegated authoritative DNS with persistent CSK signing and parent DS export, without DNS API secrets. External `cloudflare`, `gcloud`, `hetzner`, `njalla`, `route53`, and `vultr` backends are supported first-class alternatives.
+- ENS gasless automation reuses `ACME_DNS_PROVIDER` for DNSSEC and ENS TXT sync when the selected provider supports DNSSEC.
+- Relay stores its state under `IDENTITY_PATH`, including `identity.json`, `policy.json`, and certificate material. Tunnel and demo-app identities still use `IDENTITY_PATH` / `--identity-path` as a direct JSON file path.
+- Managed non-localhost ACME discovers IPv4 and IPv6 independently and keeps root and wildcard A/AAAA records in sync. An update changes only its address family; probe failure preserves existing records. ENS hostname cleanup removes both address record types on external providers; embedded DNS retains zone-wide synthesis.
+- Relay certificate material lives under `IDENTITY_PATH` as `fullchain.pem` and `privatekey.pem`.
+- Localhost uses the development certificate path instead of public managed/manual certificate setup.
+
+## Connection Model
+
+Portal has three distinct network roles:
+
+- **Control-plane HTTP requests**
+  - `POST /sdk/register/challenge`
+  - `POST /sdk/register`
+  - `POST /sdk/renew`
+  - `POST /sdk/reverse`
+  - `POST /sdk/unregister`
+  - `GET /sdk/domain`
+- **Reverse session connection**
+  - `GET /sdk/connect`
+  - HTTP/1.1 only
+  - hijacked into a long-lived raw TCP session
+  - starts idle in the per-lease stream ready queue, then becomes the tenant data path when claimed
+- **Internal datagram tunnel**
+  - QUIC to the relay URL authority (default HTTPS port 443), with ALPN `portal-tunnel`
+  - authenticated by a first-stream control message carrying `access_token`
+  - carries relay-to-SDK/tunnel datagram traffic only
+
+That distinction matters because `/sdk/connect` stops being ordinary HTTP once hijacked, while the UDP backhaul is a separate internal QUIC carrier.
+
+Direct connections require a relay address family reachable by the client.
+TCP connections use Go's dual-stack dialing. QUIC preserves resolver ordering,
+tries addresses within each family, and starts the other family after a short
+head start or when the first family fails. This supports IPv6-only and
+dual-stack relay endpoints without introducing address translation or multi-hop
+routing between disconnected families. DNS publication does not establish
+inbound reachability; deployment routing and firewalls must match the published
+A/AAAA records. See [IPv4 and IPv6 configuration](/configuration#ipv4-and-ipv6).
+
+## Package Layout
+
+The relay runtime lives in `portal/` (server, route table, transport runtimes, ACME, keyless, auth, discovery, policy).
+The SDK client library lives in `sdk/` (listener, exposure, relay API client, MITM self-probe, transport clients).
+CLI entry points live in `cmd/relay-server` and `cmd/portal-tunnel`; they import `portal/` and `sdk/` respectively but never each other.
+Shared wire types, API envelope, error codes, path constants, and transport frame codec live in `types/`.
+
+## Opt-in Static Cache
+
+`portal/cache` owns snapshot creation and synchronization on the origin side,
+and admission, storage, expiry, and serving on the relay side. A lease must
+explicitly opt in before the relay accepts its files. Eligible snapshots route
+through the relay HTTP handler and terminate browser TLS there; ordinary
+uncached connections retain TLS passthrough. Snapshots are routed only by the
+identity-bound canonical hostname; friendly aliases always use the live origin.
+See [the cache trust boundary](/security-model#opt-in-static-cache)
+and [cache limits and expiry](/configuration#static-relay-cache).
+
+## Transport Model
+
+### Raw reverse transport (TLS only)
+
+1. SDK/tunnel registers one lease per relay through `POST /sdk/register/challenge` followed by `POST /sdk/register`.
+2. SDK opens one or more reverse sessions per registered lease with `GET /sdk/connect`.
+3. Each relay hijacks `/sdk/connect` requests and places the connection in the per-lease stream ready queue.
+4. While idle, the relay writes `0x00` keepalive markers.
+5. A stream client connects to the relay SNI listener.
+6. Relay extracts SNI from ClientHello, resolves a lease, and waits up to `ClaimTimeout` for one reverse session from that lease stream queue.
+7. Relay writes `0x02` plus a 16-byte binding to activate the claimed session.
+8. SDK/tunnel receives `0x02` and the binding, terminates tenant TLS locally via the `keyless_tls` t13server (transcript signing through the binding-checked `/v1/sign`), and the relay bridges raw encrypted bytes end-to-end.
+
+Result: the relay decides routing, but tenant TLS termination still happens at the SDK/tunnel side.
+
+<Mermaid code={tlsStreamDiagram} />
+
+### Browser reverse transport
+
+Browser runtimes cannot open the raw TCP connection used by the native reverse
+transport. When the SDK runs with `GOOS=js`, it keeps the same registration,
+lease-renewal, reverse-endpoint, and tenant-stream contracts but changes the
+carrier:
+
+1. The SDK opens one WebSocket to the lease's reverse endpoint and authenticates
+   the handshake with the reverse capability and the `portal.reverse.v1`
+   subprotocol marker.
+2. A yamux session runs inside that WebSocket. Each yamux stream represents one
+   reverse connection that native runtimes would open as a separate raw
+   connection.
+3. Every logical stream presents the capability current when that stream is
+   opened. The relay verifies its signature, expiry, active lease, and lease
+   identity before offering the stream to ingress.
+4. Tenant protocol bytes then use the same activation markers and tenant TLS
+   path as the native transport.
+
+The WebSocket and yamux layers are therefore a browser-compatible carrier, not
+a separate lease or application protocol. Native runtimes continue to use the
+raw reverse path and do not pay the multiplexing cost.
+
+### Connection and resource ownership
+
+Native HTTP hijacks and authenticated WebSocket/yamux streams enter the same
+per-lease `ReversePool` as `net.Conn` values. The pool manages capacity,
+idle keepalives, acquisition, and closing queued connections. Acquiring a
+connection stops its idle writer and transfers ownership to the caller without
+writing a session-start frame. Overlay admission reserves capacity before
+acknowledging an offer and commits only after the acknowledgement succeeds;
+pool shutdown waits for that decision.
+
+Reverse framing has one owner in `portal/transport/reverse_framing.go`: the
+relay writes raw/TLS start markers, and the SDK reads the same contract directly
+from the original connection. The acquired connection's carrier does not affect
+tenant TLS, raw TCP forwarding, or static-cache fallback.
+
+The lease record owns the reverse pool, the active WebSocket/yamux carrier, the
+raw TCP `net.Listener`, and UDP ingress. Replacing or closing a lease closes its
+carrier; a replaced carrier's late cleanup cannot detach the current one. Raw
+TCP accepts and reverse acquisition are composed by the server before bridging
+the two `net.Conn` values. The registry owns TCP/UDP port reservations and access
+policy. Reservation bookkeeping uses the registry lock and canonical service
+identity key; socket shutdown happens outside that lock before ports are
+released. UDP ingress receives only an enabled/disabled gate.
+
+UDP endpoint construction starts no workers or sockets. `Start` acquires ingress
+and starts dispatch/cleanup; `Close` stops the endpoint and its QUIC backhaul.
+The relay and SDK share `DatagramSession` for a replaceable QUIC connection and
+decoded frames. UDP flows store client addresses, and the endpoint writes replies
+through its own socket. Portal retains datagram routing metadata instead of
+encoding flow IDs or relay identity into artificial stream or address types.
+
+<div id="optional-relay-overlay"></div>
+<h3 id="ivnp-backed-overlay-networking">IVNP-backed overlay networking</h3>
+
+Separating endpoint policy from network routing lets Portal expose services
+through a public ingress without managing the path behind it. The overlay can
+change its internal routes without changing Portal's lease, identity, or
+SDK-facing reverse-endpoint contract.
+
+**Portal endpoint policy stops at endpoint selection; IVNP owns the network path.**
+
+<Mermaid code={overlayPathDiagram} />
+
+The diagram shows alternative stream paths. The tunnel opens the reverse
+connection outward to the ingress or selected gateway; in overlay mode the
+gateway opens an IVNP stream to the ingress. Public clients still use the
+ingress, and the SDK still forwards streams to the local service.
+
+Ownership split:
+
+- **Portal**: selects and authorizes the public ingress, selects an eligible
+  gateway, issues the delegated reverse capability, and owns identity, lease,
+  admission, health, and fallback semantics.
+- **IVNP**: owns destination reachability, the gateway-to-ingress path, and
+  intermediate router selection and tunnel construction; may use multiple
+  internal network hops without exposing that topology to Portal.
+- **SDK**: receives the same generic reverse endpoint, selects no
+  intermediate hops, and sees no IVNP route topology.
+
+The `Gateway -> Ingress` edge is one logical Portal transport edge. IVNP may
+carry it over multiple internal hops, but that topology is opaque to Portal.
+Portal does not construct an ordered relay chain or persist IVNP's internal
+topology in discovery or lease state.
+
+With [`IVNP_CONFIG`](/configuration#ivnp-overlay) enabled, the ingress may return
+a gateway URL in the same `reverse_endpoint` contract. The SDK neither selects
+the gateway nor sees an IVNP destination. Direct reverse transport is the
+default and fallback. A lease with `overlay=true` prefers an available overlay
+gateway. A failed gateway is reported through `POST /sdk/reverse`; the ingress
+applies the lease's overlay preference while rotating the endpoint without
+replacing the lease.
+
+Protocol flow:
+
+<Mermaid code={overlayDiagram} />
+
+### Tenant TLS Self-Probe Detection
+
+1. After a real tenant connection begins I/O, the SDK may start one asynchronous self-probe for that listener if no probe is in flight and the 30-second cooldown has expired.
+2. The SDK opens a new TLS connection to its own public URL using the same tenant-facing TLS characteristics as normal traffic.
+3. The probe client exports TLS keying material (`ExportKeyingMaterial`) from that probe connection and stores it under a random nonce.
+4. The first encrypted probe payload is `16-byte nonce + random padding`; there is no fixed probe magic or dedicated ALPN.
+5. When the probe connection comes back through the relay and reaches the SDK-side tenant TLS terminator, the SDK peeks only the first 16 encrypted application bytes while a probe is pending.
+6. If those bytes match a pending nonce, the SDK exports keying material on the server side and compares it with the client-side exporter value.
+7. Matching exporter values mean the probe observed passthrough for that connection. A mismatch is logged as suspected relay-side TLS termination. A timeout is logged as probe failure, not proof of MITM.
+
+Result: this is a detect-only signal by default. It raises the cost of adaptive relay-side TLS termination, but it does not prove passthrough for every user connection. Callers that need stricter behavior can opt into relay banning.
+
+### TCP Port Transport (non-TLS)
+
+1. SDK/tunnel requests a register challenge with `tcp_enabled=true`, signs the returned SIWE message, and completes registration.
+2. Relay validates that the TCP port plane is enabled, allocates a TCP port, and creates a per-lease TCP listener.
+3. Registration response includes `tcp_addr` (public TCP endpoint).
+4. An external TCP client connects to `tcp_addr`.
+5. The relay accepts the connection, claims a reverse session from the lease stream queue, and writes `0x01` (raw TCP activation marker).
+6. SDK-side receives `0x01` and passes the raw connection directly without TLS handshake.
+7. Data is copied bidirectionally between the external client and the reverse session.
+
+Result: the relay allocates a dedicated TCP port per lease and bridges raw TCP without TLS. This is ideal for non-TLS protocols like Minecraft, game servers, or any raw TCP service.
+
+<Mermaid code={tcpPortDiagram} />
+
+### UDP/QUIC Datagram Transport
+
+1. SDK/tunnel requests a register challenge with `udp_enabled=true`, signs the returned SIWE message, and completes registration.
+2. Relay validates that the datagram plane is enabled, allocates a UDP port, and creates a per-lease datagram runtime.
+3. Registration response includes `udp_addr` and `access_token`. The SDK dials QUIC to the relay URL authority, using port 443 when the URL has no explicit port; the relay may bind a different local `SNI_PORT` behind NAT or a load balancer.
+4. SDK opens a QUIC connection with ALPN `portal-tunnel` and DATAGRAM support enabled.
+5. Authentication: SDK sends `{access_token}` JSON on the first QUIC stream; relay validates before accepting the tunnel.
+6. External UDP client sends a packet to `udp_addr` -> relay assigns a flow ID -> QUIC DATAGRAM frame to SDK.
+7. SDK-side decodes frames and delivers to local UDP target.
+8. Return path: local response -> SDK -> QUIC DATAGRAM -> relay -> `WriteToUDP` to the original client.
+
+Result: raw public UDP exposure with an internal QUIC datagram backhaul. UDP and TCP port allocations are independent from the same `MIN_PORT-MAX_PORT` range.
+
+<Mermaid code={udpQuicDiagram} />
+
+## Relay Discovery Boundary
+
+- Discovery bootstraps from public HTTPS relay URLs, then expands through relay-to-relay `/discovery` polling and periodic self-announces to bootstrap relays through `/discovery/announce`.
+- SDK exposures consume relay discovery results to choose relays, but they do not announce themselves and do not serve `/discovery`.
+- Discovery descriptors are signed relay self-descriptions. They bind public relay metadata such as `api_https_addr` and transport support to the relay identity. Lease access tokens remain separate and authorize tenant lease operations only.
+- `/discovery/announce` accepts only signed relay descriptors. Loopback or localhost relay descriptors are rejected because they cannot join the public discovery mesh.
+
+## Control Plane Flow
+
+### 1. Register
+
+- `POST /sdk/register/challenge` then `POST /sdk/register`.
+- Caller signs the returned SIWE message with the identity secp256k1 key (`personal_sign`).
+- `name` must normalize to a valid single DNS label of at most 63 ASCII characters that is not shaped like a canonical label (40 lowercase hex characters, alone or after a hyphen). The relay publishes the friendly `<name>.<root host>` route when available and always derives the canonical hostname from the SIWE-authenticated identity: `<name>-<40 lowercase address hex>.<root host>` for names of at most 22 characters, and `<21-character name hash>--<40 lowercase address hex>.<root host>` for longer names. The hash is the first 21 lowercase unpadded base32 characters of SHA-256 over `"portal-canonical-name-v1" || 0x00 || uint8(len(name)) || name`. A normalized name never ends with a hyphen, so the two forms never produce the same label.
+- Registration publishes the identity-bound route immediately. A friendly-name conflict does not transfer or block the canonical origin; if no reverse session is ready yet, inbound SNI claims wait up to `ClaimTimeout`.
+- On success, the relay issues a lease-scoped ES256K JWT access token for lease operations and a separate reverse-only capability for the returned reverse endpoint.
+- UDP registration requires server `UDP_ENABLED=true`, a valid `MIN_PORT/MAX_PORT` range, and admin enablement. Failures: `udp_disabled` (403), `udp_capacity_exceeded` (503), `udp_port_exhausted` (503).
+- TCP port registration has equivalent three-condition gating. Failures: `tcp_port_disabled` (403), `tcp_port_capacity_exceeded` (503), `tcp_port_exhausted` (503).
+- `PORTAL_URL` is normalized to its host component only; path/query segments are ignored for routing.
+
+<Mermaid code={registrationDiagram} />
+
+### 2. Reverse Connect
+
+- `GET reverse_endpoint.url` (currently `/sdk/connect`, HTTP/1.1 only) with the
+  `X-Portal-Reverse-Capability` header.
+- Direct endpoints validate the lease instance and reverse-only capability.
+  Overlay gateways validate the ingress-signed delegated capability before
+  dialing IVNP; the ingress then verifies the authenticated gateway peer and
+  lease instance before admitting the stream.
+- Overlay gateway requests are limited per source IP to 120/minute with a burst
+  of 16, before signature verification. At most 16 pending or bridged connections
+  per source share the gateway's 128 outbound slots. Exceeding either budget
+  returns HTTP 429. Source IP follows the configured trusted-proxy policy;
+  callers behind the same NAT share a budget.
+- After claim, relay writes `0x02` plus a 16-byte binding before switching the session into tenant TLS passthrough.
+- After hijack, the connection becomes a broker-managed reverse session.
+
+### 3. Renew
+
+- `POST /sdk/renew` with `access_token`. Extends lease TTL and returns refreshed
+  lease and reverse credentials.
+
+`POST /sdk/reverse` replaces only a failed reverse endpoint. Gateway replacement
+therefore preserves the ingress lease and public hostname.
+
+### 4. Unregister
+
+- `POST /sdk/unregister` with `access_token`. Removes the lease, routes, and ready reverse sessions.
+
+## Routing Behavior
+
+Route lookup order:
+
+1. Exact friendly or identity-bound hostname match
+2. Single-label wildcard match (`*.example.com`)
+3. Root-host fallback to the admin/API handler
+
+Notes:
+
+- Wildcards are one level only.
+- The exact root host is never served by the wildcard route.
+- For non-apex `PORTAL_URL` values such as `https://portal.example.com:8443/admin`, a lease named `demo` is published at `demo.portal.example.com`.
+
+## Admin API Surface
+
+The relay server owns both the selected static SPA and the relay API. Public
+state, policy, status, installer, and admin-auth endpoints use reserved paths;
+all other non-reserved paths fall back to the SPA. Route paths are enumerated
+in `types/paths.go` and `cmd/relay-server`.
+
+## Keyless TLS Trust Model
+
+For uncached HTTPS tunnels, the relay signs handshake transcripts via `/v1/sign` without receiving tenant TLS traffic secrets. The SDK/tunnel endpoint runs the full TLS server handshake and derives session keys locally. Relay control-plane TLS and reverse-session setup terminate on the relay's admin/API route and are not protected by the tenant keyless path.
+
+## Design Properties
+
+- Reverse-only backend connectivity
+- One canonical raw TCP reverse transport
+- Dedicated TCP port allocation for non-TLS services with raw TCP bridging
+- Raw public UDP exposure with an internal QUIC datagram backhaul
+- SNI-based routing with root-host fallback
+- End-to-end tenant TLS with relay-backed keyless signing
+- Traffic-triggered MITM self-probing for probable relay-side TLS termination; the keyless tenant TLS exports keying material on both sides, and callers can opt into relay banning
+- SIWE identity proof for registration plus relay-issued ES256K JWT access tokens for the lease lifecycle
+- Lease-owned reverse pools, carriers, TCP listeners, and UDP endpoints
+- Optional QUIC/UDP datagram transport coexisting with TCP on the same lease
+- Per-lease UDP and TCP port allocation with sticky service-identity reservations
+- QUIC tunnel authentication via control stream (`access_token`)
