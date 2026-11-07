@@ -76,8 +76,13 @@ configured admin token.
 | `GET`/`HEAD` | `/llms.txt` | None | relay and tunnel connection guide |
 | `GET` | `/api/healthz` | None | `{ "status": "ok" }` |
 | `GET` | `/api/state` | None | `PublicStateResponse` |
+| `POST` | `/api/reputation/vote` | None | reputation summary |
 | `GET`/`HEAD` | `/api/install.sh`, `/api/install.ps1` | None | install script |
 | `GET`/`HEAD` | `/api/install/bin/{slug}` | None | install binary or redirect |
+
+The reputation vote body is `{ "hostname": "...", "vote": "up" | "down" | "clear" }`.
+`clear` removes the caller's vote; repeating the same action is idempotent.
+The response includes vote counts and the caller's `viewer_vote`.
 
 Detailed contracts: [SDK API](/api-reference/sdk) and
 [Admin and Policy API](/api-reference/admin).
@@ -203,7 +208,6 @@ Timestamps are JSON-encoded Go `time.Time` values.
 | Field | Type |
 |-------|------|
 | `leases` | `Lease[]` |
-| `landing_page_enabled` | `boolean` |
 
 `PolicyStateResponse`:
 
@@ -224,7 +228,6 @@ Timestamps are JSON-encoded Go `time.Time` values.
 | Field | Type |
 |-------|------|
 | `approval_mode` | `"auto"` or `"manual"` |
-| `landing_page_enabled` | `boolean` |
 | `udp` | `PolicyPortSettings` |
 | `tcp_port` | `PolicyPortSettings` |
 
@@ -263,7 +266,8 @@ Timestamps are JSON-encoded Go `time.Time` values.
 | `rate_limited` | request was throttled |
 | `hostname_conflict` | canonical hostname is inconsistently bound; routing fails closed |
 | `lease_not_found` | lease token or identity has no active lease |
-| `lease_rejected` | lease is not currently allowed to route |
+| `lease_rejected` | lease is not approved to route yet |
+| `lease_denied` | relay denied or banned the lease |
 | `invalid_address` | address path or body value is invalid |
 | `invalid_mode` | approval mode is not `auto` or `manual` |
 | `http11_only` | endpoint requires HTTP/1.1 |

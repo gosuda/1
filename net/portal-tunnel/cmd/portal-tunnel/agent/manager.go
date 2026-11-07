@@ -14,9 +14,9 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/gateway"
 	"github.com/gosuda/portal-tunnel/v2/cmd/portal-tunnel/tunnel"
 	"github.com/gosuda/portal-tunnel/v2/sdk"
+	"github.com/gosuda/portal-tunnel/v2/sdk/appauth"
 	"github.com/gosuda/portal-tunnel/v2/utils"
 )
 
@@ -168,7 +168,7 @@ func (m *manager) UpdateTunnel(id string, req AgentTunnelUpdateRequest) error {
 				tunnel.Hide = *req.Metadata.Hide
 			}
 		}
-		return req.applyAuth(&tunnel.ApplicationAuthConfig)
+		return req.applyAuth(&tunnel.AuthConfig)
 	}); err != nil {
 		return err
 	}
@@ -211,17 +211,17 @@ func (m *manager) AddTunnel(req AgentTunnelRequest) error {
 		return errMaxActiveRelaysCannotNegative
 	}
 	tunnelCfg := TunnelConfig{ID: id, Config: tunnel.Config{
-		Name:                  cmp.Or(name, id),
-		TargetAddr:            target,
-		Serve:                 req.Serve,
-		HTTPRoutes:            req.HTTPRoutes,
-		StripRequestHeaders:   req.StripRequestHeaders,
-		RelayURLs:             req.RelayURLs,
-		Discovery:             req.Discovery,
-		Overlay:               req.Overlay,
-		MaxActiveRelays:       req.MaxActiveRelays,
-		ApplicationAuthConfig: req.ApplicationAuthConfig,
-		X402Config:            req.X402Config,
+		Name:                cmp.Or(name, id),
+		TargetAddr:          target,
+		Serve:               req.Serve,
+		HTTPRoutes:          req.HTTPRoutes,
+		StripRequestHeaders: req.StripRequestHeaders,
+		RelayURLs:           req.RelayURLs,
+		Discovery:           req.Discovery,
+		Overlay:             req.Overlay,
+		MaxActiveRelays:     req.MaxActiveRelays,
+		AuthConfig:          req.AuthConfig,
+		X402Config:          req.X402Config,
 	}}
 	if slices.ContainsFunc(cfg.Tunnels, func(tunnel TunnelConfig) bool { return tunnel.ID == tunnelCfg.ID }) {
 		return fmt.Errorf("tunnel %q already exists", tunnelCfg.ID)
@@ -299,7 +299,7 @@ func (m *manager) updateTunnelConfig(id string, update func(*TunnelConfig) error
 	// takes effect by restarting this tunnel the way ApplyConfig restarts a
 	// changed one; the other tunnels are left alone. The tunnel starts again
 	// from its saved config, which drops relays connected to it at runtime.
-	if tunnel == nil || reflect.DeepEqual(before.ApplicationAuthConfig, nextTunnelCfg.ApplicationAuthConfig) {
+	if tunnel == nil || reflect.DeepEqual(before.AuthConfig, nextTunnelCfg.AuthConfig) {
 		return nil
 	}
 	_ = tunnel.Stop(context.Background())
@@ -568,7 +568,7 @@ func (t *managedTunnel) Snapshot() AgentTunnelStatus {
 
 	// The config passed validation before it was saved, so it resolves.
 	spec, _ := cfg.Spec()
-	auth := cfg.ApplicationAuthConfig
+	auth := cfg.AuthConfig
 	status := AgentTunnelStatus{
 		ID:                      cfg.ID,
 		Name:                    cfg.Name,
@@ -580,12 +580,14 @@ func (t *managedTunnel) Snapshot() AgentTunnelStatus {
 		Overlay:                 cfg.Overlay,
 		MaxActiveRelays:         spec.Relays.MaxActive,
 		Metadata:                spec.Metadata,
-		ApplicationAuthConfig:   auth.Public(),
+		AuthConfig:              auth.Public(),
 		AuthOIDCClientSecretSet: auth.OIDCClientSecret != "",
+		AuthSMTPPasswordSet:     auth.SMTPPassword != "",
 		X402Config:              cfg.X402Config,
 	}
 	status.Endpoints = slices.Clone(status.Endpoints)
-	if runtime != nil && (cfg.Provider == gateway.ApplicationAuthProviderOIDC || cfg.Provider == gateway.ApplicationAuthProviderSAML) {
+	hasProviderCheck := cfg.Provider == appauth.ProviderOIDC || cfg.Provider == appauth.ProviderSAML || cfg.Provider == appauth.ProviderEmail
+	if runtime != nil && hasProviderCheck {
 		checked, err := runtime.AuthProviderCheck()
 		status.AuthProviderChecked = checked
 		if err != nil {
@@ -638,6 +640,7 @@ func agentRelayStatuses(relays []sdk.RelayStatus) []AgentRelayStatus {
 			TCPAddr:    relay.TCPAddr,
 			Version:    relay.Version,
 			Connecting: relay.State == sdk.RelayConnecting,
+			Approval:   string(relay.Approval),
 		})
 	}
 	return statuses
