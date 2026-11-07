@@ -1,0 +1,156 @@
+{
+  "comment": "GRT/1.1 regression vectors pinned from gosuda.org/grt internal/crypto; byte strings are lowercase hex, integers are decimal. See spec/GRT11.md Appendix C.",
+  "kdf_label": [
+    {
+      "name": "root 32",
+      "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "root",
+      "context": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "length": 32,
+      "output": "956c9e1317b272d0420f366d08fea2d6288822f4090f8d9e363ecd793023f79d"
+    },
+    {
+      "name": "early iv 24",
+      "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "early iv",
+      "context": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "length": 24,
+      "output": "09e42f107a6daaf3905bad5aa3bb0eea56c4790d86bbded4"
+    },
+    {
+      "name": "c2s iv 12",
+      "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "c2s iv",
+      "context": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445",
+      "length": 12,
+      "output": "2b1fed021fd2e15eff42d6ec"
+    },
+    {
+      "name": "server finished empty context",
+      "secret": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "label": "server finished",
+      "context": "",
+      "length": 32,
+      "output": "536eb56695874bf80169df50a9a9c99e0ff7eeac928c39595bc28ec05531f4d2"
+    }
+  ],
+  "epoch_keys": [
+    {
+      "name": "xchacha c2s epoch 1",
+      "root": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "t1": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "cipher": 1,
+      "epoch": 1,
+      "direction": 0,
+      "key": "a465b6a2b6535a496cf5df34d1e525d1bd0723903b4d737b47313eaabf245b2d",
+      "iv": "72ae1cf5934c6babeb611220ad7798c1d236a071060b310a"
+    },
+    {
+      "name": "xchacha s2c epoch 1",
+      "root": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "t1": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "cipher": 1,
+      "epoch": 1,
+      "direction": 1,
+      "key": "3d6e328b332f1fbda41231e3a68a75a579c61de0461bb68caf605ff9ba372aac",
+      "iv": "664f2aefbf7d1548de407846f14c8a9e2b02b3d4d92f7188"
+    },
+    {
+      "name": "aes-gcm c2s epoch 1",
+      "root": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "t1": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "cipher": 2,
+      "epoch": 1,
+      "direction": 0,
+      "key": "6eb866222a7e3deffb0934041299a91bbdeb8a578798b8d731ef40aaf37296d9",
+      "iv": "60d067fb3cabd40b6585d9bc"
+    },
+    {
+      "name": "aes-gcm s2c epoch 1",
+      "root": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "t1": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f",
+      "cipher": 2,
+      "epoch": 1,
+      "direction": 1,
+      "key": "72db56ab5277388f5cc3c98db8b609179d64667ed3f7f7240888ab583ee73cfc",
+      "iv": "3148ee6e5b8e85e55e6b9d25"
+    }
+  ],
+  "ticket_psk": [
+    {
+      "name": "ticket psk",
+      "resumption_master": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "ticket_id": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "psk": "bcdaae06ac4bcbb957d7e7515b1c7eaa32e822a3188da24e73d7e6b68ca4c4e2"
+    }
+  ],
+  "ticket_seal": [
+    {
+      "name": "first key block",
+      "master": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+      "generation": 7,
+      "now_unix_s": 1773998400,
+      "nonce_prefix": "101112131415161718191a1b1c1d1e1f",
+      "counter": 1,
+      "plaintext": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4",
+      "ticket": "05034000101112131415161718191a1b1c1d1e1f0000000000000001d0961a2fe53e282b4fc5bb315dfec142ec42f0a392a512bce162cf3a130dcf1b91ccdc1940a224d81f4c55a1768a70c3f416e3aaed643bac600826ea2bd9a69ab21a9d4522249cf4ead13c1ee4aa1063bb509d2d4f93e4e410a18013d7376aa27146cca882f4d36c5103306277ca854c1c508e47c16552541e0f95714c5838c84b7074e45ffd8e8463983a7feb590eb78ebf6c1cbd54081c980286b58985b36e6a36a830188e8598e1eafd271bc14284120087cd10a257e2992ef01d7c02dfec5dca35da"
+    },
+    {
+      "name": "second key block",
+      "master": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+      "generation": 7,
+      "now_unix_s": 1773998400,
+      "nonce_prefix": "101112131415161718191a1b1c1d1e1f",
+      "counter": 16777216,
+      "plaintext": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4",
+      "ticket": "05034001101112131415161718191a1b1c1d1e1f00000000010000005738a99b9d8df28e5114aa715c80f1a489abec6726e3cb44c0a3bfd0af3c6acad15a3c81ccb22a39a3742232a7b935bf34ff6faf7fc642670c37b14fe93663b1b2ea6353e0f4ab4b29278de4c879f9451b18ee51343dad0b9249a584f69df14006f5b642bf4e6d9c6c34d9cac03cc6688cd9ba48129f0558c5b3cc2814c790bbbe583fc6429c549b25df9130b52c678f4f364b89eb7406cd010ff50f9a7e8b167a258cc4c9a15e7799d4cfda7799cba252b90dff7cb0480e63e834c7ab69bb0afd3ecded"
+    }
+  ],
+  "token_retry": [
+    {
+      "name": "retry token",
+      "key": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+      "key_id": 3,
+      "now_unix_s": 1773998400,
+      "listener_domain": "6772742d6b61742d646f6d61696e",
+      "source": "192.0.2.1:1000",
+      "local_dest": "192.0.2.2:4433",
+      "orig_dcid": 72623859790382856,
+      "retry_dcid": 1230066625199609624,
+      "flight_hash": "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "token": "000000030000000069bd11400000000069bd115e0102030405060708000000002c76e9bb94ee562a317b14456b01cd0dff46835d01bcc89814e9fa9aff286bbb"
+    }
+  ],
+  "aead_packet": [
+    {
+      "name": "xchacha packet",
+      "cipher": 1,
+      "key": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+      "iv": "505152535455565758595a5b5c5d5e5f6061626364656667",
+      "pn": 305419896,
+      "aad": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+      "plaintext": "4752542f312e31207465737420766563746f72207061636b6574207061796c6f6164",
+      "ciphertext": "fe76cb1050d613067334dcedecb7861599b390c5703a2a555aeff90adc0e5cdfd87b2c43649fd2c63e7e060ecbaeaa371f4f"
+    },
+    {
+      "name": "aes-gcm packet",
+      "cipher": 2,
+      "key": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+      "iv": "505152535455565758595a5b",
+      "pn": 305419896,
+      "aad": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+      "plaintext": "4752542f312e31207465737420766563746f72207061636b6574207061796c6f6164",
+      "ciphertext": "57120d978e2a4f7d83898613e300091cbdbb66d2f47ff0420e3d7579df640f0b1c3f46c5e51e546d7beb3dd617fc2f08345d"
+    }
+  ],
+  "pqxdh_kdf": [
+    {
+      "name": "pqxdh",
+      "dh1": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "dh2": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+      "dh3": "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60",
+      "ss": "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80",
+      "sk": "6412aa733a03d77243a9bfcdfba8350706eacf63566ad500dacece6f3d5e0d97"
+    }
+  ]
+}

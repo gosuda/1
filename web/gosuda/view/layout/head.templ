@@ -1,0 +1,93 @@
+package layout
+
+import "strings"
+
+templ Head(m *Metadata) {
+	<head>
+		<meta charset="UTF-8"/>
+		<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+		<script>
+			(function() {
+				try {
+					var theme = localStorage.getItem('pref_theme');
+					var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+					var dark = theme === 'dark' || ((!theme || theme === 'system') && prefersDark);
+					if (dark) {
+						document.documentElement.classList.add('dark');
+						document.documentElement.setAttribute('data-theme', 'dark');
+					} else {
+						document.documentElement.classList.remove('dark');
+						document.documentElement.setAttribute('data-theme', 'light');
+					}
+				} catch (e) {}
+			})();
+		</script>
+		<link rel="stylesheet" href="/main.css"/>
+		if m.Title != "" {
+			<title>{ m.Title }</title>
+			<meta property="og:title" content={ m.Title }/>
+		}
+		if m.Image != "" {
+			<meta property="og:image" content={ m.Image }/>
+		} else {
+			<meta property="og:image" content={ m.BaseURL + "/assets/images/ogp_placeholder.png" }/>
+		}
+		if m.URL != "" {
+			<meta property="og:url" content={ m.URL }/>
+		}
+		if m.Canonical != "" {
+			<link rel="canonical" href={ m.Canonical }/>
+		} else {
+			if m.URL != "" {
+				<link rel="canonical" href={ m.URL }/>
+			}
+		}
+		if m.Description != "" {
+			<meta name="description" content={ m.Description }/>
+			<meta property="og:description" content={ m.Description }/>
+		}
+		if m.Author != "" {
+			<meta name="author" content={ m.Author }/>
+		}
+		if len(m.Keywords) > 0 {
+			<meta name="keywords" content={ strings.Join(m.Keywords, ",") }/>
+		}
+		if m.GoImport != "" {
+			<meta name="go-import" content={ m.GoImport }/>
+		}
+		if m.CustomHead != "" {
+			@templ.Raw(m.CustomHead)
+		}
+		if m.Alternate != nil {
+			for _, v := range m.Alternate.Versions {
+				<link rel="alternate" hreflang={ v.Key } href={ v.Value }/>
+			}
+			if m.Alternate.Default != "" {
+				<link rel="alternate" hreflang="x-default" href={ m.Alternate.Default }/>
+			}
+		}
+		if m.Language == "en" {
+			<link rel="alternate" type="application/rss+xml" href={ m.BaseURL + "/feed.rss" }/>
+		} else {
+			<link rel="alternate" type="application/rss+xml" href={ m.BaseURL + "/" + m.Language + "/feed.rss" }/>
+		}
+		if m.MarkdownURL != "" {
+			<link rel="alternate" type="text/markdown" href={ m.MarkdownURL }/>
+		}
+		if m.BaseURL != "" {
+			<link rel="alternate" type="application/json" title="Agent Card" href={ m.BaseURL + "/.well-known/agent-card.json" }/>
+		}
+		if m.JSONLD() != "" {
+			@templ.Raw(`<script type="application/ld+json">` + m.JSONLD() + `</script>`)
+		}
+		<link rel="apple-touch-icon" sizes="180x180" href="/assets/apple-touch-icon.png"/>
+		<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png"/>
+		<link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png"/>
+		<link rel="manifest" href="/assets/site.webmanifest"/>
+		<link rel="mask-icon" href="/assets/safari-pinned-tab.svg" color="#5bbad5"/>
+		<link rel="shortcut icon" href="/assets/favicon.ico"/>
+		<meta name="msapplication-TileColor" content="#ffc40d"/>
+		<meta name="msapplication-config" content="/assets/browserconfig.xml"/>
+		<meta name="theme-color" content="#0b1020"/>
+	</head>
+}
