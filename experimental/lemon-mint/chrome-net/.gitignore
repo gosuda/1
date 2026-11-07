@@ -5,3 +5,6 @@ build/
 *.a
 .ninja_*
 cmake-build-*
+go.work
+go.work.sum
+
