@@ -112,7 +112,6 @@ in the same shape:
 ```json
 {
   "approval_mode": "manual",
-  "landing_page_enabled": false,
   "udp": {
     "enabled": true,
     "max_leases": 10
@@ -132,6 +131,11 @@ Supported modes:
 |------|----------|
 | `auto` | active leases can route unless banned or denied |
 | `manual` | active leases route only after approval |
+
+A lease that stops being routable loses its idle reverse streams at once, so its
+`ready` count falls to `0` and the tunnel stops reporting ready. It keeps
+renewing, and it reconnects within about 3 seconds after you approve it. No new
+registration is needed.
 
 ## Lease Policy
 
