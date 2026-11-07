@@ -1,0 +1,1023 @@
+package netdb
+
+import (
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
+	"errors"
+	"io"
+	"log/slog"
+	"sync"
+	"time"
+
+	"gosuda.org/ivnp/foundation"
+	"gosuda.org/ivnp/internal/parallelism"
+	"gosuda.org/ivnp/observability"
+)
+
+var (
+	// ErrRequestManagerFull means the configured bounded pending-request limit
+	// has been reached.
+	ErrRequestManagerFull = errors.New("netdb: request manager is full")
+	// ErrConflictingLookup means a lookup for the same key is already pending
+	// with a different lookup type.
+	ErrConflictingLookup = errors.New("netdb: conflicting lookup is pending")
+	// ErrRequestExpired is delivered to every coalesced caller when a lookup
+	// reaches its deadline without receiving its requested DatabaseStore.
+	ErrRequestExpired = errors.New("netdb: lookup request expired")
+	// ErrNoFloodfill means no known floodfill (or searchable candidate) could
+	// receive the lookup.
+	ErrNoFloodfill                  = errors.New("netdb: no floodfill route for lookup")
+	ErrInvalidReplyRoute            = errors.New("netdb: invalid lookup reply route")
+	ErrRequestManagerClosed         = errors.New("netdb: request manager is closed")
+	errRequestManagerDependencies   = errors.New("netdb: request manager requires database, sender, and reply route")
+	errRequestManagerCapacity       = errors.New("netdb: request manager capacity must be positive")
+	errRequestManagerCandidateLimit = errors.New("netdb: request manager candidate limit exceeds lookup exclusions")
+	errRequestManagerTimeout        = errors.New("netdb: request manager timeout must be positive")
+	errRequestManagerClock          = errors.New("netdb: request manager requires a clock")
+	errUnknownLookupType            = errors.New("netdb: unknown lookup type")
+)
+
+const (
+	databaseLookupEnvelopeLifetime  uint64 = 20_000
+	databaseLookupAttemptTimeout    uint64 = 3_000
+	javaIterativeSearchLimit               = 5
+	javaIterativeSearchInitialPeers        = 5
+)
+
+// LookupType selects the I2NP DatabaseLookup object type.
+type LookupType uint8
+
+const (
+	// RouterInfoLookup and LeaseSetLookup are the I2NP wire values, not an
+	// internal ordinal. Zero is legacy "any" and is accepted only inbound.
+	LeaseSetLookup    LookupType = 1
+	RouterInfoLookup  LookupType = 2
+	ExplorationLookup LookupType = 3
+)
+
+// RequestSender sends a DatabaseLookup to a directly reachable floodfill.
+// Message.Payload is borrowed and may only be retained by copying it.
+type RequestSender interface {
+	Send(context.Context, RouterRef, foundation.I2NPMessage) error
+}
+
+// ReplyRoute supplies the route advertised in a DatabaseLookup. Gateway is the
+// local router hash to which the floodfill should send the answer. When Tunnel
+// is true, TunnelID must identify the inbound reply tunnel at that gateway.
+type ReplyRoute interface {
+	DatabaseLookupReplyRoute() (gateway foundation.Hash, tunnelID uint32, tunnel bool)
+}
+
+// RequestManagerConfig controls logical request lifetime and bounded work. Now
+// returns Unix milliseconds. DatabaseLookup envelopes expire after a separate,
+// fixed lifetime. Rand supplies I2NP message IDs and is injectable so tests can
+// be deterministic.
+type RequestManagerConfig struct {
+	Capacity      int
+	MaxCandidates int
+	MaxWaiters    int
+	TimeoutMillis uint64
+	Now           func() uint64
+	Rand          io.Reader
+	Metrics       *observability.Registry
+	Responders    *ResponderProfiles
+	Logger        *slog.Logger
+}
+
+// LookupResult reports the terminal state of one caller's lookup. The object
+// itself is retained in Database; callers fetch it from Database after Err is
+// nil.
+type LookupResult struct {
+	Key  foundation.Hash
+	Type LookupType
+	Err  error
+}
+
+type requestKey struct {
+	key foundation.Hash
+}
+
+type lookupCandidate struct {
+	hash       foundation.Hash
+	attempted  bool
+	sent       bool
+	settled    bool
+	refreshing bool
+}
+
+type pendingRequest struct {
+	ctx              context.Context
+	cancel           context.CancelFunc
+	key              foundation.Hash
+	typeID           LookupType
+	deadline         uint64
+	responseDeadline uint64
+	routingKey       foundation.Hash
+	seed             foundation.Hash
+	waiters          []chan LookupResult
+	candidates       []lookupCandidate
+	sentCount        int
+	fallbacks        []foundation.Hash
+	inFlight         bool
+	wakeups          int
+	wakeupDeadline   time.Time
+}
+
+type sendWork struct {
+	request    *pendingRequest
+	key        requestKey
+	typeID     LookupType
+	peer       RouterRef
+	exclusions []foundation.Hash
+	deadline   time.Time
+}
+
+// RequestManager drives bounded, iterative DatabaseLookup requests without a
+// dependency on router or tunnel implementations. DatabaseStore admission is
+// intentionally upstream: call HandleDatabaseStore only after Database has
+// accepted the store.
+//
+// Lock hierarchy:
+//   - RequestManager.mu -> ResponderProfiles.mu -> Table.mu (database.routers.mu)
+//   - RequestManager.mu and RequestManager.randMu are disjoint; neither lock may
+//     be held while acquiring the other.
+//   - RequestManager.mu and Database.leasesMu are disjoint; lookupPresent
+//     queries leasesMu outside RequestManager.mu.
+type RequestManager struct {
+	database *Database
+	sender   RequestSender
+	route    ReplyRoute
+
+	metrics       *observability.Registry
+	capacity      int
+	maxCandidates int
+	maxWaiters    int
+	timeoutMillis uint64
+	now           func() uint64
+	responders    *ResponderProfiles
+	// +checklocks:randMu
+	rand   io.Reader
+	logger *slog.Logger
+	randMu sync.Mutex
+
+	mu sync.Mutex
+	// +checklocks:mu
+	pending map[requestKey]*pendingRequest
+	// +checklocks:mu
+	closed  bool
+	active  sync.WaitGroup
+	workers sync.WaitGroup
+	jobs    chan sendWork
+	ctx     context.Context
+	// +checklocks:mu
+	cancel context.CancelFunc
+}
+
+// NewRequestManager creates a bounded request manager. A clock is required so
+// expiry policy remains deterministic and owned by the caller's scheduler.
+func NewRequestManager(database *Database, sender RequestSender, route ReplyRoute, config RequestManagerConfig) (*RequestManager, error) {
+	if database == nil || sender == nil || route == nil {
+		return nil, errRequestManagerDependencies
+	}
+	if config.Capacity <= 0 {
+		return nil, errRequestManagerCapacity
+	}
+	if config.MaxCandidates <= 0 {
+		config.MaxCandidates = 16
+	}
+	if config.MaxCandidates > foundation.I2NPMaxDatabaseLookupExcluded {
+		return nil, errRequestManagerCandidateLimit
+	}
+	if config.MaxWaiters <= 0 {
+		config.MaxWaiters = 64
+	}
+	if config.TimeoutMillis == 0 {
+		return nil, errRequestManagerTimeout
+	}
+	if config.Now == nil {
+		return nil, errRequestManagerClock
+	}
+	if config.Rand == nil {
+		config.Rand = cryptorand.Reader
+	}
+	lifecycle, cancel := context.WithCancel(context.Background())
+	workerCount := parallelism.Workers(config.Capacity)
+	manager := &RequestManager{
+		database:      database,
+		sender:        sender,
+		route:         route,
+		metrics:       config.Metrics,
+		capacity:      config.Capacity,
+		maxCandidates: config.MaxCandidates,
+		maxWaiters:    config.MaxWaiters,
+		timeoutMillis: config.TimeoutMillis,
+		now:           config.Now,
+		responders:    config.Responders,
+		logger:        config.Logger,
+		rand:          config.Rand,
+		pending:       make(map[requestKey]*pendingRequest, config.Capacity),
+		jobs:          make(chan sendWork, config.Capacity),
+		ctx:           lifecycle,
+		cancel:        cancel,
+	}
+	manager.workers.Add(workerCount)
+	for range workerCount {
+		go manager.worker()
+	}
+	return manager, nil
+}
+
+// LookupRouterInfo starts or coalesces a RouterInfo lookup.
+func (m *RequestManager) LookupRouterInfo(ctx context.Context, key foundation.Hash) (<-chan LookupResult, error) {
+	return m.Lookup(ctx, RouterInfoLookup, key)
+}
+
+// LookupLeaseSet starts or coalesces a LeaseSet lookup. Any LeaseSet store
+// variant completes this request.
+func (m *RequestManager) LookupLeaseSet(ctx context.Context, key foundation.Hash) (<-chan LookupResult, error) {
+	return m.Lookup(ctx, LeaseSetLookup, key)
+}
+
+// LookupLeaseSetFresh starts or coalesces a LeaseSet lookup that bypasses the
+// cached copy. Route exhaustion can outlive a cached LeaseSet whose leases
+// all transit failed tunnels, so callers re-resolve after peer republishing.
+func (m *RequestManager) LookupLeaseSetFresh(ctx context.Context, key foundation.Hash) (<-chan LookupResult, error) {
+	return m.lookup(ctx, LeaseSetLookup, key, true)
+}
+
+// Lookup queues bounded send work and returns without waiting for transport I/O.
+// The result channel reports completion; Expire enforces the shared request deadline.
+func (m *RequestManager) Lookup(ctx context.Context, typeID LookupType, key foundation.Hash) (<-chan LookupResult, error) {
+	return m.lookup(ctx, typeID, key, false)
+}
+
+func (m *RequestManager) lookup(ctx context.Context, typeID LookupType, key foundation.Hash, forceRefresh bool) (<-chan LookupResult, error) {
+	if typeID != RouterInfoLookup && typeID != LeaseSetLookup && typeID != ExplorationLookup {
+		return nil, errUnknownLookupType
+	}
+	if ctx ==
+		nil {
+		ctx = context.Background()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, ErrRequestManagerClosed
+	}
+	m.mu.Unlock()
+	result := make(chan LookupResult, 1)
+	if !forceRefresh && m.lookupPresent(typeID, key) {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, ErrRequestManagerClosed
+		}
+		m.mu.Unlock()
+		result <- LookupResult{Key: key, Type: typeID}
+		close(result)
+		return result, nil
+	}
+
+	lookupKey := requestKey{key: key}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, ErrRequestManagerClosed
+	}
+	if existing := m.pending[lookupKey]; existing != nil {
+		if existing.typeID != typeID {
+			m.mu.Unlock()
+			return nil, ErrConflictingLookup
+		}
+		if len(existing.waiters) == m.maxWaiters {
+			m.mu.Unlock()
+			return nil, ErrRequestManagerFull
+		}
+		existing.waiters = append(existing.waiters, result)
+		m.mu.Unlock()
+		return result, nil
+	}
+	if len(m.pending) == m.capacity {
+		m.mu.Unlock()
+		return nil, ErrRequestManagerFull
+	}
+	now := m.now()
+	allTargets := m.database.eligibleFloodTargets(make([]RouterRef, m.maxCandidates), key, now, m.sender)
+	deadline := now + m.timeoutMillis
+	if deadline < now {
+		deadline = ^uint64(0)
+	}
+	requestContext, cancelRequest := context.WithCancel(m.ctx)
+	req := &pendingRequest{
+		ctx:        requestContext,
+		cancel:     cancelRequest,
+		key:        key,
+		typeID:     typeID,
+		routingKey: RoutingKey(key, now),
+		deadline:   deadline,
+		waiters:    []chan LookupResult{result},
+		candidates: make([]lookupCandidate, 0, m.maxCandidates),
+		fallbacks:  make([]foundation.Hash, 0, len(allTargets)),
+	}
+	if m.responders != nil {
+		var responsive [1]foundation.Hash
+		for _, candidate := range m.responders.Candidates(responsive[:0], m.database) {
+			if m.addCandidateLocked(req, candidate) {
+				req.seed = candidate
+			}
+		}
+	}
+	for _, target := range allTargets {
+		if req.candidateIndex(target.Hash) >= 0 {
+			continue
+		}
+		if len(req.candidates) < javaIterativeSearchInitialPeers {
+			m.addCandidateLocked(req, target.Hash)
+			continue
+		}
+		req.fallbacks = append(req.fallbacks, target.Hash)
+	}
+	m.pending[lookupKey] = req
+	work, terminal := m.prepareSendLocked(lookupKey, req)
+	if terminal != nil {
+		m.completeLocked(lookupKey, req, terminal)
+	}
+	m.mu.Unlock()
+	if work != nil {
+		dispatchContext := m.ctx
+		if forceRefresh {
+			dispatchContext = ctx
+		}
+		if err := m.dispatch(dispatchContext, *work); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// Explore sends a type-3 DatabaseLookup through the same bounded request
+// lifecycle as ordinary lookup work.
+func (m *RequestManager) Explore(ctx context.Context, key foundation.Hash) (<-chan LookupResult, error) {
+	return m.Lookup(ctx, ExplorationLookup, key)
+}
+
+// BuildDatabaseLookup serializes the unencrypted RouterInfo or LeaseSet lookup
+// format parsed by i2np.ParseDatabaseLookup. Exclusions are copied directly as
+// 32-byte hashes and must be the peers already queried by this request.
+func BuildDatabaseLookup(key foundation.Hash, typeID LookupType, route ReplyRoute, exclusions []foundation.Hash) ([]byte, error) {
+	if route == nil || len(exclusions) > foundation.I2NPMaxDatabaseLookupExcluded {
+		return nil, ErrInvalidReplyRoute
+	}
+	gateway, tunnelID, tunnel := route.DatabaseLookupReplyRoute()
+	if gateway == (foundation.Hash{}) || (tunnel && tunnelID == 0) {
+		return nil, ErrInvalidReplyRoute
+	}
+	flags := byte(typeID << 2)
+	switch typeID {
+	case RouterInfoLookup, LeaseSetLookup, ExplorationLookup:
+	default:
+		return nil, errUnknownLookupType
+	}
+	length := 32 + 32 + 1 + 2 + len(exclusions)*foundation.HashLength
+	if tunnel {
+		flags |= 1
+		length += 4
+	}
+	payload := make([]byte, length)
+	copy(payload[:32], key[:])
+	copy(payload[32:64], gateway[:])
+	payload[64] = flags
+	off := 65
+	if tunnel {
+		binary.BigEndian.PutUint32(payload[off:off+4], tunnelID)
+		off += 4
+	}
+	binary.BigEndian.PutUint16(payload[off:off+2], uint16(len(exclusions)))
+	off += 2
+	for _, exclusion := range exclusions {
+		copy(payload[off:off+foundation.HashLength], exclusion[:])
+		off += foundation.HashLength
+	}
+	return payload, nil
+}
+
+// HandleDatabaseSearchReply incorporates reachable peers from an answer to a
+// live lookup and sends the next unqueried peer. Unknown referred RouterInfos
+// are resolved before use; known floodfills remain immediately available so a
+// stalled refresh cannot block the parent LeaseSet search. Unsolicited replies
+// cannot steer a request: From must be one of the peers already queried.
+func (m *RequestManager) HandleDatabaseSearchReply(ctx context.Context, reply foundation.I2NPDatabaseSearchReplyMessage) {
+	if ctx.Err() != nil {
+		return
+	}
+	lookupKey := requestKey{key: reply.Key}
+	var refresh []foundation.Hash
+	m.mu.Lock()
+	req := m.pending[lookupKey]
+	if req == nil {
+		if m.logger != nil {
+			m.logger.Debug("netdb search reply ignored", "reason", "not_pending", "key", foundation.EncodeI2PBase64(reply.Key[:]), "from", foundation.EncodeI2PBase64(reply.From[:]))
+		}
+		m.mu.Unlock()
+		return
+	}
+	if !req.wasSent(reply.From) {
+		m.mu.Unlock()
+		if m.logger != nil {
+			m.logger.Debug("netdb search reply ignored", "reason", "unexpected_sender", "key", foundation.EncodeI2PBase64(reply.Key[:]), "from", foundation.EncodeI2PBase64(reply.From[:]))
+		}
+		return
+	}
+	if m.responders != nil && req.deadline > m.now() && responderEligible(m.database, reply.From, m.now()) {
+		m.responders.Record(reply.From)
+	}
+	req.markSettled(reply.From)
+	if !req.hasUnsettledSent() {
+		req.responseDeadline = 0
+	}
+	for off := 0; off < len(reply.Peers) && len(req.candidates) < m.maxCandidates; off += foundation.HashLength {
+		var peer foundation.Hash
+		copy(peer[:], reply.Peers[off:off+foundation.HashLength])
+		if !m.addCandidateLocked(req, peer) {
+			continue
+		}
+		if current, known := m.database.Routers().Get(peer); !known || !targetEligible(m.sender, current) {
+			req.setRefreshing(peer, true)
+			refresh = append(refresh, peer)
+		}
+	}
+	var work *sendWork
+	if req.inFlight {
+		m.addWakeupLocked(ctx, req)
+	} else {
+		var terminal error
+		work, terminal = m.prepareSendLocked(lookupKey, req)
+		if work != nil || terminal != nil {
+			req.responseDeadline = 0
+		}
+		if terminal != nil {
+			m.completeLocked(lookupKey, req, terminal)
+		} else if work == nil && m.explorationConvergedLocked(req) {
+			m.completeLocked(lookupKey, req, nil)
+		}
+	}
+	if m.logger != nil {
+		m.logger.Debug("netdb search reply accepted", "key", foundation.EncodeI2PBase64(reply.Key[:]), "from", foundation.EncodeI2PBase64(reply.From[:]), "peers", len(reply.Peers)/foundation.HashLength)
+	}
+	m.mu.Unlock()
+	if work != nil {
+		_ = m.dispatch(ctx, *work)
+		work = nil
+	}
+	var refreshFailed []foundation.Hash
+	for _, peer := range refresh {
+		if _, err := m.lookup(ctx, RouterInfoLookup, peer, true); err != nil {
+			refreshFailed = append(refreshFailed, peer)
+		}
+	}
+	if len(refreshFailed) != 0 {
+		m.mu.Lock()
+		req = m.pending[lookupKey]
+		if req != nil {
+			for _, peer := range refreshFailed {
+				req.setRefreshing(peer, false)
+			}
+			if !req.inFlight {
+				var terminal error
+				work, terminal = m.prepareSendLocked(lookupKey, req)
+				if terminal != nil {
+					m.completeLocked(lookupKey, req, terminal)
+				}
+			}
+		}
+		m.mu.Unlock()
+	}
+	if work != nil {
+		_ = m.dispatch(ctx, *work)
+	}
+}
+
+// ExpectsDatabaseStore reports whether store can complete a live lookup.
+// Callers use it before admission to keep lookup replies out of floodfill
+// published-entry responses.
+func (m *RequestManager) ExpectsDatabaseStore(store foundation.I2NPDatabaseStoreMessage) bool {
+	m.mu.Lock()
+	req := m.pending[requestKey{key: store.Key}]
+	matched := req != nil && storeMatches(req.typeID, store.Type)
+	m.mu.Unlock()
+	return matched
+}
+
+// HandleDatabaseStore completes a matching request after the caller has
+// verified and admitted the store into Database. A RouterInfo store also wakes
+// lookups that learned its hash from a DatabaseSearchReply.
+func (m *RequestManager) HandleDatabaseStore(ctx context.Context, store foundation.I2NPDatabaseStoreMessage) {
+	if ctx.Err() != nil {
+		return
+	}
+	var work []sendWork
+	m.mu.Lock()
+	lookupKey := requestKey{key: store.Key}
+	if req := m.pending[lookupKey]; req != nil && storeMatches(req.typeID, store.Type) {
+		m.completeLocked(lookupKey, req, nil)
+		if m.logger != nil {
+			m.logger.Debug("netdb lookup completed by store", "key", foundation.EncodeI2PBase64(store.Key[:]), "store_type", uint8(store.Type))
+		}
+	}
+	if store.Type == foundation.I2NPStoreRouterInfo {
+		for key, req := range m.pending {
+			if !req.setRefreshing(store.Key, false) {
+				continue
+			}
+			if req.inFlight {
+				m.addWakeupLocked(ctx, req)
+				continue
+			}
+			if next, terminal := m.prepareSendLocked(key, req); terminal != nil {
+				m.completeLocked(key, req, terminal)
+			} else if next != nil {
+				work = append(work, *next)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for i := range work {
+		_ = m.dispatch(ctx, work[i])
+	}
+}
+
+// Expire retries a silent floodfill after the bounded per-attempt deadline and
+// completes requests whose overall deadline is no longer in the future.
+func (m *RequestManager) Expire(nowMillis uint64) int {
+	m.mu.Lock()
+	removed := 0
+	work := make([]sendWork, 0)
+	for key, req := range m.pending {
+		expired, next := m.expireLocked(key, req, nowMillis)
+		if expired {
+			removed++
+		}
+		if next != nil {
+			work = append(work, *next)
+		}
+	}
+	m.mu.Unlock()
+	for i := range work {
+		_ = m.dispatch(m.ctx, work[i])
+	}
+	return removed
+}
+
+// +checklocks:m.mu
+// +checklocksexclude:m.randMu
+func (m *RequestManager) expireLocked(key requestKey, req *pendingRequest, nowMillis uint64) (bool, *sendWork) {
+	if req.deadline <= nowMillis {
+		m.completeLocked(key, req, ErrRequestExpired)
+		return true, nil
+	}
+	if req.inFlight || req.responseDeadline == 0 || req.responseDeadline > nowMillis {
+		return false, nil
+	}
+	req.responseDeadline = 0
+	req.settleAllSent()
+	next, terminal := m.prepareSendLocked(key, req)
+	if terminal != nil {
+		m.completeLocked(key, req, terminal)
+		return true, nil
+	}
+	if next != nil {
+		return false, next
+	}
+	if !allCandidatesSent(req) {
+		return false, nil
+	}
+	if req.typeID == ExplorationLookup {
+		m.completeLocked(key, req, nil)
+	} else {
+		m.completeLocked(key, req, ErrRequestExpired)
+	}
+	return true, nil
+}
+
+// Close rejects new lookup work, completes every waiter, and joins any
+// in-flight sender call before returning. It is safe to call more than once.
+func (m *RequestManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	closing := false
+	if !m.closed {
+		if m.cancel != nil {
+			m.cancel()
+		}
+		m.closed = true
+		closing = true
+		for key, req := range m.pending {
+			m.completeLocked(key, req, ErrRequestManagerClosed)
+		}
+	}
+	m.mu.Unlock()
+	if closing {
+		m.active.Wait()
+		close(m.jobs)
+	}
+	m.workers.Wait()
+	return nil
+}
+
+// Pending returns the number of distinct keys being looked up.
+func (m *RequestManager) Pending() int {
+	m.mu.Lock()
+	n := len(m.pending)
+	m.mu.Unlock()
+	return n
+}
+
+// +checklocksexclude:m.mu
+func (m *RequestManager) lookupPresent(typeID LookupType, key foundation.Hash) bool {
+	switch typeID {
+	case RouterInfoLookup:
+		_, ok := m.database.Routers().Get(key)
+		return ok
+	case LeaseSetLookup:
+		m.database.leasesMu.RLock()
+		entry, ok := m.database.leases[key]
+		m.database.leasesMu.RUnlock()
+		return ok && entry.expires > m.now()
+	default:
+		return false
+	}
+}
+
+func (r *pendingRequest) candidateIndex(peer foundation.Hash) int {
+	for i := range r.candidates {
+		if r.candidates[i].hash == peer {
+			return i
+		}
+	}
+	return -1
+}
+
+func (r *pendingRequest) wasSent(peer foundation.Hash) bool {
+	idx := r.candidateIndex(peer)
+	return idx >= 0 && r.candidates[idx].sent
+}
+
+func (r *pendingRequest) setRefreshing(peer foundation.Hash, refreshing bool) bool {
+	idx := r.candidateIndex(peer)
+	if idx < 0 {
+		return false
+	}
+	r.candidates[idx].refreshing = refreshing
+	return true
+}
+
+func (r *pendingRequest) unmarkSent(peer foundation.Hash) {
+	idx := r.candidateIndex(peer)
+	if idx >= 0 && r.candidates[idx].sent {
+		r.candidates[idx].sent = false
+		r.candidates[idx].settled = false
+		r.sentCount--
+	}
+}
+
+func (r *pendingRequest) markSettled(peer foundation.Hash) {
+	idx := r.candidateIndex(peer)
+	if idx >= 0 && r.candidates[idx].sent {
+		r.candidates[idx].settled = true
+	}
+}
+
+func (r *pendingRequest) settleAllSent() {
+	for i := range r.candidates {
+		if r.candidates[i].sent {
+			r.candidates[i].settled = true
+		}
+	}
+}
+
+func (r *pendingRequest) hasUnsettledSent() bool {
+	for i := range r.candidates {
+		if r.candidates[i].sent && !r.candidates[i].settled {
+			return true
+		}
+	}
+	return false
+}
+
+// +checklocks:m.mu
+func (m *RequestManager) explorationConvergedLocked(req *pendingRequest) bool {
+	if req.typeID != ExplorationLookup || req.hasUnsettledSent() {
+		return false
+	}
+	return allCandidatesSent(req) || req.sentCount >= min(m.maxCandidates, javaIterativeSearchLimit)
+}
+
+func (r *pendingRequest) anyAttempted() bool {
+	for i := range r.candidates {
+		if r.candidates[i].attempted {
+			return true
+		}
+	}
+	return false
+}
+
+// +checklocks:m.mu
+func (m *RequestManager) addCandidateLocked(req *pendingRequest, peer foundation.Hash) bool {
+	if len(req.candidates) == m.maxCandidates {
+		return false
+	}
+	if req.candidateIndex(peer) >= 0 {
+		return false
+	}
+	req.candidates = append(req.candidates, lookupCandidate{hash: peer})
+	return true
+}
+
+// +checklocks:m.mu
+func (m *RequestManager) promoteFallbackLocked(req *pendingRequest) {
+	for len(req.fallbacks) != 0 && len(req.candidates) < m.maxCandidates {
+		peer := req.fallbacks[0]
+		req.fallbacks = req.fallbacks[1:]
+		if m.addCandidateLocked(req, peer) {
+			return
+		}
+	}
+}
+
+// +checklocks:m.mu
+func (m *RequestManager) addWakeupLocked(ctx context.Context, req *pendingRequest) {
+	if deadline, ok := ctx.Deadline(); ok {
+		req.wakeupDeadline = earlierSendDeadline(req.wakeupDeadline, deadline)
+	}
+	if req.wakeups < m.maxCandidates {
+		req.wakeups++
+	}
+}
+
+// +checklocks:m.mu
+// +checklocksexclude:m.randMu
+func (m *RequestManager) prepareSendLocked(key requestKey, req *pendingRequest) (*sendWork, error) {
+	if req.inFlight {
+		return nil, nil
+	}
+	if req.deadline <= m.now() {
+		return nil, ErrRequestExpired
+	}
+	if req.sentCount >= min(m.maxCandidates, javaIterativeSearchLimit) {
+		if req.hasUnsettledSent() && req.responseDeadline > m.now() {
+			return nil, nil
+		}
+		if req.typeID == ExplorationLookup {
+			return nil, nil
+		}
+		return nil, ErrRequestExpired
+	}
+	selectedIndex := -1
+	var peer RouterRef
+	if req.seed != (foundation.Hash{}) && !req.anyAttempted() {
+		if idx := req.candidateIndex(req.seed); idx >= 0 {
+			if current, known := m.database.Routers().Get(req.seed); known && responderRefEligible(current, m.now()) && targetEligible(m.sender, current) {
+				selectedIndex, peer = idx, current
+			}
+		}
+	}
+	if selectedIndex < 0 {
+		for i := range req.candidates {
+			candidate := &req.candidates[i]
+			if candidate.attempted || candidate.refreshing {
+				continue
+			}
+			current, known := m.database.Routers().Get(candidate.hash)
+			if !known || !targetEligible(m.sender, current) {
+				continue
+			}
+			if candidate.hash == req.seed && !responderRefEligible(current, m.now()) {
+				continue
+			}
+			if selectedIndex < 0 || distanceLess(req.routingKey, candidate.hash, req.candidates[selectedIndex].hash) {
+				selectedIndex, peer = i, current
+			}
+		}
+	}
+	if selectedIndex >= 0 {
+		req.candidates[selectedIndex].attempted = true
+		if !req.candidates[selectedIndex].sent {
+			req.candidates[selectedIndex].sent = true
+			req.candidates[selectedIndex].settled = false
+			req.sentCount++
+		}
+		req.inFlight = true
+		exclusions := make([]foundation.Hash, 0, req.sentCount)
+		for i := range req.candidates {
+			if req.candidates[i].sent {
+				exclusions = append(exclusions, req.candidates[i].hash)
+			}
+		}
+		return &sendWork{request: req, key: key, typeID: req.typeID, peer: peer, exclusions: exclusions, deadline: req.wakeupDeadline}, nil
+	}
+	if req.sentCount == 0 {
+		return nil, ErrNoFloodfill
+	}
+	return nil, nil
+}
+
+// Queued sends own their lifetime; the handler may return and cancel its context
+// before a worker starts. Preserve its deadline under the request lifetime.
+func (m *RequestManager) dispatch(ctx context.Context, work sendWork) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		work.deadline = earlierSendDeadline(work.deadline, deadline)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrRequestManagerClosed
+	}
+	if err := ctx.Err(); err != nil {
+		if req := m.pending[work.key]; req == work.request {
+			m.completeLocked(work.key, req, err)
+		}
+		return err
+	}
+	m.active.Add(1)
+	select {
+	case m.jobs <- work:
+		return nil
+	default:
+		m.active.Done()
+		if req := m.pending[work.key]; req == work.request {
+			m.completeLocked(work.key, req, ErrRequestManagerFull)
+		}
+		return ErrRequestManagerFull
+	}
+}
+
+func (m *RequestManager) worker() {
+	defer m.workers.Done()
+	for work := range m.jobs {
+		m.send(work)
+		m.active.Done()
+	}
+}
+
+func earlierSendDeadline(first, second time.Time) time.Time {
+	if first.IsZero() || !second.IsZero() && second.Before(first) {
+		return second
+	}
+	return first
+}
+
+func (m *RequestManager) send(work sendWork) {
+	if work.request.ctx.Err() != nil {
+		return
+	}
+	ctx := work.request.ctx
+	if !work.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, work.deadline)
+		defer cancel()
+	}
+	var payload []byte
+	err := ctx.Err()
+	if err == nil {
+		payload, err = BuildDatabaseLookup(work.key.key, work.typeID, m.route, work.exclusions)
+	}
+	if err == nil {
+		var id uint32
+		if id, err = m.nextMessageID(); err == nil {
+			message := foundation.I2NPMessage{Header: foundation.I2NPHeader{Type: foundation.I2NPDatabaseLookup, ID: id, Expiration: databaseLookupExpiration(m.now())}, Payload: payload}
+			err = m.sender.Send(ctx, work.peer, message)
+			if m.logger != nil {
+				m.logger.Debug("netdb lookup send", "key", foundation.EncodeI2PBase64(work.key.key[:]), "lookup_type", uint8(work.typeID), "peer", foundation.EncodeI2PBase64(work.peer.Hash[:]), "exclusions", len(work.exclusions))
+			}
+		}
+	}
+	if m.metrics != nil {
+		if err == nil {
+			m.metrics.IncNetDBLookups()
+		} else {
+			m.metrics.IncNetDBLookupFailures()
+		}
+	}
+	if err != nil && m.logger != nil {
+		m.logger.Debug("netdb lookup send failed", "key", foundation.EncodeI2PBase64(work.key.key[:]), "lookup_type", uint8(work.typeID), "peer", foundation.EncodeI2PBase64(work.peer.Hash[:]), "error", err)
+	}
+	if err == nil {
+		var next *sendWork
+		m.mu.Lock()
+		if req := m.pending[work.key]; req == work.request {
+			req.inFlight = false
+			req.responseDeadline = min(req.deadline, saturatingAddMillis(m.now(), databaseLookupAttemptTimeout))
+			if req.wakeups > 0 {
+				req.wakeups--
+				next, err = m.prepareSendLocked(work.key, req)
+				if next != nil || err != nil {
+					req.responseDeadline = 0
+				} else {
+					req.wakeups = 0
+				}
+				if req.wakeups == 0 {
+					req.wakeupDeadline = time.Time{}
+				}
+				if err != nil {
+					m.completeLocked(work.key, req, err)
+				}
+			}
+		}
+		m.mu.Unlock()
+		if next != nil {
+			next.deadline = earlierSendDeadline(next.deadline, work.deadline)
+			m.send(*next)
+		}
+		return
+	}
+
+	m.mu.Lock()
+	req := m.pending[work.key]
+	if req != work.request {
+		m.mu.Unlock()
+		return
+	}
+	if ctx.Err() != nil {
+		m.completeLocked(work.key, req, ctx.Err())
+		m.mu.Unlock()
+		return
+	}
+	req.unmarkSent(work.peer.Hash)
+	m.promoteFallbackLocked(req)
+	req.inFlight = false
+	next, terminal := m.prepareSendLocked(work.key, req)
+	if next == nil && terminal == nil {
+		terminal = err
+	}
+	if terminal != nil {
+		m.completeLocked(work.key, req, terminal)
+	}
+	m.mu.Unlock()
+	if next != nil {
+		next.deadline = earlierSendDeadline(next.deadline, work.deadline)
+		m.send(*next)
+	}
+}
+
+func allCandidatesSent(req *pendingRequest) bool {
+	for i := range req.candidates {
+		if !req.candidates[i].attempted {
+			return false
+		}
+	}
+	return len(req.candidates) != 0
+}
+
+func saturatingAddMillis(now, delta uint64) uint64 {
+	if ^uint64(0)-now < delta {
+		return ^uint64(0)
+	}
+	return now + delta
+}
+
+// +checklocksexclude:m.mu
+func (m *RequestManager) nextMessageID() (uint32, error) {
+	var bytes [4]byte
+	m.randMu.Lock()
+	_, err := io.ReadFull(m.rand, bytes[:])
+	m.randMu.Unlock()
+	return binary.BigEndian.Uint32(bytes[:]), err
+}
+
+func databaseLookupExpiration(now uint64) uint64 {
+	if ^uint64(0)-now < databaseLookupEnvelopeLifetime {
+		return ^uint64(0)
+	}
+	return now + databaseLookupEnvelopeLifetime
+}
+
+// +checklocks:m.mu
+// +checklocksexclude:m.randMu
+func (m *RequestManager) completeLocked(key requestKey, req *pendingRequest, err error) {
+	req.cancel()
+	delete(m.pending, key)
+	result := LookupResult{Key: req.key, Type: req.typeID, Err: err}
+	for _, waiter := range req.waiters {
+		waiter <- result
+		close(waiter)
+	}
+}
+
+func storeMatches(typeID LookupType, storeType foundation.I2NPStoreType) bool {
+	if typeID == RouterInfoLookup {
+		return storeType == foundation.I2NPStoreRouterInfo
+	}
+	switch storeType {
+	case foundation.I2NPStoreLeaseSet, foundation.I2NPStoreLeaseSet2, foundation.I2NPStoreMetaLeaseSet, foundation.I2NPStoreEncryptedLeaseSet:
+		return true
+	default:
+		return false
+	}
+}
