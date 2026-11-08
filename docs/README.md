@@ -30,6 +30,7 @@ The unified source tree on `refs/suda/main` and the linear commit chain on `refs
 | `//web/telemetry` | `gosuda/telemetry.gosuda.org` | [Browse `//web/telemetry`](https://magpie.gosuda.org/tree/web/telemetry) | [Commits `//web/telemetry`](https://magpie.gosuda.org/history/web/telemetry) |
 | `//storage/supersql` | `gosuda/supersql-alpha` | [Browse `//storage/supersql`](https://magpie.gosuda.org/tree/storage/supersql) | [Commits `//storage/supersql`](https://magpie.gosuda.org/history/storage/supersql) |
 | `//net/zeroproxy` | `gosuda/zeroproxy` | [Browse `//net/zeroproxy`](https://magpie.gosuda.org/tree/net/zeroproxy) | [Commits `//net/zeroproxy`](https://magpie.gosuda.org/history/net/zeroproxy) |
+| `//net/chromenet` | `gosuda/chromenet` | [Browse `//net/chromenet`](https://magpie.gosuda.org/tree/net/chromenet) | [Commits `//net/chromenet`](https://magpie.gosuda.org/history/net/chromenet) |
 <!-- SUDA_EXPLORER_END -->
 
 ## 2. Reference Namespace Map

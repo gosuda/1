@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"gosuda.org/chrome-net/client"
+	"gosuda.org/chromenet/client"
 )
 
 const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

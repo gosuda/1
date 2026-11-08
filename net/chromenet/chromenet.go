@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"gosuda.org/chrome-net/client"
+	"gosuda.org/chromenet/client"
 )
 
 // Options configures browser signature and engine behavior.
