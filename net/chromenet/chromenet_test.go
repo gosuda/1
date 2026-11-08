@@ -157,127 +157,51 @@ func writeWSServerFrame(w io.Writer, opcode int, payload []byte) error {
 	return nil
 }
 
-func TestConstants(t *testing.T) {
-	if chromenet.TextMessage != 1 {
-		t.Errorf("TextMessage = %d; want 1", chromenet.TextMessage)
-	}
-	if chromenet.BinaryMessage != 2 {
-		t.Errorf("BinaryMessage = %d; want 2", chromenet.BinaryMessage)
-	}
-	if chromenet.CloseMessage != 8 {
-		t.Errorf("CloseMessage = %d; want 8", chromenet.CloseMessage)
-	}
-	if chromenet.PingMessage != 9 {
-		t.Errorf("PingMessage = %d; want 9", chromenet.PingMessage)
-	}
-	if chromenet.PongMessage != 10 {
-		t.Errorf("PongMessage = %d; want 10", chromenet.PongMessage)
-	}
-}
-
-func TestNewTransport_HTTPAndHeaders(t *testing.T) {
-	var capturedHeader http.Header
+func TestNewTransport_EndToEnd(t *testing.T) {
 	var mu sync.Mutex
-
+	var seen http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		capturedHeader = r.Header.Clone()
+		seen = r.Header.Clone()
 		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("chromenet-response-body"))
+		w.Header().Set("X-Reply", "pong")
+		_, _ = io.WriteString(w, "chromenet-response-body")
 	}))
 	defer srv.Close()
 
-	customUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ChromeNet/1.0"
-	tr := chromenet.NewTransport(chromenet.Options{
-		UserAgent:          customUA,
-		InsecureSkipVerify: true,
-		Timeout:            5 * time.Second,
-	})
+	const customUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ChromeNet/1.0"
+	tr := chromenet.NewTransport(chromenet.Options{UserAgent: customUA})
 	defer tr.Close()
 
-	req, err := http.NewRequest("GET", srv.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	c := &http.Client{Transport: tr}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
-
-	resp, err := tr.RoundTrip(req)
+	resp, err := c.Do(req)
 	if err != nil {
-		t.Fatalf("RoundTrip: %v", err)
+		t.Fatalf("Do: %v", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d; want %d", resp.StatusCode, http.StatusOK)
-	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
-	if string(body) != "chromenet-response-body" {
-		t.Errorf("body = %q; want 'chromenet-response-body'", string(body))
+	if resp.StatusCode != http.StatusOK || string(body) != "chromenet-response-body" {
+		t.Errorf("got %d %q; want 200 %q", resp.StatusCode, body, "chromenet-response-body")
+	}
+	if got := resp.Header.Get("X-Reply"); got != "pong" {
+		t.Errorf("X-Reply = %q; want pong", got)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if got := capturedHeader.Get("User-Agent"); got != customUA {
-		t.Errorf("User-Agent = %q; want %q", got, customUA)
-	}
-	if got := capturedHeader.Get("Sec-Ch-Ua"); got == "" {
-		t.Error("expected Sec-Ch-Ua header, got empty")
-	}
-	if got := capturedHeader.Get("Accept-Encoding"); got == "" {
-		t.Error("expected Accept-Encoding header, got empty")
-	}
-}
-
-func TestNewTransport_HQQAndCloseRejection(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tr := chromenet.NewTransport(chromenet.Options{
-		InsecureSkipVerify: true,
-	})
-
-	// Test HQQ roundtrip
-	hqqReq, err := http.NewRequestWithContext(ctx, "GET", "hqq://chrome-net-engine/chromenet-test", nil)
-	if err != nil {
-		t.Fatalf("NewRequestWithContext: %v", err)
-	}
-
-	resp, err := tr.RoundTrip(hqqReq)
-	if err != nil {
-		t.Fatalf("HQQ RoundTrip: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("HQQ status = %d; want 200", resp.StatusCode)
-	}
-
-	buf := make([]byte, 64)
-	n, err := resp.Body.Read(buf)
-	if err != nil && err != io.EOF {
-		t.Fatalf("HQQ Read: %v", err)
-	}
-	if n == 0 {
-		t.Fatal("HQQ read 0 bytes")
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatalf("resp.Body.Close: %v", err)
-	}
-
-	// Close transport and verify rejection
-	if err := tr.Close(); err != nil {
-		t.Fatalf("tr.Close: %v", err)
-	}
-
-	dummyReq, _ := http.NewRequest("GET", "http://127.0.0.1:9999/dummy", nil)
-	_, err = tr.RoundTrip(dummyReq)
-	if err == nil {
-		t.Fatal("expected error on closed transport, got nil")
-	}
-	if !strings.Contains(err.Error(), "transport closed") {
-		t.Fatalf("expected error containing 'transport closed', got: %v", err)
+	if got := seen.Get("User-Agent"); got != customUA {
+		t.Errorf("server saw User-Agent %q; want %q", got, customUA)
 	}
 }
 

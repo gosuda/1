@@ -64,10 +64,14 @@ func StartServer(ctx context.Context, args ...string) (*launch.Server, error) {
 	})
 }
 
+// defaultPoolSize bounds the requests in flight through DefaultPool: each request holds one
+// engine session until its response body is closed.
+const defaultPoolSize = 64
+
 var (
 	sharedMu   sync.Mutex
 	sharedSrv  *launch.Server
-	sharedPool = rt.NewPool(16, func(ctx context.Context) (*Client, error) {
+	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
 		return Open(ctx)
 	}, func(c *Client) error {
 		return c.Close()
@@ -156,7 +160,7 @@ func Shutdown() error {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 	_ = sharedPool.Close()
-	sharedPool = rt.NewPool(16, func(ctx context.Context) (*Client, error) {
+	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
 		return Open(ctx)
 	}, func(c *Client) error {
 		return c.Close()
@@ -176,7 +180,7 @@ func ResetSharedServerForTesting() {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 	_ = sharedPool.Close()
-	sharedPool = rt.NewPool(16, func(ctx context.Context) (*Client, error) {
+	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
 		return Open(ctx)
 	}, func(c *Client) error {
 		return c.Close()

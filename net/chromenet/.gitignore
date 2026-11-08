@@ -1,10 +1,4 @@
-# Build artifacts
-server/build/
-build/
-*.o
-*.a
-.ninja_*
-cmake-build-*
+# scripts/engine/build.sh output
+dist/
 go.work
 go.work.sum
-

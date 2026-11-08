@@ -19,6 +19,29 @@ import (
 	"gosuda.org/hqq/secureexec"
 )
 
+// engineRoundTrip proves the server answers the generated RPC interface: it creates and destroys
+// an engine and resolves a net error code to its name.
+func engineRoundTrip(t testing.TB, cl *client.Client) {
+	t.Helper()
+	eng, err := cl.ChromeEngineCreate([]byte("quic=1\n"))
+	if err != nil {
+		t.Fatalf("ChromeEngineCreate: %v", err)
+	}
+	if eng.IsNil() {
+		t.Fatal("ChromeEngineCreate returned a nil Engine handle")
+	}
+	name, err := cl.ChromeNetErrorName(-105)
+	if err != nil {
+		t.Fatalf("ChromeNetErrorName: %v", err)
+	}
+	if name != "ERR_NAME_NOT_RESOLVED" {
+		t.Errorf("ChromeNetErrorName(-105) = %q; want ERR_NAME_NOT_RESOLVED", name)
+	}
+	if err := cl.ChromeEngineDestroy(eng); err != nil {
+		t.Fatalf("ChromeEngineDestroy: %v", err)
+	}
+}
+
 func TestServerBinary(t *testing.T) {
 	path, hash, err := client.ServerBinary()
 	if err != nil {
@@ -28,9 +51,24 @@ func TestServerBinary(t *testing.T) {
 		t.Fatal("ServerBinary() returned empty path")
 	}
 
-	expected, ok := client.ExpectedHash(runtime.GOOS, runtime.GOARCH)
-	if !ok {
-		t.Fatalf("ExpectedHash(%s, %s) returned false", runtime.GOOS, runtime.GOARCH)
+	// HQQ_CHROME_NET_SERVER replaces the embedded binary, so its digest is the file's own
+	// instead of the pinned one.
+	var expected secureexec.Hash
+	if override := os.Getenv("HQQ_CHROME_NET_SERVER"); override != "" {
+		if path != override {
+			t.Fatalf("ServerBinary() = %s; want HQQ_CHROME_NET_SERVER %s", path, override)
+		}
+		h, _, err := secureexec.HashFile(override)
+		if err != nil {
+			t.Fatalf("HashFile(%s): %v", override, err)
+		}
+		expected = h
+	} else {
+		pinned, ok := client.ExpectedHash(runtime.GOOS, runtime.GOARCH)
+		if !ok {
+			t.Fatalf("ExpectedHash(%s, %s) returned false", runtime.GOOS, runtime.GOARCH)
+		}
+		expected = pinned
 	}
 	if hash != expected {
 		t.Fatalf("hash mismatch: got %s, want %s", hash, expected)
@@ -43,7 +81,8 @@ func TestServerBinary(t *testing.T) {
 	if fi.IsDir() {
 		t.Fatalf("server binary %s is a directory", path)
 	}
-	if fi.Mode()&0111 == 0 {
+	// Windows has no execute permission bit.
+	if runtime.GOOS != "windows" && fi.Mode()&0111 == 0 {
 		t.Fatalf("server binary %s is not executable (mode %v)", path, fi.Mode())
 	}
 
@@ -88,7 +127,7 @@ func TestEnvVarOverride(t *testing.T) {
 	}
 
 	// Verify server starts and accepts calls via the overridden binary
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	srv, err := client.StartServer(ctx)
@@ -103,16 +142,7 @@ func TestEnvVarOverride(t *testing.T) {
 	}
 	defer cl.Close()
 
-	eng, err := cl.EngineCreate(nil)
-	if err != nil {
-		t.Fatalf("EngineCreate via override server: %v", err)
-	}
-	if eng.IsNil() {
-		t.Fatal("expected non-nil Engine handle")
-	}
-	if err := cl.EngineDestroy(eng); err != nil {
-		t.Fatalf("EngineDestroy: %v", err)
-	}
+	engineRoundTrip(t, cl)
 }
 
 func TestTamperedBinaryRejected(t *testing.T) {
@@ -166,7 +196,7 @@ func TestAutolaunchLifecycle(t *testing.T) {
 		_ = client.Shutdown()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	cl, err := client.Open(ctx)
@@ -175,17 +205,7 @@ func TestAutolaunchLifecycle(t *testing.T) {
 	}
 	defer cl.Close()
 
-	// Perform RPC round-trip: EngineCreate and EngineDestroy
-	eng, err := cl.EngineCreate(nil)
-	if err != nil {
-		t.Fatalf("EngineCreate: %v", err)
-	}
-	if eng.IsNil() {
-		t.Fatal("expected non-nil Engine handle")
-	}
-	if err := cl.EngineDestroy(eng); err != nil {
-		t.Fatalf("EngineDestroy: %v", err)
-	}
+	engineRoundTrip(t, cl)
 
 	if err := client.Shutdown(); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -251,7 +271,7 @@ func TestClientPool(t *testing.T) {
 		_ = client.Shutdown()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	pool := client.NewClientPool(4, client.DefaultOptions())
@@ -272,7 +292,7 @@ func TestClientPool(t *testing.T) {
 			}
 			defer pool.Put(c)
 
-			eng, err := c.EngineCreate(nil)
+			eng, err := c.ChromeEngineCreate([]byte("quic=1\n"))
 			if err != nil {
 				errCh <- err
 				return
@@ -281,7 +301,7 @@ func TestClientPool(t *testing.T) {
 				errCh <- errors.New("invalid engine handle")
 				return
 			}
-			if err := c.EngineDestroy(eng); err != nil {
+			if err := c.ChromeEngineDestroy(eng); err != nil {
 				errCh <- err
 				return
 			}

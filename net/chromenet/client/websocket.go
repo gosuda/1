@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // RFC 6455 message types / opcodes.
@@ -85,20 +84,14 @@ func DialWebSocket(ctx context.Context, rawURL string, opts Options) (WebSocketC
 		}
 	}
 
-	timeout := opts.Timeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
-
-	dialer := &net.Dialer{Timeout: timeout}
+	dialer := &net.Dialer{}
 	var conn net.Conn
 	if isTLS {
-		serverName := u.Hostname()
-		tlsConfig := &tls.Config{
+		td := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
 			InsecureSkipVerify: opts.InsecureSkipVerify,
-			ServerName:         serverName,
-		}
-		conn, err = tls.DialWithDialer(dialer, "tcp", host, tlsConfig)
+			ServerName:         u.Hostname(),
+		}}
+		conn, err = td.DialContext(ctx, "tcp", host)
 	} else {
 		conn, err = dialer.DialContext(ctx, "tcp", host)
 	}
