@@ -1,0 +1,80 @@
+name: Release
+
+# Builds the six chrome_net_server binaries with engine.yml, attests their build provenance, pins
+# them in internal/embedded (hashes.go and bin/), commits that to main as github-actions[bot] and
+# publishes a GitHub release. The commit reaches gosuda/0 as an inbound mirror change that a
+# member lands.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  engine:
+    uses: ./.github/workflows/engine.yml
+
+  publish:
+    needs: [engine]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: engine-*
+          path: dist
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: 'dist/chrome_net_server_*'
+      - name: Pin binaries and digests
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          chromium=$(sed -n 's/^version=//p' third_party/chromium/VERSION)
+          (cd dist && sha256sum chrome_net_server_* | sort -k2 > SHA256SUMS)
+          cat dist/SHA256SUMS
+          scripts/engine/pin-embedded.sh dist "$tag" "$chromium"
+          git add internal/embedded third_party/chromium/notices
+          if [ "$GITHUB_REF_TYPE" != "tag" ] && ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "internal/embedded: pin chrome_net_server ${tag} (Chromium ${chromium})"
+            git push origin HEAD:main
+          fi
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=$(git rev-parse HEAD)
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            git tag -f "$TAG" "$target"
+            git push origin -f "refs/tags/$TAG"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$target" \
+              --title "$TAG" --generate-notes
+          fi
