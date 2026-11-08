@@ -1,4 +1,6 @@
-CHROMIUM_VERSION=134.0.6998.35
-CHROMIUM_CHANNEL=stable
-CHROMIUM_REVISION=6998
-UPSTREAM_COMMIT=95b45f41aa0c9e6d0a75ea9c6a71cecae95f9e21
+# Chromium release whose //net stack chrome_net_server is built from.
+# Read by scripts/engine/engine.py; rewritten by `engine.py pin`.
+# Official source archive, verified against SHA256 in this directory.
+version=157.0.8103.38
+archive=chromium-157.0.8103.38-lite.tar.xz
+url=https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.38-lite.tar.xz

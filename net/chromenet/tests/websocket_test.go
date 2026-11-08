@@ -2,8 +2,11 @@ package tests
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -485,5 +488,236 @@ func TestWebSocket_ConcurrentWrites(t *testing.T) {
 
 	for err := range errCh {
 		t.Errorf("concurrent WriteMessage error: %v", err)
+	}
+}
+
+func TestWebSocket_PingBoundaries(t *testing.T) {
+	wsURL, cleanup := startMockWSServer(t, func(conn net.Conn, r *bufio.Reader) {
+		for {
+			op, payload, err := readClientFrame(r)
+			if err != nil {
+				return
+			}
+			if op == client.PingMessage {
+				_ = writeServerFrame(conn, client.PongMessage, payload)
+			}
+		}
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, resp, err := client.DialWebSocket(ctx, wsURL+"/ping-boundaries", client.Options{})
+	if err != nil {
+		t.Fatalf("DialWebSocket: %v", err)
+	}
+	_ = resp.Body.Close()
+	defer ws.Close()
+
+	// 0, 1 and 125 bytes (the RFC 6455 control frame maximum) must round-trip.
+	for _, n := range []int{0, 1, 125} {
+		ping := bytes.Repeat([]byte{0x7f}, n)
+		if err := ws.Ping(ping); err != nil {
+			t.Fatalf("Ping(%d bytes): %v", n, err)
+		}
+		op, pong, err := ws.ReadMessage()
+		if err != nil || op != client.PongMessage || !bytes.Equal(pong, ping) {
+			t.Fatalf("Ping(%d bytes): got op=%d payload=%d bytes err=%v", n, op, len(pong), err)
+		}
+	}
+
+	// Anything larger is rejected locally and must not desynchronize the stream.
+	for _, n := range []int{126, 1000} {
+		if err := ws.Ping(make([]byte, n)); err == nil {
+			t.Fatalf("Ping(%d bytes) succeeded; want error", n)
+		}
+	}
+	if err := ws.Ping([]byte("still-in-sync")); err != nil {
+		t.Fatalf("Ping after rejected ping: %v", err)
+	}
+	op, pong, err := ws.ReadMessage()
+	if err != nil || op != client.PongMessage || string(pong) != "still-in-sync" {
+		t.Fatalf("pong after rejected ping: op=%d payload=%q err=%v", op, pong, err)
+	}
+}
+
+func TestWebSocket_OperationsAfterClose(t *testing.T) {
+	wsURL, cleanup := startMockWSServer(t, nil)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ws, resp, err := client.DialWebSocket(ctx, wsURL+"/ops-after-close", client.Options{})
+	if err != nil {
+		t.Fatalf("DialWebSocket: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if err := ws.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := ws.Ping([]byte("ping")); err == nil {
+		t.Fatal("Ping after Close succeeded; want error")
+	}
+	if err := ws.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, _, err := ws.ReadMessage(); err != io.EOF {
+		t.Fatalf("ReadMessage after Close = %v; want io.EOF", err)
+	}
+}
+
+func TestWebSocket_TruncatedFrame(t *testing.T) {
+	wsURL, cleanup := startMockWSServer(t, func(c net.Conn, r *bufio.Reader) {
+		// One byte of a frame header, then the connection drops.
+		_, _ = c.Write([]byte{0x81})
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ws, resp, err := client.DialWebSocket(ctx, wsURL+"/truncated", client.Options{})
+	if err != nil {
+		t.Fatalf("DialWebSocket: %v", err)
+	}
+	_ = resp.Body.Close()
+	defer ws.Close()
+
+	if _, _, err := ws.ReadMessage(); err == nil {
+		t.Fatal("ReadMessage on truncated frame succeeded; want error")
+	}
+}
+
+func TestWebSocket_MalformedServerFrames(t *testing.T) {
+	big := make([]byte, 2+2+126)
+	big[0], big[1], big[3] = 0x89, 126, 126 // ping with a 126-byte payload
+
+	tests := []struct {
+		name  string
+		frame []byte
+		want  string
+	}{
+		{"64bit length with MSB set", []byte{0x81, 127, 0x80, 0, 0, 0, 0, 0, 0, 1, 'A'}, "most significant bit"},
+		{"declared length over 16 MiB", []byte{0x82, 127, 0, 0, 0, 0, 0x01, 0, 0, 0x01}, "exceeds max frame size"},
+		{"non-minimal 16-bit length", []byte{0x81, 126, 0, 5, 'h', 'e', 'l', 'l', 'o'}, "non-minimal"},
+		{"non-minimal 64-bit length", append([]byte{0x82, 127, 0, 0, 0, 0, 0, 0, 1, 0}, make([]byte, 256)...), "non-minimal"},
+		{"reserved data opcode", []byte{0x83, 0}, "reserved opcode"},
+		{"reserved control opcode", []byte{0x8b, 0}, "reserved opcode"},
+		{"fragmented control frame", []byte{0x09, 4, 'p', 'i', 'n', 'g'}, "fragmented control frame"},
+		{"control frame over 125 bytes", big, "125"},
+		{"RSV1 without extension", []byte{0xc1, 4, 't', 'e', 's', 't'}, "non-zero RSV"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wsURL, cleanup := startMockWSServer(t, func(c net.Conn, r *bufio.Reader) {
+				_, _ = c.Write(tc.frame)
+			})
+			defer cleanup()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			ws, resp, err := client.DialWebSocket(ctx, wsURL+"/malformed", client.Options{})
+			if err != nil {
+				t.Fatalf("DialWebSocket: %v", err)
+			}
+			_ = resp.Body.Close()
+			defer ws.Close()
+
+			_, _, err = ws.ReadMessage()
+			if err == nil {
+				t.Fatal("ReadMessage succeeded; want protocol error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ReadMessage error = %v; want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestWebSocket_MaskedServerFrame(t *testing.T) {
+	wsURL, cleanup := startMockWSServer(t, func(c net.Conn, r *bufio.Reader) {
+		maskKey := []byte{0x12, 0x34, 0x56, 0x78}
+		data := []byte("masked-server-payload")
+		masked := make([]byte, len(data))
+		for i := range data {
+			masked[i] = data[i] ^ maskKey[i%4]
+		}
+		frame := append([]byte{0x81, byte(0x80 | len(data))}, maskKey...)
+		_, _ = c.Write(append(frame, masked...))
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ws, resp, err := client.DialWebSocket(ctx, wsURL+"/masked", client.Options{})
+	if err != nil {
+		t.Fatalf("DialWebSocket: %v", err)
+	}
+	_ = resp.Body.Close()
+	defer ws.Close()
+
+	// RFC 6455 §5.1 lets the client either reject the frame or unmask it; it must not
+	// deliver the payload still masked or desynchronize.
+	op, payload, err := ws.ReadMessage()
+	if err == nil && (op != client.TextMessage || string(payload) != "masked-server-payload") {
+		t.Fatalf("masked frame delivered as op=%d payload=%q", op, payload)
+	}
+}
+
+func TestWebSocket_LargeMessageBothDirections(t *testing.T) {
+	const size = 1 << 20
+	clientData := make([]byte, size)
+	serverData := make([]byte, size)
+	if _, err := rand.Read(clientData); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(serverData); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan [32]byte, 1)
+	wsURL, cleanup := startMockWSServer(t, func(c net.Conn, r *bufio.Reader) {
+		op, payload, err := readClientFrame(r)
+		if err != nil || op != client.BinaryMessage {
+			received <- [32]byte{}
+			return
+		}
+		received <- sha256.Sum256(payload)
+		_ = writeServerFrame(c, client.BinaryMessage, serverData)
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ws, resp, err := client.DialWebSocket(ctx, wsURL+"/large", client.Options{})
+	if err != nil {
+		t.Fatalf("DialWebSocket: %v", err)
+	}
+	_ = resp.Body.Close()
+	defer ws.Close()
+
+	if err := ws.WriteMessage(client.BinaryMessage, clientData); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	op, payload, err := ws.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if op != client.BinaryMessage || sha256.Sum256(payload) != sha256.Sum256(serverData) {
+		t.Fatalf("client received corrupted message: op=%d len=%d", op, len(payload))
+	}
+	select {
+	case got := <-received:
+		if got != sha256.Sum256(clientData) {
+			t.Fatal("server received corrupted client message")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for server to receive message")
 	}
 }
