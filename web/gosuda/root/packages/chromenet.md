@@ -1,4 +1,5 @@
 ---
+id: 6e0bce9e22a4bf7d9672c59e67bcf5ec
 author: Lemon Mint
 title: 'Teaching Your Go Program to Speak Like Chrome'
 description: How chromenet lets standard Go HTTP clients talk to the web through the real Chromium network engine without cgo or a C compiler.
