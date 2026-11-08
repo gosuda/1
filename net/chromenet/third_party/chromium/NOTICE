@@ -1,0 +1,36 @@
+Third-Party Software Attributions for Chromium Network Engine
+============================================================
+
+1. BoringSSL
+Portions of BoringSSL are licensed under the following terms:
+
+Copyright (c) 2015, Google Inc.
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+2. QUICHE (QUIC, HTTP/2, and WebTransport)
+Copyright (c) Google LLC
+Licensed under the BSD 3-Clause License.
+
+3. Brotli
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction.
+
+4. Zlib
+Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler
+This software is provided 'as-is', without any express or implied warranty.
+
+5. ICU / URL Normalization
+Copyright (c) 1995-2023 International Business Machines Corporation and others.
+Licensed under the Unicode License Agreement.

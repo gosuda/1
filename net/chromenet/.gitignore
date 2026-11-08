@@ -1,0 +1,10 @@
+# Build artifacts
+server/build/
+build/
+*.o
+*.a
+.ninja_*
+cmake-build-*
+go.work
+go.work.sum
+

@@ -1,0 +1,52 @@
+idl 1;
+
+@serialize(none)
+service chrome_net;
+
+include "chrome_net.h";
+
+const CHROME_NET_OK: i32 = 0;
+const CHROME_NET_ERROR: i32 = -1;
+
+@c("chrome_engine_t *")
+handle Engine destroy engine_destroy;
+
+@c("chrome_request_t *")
+handle Request owned_by Engine destroy request_destroy;
+
+@c("chrome_wt_session_t *")
+handle WtSession owned_by Engine destroy wt_session_destroy;
+
+@c("chrome_ws_conn_t *")
+handle WsConn owned_by Engine destroy ws_conn_destroy;
+
+@error(null)
+fn engine_create(opts: bytes<=4096, opts_len: size @len_of(opts)) -> Engine;
+
+@error(status, ok(CHROME_NET_OK))
+fn engine_destroy(e: Engine) -> i32;
+
+@error(null)
+fn http_request(e: Engine, req: bytes<=65536, req_len: size @len_of(req),
+                out headers: bytes<=65536, headers_cap: size @len_of(headers),
+                out headers_len: size @len_of(headers),
+                out status: i32) -> Request;
+
+fn http_read_body(r: Request, max_len: u32,
+                  out buf: bytes<=65536, buf_cap: size @len_of(buf),
+                  out eof: bool) -> size @len_of(buf);
+
+@error(status, ok(CHROME_NET_OK))
+fn request_destroy(r: Request) -> i32;
+
+@error(null)
+fn wt_dial(e: Engine, url: str<=2048) -> WtSession;
+
+@error(status, ok(CHROME_NET_OK))
+fn wt_session_destroy(s: WtSession) -> i32;
+
+@error(null)
+fn ws_dial(e: Engine, url: str<=2048) -> WsConn;
+
+@error(status, ok(CHROME_NET_OK))
+fn ws_conn_destroy(w: WsConn) -> i32;

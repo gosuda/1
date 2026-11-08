@@ -1,0 +1,22 @@
+# NetDB router snapshot & runtime state
+*.routers
+netdb.routers
+state.bundle
+addressbook.json
+*.log
+data/
+
+# Binaries & test artifacts
+/ivnpd
+*.test
+*.out
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Embedded WebUI workspace (production build is committed for go:embed)
+cmd/ivnpd/webui/node_modules/
+cmd/ivnpd/webui/.svelte-kit/
+.agents/skills/hallmark

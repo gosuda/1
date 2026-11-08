@@ -1,0 +1,67 @@
+version: "2"
+
+run:
+  tests: true
+
+formatters:
+  enable: [goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/gosuda/portal-tunnel/v2]
+
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - errorlint
+    - copyloopvar
+    - nilerr
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+    - durationcheck
+    - noctx
+    - wastedassign
+
+  exclusions:
+    paths:
+      - ^frontend/node_modules/
+      - ^cmd/relay-server/dist/
+    rules:
+      # govultr DoWithContext consumes the HTTP body and returns an in-memory copy.
+      - path: '^portal/acme/vultr/provider\.go$'
+        linters: [bodyclose]
+        source: 'client\.(Domain|DomainRecord)\.(Get|GetDNSSec|List|Create)\('
+      - linters: [errcheck]
+        source: "^\\s*defer\\s+"
+      - path: "_test\\.go"
+        linters: [bodyclose, errcheck, noctx]
+
+  settings:
+    errcheck:
+      check-blank: false
+      check-type-assertions: false
+      exclude-functions:
+        - fmt.Printf
+        - fmt.Println
+        - fmt.Print
+        - fmt.Fprintf
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Sprintf
+        - os.Unsetenv
+        - encoding/json.Marshal
+        - encoding/json.Unmarshal
+        - io.Copy
+        - log.Printf
+        - log.Println
+        - log.Print
+        - time.Now
+        - time.Sleep
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
