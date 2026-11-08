@@ -1,7 +1,7 @@
 # Notices & Attribution
 
 ## Project Overview & Architecture
-`gosuda.org/chrome-net` provides a pure-Go (`CGO_ENABLED=0`) client library providing authentic Chromium network stack capabilities (HTTP/1.1, HTTP/2, QUIC/HTTP/3, WebTransport, and WebSocket) with complete browser signature fidelity (JA3/JA4, BoringSSL cipher suites, GREASE, and ALPN).
+`gosuda.org/chromenet` provides a pure-Go (`CGO_ENABLED=0`) client library providing authentic Chromium network stack capabilities (HTTP/1.1, HTTP/2, QUIC/HTTP/3, WebTransport, and WebSocket) with complete browser signature fidelity (JA3/JA4, BoringSSL cipher suites, GREASE, and ALPN).
 
 ### Process Isolation & Dual Licensing Model
 To maintain complete separation of licensing boundaries and guarantee cross-platform portability without requiring a C/C++ toolchain at Go compile time:

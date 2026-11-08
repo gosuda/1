@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"gosuda.org/chrome-net/internal/embedded"
+	"gosuda.org/chromenet/internal/embedded"
 	"gosuda.org/hqq/bindgen/rt"
 	"gosuda.org/hqq/launch"
 	"gosuda.org/hqq/secureexec"
@@ -30,7 +30,7 @@ func ServerBinary() (string, secureexec.Hash, error) {
 	if p := os.Getenv("HQQ_CHROME_NET_SERVER"); p != "" {
 		h, _, err := secureexec.HashFile(p)
 		if err != nil {
-			return "", secureexec.Hash{}, fmt.Errorf("chrome-net: hash HQQ_CHROME_NET_SERVER (%s): %w", p, err)
+			return "", secureexec.Hash{}, fmt.Errorf("chromenet: hash HQQ_CHROME_NET_SERVER (%s): %w", p, err)
 		}
 		return p, h, nil
 	}
@@ -39,9 +39,9 @@ func ServerBinary() (string, secureexec.Hash, error) {
 		if err == nil {
 			return path, expected, nil
 		}
-		return "", secureexec.Hash{}, fmt.Errorf("chrome-net: materialize embedded binary (%s/%s): %w", runtime.GOOS, runtime.GOARCH, err)
+		return "", secureexec.Hash{}, fmt.Errorf("chromenet: materialize embedded binary (%s/%s): %w", runtime.GOOS, runtime.GOARCH, err)
 	}
-	return "", secureexec.Hash{}, fmt.Errorf("chrome-net: no embedded chrome_net_server binary for %s/%s", runtime.GOOS, runtime.GOARCH)
+	return "", secureexec.Hash{}, fmt.Errorf("chromenet: no embedded chrome_net_server binary for %s/%s", runtime.GOOS, runtime.GOARCH)
 }
 
 // StartServer verifies the server binary with secureexec and starts an isolated

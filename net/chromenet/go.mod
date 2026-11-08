@@ -1,4 +1,4 @@
-module gosuda.org/chrome-net
+module gosuda.org/chromenet
 
 go 1.24.0
 

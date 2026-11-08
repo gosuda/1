@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Multi-Platform Build and Cross-Compilation Driver for chrome-net Server
+# Multi-Platform Build and Cross-Compilation Driver for chromenet Server
 # Target architectures supported:
 #   - linux/amd64   (x86_64-linux-gnu)
 #   - linux/arm64   (aarch64-linux-gnu)
@@ -56,7 +56,7 @@ for arg in "$@"; do
 done
 
 echo "=========================================================="
-echo " chrome-net Native Server Build & Cross-Compilation Driver"
+echo " chromenet Native Server Build & Cross-Compilation Driver"
 echo " Platform target: ${PLATFORM}"
 echo " Build directory: ${BUILD_DIR}"
 echo " Build type:      ${BUILD_TYPE}"

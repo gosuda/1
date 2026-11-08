@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"gosuda.org/chrome-net/client"
+	"gosuda.org/chromenet/client"
 )
 
 func TestSignatures_CipherSuiteOrder(t *testing.T) {

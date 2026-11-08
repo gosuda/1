@@ -1,6 +1,6 @@
-# chrome-net: Portable Chromium Network Engine for Go
+# chromenet: Portable Chromium Network Engine for Go
 
-`gosuda.org/chrome-net` provides a high-performance network engine for Go that executes HTTP/1.1, HTTP/2, QUIC/HTTP/3, WebTransport, and WebSocket requests with 100% authentic Google Chrome browser signatures (JA3/JA4, BoringSSL cipher suites, GREASE, and ALPN).
+`gosuda.org/chromenet` provides a high-performance network engine for Go that executes HTTP/1.1, HTTP/2, QUIC/HTTP/3, WebTransport, and WebSocket requests with 100% authentic Google Chrome browser signatures (JA3/JA4, BoringSSL cipher suites, GREASE, and ALPN).
 
 ## Architecture
 
@@ -58,7 +58,7 @@ The system isolates Chromium's native C++ network engine into an independent wor
 
 ## Directory Layout
 ```
-experimental/lemon-mint/chrome-net/
+net/chromenet/
 ├── go.mod                           # Module definition
 ├── LICENSE                          # MIT License
 ├── NOTICE.md                        # Attribution and IPC architecture notes

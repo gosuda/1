@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"gosuda.org/chrome-net/client"
+	"gosuda.org/chromenet/client"
 	"gosuda.org/hqq/launch"
 	"gosuda.org/hqq/secureexec"
 )

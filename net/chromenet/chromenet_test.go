@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	chromenet "gosuda.org/chrome-net"
+	chromenet "gosuda.org/chromenet"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

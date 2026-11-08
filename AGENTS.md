@@ -86,6 +86,7 @@ Table 2 maps the mounted repositories to their exact paths inside `refs/suda/mai
 | `gosuda/randflake` | `crypto/randflake` | `gosuda.org/randflake/v2` |
 | `gosuda/jimin` | `ai/jimin` | `gosuda.org/jimin` |
 | `gosuda/telemetry.gosuda.org` | `web/telemetry` | `telemetry.gosuda.org/telemetry` |
+| `gosuda/chromenet` | `net/chromenet` | `gosuda.org/chromenet` |
 | `gosuda/rivulet` (private, not mirrored) | `corp/rivulet` | `github.com/gosuda/rivulet` |
 
 ## 4. Internal and External Contribution Processes

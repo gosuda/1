@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"gosuda.org/chrome-net/client"
+	"gosuda.org/chromenet/client"
 )
 
 func TestTransport_ImplementsRoundTripper(t *testing.T) {
