@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package record;
+
+option go_package = "github.com/gosuda/rivulet/proto/record";
+
+import "google/protobuf/timestamp.proto";
+
+// Node represents a node in the cluster
+message Node {
+  string init_address = 1;     // Initial address of the node
+  string cluster_address = 2;  // Cluster address of the node
+  bool is_active = 3;          // Indicates if the node is active
+}
+
+// ChainDefinition defines a processing chain
+message ChainDefinition {
+  string name = 1;             // Unique identifier for the chain
+  string entry_point = 2;      // The entry point of the chain, typically a flowlet name
+  repeated string flowlets = 3; // Requirement list of flowlets that are part of the chain
+}
+
+// State represents the execution state of a chain
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_STANDBY = 1;     // Chain is in standby state, waiting for evaluation
+  STATE_RUNNING = 2;     // Chain is currently being evaluated
+  STATE_COMPLETED = 3;   // Chain evaluation has completed successfully
+  STATE_FAILED = 4;      // Chain evaluation has failed
+}
+
+// ChainHistory records the execution history of a chain
+message ChainHistory {
+  string chain_name = 1;                        // Name of the chain
+  google.protobuf.Timestamp eval_time = 2;     // Time when the chain was evaluated
+  string flowlet = 3;                          // Name of the flowlet that was executed
+  State state = 4;                             // State of the chain after evaluation
+  string message = 5;                          // Additional message or error description
+}
+
+// Config represents database configuration
+message Config {
+  string path = 1;              // Database path
+  map<string, string> options = 2; // Database options as key-value pairs
+}
+
+// Record service for database operations
+service RecordService {
+  // Node operations
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc SetNode(SetNodeRequest) returns (SetNodeResponse);
+  rpc DeleteNode(DeleteNodeRequest) returns (DeleteNodeResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // ChainDefinition operations
+  rpc GetChainDefinition(GetChainDefinitionRequest) returns (GetChainDefinitionResponse);
+  rpc SetChainDefinition(SetChainDefinitionRequest) returns (SetChainDefinitionResponse);
+  rpc DeleteChainDefinition(DeleteChainDefinitionRequest) returns (DeleteChainDefinitionResponse);
+  rpc ListChainDefinitions(ListChainDefinitionsRequest) returns (ListChainDefinitionsResponse);
+
+  // ChainHistory operations
+  rpc GetChainHistory(GetChainHistoryRequest) returns (GetChainHistoryResponse);
+  rpc AddChainHistory(AddChainHistoryRequest) returns (AddChainHistoryResponse);
+  rpc ListChainHistories(ListChainHistoriesRequest) returns (ListChainHistoriesResponse);
+}
+
+// Request/Response messages for Node operations
+message GetNodeRequest {
+  string address = 1;
+}
+
+message GetNodeResponse {
+  Node node = 1;
+}
+
+message SetNodeRequest {
+  string address = 1;
+  Node node = 2;
+}
+
+message SetNodeResponse {
+  bool success = 1;
+}
+
+message DeleteNodeRequest {
+  string address = 1;
+}
+
+message DeleteNodeResponse {
+  bool success = 1;
+}
+
+message ListNodesRequest {
+  int32 limit = 1;
+  string cursor = 2;
+}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+  string next_cursor = 2;
+}
+
+// Request/Response messages for ChainDefinition operations
+message GetChainDefinitionRequest {
+  string name = 1;
+}
+
+message GetChainDefinitionResponse {
+  ChainDefinition chain_definition = 1;
+}
+
+message SetChainDefinitionRequest {
+  ChainDefinition chain_definition = 1;
+}
+
+message SetChainDefinitionResponse {
+  bool success = 1;
+}
+
+message DeleteChainDefinitionRequest {
+  string name = 1;
+}
+
+message DeleteChainDefinitionResponse {
+  bool success = 1;
+}
+
+message ListChainDefinitionsRequest {
+  int32 limit = 1;
+  string cursor = 2;
+}
+
+message ListChainDefinitionsResponse {
+  repeated ChainDefinition chain_definitions = 1;
+  string next_cursor = 2;
+}
+
+// Request/Response messages for ChainHistory operations
+message GetChainHistoryRequest {
+  string chain_name = 1;
+  google.protobuf.Timestamp from_time = 2;
+  google.protobuf.Timestamp to_time = 3;
+}
+
+message GetChainHistoryResponse {
+  repeated ChainHistory histories = 1;
+}
+
+message AddChainHistoryRequest {
+  ChainHistory history = 1;
+}
+
+message AddChainHistoryResponse {
+  bool success = 1;
+}
+
+message ListChainHistoriesRequest {
+  int32 limit = 1;
+  string cursor = 2;
+  string chain_name = 3;  // Optional filter by chain name
+}
+
+message ListChainHistoriesResponse {
+  repeated ChainHistory histories = 1;
+  string next_cursor = 2;
+}
