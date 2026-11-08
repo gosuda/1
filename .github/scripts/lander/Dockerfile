@@ -11,7 +11,7 @@ FROM docker:cli AS dockercli
 
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git openssh-client ca-certificates \
+ && apt-get install -y --no-install-recommends git openssh-client ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 # Go is needed to warm module caches for presubmit (`go mod download`); no repository code runs here.
 COPY --from=build /usr/local/go /usr/local/go
@@ -23,5 +23,8 @@ RUN useradd --system --uid 10001 --home-dir /var/lib/lander --create-home lander
 USER 10001
 VOLUME /var/lib/lander
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/lander"]
+# tini runs as PID 1 and reaps orphans: git 2.47 detaches `git maintenance run --auto` after each
+# fetch/push, and the orphan is reparented to PID 1. The lander never reaps it, so zombies pile up
+# until the pids cgroup rejects fork.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/lander"]
 CMD ["run"]
