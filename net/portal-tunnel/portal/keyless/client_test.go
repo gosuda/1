@@ -1,0 +1,530 @@
+package keyless
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	ksigner "github.com/gosuda/keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
+
+	"github.com/gosuda/portal-tunnel/v2/types"
+)
+
+var errSignerCloseFailed = errors.New("signer close failed")
+
+func TestClientAccessTokenUpdateChangesSignerHeaders(t *testing.T) {
+	t.Parallel()
+	client := &Client{}
+	client.SetAccessToken(" first ")
+	if got := client.headers().Get(types.HeaderAccessToken); got != "first" {
+		t.Fatalf("initial access token header = %q, want first", got)
+	}
+	client.SetAccessToken("second")
+	if got := client.headers().Get(types.HeaderAccessToken); got != "second" {
+		t.Fatalf("updated access token header = %q, want second", got)
+	}
+}
+
+func TestClientClosePreservesFirstError(t *testing.T) {
+	t.Parallel()
+	closer := &failingCloseResource{}
+	client := &Client{pin: &pinnedChain{signer: closer}}
+
+	first := client.Close()
+	second := client.Close()
+	if first == nil || second == nil {
+		t.Fatalf("Close() must keep reporting the first close error; got first=%v second=%v", first, second)
+	}
+	if !errors.Is(second, first) {
+		t.Fatalf("second Close() = %v, want first close error %v", second, first)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("underlying resource closed %d times, want exactly 1", closer.calls)
+	}
+}
+
+func TestNewSignerRequiresBindingRegistry(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewSigner(nil, nil); err == nil {
+		t.Fatal("NewSigner(nil bindings) = nil error, want policy guard")
+	} else if err.Error() != "portal binding registry is required" {
+		t.Fatalf("NewSigner(nil bindings) error = %q, want binding registry requirement", err)
+	}
+	if _, err := NewSigner(NewBindingRegistry(time.Minute), nil); err == nil {
+		t.Fatal("NewSigner(nil key lookup) = nil error, want a signer that cannot sign refused")
+	}
+}
+
+func TestVerifyCertificateHostname(t *testing.T) {
+	t.Parallel()
+	_, _, certPEM := mustSelfSignedCert(t, "covered.test.example", nil)
+
+	if err := verifyCertificateHostname(certPEM, "covered.test.example"); err != nil {
+		t.Fatalf("VerifyCertificateHostname(covered) error = %v", err)
+	}
+	if err := verifyCertificateHostname(certPEM, "other.test.example"); err == nil {
+		t.Fatal("VerifyCertificateHostname(other) = nil, want hostname mismatch error")
+	}
+}
+
+// TestClientTerminateConnLoopback is the end-to-end proof of the rebuilt
+// tenant client: a loopback relay stand-in serves the transcript-bound
+// /v1/sign wire (POST JSON in the signrpc shape) behind HTTPS, the client
+// pins that endpoint's certificate chain, and TerminateConn completes a real
+// TLS 1.3 handshake against a stock crypto/tls counterpart. The relay-minted
+// binding and the access token must reach the sign endpoint untouched, and
+// the terminated connection must carry application data both ways.
+func TestClientTerminateConnLoopback(t *testing.T) {
+	const (
+		hostname        = "tunnel.test.example"
+		initialToken    = "token-initial"
+		handshakeBudget = 15 * time.Second
+	)
+
+	key, certDER, certPEM := mustSelfSignedCert(t, hostname, []net.IP{net.ParseIP("127.0.0.1")})
+
+	service := &ksigner.Service{
+		Store: func() ksigner.KeyStore {
+			store := ksigner.NewStaticKeyStore()
+			if err := store.Put(relayKeyID, key); err != nil {
+				t.Fatalf("seed static key store: %v", err)
+			}
+			return store
+		}(),
+		// Test-only: this stand-in's validator accepts every structurally
+		// valid request; the binding's presence and value are asserted below.
+		TranscriptValidator: ksigner.TranscriptValidatorFunc(func(context.Context, *signrpc.TranscriptSignRequest) error {
+			return nil
+		}),
+	}
+
+	type signObservation struct {
+		binding     []byte
+		accessToken string
+	}
+	observations := make(chan signObservation, 4)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != signrpc.SignPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req signrpc.TranscriptSignRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10)).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(signrpc.ErrorResponse{Error: err.Error()})
+			return
+		}
+		resp, err := service.SignTranscript(r.Context(), &req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, ksigner.ErrInvalidArgument):
+				status = http.StatusBadRequest
+			case errors.Is(err, ksigner.ErrPermissionDenied):
+				status = http.StatusForbidden
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(signrpc.ErrorResponse{Error: err.Error()})
+			return
+		}
+		observations <- signObservation{
+			binding:     bytes.Clone(req.Binding),
+			accessToken: r.Header.Get(types.HeaderAccessToken),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	srv := httptest.NewUnstartedServer(handler)
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	client, err := NewClient(ClientConfig{
+		RelayURL:    srv.URL,
+		Hostname:    hostname,
+		AccessToken: initialToken,
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if closeErr := client.Close(); closeErr != nil {
+			t.Errorf("client.Close() error = %v", closeErr)
+		}
+	})
+	if !client.ExportsKeyingMaterial() {
+		t.Fatal("ExportsKeyingMaterial() = false, want true for the t13server terminator")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeBudget)
+	defer cancel()
+
+	binding := make([]byte, 16)
+	if _, err := rand.Read(binding); err != nil {
+		t.Fatalf("generate binding: %v", err)
+	}
+
+	relayEnd, tenantEnd := net.Pipe()
+	t.Cleanup(func() { _ = relayEnd.Close() })
+	probeTLS := tls.Client(relayEnd, &tls.Config{
+		ServerName: hostname,
+		RootCAs:    mustCertPool(t, certPEM),
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"http/1.1"},
+	})
+	t.Cleanup(func() { _ = probeTLS.Close() })
+
+	probeHandshake := make(chan error, 1)
+	go func() {
+		probeHandshake <- probeTLS.HandshakeContext(ctx)
+	}()
+
+	terminated, err := client.TerminateConn(ctx, tenantEnd, binding)
+	if err != nil {
+		t.Fatalf("TerminateConn() error = %v", err)
+	}
+	t.Cleanup(func() { _ = terminated.Close() })
+	if err := <-probeHandshake; err != nil {
+		t.Fatalf("client-side tls handshake error = %v", err)
+	}
+	if got := terminated.(interface{ ConnectionState() tls.ConnectionState }).ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+		t.Fatalf("negotiated ALPN = %q, want http/1.1", got)
+	}
+
+	select {
+	case obs := <-observations:
+		if !bytes.Equal(obs.binding, binding) {
+			t.Fatalf("sign request binding = %X, want %X", obs.binding, binding)
+		}
+		if obs.accessToken != initialToken {
+			t.Fatalf("sign request access token header = %q, want %q", obs.accessToken, initialToken)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sign endpoint saw no transcript sign request")
+	}
+
+	echoDone := make(chan error, 1)
+	go func() {
+		if _, err := probeTLS.Write([]byte("ping")); err != nil {
+			echoDone <- fmt.Errorf("probe write: %w", err)
+			return
+		}
+		pong := make([]byte, len("ping-pong"))
+		if _, err := io.ReadFull(probeTLS, pong); err != nil {
+			echoDone <- fmt.Errorf("probe read echo: %w", err)
+			return
+		}
+		if string(pong) != "ping-pong" {
+			echoDone <- fmt.Errorf("probe echo = %q, want ping-pong", pong)
+			return
+		}
+		echoDone <- nil
+	}()
+	ping := make([]byte, len("ping"))
+	if _, err := io.ReadFull(terminated, ping); err != nil {
+		t.Fatalf("terminated conn read = %v", err)
+	}
+	if string(ping) != "ping" {
+		t.Fatalf("terminated conn read = %q, want ping", ping)
+	}
+	if _, err := terminated.Write([]byte("ping-pong")); err != nil {
+		t.Fatalf("terminated conn write = %v", err)
+	}
+	if err := <-echoDone; err != nil {
+		t.Fatalf("application data round trip failed: %v", err)
+	}
+}
+
+// mustSelfSignedCert generates one ECDSA P-256 self-signed server certificate
+// covering hostname (plus any extra IPs) and returns the private key, DER,
+// and PEM forms.
+func mustSelfSignedCert(t *testing.T, hostname string, ips []net.IP) (*ecdsa.PrivateKey, []byte, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ecdsa key: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: hostname},
+		DNSNames:              []string{hostname},
+		IPAddresses:           ips,
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if certPEM == nil {
+		t.Fatal("encode certificate pem")
+	}
+	return key, der, certPEM
+}
+
+func mustCertPool(t *testing.T, certPEM []byte) *x509.CertPool {
+	t.Helper()
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("append certificate to pool")
+	}
+	return pool
+}
+
+type failingCloseResource struct {
+	calls int
+}
+
+func (c *failingCloseResource) Close() error {
+	c.calls++
+	return errSignerCloseFailed
+}
+
+// TestClientTerminateConnExportsKeyingMaterial is the MITM self-probe
+// integration regression: the terminated t13server conn satisfies the
+// direct exporter capability the SDK's responder side asserts, and both
+// endpoints of the same probe session — the stock crypto/tls probe client
+// and the t13server responder conn — derive byte-identical keying material
+// for the same label. Exporter derivation itself is owned and tested by
+// keyless_tls; this pins the Portal-facing capability boundary.
+func TestClientTerminateConnExportsKeyingMaterial(t *testing.T) {
+	const (
+		hostname        = "probe.test.example"
+		probeExporter   = "Portal-MITM-Probe-v1"
+		handshakeBudget = 15 * time.Second
+	)
+
+	key, certDER, certPEM := mustSelfSignedCert(t, hostname, []net.IP{net.ParseIP("127.0.0.1")})
+	service := &ksigner.Service{
+		Store: func() ksigner.KeyStore {
+			store := ksigner.NewStaticKeyStore()
+			if err := store.Put(relayKeyID, key); err != nil {
+				t.Fatalf("seed static key store: %v", err)
+			}
+			return store
+		}(),
+		// Test-only: this stand-in's validator accepts every structurally
+		// valid request; the binding validator contract is covered by the
+		// loopback termination test.
+		TranscriptValidator: ksigner.TranscriptValidatorFunc(func(context.Context, *signrpc.TranscriptSignRequest) error {
+			return nil
+		}),
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != signrpc.SignPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req signrpc.TranscriptSignRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10)).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		resp, err := service.SignTranscript(r.Context(), &req)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key}},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	client, err := NewClient(ClientConfig{RelayURL: srv.URL, Hostname: hostname})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if !client.ExportsKeyingMaterial() {
+		t.Fatal("ExportsKeyingMaterial() = false, want true for the t13server terminator")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), handshakeBudget)
+	defer cancel()
+	binding := make([]byte, 16)
+	if _, err := rand.Read(binding); err != nil {
+		t.Fatalf("generate binding: %v", err)
+	}
+
+	relayEnd, tenantEnd := net.Pipe()
+	t.Cleanup(func() { _ = relayEnd.Close() })
+	probeTLS := tls.Client(relayEnd, &tls.Config{
+		ServerName: hostname,
+		RootCAs:    mustCertPool(t, certPEM),
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"http/1.1"},
+	})
+	t.Cleanup(func() { _ = probeTLS.Close() })
+
+	probeHandshake := make(chan error, 1)
+	go func() {
+		probeHandshake <- probeTLS.HandshakeContext(ctx)
+	}()
+
+	terminated, err := client.TerminateConn(ctx, tenantEnd, binding)
+	if err != nil {
+		t.Fatalf("TerminateConn() error = %v", err)
+	}
+	t.Cleanup(func() { _ = terminated.Close() })
+	if err := <-probeHandshake; err != nil {
+		t.Fatalf("probe handshake error = %v", err)
+	}
+
+	exporter, ok := terminated.(interface {
+		ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
+	})
+	if !ok {
+		t.Fatal("terminated conn does not satisfy the direct exporter capability")
+	}
+	probeState := probeTLS.ConnectionState()
+	probeExport, err := (&probeState).ExportKeyingMaterial(probeExporter, nil, 32)
+	if err != nil {
+		t.Fatalf("probe ExportKeyingMaterial() error = %v", err)
+	}
+	serverExport, err := exporter.ExportKeyingMaterial(probeExporter, nil, 32)
+	if err != nil {
+		t.Fatalf("terminated conn ExportKeyingMaterial() error = %v", err)
+	}
+	if !bytes.Equal(probeExport, serverExport) {
+		t.Fatal("exporter values of the same probe session differ between the stock client and the t13server terminator")
+	}
+}
+
+// captureWrites passes writes through until capture is set and keeps them
+// afterwards, so a test can hand a visitor's record to the tenant in parts.
+type captureWrites struct {
+	net.Conn
+	capture  bool
+	captured []byte
+}
+
+func (c *captureWrites) Write(p []byte) (int, error) {
+	if c.capture {
+		c.captured = append(c.captured, p...)
+		return len(p), nil
+	}
+	return c.Conn.Write(p)
+}
+
+// The SDK reads the first bytes of every terminated connection under a short
+// deadline, to look for a channel binding request, before the application
+// reads it. A deadline that fires while the visitor's record is only partly
+// received must leave the stream intact (gosuda/keyless_tls#34).
+func TestTerminatedConnKeepsARecordAcrossAReadDeadline(t *testing.T) {
+	t.Parallel()
+
+	issuer := newTestIssuer(t)
+	relay := newRelayStandIn(t, issuer.issue(t, 2))
+	client := relay.newClient(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	binding := relay.bindings.Issue("lease", nil)
+	relayEnd, tenantEnd := net.Pipe()
+	defer relayEnd.Close()
+	wire := &captureWrites{Conn: relay.bindings.FixHelloOnWrite(relayEnd, binding)}
+	visitor := tls.Client(wire, &tls.Config{ServerName: tenantHostname, RootCAs: issuer.pool, MinVersion: tls.VersionTLS13})
+	defer visitor.Close()
+	visitorDone := make(chan error, 1)
+	go func() { visitorDone <- visitor.HandshakeContext(ctx) }()
+	terminated, err := client.TerminateConn(ctx, tenantEnd, binding[:])
+	if err != nil {
+		t.Fatalf("TerminateConn() error = %v", err)
+	}
+	defer terminated.Close()
+	if err := <-visitorDone; err != nil {
+		t.Fatalf("visitor handshake: %v", err)
+	}
+
+	const request = "GET / HTTP/1.1\r\nHost: " + tenantHostname + "\r\n\r\n"
+	wire.capture = true
+	if _, err := visitor.Write([]byte(request)); err != nil {
+		t.Fatalf("visitor write: %v", err)
+	}
+	record := wire.captured
+	const split = 10 // inside the record's payload
+
+	type readResult struct {
+		data string
+		err  error
+	}
+	read := func() <-chan readResult {
+		done := make(chan readResult, 1)
+		go func() {
+			buf := make([]byte, len(request))
+			n, err := io.ReadFull(terminated, buf)
+			done <- readResult{data: string(buf[:n]), err: err}
+		}()
+		return done
+	}
+	await := func(done <-chan readResult) readResult {
+		t.Helper()
+		select {
+		case res := <-done:
+			return res
+		case <-ctx.Done():
+			t.Fatal("tenant read did not return")
+			return readResult{}
+		}
+	}
+
+	// net.Pipe returns from Write only once the reader has taken every byte,
+	// so this part is with the tenant before its deadline fires.
+	first := read()
+	if _, err := relayEnd.Write(record[:split]); err != nil {
+		t.Fatalf("deliver the first part: %v", err)
+	}
+	if err := terminated.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	var netErr net.Error
+	if res := await(first); !errors.As(res.err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("read past the deadline = (%q, %v), want a timeout", res.data, res.err)
+	}
+
+	if err := terminated.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear read deadline: %v", err)
+	}
+	second := read()
+	go func() { _, _ = relayEnd.Write(record[split:]) }()
+	if res := await(second); res.err != nil || res.data != request {
+		t.Fatalf("read after the deadline = (%q, %v), want %q", res.data, res.err, request)
+	}
+}
