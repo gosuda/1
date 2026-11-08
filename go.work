@@ -13,6 +13,7 @@ use (
 	./ipc/hqq/hqq-sqlite3
 	./ipc/hqq/hqq-zstd
 	./net/autoirc2p
+	./net/chrome-net
 	./net/grt
 	./net/ivnp
 	./net/portal-tunnel
