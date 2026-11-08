@@ -272,7 +272,21 @@ func (c *wsConn) ReadMessage() (int, []byte, error) {
 		return 0, nil, err
 	}
 
+	fin := (header[0] & 0x80) != 0
+	rsv := (header[0] & 0x70) >> 4
+	if rsv != 0 {
+		return 0, nil, fmt.Errorf("websocket: non-zero RSV bits: 0x%x", rsv)
+	}
+
 	opcode := int(header[0] & 0x0f)
+	if (opcode >= 0x3 && opcode <= 0x7) || (opcode >= 0xB && opcode <= 0xF) {
+		return 0, nil, fmt.Errorf("websocket: reserved opcode 0x%x", opcode)
+	}
+
+	if (opcode >= 0x8) && !fin {
+		return 0, nil, fmt.Errorf("websocket: fragmented control frame (FIN=0)")
+	}
+
 	isMasked := (header[1] & 0x80) != 0
 	rawLen := int(header[1] & 0x7f)
 
@@ -283,14 +297,31 @@ func (c *wsConn) ReadMessage() (int, []byte, error) {
 			return 0, nil, err
 		}
 		payloadLen = int(binary.BigEndian.Uint16(ext))
+		if payloadLen < 126 {
+			return 0, nil, fmt.Errorf("websocket: non-minimal 16-bit payload length encoding: %d < 126", payloadLen)
+		}
 	} else if rawLen == 127 {
 		ext := make([]byte, 8)
 		if _, err := io.ReadFull(c.bufrw.Reader, ext); err != nil {
 			return 0, nil, err
 		}
-		payloadLen = int(binary.BigEndian.Uint64(ext))
+		uLen := binary.BigEndian.Uint64(ext)
+		if (uLen & (1 << 63)) != 0 {
+			return 0, nil, fmt.Errorf("websocket: 64-bit frame length has most significant bit set: 0x%x", uLen)
+		}
+		if uLen <= 65535 {
+			return 0, nil, fmt.Errorf("websocket: non-minimal 64-bit payload length encoding: %d <= 65535", uLen)
+		}
+		if uLen > uint64(c.maxFrameSize) {
+			return 0, nil, fmt.Errorf("websocket: payload size %d exceeds max frame size %d", uLen, c.maxFrameSize)
+		}
+		payloadLen = int(uLen)
 	} else {
 		payloadLen = rawLen
+	}
+
+	if opcode >= 0x8 && (rawLen > 125 || payloadLen > 125) {
+		return 0, nil, fmt.Errorf("websocket: control frame payload %d exceeds RFC 6455 limit of 125 bytes", payloadLen)
 	}
 
 	if payloadLen > c.maxFrameSize {

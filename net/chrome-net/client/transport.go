@@ -128,7 +128,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 
-		respHeader := parseResponseHeaders(respHeadersRaw)
+		respHeader := ParseResponseHeaders(respHeadersRaw)
 
 		resp := &http.Response{
 			Status:     http.StatusText(int(status)),
@@ -160,8 +160,8 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-// parseResponseHeaders parses raw header lines (including HTTP/2 pseudo-headers) into http.Header.
-func parseResponseHeaders(raw []byte) http.Header {
+// ParseResponseHeaders parses raw header lines (including HTTP/2 pseudo-headers) into http.Header.
+func ParseResponseHeaders(raw []byte) http.Header {
 	hdr := make(http.Header)
 	if len(raw) == 0 {
 		return hdr
