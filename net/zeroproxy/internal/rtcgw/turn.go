@@ -1,0 +1,214 @@
+package rtcgw
+
+// Embedded TURN server using pion/turn/v4 in-process so operators do not need
+// an external coturn deployment. The page's native RTCPeerConnection runs
+// relay-only through this server using short-term TURN-REST credentials
+// (RFC 7635): each `IssueICEServerCreds` call returns a username/password
+// tuple derived from `sharedSecret`, valid for `ttl`. The page realm reads
+// the tuple from `/zp/api/config` and passes it into `RTCPeerConnection`
+// `iceServers`.
+//
+// Remote peers see the TURN server's external IP rather than the client's IP.
+// Operators behind NAT must supply `-rtc-turn-external-ip`; otherwise pion
+// advertises the listener's local IP in allocation responses.
+//
+// Disabled by default: requires `-rtc-enable` and a routable `-rtc-turn-addr`
+// (Chrome ignores loopback TURN servers). Without it, the page keeps the
+// RTC_GATEWAY_UNAVAILABLE stub so host candidates cannot connect the client
+// directly to a remote peer. DTLS/SRTP remains end-to-end encrypted.
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/gosuda/zeroproxy/internal/netguard"
+	"github.com/pion/logging"
+	"github.com/pion/turn/v4"
+)
+
+// TURNServer wraps a pion/turn/v4 Server with the cred-issuance
+// helper the page-side config endpoint uses.
+type TURNServer struct {
+	server       *turn.Server
+	publicAddr   string // host:port advertised to clients (covers NAT)
+	realm        string
+	sharedSecret string
+	defaultTTL   time.Duration
+
+	mu   sync.Mutex
+	conn *net.UDPConn
+}
+
+// TURNConfig carries operator-supplied knobs. `Addr` is the UDP
+// listener `ip:port` (typically `0.0.0.0:3478`). `PublicAddr` is the
+// address clients reach the server at (for port-forwarded NAT,
+// `<public-ip>:3478`). `ExternalIP` is the relay-address IP
+// pion advertises in TURN allocation responses; for a single-IP host
+// this is the same as the listener IP. `Realm` is the TURN realm
+// string (any operator-meaningful identifier).
+type TURNConfig struct {
+	Addr         string        // "0.0.0.0:3478"
+	PublicAddr   string        // host:port clients reach
+	ExternalIP   string        // relay address IP (NAT-aware)
+	Realm        string        // TURN realm
+	SharedSecret string        // long-term auth shared secret
+	DefaultTTL   time.Duration // default cred validity (e.g. 30 min)
+	// AllowPrivatePeers lets clients relay to loopback/private/link-local
+	// peers. The relay sends UDP directly (it cannot ride the SOCKS
+	// upstream), so like the WebTransport gateway it may reach only what the
+	// HTTP path reaches: the server sets this only with `-socks internal`.
+	AllowPrivatePeers bool
+}
+
+// NewTURNServer starts the TURN listener. The caller owns the
+// returned *TURNServer and must invoke Close() to tear down the UDP
+// socket + pion server goroutines.
+func NewTURNServer(cfg TURNConfig) (*TURNServer, error) {
+	if cfg.Addr == "" {
+		return nil, fmt.Errorf("rtcgw: TURNConfig.Addr required")
+	}
+	if cfg.Realm == "" {
+		cfg.Realm = "zeroproxy"
+	}
+	if cfg.DefaultTTL == 0 {
+		cfg.DefaultTTL = 30 * time.Minute
+	}
+	if cfg.SharedSecret == "" {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return nil, fmt.Errorf("rtcgw: random secret: %w", err)
+		}
+		cfg.SharedSecret = hex.EncodeToString(buf)
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp4", cfg.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("rtcgw: resolve %q: %w", cfg.Addr, err)
+	}
+	conn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("rtcgw: TURN ListenUDP %q: %w", cfg.Addr, err)
+	}
+
+	externalIP := cfg.ExternalIP
+	if externalIP == "" {
+		// Fall back to the listener's local IP; NAT deployments must supply
+		// `-rtc-turn-external-ip` explicitly.
+		externalIP = udpAddr.IP.String()
+		if externalIP == "0.0.0.0" || externalIP == "::" {
+			externalIP = "127.0.0.1"
+		}
+	}
+	relayGen := &turn.RelayAddressGeneratorStatic{
+		RelayAddress: net.ParseIP(externalIP),
+		Address:      "0.0.0.0",
+	}
+	if relayGen.RelayAddress == nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("rtcgw: invalid external IP %q", externalIP)
+	}
+
+	server, err := turn.NewServer(turn.ServerConfig{
+		Realm: cfg.Realm,
+		// IssueICEServerCreds mints TURN-REST usernames ("<expiry>:<label>"),
+		// which require LongTermTURNRESTAuthHandler rather than
+		// NewLongTermAuthHandler (which expects integer-only usernames).
+		AuthHandler: turn.LongTermTURNRESTAuthHandler(cfg.SharedSecret, logging.NewDefaultLoggerFactory().NewLogger("turn")),
+		PacketConnConfigs: []turn.PacketConnConfig{
+			{
+				PacketConn:            conn,
+				RelayAddressGenerator: relayGen,
+				// CreatePermission and ChannelBind specify the target peer IP;
+				// block non-public peers unless AllowPrivatePeers is enabled.
+				PermissionHandler: func(_ net.Addr, peerIP net.IP) bool {
+					return cfg.AllowPrivatePeers || !netguard.IsNonPublic(peerIP)
+				},
+			},
+		},
+	})
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("rtcgw: turn.NewServer: %w", err)
+	}
+
+	publicAddr := cfg.PublicAddr
+	if publicAddr == "" {
+		publicAddr = cfg.Addr
+	}
+
+	return &TURNServer{
+		server:       server,
+		publicAddr:   publicAddr,
+		realm:        cfg.Realm,
+		sharedSecret: cfg.SharedSecret,
+		defaultTTL:   cfg.DefaultTTL,
+		conn:         conn,
+	}, nil
+}
+
+// Close tears down the TURN server + UDP socket. Idempotent.
+func (s *TURNServer) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.server != nil {
+		_ = s.server.Close()
+		s.server = nil
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	return nil
+}
+
+// ICEServerCred is the cred tuple the page realm consumes.
+// `URLs` is one or two TURN URLs (UDP + TLS variants). `Username` +
+// `Credential` are short-term derived per RFC 7635: username is
+// `<expiry-unix>:<userlabel>`, credential is base64(HMAC-SHA1(secret,
+// username)).
+type ICEServerCred struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username"`
+	Credential string   `json:"credential"`
+}
+
+// IssueICEServerCreds returns a fresh time-limited cred tuple the
+// caller can hand to the page realm. `userLabel` lets operators
+// attribute creds to a specific session or tab (when empty, a random
+// hex label is generated).
+func (s *TURNServer) IssueICEServerCreds(userLabel string) (ICEServerCred, error) {
+	if s == nil {
+		return ICEServerCred{}, fmt.Errorf("rtcgw: nil TURN server")
+	}
+	if userLabel == "" {
+		buf := make([]byte, 8)
+		if _, err := rand.Read(buf); err != nil {
+			return ICEServerCred{}, fmt.Errorf("rtcgw: random label: %w", err)
+		}
+		userLabel = hex.EncodeToString(buf)
+	}
+	username, password, err := turn.GenerateLongTermTURNRESTCredentials(s.sharedSecret, userLabel, s.defaultTTL)
+	if err != nil {
+		return ICEServerCred{}, fmt.Errorf("rtcgw: GenerateLongTermTURNRESTCredentials: %w", err)
+	}
+	return ICEServerCred{
+		URLs:       []string{"turn:" + s.publicAddr},
+		Username:   username,
+		Credential: password,
+	}, nil
+}
+
+// PublicAddr returns the host:port clients connect to.
+func (s *TURNServer) PublicAddr() string {
+	if s == nil {
+		return ""
+	}
+	return s.publicAddr
+}

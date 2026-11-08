@@ -1,0 +1,106 @@
+package httpapi
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/julienschmidt/httprouter"
+
+	securlv1 "securl.click/securl/gen/go/securl/v1"
+	"securl.click/securl/internal/access"
+	"securl.click/securl/internal/captcha"
+	"securl.click/securl/internal/safebrowsing"
+	"securl.click/securl/internal/store"
+)
+
+type Dependencies struct {
+	Repository       store.Repository
+	Access           *access.Service
+	CaptchaVerifier  captcha.Verifier
+	CaptchaWrapper   *captcha.KeyWrapper
+	SafeBrowsing     safebrowsing.LookupClient
+	RuntimeConfig    *securlv1.RuntimeConfig
+	AllowedTTLs      map[uint32]struct{}
+	MaxEnvelopeBytes int
+	// MaxPasteEnvelopeBytes is the serialized envelope limit for Markdown pastes. Zero disables pastes.
+	MaxPasteEnvelopeBytes int
+	Now                   func() time.Time
+	Frontend              http.Handler
+	PublicOrigins         map[string]struct{}
+	CORSAllowedOrigins    map[string]struct{}
+	EnableHSTS            bool
+	Logger                *zerolog.Logger
+}
+
+// PasteEnvelopeOverhead is added to the maximum padded compressed Markdown size to
+// obtain the serialized envelope limit: a 1024-byte padding bucket plus 1024 bytes
+// of protobuf, AEAD, and metadata headroom.
+const PasteEnvelopeOverhead = 2048
+
+// createRequestOverhead covers the request wrapper around the envelope: storage
+// key, CAPTCHA key, and CAPTCHA token.
+const createRequestOverhead = 8 << 10
+
+type api struct {
+	dependencies       Dependencies
+	createRequestLimit int64
+}
+
+func NewRouter(dependencies Dependencies) http.Handler {
+	if dependencies.MaxEnvelopeBytes <= 0 {
+		dependencies.MaxEnvelopeBytes = 6144
+	}
+	if dependencies.Now == nil {
+		dependencies.Now = time.Now
+	}
+	if dependencies.Logger == nil {
+		logger := zerolog.Nop()
+		dependencies.Logger = &logger
+	}
+	handler := &api{
+		dependencies:       dependencies,
+		createRequestLimit: int64(max(dependencies.MaxEnvelopeBytes, dependencies.MaxPasteEnvelopeBytes)) + createRequestOverhead,
+	}
+	router := httprouter.New()
+	router.RedirectTrailingSlash = false
+	router.RedirectFixedPath = false
+	router.HandleMethodNotAllowed = true
+
+	router.GET("/api/v1/config", route("/api/v1/config", handler.getConfig))
+	router.POST("/api/v1/envelopes", route("/api/v1/envelopes", handler.createEnvelope))
+	router.GET(
+		"/api/v1/envelopes/:storageKey/metadata",
+		route("/api/v1/envelopes/:storageKey/metadata", handler.getEnvelopeMetadata),
+	)
+	router.GET(
+		"/api/v1/envelopes/:storageKey",
+		route("/api/v1/envelopes/:storageKey", handler.getEnvelope),
+	)
+	router.POST(
+		"/api/v1/envelopes/:storageKey/access",
+		route("/api/v1/envelopes/:storageKey/access", handler.accessEnvelope),
+	)
+	router.POST(
+		"/api/v1/safe-browsing/lookup",
+		route("/api/v1/safe-browsing/lookup", handler.safeBrowsingLookup),
+	)
+	router.GET("/healthz", route("/healthz", handler.health))
+	router.GET("/readyz", route("/readyz", handler.ready))
+	router.OPTIONS("/*path", route("OPTIONS /*path", handler.options))
+	router.MethodNotAllowed = http.HandlerFunc(handler.methodNotAllowed)
+	if dependencies.Frontend != nil {
+		router.NotFound = dependencies.Frontend
+	} else {
+		router.NotFound = http.HandlerFunc(handler.notFound)
+	}
+	return middleware(dependencies, router)
+}
+
+func route(pattern string, handler httprouter.Handle) httprouter.Handle {
+	return func(writer http.ResponseWriter, request *http.Request, params httprouter.Params) {
+		request.Pattern = pattern
+		handler(writer, request, params)
+	}
+}
