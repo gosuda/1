@@ -4,7 +4,7 @@ author: Lemon Mint
 title: 'Teaching Your Go Program to Speak Like Chrome'
 description: How chromenet lets standard Go HTTP clients talk to the web through the real Chromium network engine without cgo or a C compiler.
 language: en
-date: 2026-11-09T00:30:00.000000000Z
+date: 2026-11-09T00:00:00Z
 path: /chromenet
 go_package: gosuda.org/chromenet
 go_repourl: https://github.com/gosuda/chromenet.git
