@@ -9,7 +9,6 @@ use (
 	./crypto/x402-facilitator
 	./crypto/x402-facilitator/cmd
 	./crypto/x402-facilitator/scheme/evm
-	./experimental/lemon-mint/markdown-editor
 	./ipc/hqq/HQQ
 	./ipc/hqq/hqq-sqlite3
 	./ipc/hqq/hqq-zstd
@@ -20,6 +19,7 @@ use (
 	./net/portal-tunnel
 	./net/portalite
 	./storage/supersql
+	./web/flats-md
 	./web/gosuda
 	./web/securl
 	./web/telemetry

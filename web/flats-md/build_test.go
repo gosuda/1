@@ -1,4 +1,4 @@
-package markdowneditor
+package flatsmd
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -18,6 +19,29 @@ func TestEmbeddedBundleAndBuildInputsUpToDate(t *testing.T) {
 	if h := Hash(); len(h) != 12 {
 		t.Fatalf("Hash() = %q, want 12-char hex digest", h)
 	}
+	if !strings.Contains(License(), "MIT License") {
+		t.Fatalf("License() does not contain MIT License header")
+	}
+
+	tp := ThirdPartyLicenses()
+	headerRe := regexp.MustCompile(`(?m)^===== ([^\n]+) =====$`)
+	matches := headerRe.FindAllStringIndex(tp, -1)
+	if len(matches) < 25 {
+		t.Fatalf("ThirdPartyLicenses() has %d package entries, want >= 25", len(matches))
+	}
+	for i, m := range matches {
+		header := tp[m[0]:m[1]]
+		bodyStart := m[1]
+		bodyEnd := len(tp)
+		if i+1 < len(matches) {
+			bodyEnd = matches[i+1][0]
+		}
+		body := strings.TrimSpace(tp[bodyStart:bodyEnd])
+		if len(body) < 20 {
+			t.Fatalf("ThirdPartyLicenses() entry %s has empty or truncated license body: %q", header, body)
+		}
+	}
+
 	for _, asset := range []string{
 		"index.js",
 		"index.css",
@@ -34,10 +58,7 @@ func TestEmbeddedBundleAndBuildInputsUpToDate(t *testing.T) {
 		}
 	}
 
-	var rels []string
-	for _, top := range []string{"package.json", "package-lock.json", "build.mjs"} {
-		rels = append(rels, top)
-	}
+	rels := []string{"LICENSE", "package.json", "package-lock.json", "build.mjs"}
 	err := filepath.WalkDir("src", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
