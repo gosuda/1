@@ -1,0 +1,8 @@
+# MSVC CRT and Windows SDK for the windows-* engine targets, fetched from Microsoft by xwin
+# (https://github.com/Jake-Shadle/xwin) inside the build container. The xwin archive is pinned in
+# SHA256; xwin verifies every Microsoft package against the Visual Studio manifest.
+# sdk must equal SDK_VERSION of the Chromium release (build/vs_toolchain.py) without ".0".
+xwin=0.10.0
+manifest=18
+sdk=10.0.28000
+crt=14.51
