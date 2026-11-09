@@ -1,0 +1,47 @@
+[
+  {
+    "name": "settle",
+    "type": "function",
+    "inputs": [
+      {
+        "name": "permit",
+        "type": "tuple",
+        "components": [
+          {
+            "name": "permitted",
+            "type": "tuple",
+            "components": [
+              { "name": "token", "type": "address" },
+              { "name": "amount", "type": "uint256" }
+            ]
+          },
+          { "name": "nonce", "type": "uint256" },
+          { "name": "deadline", "type": "uint256" }
+        ]
+      },
+      { "name": "owner", "type": "address" },
+      {
+        "name": "witness",
+        "type": "tuple",
+        "components": [
+          { "name": "to", "type": "address" },
+          { "name": "validAfter", "type": "uint256" }
+        ]
+      },
+      { "name": "signature", "type": "bytes" }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "name": "balanceOf",
+    "type": "function",
+    "inputs": [
+      { "name": "account", "type": "address" }
+    ],
+    "outputs": [
+      { "name": "balance", "type": "uint256" }
+    ],
+    "stateMutability": "view"
+  }
+]

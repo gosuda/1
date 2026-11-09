@@ -1,0 +1,12 @@
+{
+  "name": "azure-magpie",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Azure-Winged Magpie: Diff Link Generator, Snapshot Explorer, and Edge Webhook Router for gosuda/0",
+  "scripts": {
+    "build": "bun run build.ts",
+    "test": "bun test",
+    "deploy:pages": "bun run build.ts && npx wrangler pages deploy public --project-name=azure-magpie",
+    "deploy:worker": "bun run build.ts && npx wrangler deploy"
+  }
+}
