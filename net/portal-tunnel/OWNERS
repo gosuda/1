@@ -1,0 +1,21 @@
+# Organization members who committed to this project before it joined the monorepo, by commit count.
+# They add to the owners inherited from the parent directories.
+#
+# Every change needs an approval by an owner other than the requester: a gosuda/1 review pull request
+# for workspaces, or an approval of the merged head on the gosuda/portal-tunnel pull request for
+# merges on the mirror (AGENTS.md 4.4).
+set require-review
+@gg582
+@1ncursio
+@AgentDawn
+@yoonhyunwoo
+@boxqkrtm
+@lidarbtc
+@sinwoojin
+@iwanhae
+@snowmerak
+@fatheradvisor
+@dalbodeule
+@MyungSub0519
+@Jeffr-K
+@DPS0340

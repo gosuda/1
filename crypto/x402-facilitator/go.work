@@ -1,0 +1,11 @@
+go 1.24.2
+
+use (
+	.
+	./cmd
+	./scheme/evm
+)
+
+replace github.com/gosuda/x402-facilitator v0.0.5 => ./
+
+replace github.com/gosuda/x402-facilitator/scheme/evm v0.0.1 => ./scheme/evm
