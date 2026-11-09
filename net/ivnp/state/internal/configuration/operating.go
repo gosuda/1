@@ -1,0 +1,1541 @@
+package configuration
+
+import (
+	"cmp"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	filesystemstore "gosuda.org/ivnp/state/internal/filesystem_store"
+)
+
+// ErrInvalidOperating indicates a syntactically valid config with invalid or unsupported settings.
+var ErrInvalidOperating = errors.New("config: invalid operating configuration")
+
+var (
+	errResolveOperating                    = errors.New("config: cannot resolve operating configuration")
+	errCreateOperating                     = errors.New("config: cannot create operating configuration")
+	errPersistOperating                    = errors.New("config: cannot persist operating configuration")
+	errOpenOperating                       = errors.New("config: cannot open operating configuration")
+	errUnsafeOperating                     = errors.New("config: unsafe operating configuration")
+	errReadOperating                       = errors.New("config: cannot read operating configuration")
+	errBearerCredentialsRequirePrivateFile = errors.New("config: bearer credentials require a private configuration file")
+	errInvalidEndpoint                     = errors.New("invalid endpoint")
+	errInvalidReseedEndpoint               = errors.New("invalid endpoint")
+	errInvalidReseedEndpointCount          = errors.New("invalid endpoint count")
+	errInvalidBoolean                      = errors.New("invalid boolean")
+	errInvalidInteger                      = errors.New("invalid integer")
+	errIntegerOutOfRange                   = errors.New("integer out of range")
+	errDurationOutOfRange                  = errors.New("duration out of range")
+	errInvalidPath                         = errors.New("invalid path")
+)
+
+// Operating represents the complete configuration for an IVNP node.
+type Operating struct {
+	DataDir   string
+	StateDir  string
+	StatePath string
+	KeyPath   string
+	TempDir   string
+	Network   Network
+	Router    Router
+	State     State
+	NetDB     NetDB
+	Tunnel    Tunnel
+
+	NTCP2  Transport
+	SSU2   Transport
+	Reseed Reseed
+	NAT    NAT
+
+	Control     Listener
+	HTTPProxy   HTTPProxy
+	SOCKS5      Listener
+	Metrics     Listener
+	SAM         Listener
+	AddressBook AddressBook
+	Log         Log
+}
+
+// NetworkProfile selects the baseline parameter preset for an IVNP network.
+type NetworkProfile string
+
+const (
+	NetworkProfilePublic    NetworkProfile = "public"
+	NetworkProfileDedicated NetworkProfile = "dedicated"
+	NetworkProfileDirect    NetworkProfile = "direct"
+)
+
+// Network specifies network ID, preset profile, and enabled IP protocol families.
+type Network struct {
+	ID      uint32
+	Profile NetworkProfile
+	IPv4    bool
+	IPv6    bool
+}
+
+// Router holds identity and capability settings advertised in RouterInfo.
+type Router struct {
+	IdentityType string
+	Floodfill    bool
+	Transit      bool
+	Family       string
+	Version      string
+}
+
+// NetDB configures Kademlia bucket limits, publication replication targets, and bootstrap RouterInfo files.
+type NetDB struct {
+	BucketCapacity            int
+	BucketSubnetQuota         int
+	DisableBucketSubnetQuota  bool
+	BootstrapRouterInfoPaths  []string
+	LookupCapacity            int
+	MinRouters                int
+	RouterInfoFloodfillK      int
+	LeaseSetFloodfillK        int
+	ExplorationBootstrapDelay time.Duration
+	ExplorationSteadyDelay    time.Duration
+}
+
+// Tunnel configures tunnel pool targets, capacities, and build parameters.
+type Tunnel struct {
+	Enabled                     bool
+	Hops                        int
+	IPRestriction               int
+	DisableIPRestriction        bool
+	ExploratoryInboundTarget    int
+	ExploratoryOutboundTarget   int
+	ExploratoryPoolCapacity     int
+	ClientInboundTarget         int
+	ClientOutboundTarget        int
+	ClientPoolCapacity          int
+	BuildPendingCapacity        int
+	Lifetime                    time.Duration
+	RenewBefore                 time.Duration
+	MaintenanceInterval         time.Duration
+	ProbeTimeout                time.Duration
+	ProbeFailureThreshold       int
+	BandwidthRateBytesPerSecond int
+	BandwidthBurstBytes         int
+}
+
+// State sets storage limits for persistent destination state.
+type State struct {
+	MaxBytes          int64
+	MaxDestinations   int
+	MaxNameBytes      int
+	TaintedCopy       bool
+	PromoteToMaster   bool
+	LockRetryInterval time.Duration
+}
+
+// Endpoint represents a host:port socket address.
+type Endpoint struct {
+	Host string
+	Port uint16
+}
+
+func (e Endpoint) String() string { return net.JoinHostPort(e.Host, strconv.Itoa(int(e.Port))) }
+
+// Transport configures a point-to-point network transport (NTCP2 or SSU2).
+type Transport struct {
+	Enabled     bool
+	Bind        Endpoint
+	Advertised  Endpoint
+	MaxSessions int
+	IdleTimeout time.Duration
+}
+
+// NAT configures NAT-PMP or UPnP port mapping discovery endpoints.
+type NAT struct {
+	NATPMPEndpoint netip.AddrPort
+	UPnPEndpoint   string
+}
+
+// Reseed configures SU3 reseed server URLs, limits, and trusted signer certificates.
+type Reseed struct {
+	Enabled           bool
+	Required          bool
+	PriorityEndpoints []string
+	PriorityTimeout   time.Duration
+	Endpoints         []string
+	Timeout           time.Duration
+	MaxArchiveBytes   int64
+	MaxRouterInfos    int
+	MaxTotalBytes     int64
+	// BucketSubnetQuota caps admitted RouterInfos per local K-bucket per
+	// subnet (IPv4 /16 or IPv6 /48). BucketAdmitLimit caps admissions per
+	// local K-bucket. VerifyAnchorCount bounds post-reseed floodfill anchors.
+	BucketSubnetQuota        int
+	DisableBucketSubnetQuota bool
+	BucketAdmitLimit         int
+	VerifyAnchorCount        int
+	// MergeWait bounds how long reseed waits for all priority endpoints to
+	// respond before ingesting their merged candidates. Zero selects the
+	// client default; a negative value finishes on the first priority
+	// response instead of merging.
+	MergeWait        time.Duration
+	TrustedCertPaths []string
+}
+
+// Listener configures a local RPC, proxy, or SAM listener.
+type Listener struct {
+	Enabled              bool
+	Address              Endpoint
+	UDPAddress           Endpoint
+	BearerToken          string
+	MaxConnections       int
+	ReadinessTimeout     time.Duration
+	SessionQueue         int
+	MaxSessionQueueBytes int64
+	MaxServerQueueBytes  int64
+}
+
+// HTTPProxy configures the local HTTP outproxy listener.
+type HTTPProxy struct {
+	Listener
+	Outproxies []string
+}
+
+func (p HTTPProxy) String() string { return p.Listener.String() }
+
+// AddressBook configures hosts.txt name resolution and subscription feeds.
+type AddressBook struct {
+	Enabled          bool
+	PrivateHostsPath string
+	UserHostsPath    string
+	HostsPath        string
+	StatePath        string
+	// Subscriptions lists remote hosts.txt URLs fetched during periodic refreshes.
+	Subscriptions    []string
+	RefreshInterval  time.Duration
+	RetryInterval    time.Duration
+	RequestTimeout   time.Duration
+	MaxEntries       int
+	MaxFileBytes     int64
+	MaxResponseBytes int64
+	MaxRedirects     int
+}
+
+func (l Listener) String() string {
+	if !l.Enabled {
+		return "disabled"
+	}
+	return "address=" + l.Address.String() + ", authenticated=" + strconv.FormatBool(l.BearerToken != "")
+}
+
+// Log configures logging level and format.
+type Log struct {
+	Level  string
+	Format string
+}
+
+func (o Operating) String() string {
+	return fmt.Sprintf("config.Operating{DataDir:%q StateDir:%q StatePath:%q KeyPath:%q Network:%d/%t/%t Router:%s/%s NetDB:%d Tunnel:%t/%d/%d/%d/%d/%d/%d NTCP2:%t SSU2:%t Reseed:%t/%d SAM:%s AddressBook:%t/%d Control:%s HTTPProxy:%s SOCKS5:%s Metrics:%s Log:%s/%s}",
+		o.DataDir, o.StateDir, o.StatePath, o.KeyPath, o.Network.ID, o.Network.IPv4, o.Network.IPv6,
+		o.Router.Family, o.Router.Version, o.NetDB.BucketCapacity, o.Tunnel.Enabled,
+		o.Tunnel.ExploratoryInboundTarget, o.Tunnel.ExploratoryOutboundTarget, o.Tunnel.ExploratoryPoolCapacity,
+		o.Tunnel.ClientInboundTarget, o.Tunnel.ClientOutboundTarget, o.Tunnel.ClientPoolCapacity,
+		o.NTCP2.Enabled, o.SSU2.Enabled, o.Reseed.Enabled, len(o.Reseed.Endpoints), o.SAM, o.AddressBook.Enabled, len(o.AddressBook.Subscriptions),
+		o.Control, o.HTTPProxy, o.SOCKS5, o.Metrics, o.Log.Level, o.Log.Format)
+}
+
+// LoadOrCreateOperating loads the configuration file, creating an empty one if it doesn't exist.
+func LoadOrCreateOperating(path string) (Operating, error) {
+	operating, err := LoadOperating(path)
+	if err == nil {
+		return operating, nil
+	}
+	absolute, absoluteErr := filepath.Abs(path)
+	if absoluteErr != nil {
+		return Operating{}, errResolveOperating
+	}
+	if _, statErr := os.Lstat(absolute); statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
+		return Operating{}, err
+	}
+	file, createErr := filesystemstore.CreatePrivate(absolute)
+	if createErr != nil {
+		if errors.Is(createErr, os.ErrExist) {
+			return LoadOperating(absolute)
+		}
+		return Operating{}, errCreateOperating
+	}
+	if syncErr := filesystemstore.SyncCreated(file); syncErr != nil {
+		_ = file.Close()
+		return Operating{}, errPersistOperating
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return Operating{}, errPersistOperating
+	}
+	return LoadOperating(absolute)
+}
+
+// LoadOperating reads and validates an operating configuration file from disk.
+func LoadOperating(path string) (Operating, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return Operating{}, errResolveOperating
+	}
+	file, _, err := filesystemstore.OpenRegular(absolute)
+	if err != nil {
+		return Operating{}, errOpenOperating
+	}
+	defer file.Close()
+	if err := filesystemstore.ValidateOwnedFile(file); err != nil {
+		return Operating{}, errUnsafeOperating
+	}
+	contents, err := filesystemstore.ReadBoundedFile(file, maxConfigBytes)
+	if err != nil {
+		if errors.Is(err, filesystemstore.ErrTooLarge) {
+			return Operating{}, ErrMalformed
+		}
+		return Operating{}, errReadOperating
+	}
+	operating, err := ParseOperating(string(contents), absolute)
+	if err != nil {
+		return Operating{}, err
+	}
+	if operatingHasBearerCredentials(operating) && filesystemstore.ValidatePrivateAccess(file) != nil {
+		return Operating{}, errBearerCredentialsRequirePrivateFile
+	}
+	return operating, nil
+}
+
+func operatingHasBearerCredentials(operating Operating) bool {
+	return operating.Control.BearerToken != "" || operating.HTTPProxy.BearerToken != "" || operating.SOCKS5.BearerToken != "" || operating.Metrics.BearerToken != ""
+}
+
+// ParseOperating parses configuration text rooted at the specified file path.
+func ParseOperating(text, path string) (Operating, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return Operating{}, errResolveOperating
+	}
+	entries, err := Parse(text)
+	if err != nil {
+		return Operating{}, err
+	}
+	values := make(map[entryKey]string, len(entries))
+	for _, entry := range entries {
+		if !knownOperatingKey(entry.Section, entry.Key) {
+			return Operating{}, invalid(entry.Section, entry.Key)
+		}
+		values[entryKey{section: entry.Section, key: entry.Key}] = entry.Value
+	}
+
+	operating := defaultOperating(filepath.Dir(absolute))
+	if err := applyPaths(&operating, values, filepath.Dir(absolute)); err != nil {
+		return Operating{}, err
+	}
+	if err := applyNetwork(&operating, values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyRouter(&operating, values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyState(&operating, values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyNetDB(&operating, values, filepath.Dir(absolute)); err != nil {
+		return Operating{}, err
+	}
+	if err := applyTunnel(&operating, values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyTransport(&operating.NTCP2, "ntcp2", values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyTransport(&operating.SSU2, "ssu2", values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyNAT(&operating.NAT, values); err != nil {
+		return Operating{}, err
+	}
+	if !operating.NTCP2.Enabled && !operating.SSU2.Enabled {
+		return Operating{}, invalid("transport", "enabled")
+	}
+	if err := applyReseed(&operating, values, filepath.Dir(absolute)); err != nil {
+		return Operating{}, err
+	}
+	if err := applyListener(&operating.SAM, "sam", values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyAddressBook(&operating.AddressBook, values, filepath.Dir(absolute)); err != nil {
+		return Operating{}, err
+	}
+	if err := applyListener(&operating.Control, "control", values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyHTTPProxy(&operating.HTTPProxy, values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyListener(&operating.SOCKS5, "socks5", values); err != nil {
+		return Operating{}, err
+	}
+	if operating.Control.Enabled && operating.Control.BearerToken == "" {
+		return Operating{}, invalid("control", "bearer_token")
+	}
+	if err := applyListener(&operating.Metrics, "metrics", values); err != nil {
+		return Operating{}, err
+	}
+	if err := applyLog(&operating, values); err != nil {
+		return Operating{}, err
+	}
+	return operating, nil
+}
+
+var defaultReseedPriorityEndpoints = []string{
+	"https://hotseed.gosuda.org/i2pseeds.su3?netid=2",
+}
+
+var defaultReseedEndpoints = []string{
+	"https://waw01.i2p-reseed.hosted-by.skhron.eu/i2pseeds.su3?netid=2",
+	"https://sto01.i2p-reseed.hosted-by.skhron.eu/i2pseeds.su3?netid=2",
+	"https://i2p.ntp.poweredbyberlin.de/i2pseeds.su3?netid=2",
+	"https://spiral.likogan.dev/i2pseeds.su3?netid=2",
+	"https://reseed.sahil.world/i2pseeds.su3?netid=2",
+	"https://i2p.diyarciftci.xyz/i2pseeds.su3?netid=2",
+	"https://reseed.stormycloud.org/i2pseeds.su3?netid=2",
+	"https://reseed-pl.i2pd.xyz/i2pseeds.su3?netid=2",
+	"https://reseed-fr.i2pd.xyz/i2pseeds.su3?netid=2",
+	"https://www2.mk16.de/i2pseeds.su3?netid=2",
+	"https://reseed2.i2p.net/i2pseeds.su3?netid=2",
+	"https://reseed.diva.exchange/i2pseeds.su3?netid=2",
+	"https://reseed.i2pgit.org/i2pseeds.su3?netid=2",
+	"https://i2p.novg.net/i2pseeds.su3?netid=2",
+	"https://i2pseed.creativecowpat.net:8443/i2pseeds.su3?netid=2",
+	"https://reseed.onion.im/i2pseeds.su3?netid=2",
+}
+
+var defaultHTTPOutproxies = []string{"exit.stormycloud.i2p"}
+
+var defaultAddressBookSubscriptions = []string{
+	"http://reg.i2p/export/hosts.txt",
+	"http://identiguy.i2p/hosts.txt",
+	"http://stats.i2p/cgi-bin/newhosts.txt",
+	"https://raw.githubusercontent.com/i2p/i2p.i2p/master/installer/resources/hosts.txt",
+}
+
+// DefaultOperating returns independent defaults without reading or creating files.
+func DefaultOperating() Operating {
+	return defaultOperating("")
+}
+
+// DefaultOperatingForProfile returns independent defaults for the specified network profile.
+func DefaultOperatingForProfile(profile NetworkProfile) Operating {
+	operating := defaultOperating("")
+	if profile != "" && profile != NetworkProfilePublic {
+		_ = applyNetworkProfile(&operating, profile)
+	}
+	return operating
+}
+
+func defaultOperating(base string) Operating {
+	dataDir := "./data"
+	stateDir := filepath.Join(dataDir, "state")
+	return Operating{
+		DataDir:   dataDir,
+		StateDir:  stateDir,
+		StatePath: filepath.Join(stateDir, "router.state"),
+		KeyPath:   filepath.Join(stateDir, "router.keys"),
+		TempDir:   os.TempDir(),
+		Network:   Network{ID: 2, Profile: NetworkProfilePublic, IPv4: true},
+		Router:    Router{IdentityType: "ed25519", Transit: true, Version: "0.9.70"},
+		State:     State{MaxBytes: 16 << 20, MaxDestinations: 64, MaxNameBytes: 255, PromoteToMaster: true, LockRetryInterval: 15 * time.Second},
+		NetDB: NetDB{
+			BucketCapacity: 24, BucketSubnetQuota: 2, LookupCapacity: 32,
+			MinRouters: 50, RouterInfoFloodfillK: 5, LeaseSetFloodfillK: 4,
+			ExplorationBootstrapDelay: time.Second, ExplorationSteadyDelay: 5 * time.Second,
+		},
+		Tunnel: Tunnel{
+			Enabled: true, Hops: 3, IPRestriction: 2,
+			ExploratoryInboundTarget: 4, ExploratoryOutboundTarget: 4, ExploratoryPoolCapacity: 8,
+			ClientInboundTarget: 2, ClientOutboundTarget: 2, ClientPoolCapacity: 4,
+			BuildPendingCapacity: 32, Lifetime: 10 * time.Minute,
+			RenewBefore: 210 * time.Second, MaintenanceInterval: time.Minute,
+			ProbeTimeout: time.Minute, ProbeFailureThreshold: 2,
+			BandwidthRateBytesPerSecond: 1 << 20, BandwidthBurstBytes: 2 << 20,
+		},
+		NTCP2:  defaultTransport(),
+		SSU2:   defaultTransport(),
+		Reseed: Reseed{Enabled: true, PriorityEndpoints: append([]string(nil), defaultReseedPriorityEndpoints...), PriorityTimeout: 2 * time.Second, Endpoints: append([]string(nil), defaultReseedEndpoints...), Timeout: 30 * time.Second, MaxArchiveBytes: 1 << 20, MaxRouterInfos: 4_000, MaxTotalBytes: 64 << 20, BucketSubnetQuota: 2, BucketAdmitLimit: 20, VerifyAnchorCount: 16},
+		SAM: Listener{
+			Enabled: true, Address: Endpoint{Host: "127.0.0.1", Port: 7656}, UDPAddress: Endpoint{Host: "127.0.0.1", Port: 7655},
+			MaxConnections: 128, ReadinessTimeout: 2 * time.Minute, SessionQueue: 64, MaxSessionQueueBytes: 4 << 20, MaxServerQueueBytes: 64 << 20,
+		},
+		AddressBook: AddressBook{
+			Enabled: true, PrivateHostsPath: filepath.Join(base, "privatehosts.txt"), UserHostsPath: filepath.Join(base, "userhosts.txt"), HostsPath: filepath.Join(base, "hosts.txt"), StatePath: filepath.Join(stateDir, "addressbook.json"),
+			Subscriptions:   append([]string(nil), defaultAddressBookSubscriptions...),
+			RefreshInterval: 12 * time.Hour, RetryInterval: 5 * time.Minute, RequestTimeout: 30 * time.Second,
+			MaxEntries: 100_000, MaxFileBytes: 8 << 20, MaxResponseBytes: 16 << 20, MaxRedirects: 3,
+		},
+		Control:   defaultListener(7650),
+		HTTPProxy: HTTPProxy{Listener: defaultListener(4444), Outproxies: append([]string(nil), defaultHTTPOutproxies...)},
+		SOCKS5:    defaultListener(4447),
+		Metrics:   defaultListener(9090),
+		Log:       Log{Level: "info", Format: "text"},
+	}
+}
+
+func applyNetworkProfile(operating *Operating, profile NetworkProfile) error {
+	switch profile {
+	case NetworkProfilePublic:
+		operating.Network.Profile = NetworkProfilePublic
+		return nil
+	case NetworkProfileDedicated:
+		operating.Network.Profile = NetworkProfileDedicated
+		operating.Router.Floodfill = true
+		operating.Router.Transit = true
+		operating.NetDB.BucketSubnetQuota = 16
+		operating.NetDB.DisableBucketSubnetQuota = false
+		operating.NetDB.MinRouters = 2
+		operating.NetDB.RouterInfoFloodfillK = 2
+		operating.NetDB.LeaseSetFloodfillK = 2
+		operating.NetDB.ExplorationBootstrapDelay = 500 * time.Millisecond
+		operating.NetDB.ExplorationSteadyDelay = 5 * time.Second
+		operating.Tunnel.Hops = 1
+		operating.Tunnel.IPRestriction = 2
+		operating.Tunnel.DisableIPRestriction = false
+		operating.Tunnel.ExploratoryInboundTarget = 2
+		operating.Tunnel.ExploratoryOutboundTarget = 2
+		operating.Tunnel.ExploratoryPoolCapacity = 6
+		operating.Tunnel.ClientInboundTarget = 2
+		operating.Tunnel.ClientOutboundTarget = 2
+		operating.Tunnel.ClientPoolCapacity = 6
+		operating.Tunnel.MaintenanceInterval = 5 * time.Second
+		operating.Tunnel.ProbeTimeout = 10 * time.Second
+		operating.Tunnel.ProbeFailureThreshold = 2
+		operating.Reseed.Enabled = false
+		operating.Reseed.PriorityEndpoints = nil
+		operating.Reseed.Endpoints = nil
+		operating.Reseed.BucketSubnetQuota = 16
+		operating.Reseed.DisableBucketSubnetQuota = false
+		operating.Reseed.VerifyAnchorCount = 2
+		operating.HTTPProxy.Outproxies = []string{}
+		operating.AddressBook.Subscriptions = nil
+		return nil
+	case NetworkProfileDirect:
+		operating.Network.Profile = NetworkProfileDirect
+		operating.Router.Floodfill = true
+		operating.Router.Transit = true
+		operating.NetDB.BucketSubnetQuota = 0
+		operating.NetDB.DisableBucketSubnetQuota = true
+		operating.NetDB.MinRouters = 1
+		operating.NetDB.RouterInfoFloodfillK = 1
+		operating.NetDB.LeaseSetFloodfillK = 1
+		operating.NetDB.ExplorationBootstrapDelay = 500 * time.Millisecond
+		operating.NetDB.ExplorationSteadyDelay = 3 * time.Second
+		operating.Tunnel.Hops = 1
+		operating.Tunnel.IPRestriction = 0
+		operating.Tunnel.DisableIPRestriction = true
+		operating.Tunnel.ExploratoryInboundTarget = 2
+		operating.Tunnel.ExploratoryOutboundTarget = 2
+		operating.Tunnel.ExploratoryPoolCapacity = 4
+		operating.Tunnel.ClientInboundTarget = 2
+		operating.Tunnel.ClientOutboundTarget = 2
+		operating.Tunnel.ClientPoolCapacity = 4
+		operating.Tunnel.MaintenanceInterval = 3 * time.Second
+		operating.Tunnel.ProbeTimeout = 5 * time.Second
+		operating.Tunnel.ProbeFailureThreshold = 2
+		operating.Reseed.Enabled = false
+		operating.Reseed.PriorityEndpoints = nil
+		operating.Reseed.Endpoints = nil
+		operating.Reseed.BucketSubnetQuota = 0
+		operating.Reseed.DisableBucketSubnetQuota = true
+		operating.Reseed.VerifyAnchorCount = 1
+		operating.HTTPProxy.Outproxies = []string{}
+		operating.AddressBook.Subscriptions = nil
+		return nil
+	default:
+		return invalid("network", "profile")
+	}
+}
+
+func defaultTransport() Transport {
+	return Transport{Enabled: true, Bind: Endpoint{Host: "0.0.0.0", Port: 0}, MaxSessions: 256, IdleTimeout: 10 * time.Minute}
+}
+
+func defaultListener(port uint16) Listener {
+	return Listener{Address: Endpoint{Host: "127.0.0.1", Port: port}, MaxConnections: 128}
+}
+
+func applyPaths(operating *Operating, values map[entryKey]string, base string) error {
+	var err error
+	dataConfigured := false
+	if value, ok := valueOf(values, "paths", "data_dir"); ok {
+		operating.DataDir, err = resolvePath(value, base)
+		if err != nil {
+			return invalid("paths", "data_dir")
+		}
+		dataConfigured = true
+	}
+	if value, ok := valueOf(values, "paths", "state_dir"); ok {
+		operating.StateDir, err = resolvePath(value, base)
+		if err != nil {
+			return invalid("paths", "state_dir")
+		}
+	} else if dataConfigured {
+		operating.StateDir = filepath.Join(operating.DataDir, "state")
+	}
+	if value, ok := valueOf(values, "paths", "state_path"); ok {
+		operating.StatePath, err = resolvePath(value, base)
+		if err != nil {
+			return invalid("paths", "state_path")
+		}
+	} else if _, stateConfigured := valueOf(values, "paths", "state_dir"); stateConfigured || dataConfigured {
+		operating.StatePath = filepath.Join(operating.StateDir, "router.state")
+	}
+	if value, ok := valueOf(values, "paths", "key_path"); ok {
+		operating.KeyPath, err = resolvePath(value, base)
+		if err != nil {
+			return invalid("paths", "key_path")
+		}
+	} else if _, stateConfigured := valueOf(values, "paths", "state_dir"); stateConfigured || dataConfigured {
+		operating.KeyPath = filepath.Join(operating.StateDir, "router.keys")
+	}
+	if _, stateConfigured := valueOf(values, "paths", "state_dir"); stateConfigured || dataConfigured {
+		operating.AddressBook.StatePath = filepath.Join(operating.StateDir, "addressbook.json")
+	}
+	if value, ok := valueOf(values, "paths", "temp_dir"); ok {
+		operating.TempDir, err = resolvePath(value, base)
+		if err != nil {
+			return invalid("paths", "temp_dir")
+		}
+	}
+	return nil
+}
+
+func applyNetwork(operating *Operating, values map[entryKey]string) error {
+	if value, ok := valueOf(values, "network", "profile"); ok {
+		if err := applyNetworkProfile(operating, NetworkProfile(value)); err != nil {
+			return err
+		}
+	}
+	if value, ok := valueOf(values, "network", "id"); ok {
+		parsed, err := parseUint(value, 1, int64(^uint32(0)))
+		if err != nil {
+			return invalid("network", "id")
+		}
+		operating.Network.ID = uint32(parsed)
+	}
+	for _, key := range []string{"ipv4", "ipv6"} {
+		if value, ok := valueOf(values, "network", key); ok {
+			parsed, err := parseBool(value)
+			if err != nil {
+				return invalid("network", key)
+			}
+			if key == "ipv4" {
+				operating.Network.IPv4 = parsed
+			} else {
+				operating.Network.IPv6 = parsed
+			}
+		}
+	}
+	if !operating.Network.IPv4 && !operating.Network.IPv6 {
+		return invalid("network", "ip_families")
+	}
+	return nil
+}
+
+func applyRouter(operating *Operating, values map[entryKey]string) error {
+	if value, ok := valueOf(values, "router", "identity_type"); ok {
+		if value != "ed25519" {
+			return invalid("router", "identity_type")
+		}
+		operating.Router.IdentityType = value
+	}
+	if value, ok := valueOf(values, "router", "floodfill"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("router", "floodfill")
+		}
+		operating.Router.Floodfill = parsed
+	}
+	if value, ok := valueOf(values, "router", "transit"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("router", "transit")
+		}
+		operating.Router.Transit = parsed
+	}
+	if value, ok := valueOf(values, "router", "family"); ok {
+		if !validLabel(value, 64) {
+			return invalid("router", "family")
+		}
+		operating.Router.Family = value
+	}
+	if value, ok := valueOf(values, "router", "version"); ok {
+		if !validLabel(value, 64) {
+			return invalid("router", "version")
+		}
+		operating.Router.Version = value
+	}
+	return nil
+}
+
+func applyState(operating *Operating, values map[entryKey]string) error {
+	var err error
+	if value, ok := valueOf(values, "state", "max_bytes"); ok {
+		operating.State.MaxBytes, err = parseUint(value, 64<<10, 1<<30)
+		if err != nil {
+			return invalid("state", "max_bytes")
+		}
+	}
+	if value, ok := valueOf(values, "state", "max_destinations"); ok {
+		parsed, err := parseUint(value, 1, 256)
+		if err != nil {
+			return invalid("state", "max_destinations")
+		}
+		operating.State.MaxDestinations = int(parsed)
+	}
+	if value, ok := valueOf(values, "state", "max_name_bytes"); ok {
+		parsed, err := parseUint(value, 1, 1_024)
+		if err != nil {
+			return invalid("state", "max_name_bytes")
+		}
+		operating.State.MaxNameBytes = int(parsed)
+	}
+	if value, ok := valueOf(values, "state", "tainted_copy"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("state", "tainted_copy")
+		}
+		operating.State.TaintedCopy = parsed
+	}
+	if value, ok := valueOf(values, "state", "promote_to_master"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("state", "promote_to_master")
+		}
+		operating.State.PromoteToMaster = parsed
+	}
+	if value, ok := valueOf(values, "state", "lock_retry_interval"); ok {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed < time.Second {
+			return invalid("state", "lock_retry_interval")
+		}
+		operating.State.LockRetryInterval = parsed
+	}
+	return nil
+}
+
+func applyNetDB(operating *Operating, values map[entryKey]string, base string) error {
+	if value, ok := valueOf(values, "netdb", "bucket_capacity"); ok {
+		parsed, err := parseUint(value, 5, 1_024)
+		if err != nil {
+			return invalid("netdb", "bucket_capacity")
+		}
+		operating.NetDB.BucketCapacity = int(parsed)
+	}
+	if value, ok := valueOf(values, "netdb", "bucket_subnet_quota"); ok {
+		parsed, err := parseUint(value, 0, 1_024)
+		if err != nil {
+			return invalid("netdb", "bucket_subnet_quota")
+		}
+		operating.NetDB.BucketSubnetQuota = int(parsed)
+		operating.NetDB.DisableBucketSubnetQuota = parsed == 0
+	}
+	if value, ok := valueOf(values, "netdb", "lookup_capacity"); ok {
+		parsed, err := parseUint(value, 1, 256)
+		if err != nil {
+			return invalid("netdb", "lookup_capacity")
+		}
+		operating.NetDB.LookupCapacity = int(parsed)
+	}
+	for _, setting := range []struct {
+		key string
+		dst *int
+		min int64
+		max int64
+	}{
+		{"min_routers", &operating.NetDB.MinRouters, 1, 10_000},
+		{"router_info_floodfill_k", &operating.NetDB.RouterInfoFloodfillK, 1, 16},
+		{"lease_set_floodfill_k", &operating.NetDB.LeaseSetFloodfillK, 1, 16},
+	} {
+		if value, ok := valueOf(values, "netdb", setting.key); ok {
+			parsed, err := parseUint(value, setting.min, setting.max)
+			if err != nil {
+				return invalid("netdb", setting.key)
+			}
+			*setting.dst = int(parsed)
+		}
+	}
+	for _, setting := range []struct {
+		key string
+		dst *time.Duration
+		min time.Duration
+		max time.Duration
+	}{
+		{"exploration_bootstrap_delay", &operating.NetDB.ExplorationBootstrapDelay, 100 * time.Millisecond, 10 * time.Minute},
+		{"exploration_steady_delay", &operating.NetDB.ExplorationSteadyDelay, 100 * time.Millisecond, 10 * time.Minute},
+	} {
+		if value, ok := valueOf(values, "netdb", setting.key); ok {
+			parsed, err := parseDuration(value, setting.min, setting.max)
+			if err != nil {
+				return invalid("netdb", setting.key)
+			}
+			*setting.dst = parsed
+		}
+	}
+	if value, ok := valueOf(values, "netdb", "bootstrap_router_info_files"); ok {
+		paths, err := parsePathList(value, base, maxBootstrapRouterInfoFiles, false)
+		if err != nil {
+			return invalid("netdb", "bootstrap_router_info_files")
+		}
+		operating.NetDB.BootstrapRouterInfoPaths = paths
+	}
+	return nil
+}
+
+func parsePathList(value, base string, maxFiles int, allowEmpty bool) ([]string, error) {
+	if allowEmpty && strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	raw := strings.Split(value, ",")
+	if len(raw) == 0 || len(raw) > maxFiles {
+		return nil, errInvalidPath
+	}
+	paths := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		resolved, err := resolvePath(strings.TrimSpace(item), base)
+		if err != nil {
+			return nil, errInvalidPath
+		}
+		if _, duplicate := seen[resolved]; duplicate {
+			return nil, errInvalidPath
+		}
+		seen[resolved] = struct{}{}
+		paths = append(paths, resolved)
+	}
+	return paths, nil
+}
+
+func applyTunnel(operating *Operating, values map[entryKey]string) error {
+	tunnel := &operating.Tunnel
+	if value, ok := valueOf(values, "tunnel", "enabled"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("tunnel", "enabled")
+		}
+		tunnel.Enabled = parsed
+	}
+	if value, ok := valueOf(values, "tunnel", "ip_restriction"); ok {
+		parsed, err := parseUint(value, 0, 4)
+		if err != nil {
+			return invalid("tunnel", "ip_restriction")
+		}
+		tunnel.IPRestriction = int(parsed)
+		tunnel.DisableIPRestriction = parsed == 0
+	}
+	for _, setting := range []struct {
+		key string
+		dst *int
+		min int64
+		max int64
+	}{
+		{"hops", &tunnel.Hops, 1, 7},
+		{"exploratory_inbound_target", &tunnel.ExploratoryInboundTarget, 1, 16},
+		{"exploratory_outbound_target", &tunnel.ExploratoryOutboundTarget, 1, 16},
+		{"exploratory_pool_capacity", &tunnel.ExploratoryPoolCapacity, 2, 64},
+		{"client_inbound_target", &tunnel.ClientInboundTarget, 1, 16},
+		{"client_outbound_target", &tunnel.ClientOutboundTarget, 1, 16},
+		{"client_pool_capacity", &tunnel.ClientPoolCapacity, 2, 64},
+		{"build_pending_capacity", &tunnel.BuildPendingCapacity, 1, 256},
+		{"bandwidth_rate_bytes_per_second", &tunnel.BandwidthRateBytesPerSecond, 1 << 10, 1 << 30},
+		{"bandwidth_burst_bytes", &tunnel.BandwidthBurstBytes, 1 << 10, 1 << 30},
+		{"probe_failure_threshold", &tunnel.ProbeFailureThreshold, 1, 255},
+	} {
+		if value, ok := valueOf(values, "tunnel", setting.key); ok {
+			parsed, err := parseUint(value, setting.min, setting.max)
+			if err != nil {
+				return invalid("tunnel", setting.key)
+			}
+			*setting.dst = int(parsed)
+		}
+	}
+	for _, setting := range []struct {
+		key string
+		dst *time.Duration
+		min time.Duration
+		max time.Duration
+	}{
+		{"lifetime", &tunnel.Lifetime, 10 * time.Minute, 10 * time.Minute},
+		{"renew_before", &tunnel.RenewBefore, time.Second, 10*time.Minute - time.Nanosecond},
+		{"maintenance_interval", &tunnel.MaintenanceInterval, time.Second, 10 * time.Minute},
+		{"probe_timeout", &tunnel.ProbeTimeout, time.Second, 10 * time.Minute},
+	} {
+		if value, ok := valueOf(values, "tunnel", setting.key); ok {
+			parsed, err := parseDuration(value, setting.min, setting.max)
+			if err != nil {
+				return invalid("tunnel", setting.key)
+			}
+			*setting.dst = parsed
+		}
+	}
+	if tunnel.RenewBefore >= tunnel.Lifetime {
+		return invalid("tunnel", "renew_before")
+	}
+	if tunnel.MaintenanceInterval > tunnel.RenewBefore {
+		return invalid("tunnel", "maintenance_interval")
+	}
+	if tunnel.ExploratoryPoolCapacity < 2*tunnel.ExploratoryInboundTarget || tunnel.ExploratoryPoolCapacity < 2*tunnel.ExploratoryOutboundTarget {
+		return invalid("tunnel", "exploratory_pool_capacity")
+	}
+	if tunnel.ClientPoolCapacity < 2*tunnel.ClientInboundTarget || tunnel.ClientPoolCapacity < 2*tunnel.ClientOutboundTarget {
+		return invalid("tunnel", "client_pool_capacity")
+	}
+	return nil
+}
+
+func applyTransport(transport *Transport, section string, values map[entryKey]string) error {
+	if value, ok := valueOf(values, section, "enabled"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid(section, "enabled")
+		}
+		transport.Enabled = parsed
+	}
+	if err := applyEndpoint(&transport.Bind, section, "bind", values, endpointOptions{allowUnspecified: true, allowZeroPort: true}); err != nil {
+		return err
+	}
+	if err := applyOptionalEndpoint(&transport.Advertised, section, "advertise", values); err != nil {
+		return err
+	}
+	if value, ok := valueOf(values, section, "max_sessions"); ok {
+		parsed, err := parseUint(value, 1, 65_536)
+		if err != nil {
+			return invalid(section, "max_sessions")
+		}
+		transport.MaxSessions = int(parsed)
+	}
+	if value, ok := valueOf(values, section, "idle_timeout"); ok {
+		parsed, err := parseDuration(value, time.Second, 24*time.Hour)
+		if err != nil {
+			return invalid(section, "idle_timeout")
+		}
+		transport.IdleTimeout = parsed
+	}
+	return nil
+}
+func applyNAT(nat *NAT, values map[entryKey]string) error {
+	if value, ok := valueOf(values, "nat", "natpmp_endpoint"); ok {
+		endpoint, err := netip.ParseAddrPort(value)
+		if err != nil {
+			return invalid("nat", "natpmp_endpoint")
+		}
+		address := endpoint.Addr().Unmap()
+		if !address.Is4() || address.IsUnspecified() || address.IsLoopback() || address.IsMulticast() || endpoint.Port() == 0 {
+			return invalid("nat", "natpmp_endpoint")
+		}
+		nat.NATPMPEndpoint = netip.AddrPortFrom(address, endpoint.Port())
+	}
+	if value, ok := valueOf(values, "nat", "upnp_endpoint"); ok {
+		endpoint, err := url.Parse(value)
+		applyNATRejected := err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.Fragment != ""
+		if !applyNATRejected {
+			applyNATRejected = endpoint.Scheme != "http" && endpoint.Scheme != "https"
+		}
+		if applyNATRejected {
+			return invalid("nat", "upnp_endpoint")
+		}
+		nat.UPnPEndpoint = endpoint.String()
+	}
+	return nil
+}
+
+func applyReseed(operating *Operating, values map[entryKey]string, base string) error {
+	reseed := &operating.Reseed
+	if value, ok := valueOf(values, "reseed", "enabled"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("reseed", "enabled")
+		}
+		reseed.Enabled = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "required"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("reseed", "required")
+		}
+		reseed.Required = parsed
+	}
+	priorityEndpointsSpecified := false
+	if value, ok := valueOf(values, "reseed", "priority_endpoints"); ok {
+		priorityEndpointsSpecified = true
+		endpoints, err := parseReseedEndpoints(value, operating.Network.ID)
+		if err != nil {
+			return invalid("reseed", "priority_endpoints")
+		}
+		reseed.PriorityEndpoints = endpoints
+	} else if operating.Network.ID != 2 {
+		reseed.PriorityEndpoints = nil
+	}
+	if value, ok := valueOf(values, "reseed", "priority_timeout"); ok {
+		parsed, err := parseDuration(value, 100*time.Millisecond, 10*time.Minute)
+		if err != nil {
+			return invalid("reseed", "priority_timeout")
+		}
+		reseed.PriorityTimeout = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "endpoints"); ok {
+		endpoints, err := parseReseedEndpoints(value, operating.Network.ID)
+		if err != nil {
+			return invalid("reseed", "endpoints")
+		}
+		reseed.Endpoints = endpoints
+	} else if operating.Network.ID != 2 {
+		reseed.Endpoints = nil
+	}
+	if value, ok := valueOf(values, "reseed", "timeout"); ok {
+		parsed, err := parseDuration(value, time.Second, 10*time.Minute)
+		if err != nil {
+			return invalid("reseed", "timeout")
+		}
+		reseed.Timeout = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "max_archive_bytes"); ok {
+		parsed, err := parseUint(value, 64<<10, 1<<30)
+		if err != nil {
+			return invalid("reseed", "max_archive_bytes")
+		}
+		reseed.MaxArchiveBytes = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "max_router_infos"); ok {
+		parsed, err := parseUint(value, 1, 100_000)
+		if err != nil {
+			return invalid("reseed", "max_router_infos")
+		}
+		reseed.MaxRouterInfos = int(parsed)
+	}
+	if value, ok := valueOf(values, "reseed", "max_total_bytes"); ok {
+		parsed, err := parseUint(value, 64<<10, 2<<30)
+		if err != nil {
+			return invalid("reseed", "max_total_bytes")
+		}
+		reseed.MaxTotalBytes = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "bucket_subnet_quota"); ok {
+		parsed, err := parseUint(value, 0, 64)
+		if err != nil {
+			return invalid("reseed", "bucket_subnet_quota")
+		}
+		reseed.BucketSubnetQuota = int(parsed)
+		reseed.DisableBucketSubnetQuota = parsed == 0
+	}
+	if value, ok := valueOf(values, "reseed", "bucket_admit_limit"); ok {
+		parsed, err := parseUint(value, 1, 256)
+		if err != nil {
+			return invalid("reseed", "bucket_admit_limit")
+		}
+		reseed.BucketAdmitLimit = int(parsed)
+	}
+	if value, ok := valueOf(values, "reseed", "verify_anchor_count"); ok {
+		parsed, err := parseUint(value, 1, 64)
+		if err != nil {
+			return invalid("reseed", "verify_anchor_count")
+		}
+		reseed.VerifyAnchorCount = int(parsed)
+	}
+	if value, ok := valueOf(values, "reseed", "merge_wait"); ok {
+		parsed, err := parseDuration(value, -10*time.Minute, 10*time.Minute)
+		if err != nil {
+			return invalid("reseed", "merge_wait")
+		}
+		reseed.MergeWait = parsed
+	}
+	if value, ok := valueOf(values, "reseed", "trusted_cert_files"); ok {
+		paths, err := parsePathList(value, base, maxReseedTrustedCertFiles, true)
+		if err != nil {
+			return invalid("reseed", "trusted_cert_files")
+		}
+		reseed.TrustedCertPaths = paths
+	}
+	if reseed.MaxTotalBytes < reseed.MaxArchiveBytes {
+		return invalid("reseed", "max_total_bytes")
+	}
+	if reseed.Required && !reseed.Enabled {
+		return invalid("reseed", "required")
+	}
+	if !reseed.Enabled && !priorityEndpointsSpecified {
+		reseed.PriorityEndpoints = nil
+	}
+	if reseed.Enabled && len(reseed.Endpoints) == 0 {
+		return invalid("reseed", "endpoints")
+	}
+	if !reseed.Enabled && (len(reseed.Endpoints) != 0 || len(reseed.PriorityEndpoints) != 0) {
+		return invalid("reseed", "endpoints")
+	}
+	return nil
+}
+
+func applyListener(listener *Listener, section string, values map[entryKey]string) error {
+	if value, ok := valueOf(values, section, "enabled"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid(section, "enabled")
+		}
+		listener.Enabled = parsed
+	}
+	if err := applyEndpoint(&listener.Address, section, "listen", values, endpointOptions{}); err != nil {
+		return err
+	}
+	if section == "sam" {
+		if err := applyEndpoint(&listener.UDPAddress, section, "udp", values, endpointOptions{}); err != nil {
+			return err
+		}
+	}
+	if value, ok := valueOf(values, section, "bearer_token"); ok {
+		if !validBearerToken(value) {
+			return invalid(section, "bearer_token")
+		}
+		listener.BearerToken = value
+	}
+	if value, ok := valueOf(values, section, "max_connections"); ok {
+		parsed, err := parseUint(value, 1, 65_536)
+		if err != nil {
+			return invalid(section, "max_connections")
+		}
+		listener.MaxConnections = int(parsed)
+	}
+	if section == "sam" {
+		if value, ok := valueOf(values, section, "readiness_timeout"); ok {
+			parsed, err := parseDuration(value, 100*time.Millisecond, 10*time.Minute)
+			if err != nil {
+				return invalid(section, "readiness_timeout")
+			}
+			listener.ReadinessTimeout = parsed
+		}
+	}
+	for _, setting := range []struct {
+		key    string
+		target *int64
+		min    int64
+		max    int64
+	}{
+		{"max_session_queue_bytes", &listener.MaxSessionQueueBytes, 64 << 10, 1 << 30},
+		{"max_server_queue_bytes", &listener.MaxServerQueueBytes, 64 << 10, 16 << 30},
+	} {
+		if value, ok := valueOf(values, section, setting.key); ok {
+			parsed, err := parseUint(value, setting.min, setting.max)
+			if err != nil {
+				return invalid(section, setting.key)
+			}
+			*setting.target = parsed
+		}
+	}
+	if value, ok := valueOf(values, section, "session_queue"); ok {
+		parsed, err := parseUint(value, 1, 4096)
+		if err != nil {
+			return invalid(section, "session_queue")
+		}
+		listener.SessionQueue = int(parsed)
+	}
+	if listener.MaxSessionQueueBytes > listener.MaxServerQueueBytes {
+		return invalid(section, "max_server_queue_bytes")
+	}
+	if (section == "http_proxy" || section == "socks5") && listener.BearerToken != "" {
+		return invalid(section, "bearer_token")
+	}
+	if !listener.Enabled {
+		return nil
+	}
+	address, err := netip.ParseAddr(listener.Address.Host)
+	if err != nil {
+		return invalid(section, "listen_host")
+	}
+	applyListenerRejected := (section == "http_proxy" || section == "socks5")
+	if applyListenerRejected {
+		applyListenerRejected = (!address.IsLoopback() || listener.BearerToken != "")
+	}
+	if applyListenerRejected {
+		return invalid(section, "listen")
+	}
+	if !address.IsLoopback() && listener.BearerToken == "" {
+		return invalid(section, "bearer_token")
+	}
+	if section == "sam" && listener.UDPAddress.Host != "" {
+		udpAddress, parseErr := netip.ParseAddr(listener.UDPAddress.Host)
+		if parseErr != nil || !udpAddress.IsLoopback() || listener.UDPAddress.Port == 0 {
+			return invalid(section, "udp")
+		}
+	}
+	return nil
+}
+
+func applyHTTPProxy(proxy *HTTPProxy, values map[entryKey]string) error {
+	if err := applyListener(&proxy.Listener, "http_proxy", values); err != nil {
+		return err
+	}
+	value, ok := valueOf(values, "http_proxy", "outproxies")
+	if !ok {
+		return nil
+	}
+	raw := strings.Split(value, ",")
+	outproxies := make([]string, 0, len(raw))
+	for _, candidate := range raw {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" {
+			continue
+		}
+		if !validI2PHostname(candidate) || slices.Contains(outproxies, candidate) {
+			return invalid("http_proxy", "outproxies")
+		}
+		outproxies = append(outproxies, candidate)
+	}
+	if len(outproxies) > 16 {
+		return invalid("http_proxy", "outproxies")
+	}
+	proxy.Outproxies = outproxies
+	return nil
+}
+
+func validI2PHostname(host string) bool {
+	if len(host) < len("a.i2p") || len(host) > 253 || !strings.HasSuffix(host, ".i2p") {
+		return false
+	}
+	for label := range strings.SplitSeq(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if !validHostnameCharacter(character) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validHostnameCharacter(character rune) bool {
+	isLetter := character >= 'a' && character <= 'z'
+	isDigit := character >= '0' && character <= '9'
+	return isLetter || isDigit || character == '-'
+}
+
+func applyAddressBook(book *AddressBook, values map[entryKey]string, base string) error {
+	if value, ok := valueOf(values, "addressbook", "enabled"); ok {
+		parsed, err := parseBool(value)
+		if err != nil {
+			return invalid("addressbook", "enabled")
+		}
+		book.Enabled = parsed
+	}
+	paths := []struct {
+		key    string
+		target *string
+	}{
+		{"privatehosts_path", &book.PrivateHostsPath}, {"userhosts_path", &book.UserHostsPath},
+		{"hosts_path", &book.HostsPath}, {"state_path", &book.StatePath},
+	}
+	for _, item := range paths {
+		if value, ok := valueOf(values, "addressbook", item.key); ok {
+			if value == "" {
+				return invalid("addressbook", item.key)
+			}
+			resolved, err := resolvePath(value, base)
+			if err != nil {
+				return invalid("addressbook", item.key)
+			}
+			*item.target = resolved
+		}
+	}
+	if value, ok := valueOf(values, "addressbook", "subscriptions"); ok {
+		raw := strings.Split(value, ",")
+		parts := make([]string, 0, len(raw))
+		for _, part := range raw {
+			if part = strings.TrimSpace(part); part != "" {
+				parts = append(parts, part)
+			}
+		}
+		if len(parts) > 32 {
+			return invalid("addressbook", "subscriptions")
+		}
+		book.Subscriptions = parts
+	}
+	durations := []struct {
+		key      string
+		target   *time.Duration
+		min, max time.Duration
+	}{
+		{"refresh_interval", &book.RefreshInterval, time.Minute, 7 * 24 * time.Hour},
+		{"retry_interval", &book.RetryInterval, time.Second, 24 * time.Hour},
+		{"request_timeout", &book.RequestTimeout, time.Second, 10 * time.Minute},
+	}
+	for _, item := range durations {
+		if value, ok := valueOf(values, "addressbook", item.key); ok {
+			parsed, err := parseDuration(value, item.min, item.max)
+			if err != nil {
+				return invalid("addressbook", item.key)
+			}
+			*item.target = parsed
+		}
+	}
+	if value, ok := valueOf(values, "addressbook", "max_entries"); ok {
+		parsed, err := parseUint(value, 1, 1_000_000)
+		if err != nil {
+			return invalid("addressbook", "max_entries")
+		}
+		book.MaxEntries = int(parsed)
+	}
+	if value, ok := valueOf(values, "addressbook", "max_file_bytes"); ok {
+		parsed, err := parseUint(value, 1024, 1<<30)
+		if err != nil {
+			return invalid("addressbook", "max_file_bytes")
+		}
+		book.MaxFileBytes = int64(parsed)
+	}
+	if value, ok := valueOf(values, "addressbook", "max_response_bytes"); ok {
+		parsed, err := parseUint(value, 1024, 1<<30)
+		if err != nil {
+			return invalid("addressbook", "max_response_bytes")
+		}
+		book.MaxResponseBytes = int64(parsed)
+	}
+	if value, ok := valueOf(values, "addressbook", "max_redirects"); ok {
+		parsed, err := parseUint(value, 0, 16)
+		if err != nil {
+			return invalid("addressbook", "max_redirects")
+		}
+		book.MaxRedirects = int(parsed)
+	}
+	return nil
+}
+
+func applyLog(operating *Operating, values map[entryKey]string) error {
+	if value, ok := valueOf(values, "log", "level"); ok {
+		switch value {
+		case "debug", "info", "warn", "error":
+			operating.Log.Level = value
+		default:
+			return invalid("log", "level")
+		}
+	}
+	if value, ok := valueOf(values, "log", "format"); ok {
+		switch value {
+		case "text", "json":
+			operating.Log.Format = value
+		default:
+			return invalid("log", "format")
+		}
+	}
+	return nil
+}
+
+type endpointOptions struct {
+	allowUnspecified bool
+	allowZeroPort    bool
+}
+
+func applyEndpoint(endpoint *Endpoint, section, prefix string, values map[entryKey]string, options endpointOptions) error {
+	host, hostOK := valueOf(values, section, prefix+"_host")
+	port, portOK := valueOf(values, section, prefix+"_port")
+	if hostOK != portOK {
+		return invalid(section, prefix+"_endpoint")
+	}
+	if !hostOK {
+		return nil
+	}
+	parsed, err := parseEndpoint(host, port, options.allowUnspecified, options.allowZeroPort)
+	if err != nil {
+		return invalid(section, prefix+"_endpoint")
+	}
+	*endpoint = parsed
+	return nil
+}
+
+func applyOptionalEndpoint(endpoint *Endpoint, section, prefix string, values map[entryKey]string) error {
+	host, hostOK := valueOf(values, section, prefix+"_host")
+	port, portOK := valueOf(values, section, prefix+"_port")
+	if !hostOK && !portOK {
+		return nil
+	}
+	var parsed Endpoint
+	if hostOK {
+		address, err := netip.ParseAddr(host)
+		if err != nil {
+			return invalid(section, prefix+"_endpoint")
+		}
+		address = address.Unmap()
+		if address.IsMulticast() || address.IsUnspecified() {
+			return invalid(section, prefix+"_endpoint")
+		}
+		parsed.Host = address.String()
+	}
+	if portOK {
+		value, err := parseUint(port, 0, 65_535)
+		if err != nil {
+			return invalid(section, prefix+"_endpoint")
+		}
+		parsed.Port = uint16(value)
+	}
+	if parsed.Port != 0 && parsed.Host == "" {
+		return invalid(section, prefix+"_endpoint")
+	}
+	*endpoint = parsed
+	return nil
+}
+
+func parseEndpoint(host, port string, allowUnspecified, allowZeroPort bool) (Endpoint, error) {
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return Endpoint{}, errInvalidEndpoint
+	}
+	address = address.Unmap()
+	if address.IsMulticast() || (!allowUnspecified && address.IsUnspecified()) {
+		return Endpoint{}, errInvalidEndpoint
+	}
+	minimumPort := int64(1)
+	if allowZeroPort {
+		minimumPort = 0
+	}
+	parsedPort, err := parseUint(port, minimumPort, 65_535)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	return Endpoint{Host: address.String(), Port: uint16(parsedPort)}, nil
+}
+
+func parseReseedEndpoints(value string, networkID uint32) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	networkID = cmp.Or(networkID, 2)
+	expectedQuery := "netid=" + strconv.FormatUint(uint64(networkID), 10)
+	parts := strings.Split(value, ",")
+	if len(parts) == 0 || len(parts) > maxReseedEndpoints {
+		return nil, errInvalidReseedEndpointCount
+	}
+	endpoints := make([]string, 0, len(parts))
+	for _, part := range parts {
+		endpoint := strings.TrimSpace(part)
+		parsed, err := url.Parse(endpoint)
+		parseReseedEndpointsRejected := len(endpoint) == 0 || len(endpoint) > maxReseedEndpointBytes || err != nil ||
+			parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil ||
+			parsed.RawQuery != expectedQuery || parsed.ForceQuery
+		if !parseReseedEndpointsRejected {
+			parseReseedEndpointsRejected = parsed.Fragment != ""
+		}
+		if parseReseedEndpointsRejected {
+			return nil, errInvalidReseedEndpoint
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints, nil
+}
+
+func parseBool(value string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errInvalidBoolean
+	}
+}
+
+func parseUint(value string, min, max int64) (int64, error) {
+	if value == "" || strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") {
+		return 0, errInvalidInteger
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < min || parsed > max {
+		return 0, errIntegerOutOfRange
+	}
+	return parsed, nil
+}
+func parseDuration(value string, min, max time.Duration) (time.Duration, error) {
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < min || parsed > max {
+		return 0, errDurationOutOfRange
+	}
+	return parsed, nil
+}
+
+func resolvePath(value, base string) (string, error) {
+	if value == "" || len(value) > maxOperatingPathBytes || strings.IndexByte(value, 0) >= 0 || !utf8.ValidString(value) {
+		return "", errInvalidPath
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value), nil
+	}
+	return filepath.Join(base, filepath.Clean(value)), nil
+}
+
+func validLabel(value string, maximum int) bool {
+	if value == "" || len(value) > maximum || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if character <= 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validBearerToken(value string) bool {
+	if len(value) < 16 || len(value) > 4_096 {
+		return false
+	}
+	for _, character := range value {
+		if !validBearerTokenCharacter(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validBearerTokenCharacter(character rune) bool {
+	return (character >= 'a' && character <= 'z') ||
+		(character >= 'A' && character <= 'Z') ||
+		(character >= '0' && character <= '9') ||
+		strings.ContainsRune("-._~+/=", character)
+}
+
+func valueOf(values map[entryKey]string, section, key string) (string, bool) {
+	value, ok := values[entryKey{section: section, key: key}]
+	return value, ok
+}
+
+func invalid(section, key string) error {
+	if section == "" {
+		return fmt.Errorf("%w: %s", ErrInvalidOperating, key)
+	}
+	return fmt.Errorf("%w: %s.%s", ErrInvalidOperating, section, key)
+}
+
+func knownOperatingKey(section, key string) bool {
+	allowed, ok := operatingKeys[section]
+	return ok && allowed[key]
+}
+
+var operatingKeys = map[string]map[string]bool{
+	"paths":       {"data_dir": true, "state_dir": true, "state_path": true, "key_path": true, "temp_dir": true},
+	"network":     {"id": true, "profile": true, "ipv4": true, "ipv6": true},
+	"router":      {"identity_type": true, "floodfill": true, "transit": true, "family": true, "version": true},
+	"state":       {"max_bytes": true, "max_destinations": true, "max_name_bytes": true, "tainted_copy": true, "promote_to_master": true, "lock_retry_interval": true},
+	"netdb":       {"bucket_capacity": true, "bucket_subnet_quota": true, "lookup_capacity": true, "bootstrap_router_info_files": true, "min_routers": true, "router_info_floodfill_k": true, "lease_set_floodfill_k": true, "exploration_bootstrap_delay": true, "exploration_steady_delay": true},
+	"tunnel":      {"enabled": true, "hops": true, "ip_restriction": true, "exploratory_inbound_target": true, "exploratory_outbound_target": true, "exploratory_pool_capacity": true, "client_inbound_target": true, "client_outbound_target": true, "client_pool_capacity": true, "build_pending_capacity": true, "lifetime": true, "renew_before": true, "maintenance_interval": true, "probe_timeout": true, "probe_failure_threshold": true, "bandwidth_rate_bytes_per_second": true, "bandwidth_burst_bytes": true},
+	"ntcp2":       {"enabled": true, "bind_host": true, "bind_port": true, "advertise_host": true, "advertise_port": true, "max_sessions": true, "idle_timeout": true},
+	"ssu2":        {"enabled": true, "bind_host": true, "bind_port": true, "advertise_host": true, "advertise_port": true, "max_sessions": true, "idle_timeout": true},
+	"nat":         {"natpmp_endpoint": true, "upnp_endpoint": true},
+	"reseed":      {"enabled": true, "required": true, "priority_endpoints": true, "priority_timeout": true, "endpoints": true, "timeout": true, "max_archive_bytes": true, "max_router_infos": true, "max_total_bytes": true, "bucket_subnet_quota": true, "bucket_admit_limit": true, "verify_anchor_count": true, "merge_wait": true, "trusted_cert_files": true},
+	"control":     {"enabled": true, "listen_host": true, "listen_port": true, "bearer_token": true, "max_connections": true},
+	"http_proxy":  {"enabled": true, "listen_host": true, "listen_port": true, "bearer_token": true, "max_connections": true, "outproxies": true},
+	"socks5":      {"enabled": true, "listen_host": true, "listen_port": true, "bearer_token": true, "max_connections": true},
+	"metrics":     {"enabled": true, "listen_host": true, "listen_port": true, "bearer_token": true, "max_connections": true},
+	"sam":         {"enabled": true, "listen_host": true, "listen_port": true, "udp_host": true, "udp_port": true, "bearer_token": true, "max_connections": true, "readiness_timeout": true, "session_queue": true, "max_session_queue_bytes": true, "max_server_queue_bytes": true},
+	"addressbook": {"enabled": true, "privatehosts_path": true, "userhosts_path": true, "hosts_path": true, "state_path": true, "subscriptions": true, "refresh_interval": true, "retry_interval": true, "request_timeout": true, "max_entries": true, "max_file_bytes": true, "max_response_bytes": true, "max_redirects": true},
+	"log":         {"level": true, "format": true},
+}
