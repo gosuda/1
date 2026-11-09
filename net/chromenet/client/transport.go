@@ -71,13 +71,29 @@ func (o Options) engineOptions() []byte {
 
 func validOptionValue(v string) bool { return !strings.ContainsAny(v, "\r\n") }
 
+// validate rejects option values that would break the line-based engine options.
+func (o Options) validate() error {
+	for _, v := range []string{o.UserAgent, o.AcceptLanguage, o.Proxy} {
+		if !validOptionValue(v) {
+			return errors.New("chromenet: option values must not contain line breaks")
+		}
+	}
+	return nil
+}
+
 // NetError is a request failure reported by Chromium's network stack.
 type NetError struct {
 	Code int32  // a negative net::Error value, such as -105
 	Name string // the net::Error name, such as "ERR_NAME_NOT_RESOLVED"
+	// Detail is what the stack reports besides the code, such as the QUIC error behind a failed
+	// WebTransport handshake. Often empty.
+	Detail string
 }
 
 func (e *NetError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("chromenet: net::%s (%d): %s", e.Name, e.Code, e.Detail)
+	}
 	return fmt.Sprintf("chromenet: net::%s (%d)", e.Name, e.Code)
 }
 
@@ -133,10 +149,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL == nil || (req.URL.Scheme != "http" && req.URL.Scheme != "https") {
 		return nil, fmt.Errorf("chromenet: unsupported URL scheme in %v", req.URL)
 	}
-	for _, v := range []string{t.opts.UserAgent, t.opts.AcceptLanguage, t.opts.Proxy} {
-		if !validOptionValue(v) {
-			return nil, errors.New("chromenet: option values must not contain line breaks")
-		}
+	if err := t.opts.validate(); err != nil {
+		return nil, err
 	}
 	head, err := requestHead(req)
 	if err != nil {

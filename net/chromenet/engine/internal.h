@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "base/functional/callback.h"
 #include "base/memory/ref_counted.h"
 #include "base/memory/ref_counted_delete_on_sequence.h"
 #include "base/memory/scoped_refptr.h"
@@ -24,6 +25,7 @@
 #include "net/http/http_request_headers.h"
 #include "net/url_request/url_request.h"
 #include "url/gurl.h"
+#include "url/origin.h"
 
 namespace net {
 class IOBuffer;
@@ -168,6 +170,26 @@ class Job : public net::URLRequest::Delegate {
   bool done_ = false;
 };
 
+// "URL\nName: value\n..." as sent by the Go client for WebSocket and WebTransport. Returns false on
+// a malformed head.
+bool ParseConnectHead(const char* data,
+                      size_t len,
+                      GURL* url,
+                      net::HttpRequestHeaders* headers);
+
+// The origin a browser would send for `url`: the Origin header when `headers` has one (removed from
+// `headers`), else the http(s) origin of the same host.
+url::Origin TakeOrigin(const GURL& url, net::HttpRequestHeaders* headers);
+
+// Runs `task` on the network thread and blocks the calling (session) thread until it returned.
+void RunOnNetworkThread(base::OnceClosure task);
+
 }  // namespace chromenet
+
+// One engine handle: the shared URLRequestContext of its options.
+struct chrome_engine {
+  std::string key;
+  scoped_refptr<chromenet::SharedContext> shared;
+};
 
 #endif  // THIRD_PARTY_CHROMENET_INTERNAL_H_

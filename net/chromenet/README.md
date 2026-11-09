@@ -36,7 +36,24 @@ flowchart LR
 
 `HQQ_CHROME_NET_SERVER=/path/to/chrome_net_server` replaces the embedded binary, for example with a local build.
 
-`DialWebSocket` is a pure-Go RFC 6455 client and does not use the Chromium stack. `DialWebTransport` is an in-process implementation that does not reach a server.
+## WebSocket and WebTransport
+
+`DialWebSocket` and `DialWebTransport` go through the same Chromium stack.
+
+```go
+ws, resp, err := chromenet.DialWebSocketHeader(ctx, "wss://example.com/socket",
+	http.Header{"Sec-WebSocket-Protocol": {"chat"}}, chromenet.Options{})
+typ, msg, err := ws.ReadMessage() // messages arrive reassembled; pings are answered
+
+wt, err := chromenet.DialWebTransport(ctx, "https://example.com/wt", chromenet.Options{})
+st, err := wt.OpenStream(ctx)     // bidirectional; Close sends FIN, reads continue to the peer's FIN
+err = wt.SendDatagram([]byte("hi"))
+```
+
+- **WebSocket** uses Chromium's `WebSocketStream`: the opening handshake (RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2), frame parsing and masking, and permessage-deflate come from the stack. The Go side reassembles fragments, answers pings, validates the order of data frames and UTF-8 of text messages, and echoes the close frame.
+- **WebTransport** uses Chromium's `WebTransportClient` over HTTP/3. It has bidirectional and unidirectional streams (`OpenStream`, `OpenUniStream`, `AcceptStream`; the streams also implement `CancelRead` and `CancelWrite`), datagrams (`SendDatagram`, `ReceiveDatagram`, `MaxDatagramSize`), and `CloseWithError`. Reads are flow controlled with a 1 MiB window per stream.
+- When the peer ends a session by sending the close capsule and then aborting the CONNECT stream, as quic-go does, Chromium reports the abort before it processes the capsule, and the session ends with a `*SessionError` whose `Transport` field is true instead of the peer's application code.
+- A WebSocket uses two engine sessions and a WebTransport session three, because a blocked read must not hold up writes.
 
 ## Platforms
 

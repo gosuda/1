@@ -388,6 +388,7 @@ def install_winsdk(work, src, pins, targets):
     run([xwin, '--accept-license', '--cache-dir', os.path.join(work, 'cache', 'xwin-cache'),
          '--manifest-version', w['manifest'], '--sdk-version', w['sdk'],
          '--crt-version', w['crt'], '--arch', ','.join(arches), '--include-atl',
+         '--http-retry', '8',
          'splat', '--use-winsysroot-style', '--preserve-ms-arch-notation', '--output', root])
     write_win_toolchain(src, root)
 

@@ -65,6 +65,8 @@ executable("chrome_net_server") {
     "internal.h",
     "main.cc",
     "request.cc",
+    "ws.cc",
+    "wt.cc",
   ]
   defines = [ "CHROMENET_CHROME_MAJOR=\"$chrome_version_major\"" ]
   deps = [

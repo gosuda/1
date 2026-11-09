@@ -94,6 +94,9 @@ class AcceptAllCertVerifier : public net::CertVerifier {
              const net::NetLogWithSource& net_log) override {
     verify_result->Reset();
     verify_result->verified_cert = params.certificate();
+    // QUIC (HTTP/3 and WebTransport) refuses a chain that is not "issued by a known root" unless
+    // the host is allow-listed; with verification off that must not be a reason to fail.
+    verify_result->is_issued_by_known_root = true;
     return net::OK;
   }
   void Verify2QwacBinding(
@@ -222,11 +225,6 @@ net::URLRequestContext* SharedContext::context() {
 }  // namespace chromenet
 
 // C API --------------------------------------------------------------------------------------
-
-struct chrome_engine {
-  std::string key;
-  scoped_refptr<chromenet::SharedContext> shared;
-};
 
 struct chrome_request {
   scoped_refptr<chromenet::RequestCore> core;

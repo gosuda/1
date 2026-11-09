@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -202,76 +201,6 @@ func TestNewTransport_EndToEnd(t *testing.T) {
 	defer mu.Unlock()
 	if got := seen.Get("User-Agent"); got != customUA {
 		t.Errorf("server saw User-Agent %q; want %q", got, customUA)
-	}
-}
-
-func TestDialWebTransport_FullLifecycle(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Invalid scheme rejection
-	_, err := chromenet.DialWebTransport(ctx, "ftp://127.0.0.1:443/wt", chromenet.Options{})
-	if err == nil {
-		t.Fatal("expected error on invalid scheme ftp://, got nil")
-	}
-
-	// Valid dial
-	sess, err := chromenet.DialWebTransport(ctx, "https://127.0.0.1:443/wt", chromenet.Options{})
-	if err != nil {
-		t.Fatalf("DialWebTransport: %v", err)
-	}
-
-	// Open stream and exchange data
-	st, err := sess.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream: %v", err)
-	}
-	defer st.Close()
-
-	payload := []byte("webtransport-chromenet-data")
-	go func() {
-		_, _ = st.Write(payload)
-	}()
-
-	recvBuf := make([]byte, len(payload))
-	n, err := io.ReadFull(st, recvBuf)
-	if err != nil {
-		t.Fatalf("ReadFull: %v", err)
-	}
-	if n != len(payload) || !bytes.Equal(recvBuf, payload) {
-		t.Fatalf("stream data mismatch: got %q; want %q", recvBuf, payload)
-	}
-
-	// Datagram transmission
-	dg := []byte("datagram-payload")
-	if err := sess.SendDatagram(dg); err != nil {
-		t.Fatalf("SendDatagram: %v", err)
-	}
-	recvdDg, err := sess.ReceiveDatagram(ctx)
-	if err != nil {
-		t.Fatalf("ReceiveDatagram: %v", err)
-	}
-	if !bytes.Equal(recvdDg, dg) {
-		t.Fatalf("datagram mismatch: got %q, want %q", recvdDg, dg)
-	}
-
-	// MTU limit rejection (> 1472 bytes)
-	giantDg := make([]byte, 1500)
-	if err := sess.SendDatagram(giantDg); err == nil {
-		t.Fatal("expected MTU limit error on 1500-byte datagram, got nil")
-	}
-
-	// AcceptStream on closed session
-	if err := sess.CloseWithError(0x42, "graceful_abort"); err != nil {
-		t.Fatalf("CloseWithError: %v", err)
-	}
-
-	_, err = sess.AcceptStream(ctx)
-	if err == nil {
-		t.Fatal("expected error on AcceptStream after CloseWithError, got nil")
-	}
-	if !strings.Contains(err.Error(), "session closed") {
-		t.Fatalf("expected error containing 'session closed', got: %v", err)
 	}
 }
 

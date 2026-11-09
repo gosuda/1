@@ -339,8 +339,8 @@ func TestWebSocket_FrameSizeLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error exceeding max frame size, got nil")
 	}
-	if !strings.Contains(err.Error(), "exceeds max frame size") {
-		t.Fatalf("expected error containing 'exceeds max frame size', got: %v", err)
+	if !strings.Contains(err.Error(), "exceeds max message size") {
+		t.Fatalf("expected error containing 'exceeds max message size', got: %v", err)
 	}
 }
 
@@ -412,32 +412,6 @@ func TestWebSocket_WriteAfterClose(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "after close") {
 		t.Fatalf("expected error containing 'after close', got: %v", err)
-	}
-}
-
-func TestWebSocket_RFC8441Headers(t *testing.T) {
-	if client.RFC8441MethodConnect != "CONNECT" {
-		t.Errorf("RFC8441MethodConnect = %q; want CONNECT", client.RFC8441MethodConnect)
-	}
-	if client.RFC8441ProtocolWS != "websocket" {
-		t.Errorf("RFC8441ProtocolWS = %q; want websocket", client.RFC8441ProtocolWS)
-	}
-
-	headers := client.NewRFC8441ConnectHeaders("example.com", "/ws", "https")
-	if headers[":method"] != "CONNECT" {
-		t.Errorf(":method = %q; want CONNECT", headers[":method"])
-	}
-	if headers[":protocol"] != "websocket" {
-		t.Errorf(":protocol = %q; want websocket", headers[":protocol"])
-	}
-	if headers[":scheme"] != "https" {
-		t.Errorf(":scheme = %q; want https", headers[":scheme"])
-	}
-	if headers[":path"] != "/ws" {
-		t.Errorf(":path = %q; want /ws", headers[":path"])
-	}
-	if headers[":authority"] != "example.com" {
-		t.Errorf(":authority = %q; want example.com", headers[":authority"])
 	}
 }
 
@@ -595,20 +569,23 @@ func TestWebSocket_MalformedServerFrames(t *testing.T) {
 	big := make([]byte, 2+2+126)
 	big[0], big[1], big[3] = 0x89, 126, 126 // ping with a 126-byte payload
 
+	// Chromium's stack parses and validates the frames: each of these ends the connection with an
+	// error and never yields a message.
 	tests := []struct {
 		name  string
 		frame []byte
-		want  string
 	}{
-		{"64bit length with MSB set", []byte{0x81, 127, 0x80, 0, 0, 0, 0, 0, 0, 1, 'A'}, "most significant bit"},
-		{"declared length over 16 MiB", []byte{0x82, 127, 0, 0, 0, 0, 0x01, 0, 0, 0x01}, "exceeds max frame size"},
-		{"non-minimal 16-bit length", []byte{0x81, 126, 0, 5, 'h', 'e', 'l', 'l', 'o'}, "non-minimal"},
-		{"non-minimal 64-bit length", append([]byte{0x82, 127, 0, 0, 0, 0, 0, 0, 1, 0}, make([]byte, 256)...), "non-minimal"},
-		{"reserved data opcode", []byte{0x83, 0}, "reserved opcode"},
-		{"reserved control opcode", []byte{0x8b, 0}, "reserved opcode"},
-		{"fragmented control frame", []byte{0x09, 4, 'p', 'i', 'n', 'g'}, "fragmented control frame"},
-		{"control frame over 125 bytes", big, "125"},
-		{"RSV1 without extension", []byte{0xc1, 4, 't', 'e', 's', 't'}, "non-zero RSV"},
+		{"64bit length with MSB set", []byte{0x81, 127, 0x80, 0, 0, 0, 0, 0, 0, 1, 'A'}},
+		{"non-minimal 16-bit length", []byte{0x81, 126, 0, 5, 'h', 'e', 'l', 'l', 'o'}},
+		{"non-minimal 64-bit length", append([]byte{0x82, 127, 0, 0, 0, 0, 0, 0, 1, 0}, make([]byte, 256)...)},
+		{"reserved data opcode", []byte{0x83, 0}},
+		{"reserved control opcode", []byte{0x8b, 0}},
+		{"fragmented control frame", []byte{0x09, 4, 'p', 'i', 'n', 'g'}},
+		{"control frame over 125 bytes", big},
+		{"RSV1 without extension", []byte{0xc1, 4, 't', 'e', 's', 't'}},
+		{"continuation without a message", []byte{0x80, 2, 'h', 'i'}},
+		{"data frame inside a fragmented message", []byte{0x01, 1, 'a', 0x81, 1, 'b'}},
+		{"invalid UTF-8 text", []byte{0x81, 2, 0xc3, 0x28}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -617,7 +594,7 @@ func TestWebSocket_MalformedServerFrames(t *testing.T) {
 			})
 			defer cleanup()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
 			ws, resp, err := client.DialWebSocket(ctx, wsURL+"/malformed", client.Options{})
@@ -627,12 +604,9 @@ func TestWebSocket_MalformedServerFrames(t *testing.T) {
 			_ = resp.Body.Close()
 			defer ws.Close()
 
-			_, _, err = ws.ReadMessage()
+			typ, msg, err := ws.ReadMessage()
 			if err == nil {
-				t.Fatal("ReadMessage succeeded; want protocol error")
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ReadMessage error = %v; want it to contain %q", err, tc.want)
+				t.Fatalf("ReadMessage = type %d %q; want an error", typ, msg)
 			}
 		})
 	}

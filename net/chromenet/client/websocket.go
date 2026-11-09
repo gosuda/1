@@ -1,20 +1,17 @@
 package client
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
-	"crypto/tls"
-	"encoding/base64"
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 )
 
 // RFC 6455 message types / opcodes.
@@ -26,344 +23,428 @@ const (
 	PongMessage   = 10
 )
 
-// RFC 8441 HTTP/2 Extended CONNECT constants.
 const (
-	RFC8441MethodConnect = "CONNECT"
-	RFC8441ProtocolWS    = "websocket"
+	opContinuation = 0
+	// maxMessageSize bounds the reassembled size of one message.
+	maxMessageSize = 16 << 20
+	// maxControlPayload is the RFC 6455 limit of a control frame.
+	maxControlPayload      = 125
+	netErrConnectionClosed = -100
 )
 
-// NewRFC8441ConnectHeaders returns the standard pseudo-headers for RFC 8441 Extended CONNECT.
-func NewRFC8441ConnectHeaders(authority, path, scheme string) map[string]string {
-	if scheme == "" {
-		scheme = "https"
-	}
-	return map[string]string{
-		":method":    RFC8441MethodConnect,
-		":protocol":  RFC8441ProtocolWS,
-		":scheme":    scheme,
-		":path":      path,
-		":authority": authority,
-	}
-}
-
-// WebSocketConn defines the WebSocket client interface.
+// WebSocketConn is a WebSocket connection made by Chromium's network stack. The stack does the
+// opening handshake (RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2), frame
+// parsing and validation, masking, and permessage-deflate. ReadMessage and WriteMessage may run in
+// different goroutines; calls of one kind are serialized.
 type WebSocketConn interface {
+	// ReadMessage returns the next message, reassembled from its fragments. A ping is answered
+	// with a pong and also returned (PingMessage); a pong is returned as PongMessage. After a close
+	// frame it returns CloseMessage with the close payload (2-byte status code and reason) and
+	// io.EOF, and io.EOF afterwards.
 	ReadMessage() (messageType int, p []byte, err error)
 	WriteMessage(messageType int, data []byte) error
 	Ping(data []byte) error
 	Close() error
 }
 
-// DialWebSocket establishes an RFC 6455 WebSocket connection.
+// DialWebSocket opens a WebSocket connection through the Chromium network stack. rawURL is a ws,
+// wss, http, or https URL. When the server refuses the handshake, the error is a *NetError and the
+// returned response carries the HTTP status.
 func DialWebSocket(ctx context.Context, rawURL string, opts Options) (WebSocketConn, *http.Response, error) {
+	return DialWebSocketHeader(ctx, rawURL, nil, opts)
+}
+
+// DialWebSocketHeader is DialWebSocket with extra handshake request headers. Sec-WebSocket-Protocol
+// lists the subprotocols to offer and Origin sets the origin; the negotiated subprotocol is in the
+// response's Sec-WebSocket-Protocol header.
+func DialWebSocketHeader(ctx context.Context, rawURL string, header http.Header, opts Options) (WebSocketConn, *http.Response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("websocket: invalid url %q: %w", rawURL, err)
 	}
-
-	isTLS := false
 	switch u.Scheme {
-	case "ws", "http":
-		isTLS = false
-	case "wss", "https":
-		isTLS = true
+	case "ws", "wss", "http", "https":
 	default:
 		return nil, nil, fmt.Errorf("websocket: unsupported scheme %q", u.Scheme)
 	}
-
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		if isTLS {
-			host += ":443"
-		} else {
-			host += ":80"
-		}
+	if err := opts.validate(); err != nil {
+		return nil, nil, err
 	}
-
-	dialer := &net.Dialer{}
-	var conn net.Conn
-	if isTLS {
-		td := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
-			InsecureSkipVerify: opts.InsecureSkipVerify,
-			ServerName:         u.Hostname(),
-		}}
-		conn, err = td.DialContext(ctx, "tcp", host)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", host)
-	}
+	head, err := connectHead(rawURL, header)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// Generate 16-byte random nonce for Sec-WebSocket-Key
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("websocket: nonce generation failed: %w", err)
-	}
-	secKey := base64.StdEncoding.EncodeToString(nonce)
-
-	reqURI := u.RequestURI()
-	if reqURI == "" {
-		reqURI = "/"
-	}
-
-	headers := make(http.Header)
-	ApplyChromeHeaders(headers, opts.UserAgent)
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("GET %s HTTP/1.1\r\n", reqURI))
-	sb.WriteString(fmt.Sprintf("Host: %s\r\n", u.Host))
-	sb.WriteString("Upgrade: websocket\r\n")
-	sb.WriteString("Connection: Upgrade\r\n")
-	sb.WriteString(fmt.Sprintf("Sec-WebSocket-Key: %s\r\n", secKey))
-	sb.WriteString("Sec-WebSocket-Version: 13\r\n")
-
-	for k, vv := range headers {
-		if strings.EqualFold(k, "Upgrade") || strings.EqualFold(k, "Connection") ||
-			strings.EqualFold(k, "Sec-WebSocket-Key") || strings.EqualFold(k, "Sec-WebSocket-Version") ||
-			strings.EqualFold(k, "Host") {
-			continue
-		}
-		for _, v := range vv {
-			sb.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-		}
-	}
-	sb.WriteString("\r\n")
-
-	bufrw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
-	if _, err := bufrw.WriteString(sb.String()); err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-	if err := bufrw.Flush(); err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-
-	req := &http.Request{Method: "GET", URL: u}
-	resp, err := http.ReadResponse(bufrw.Reader, req)
+	main, err := OpenWith(ctx, DefaultOptions())
 	if err != nil {
-		_ = conn.Close()
 		return nil, nil, err
 	}
-
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		_ = conn.Close()
-		return nil, resp, fmt.Errorf("websocket: bad handshake status code: %d", resp.StatusCode)
+	s := &engineSession{main: main}
+	if err := s.start(ctx, opts, head, kindWebSocket); err != nil {
+		s.release()
+		return nil, nil, err
 	}
-
-	ws := &wsConn{
-		conn:         conn,
-		bufrw:        bufrw,
-		maxFrameSize: 16 * 1024 * 1024,
+	code, raw, id, err := s.wsWait(ctx)
+	if err != nil {
+		s.release()
+		return nil, nil, err
 	}
-	return ws, resp, nil
+	if code != 0 {
+		resp := failedHandshakeResponse(raw)
+		ne := s.netError(code)
+		s.release()
+		return nil, resp, ne
+	}
+	reader, err := OpenWith(ctx, DefaultOptions())
+	if err != nil {
+		s.release()
+		return nil, nil, err
+	}
+	resp, subprotocol := parseWebSocketHead(raw)
+	resp.Request = &http.Request{Method: http.MethodGet, URL: u}
+	if subprotocol != "" && resp.Header.Get("Sec-WebSocket-Protocol") == "" {
+		resp.Header.Set("Sec-WebSocket-Protocol", subprotocol)
+	}
+	return &wsConn{s: s, reader: reader, id: id}, resp, nil
+}
+
+// engineSession is the main session of a WebSocket or WebTransport connection: it holds the engine
+// and connection handles, and serves writes. All its calls are serialized by mu.
+type engineSession struct {
+	main *Client
+	mu   sync.Mutex
+	eng  Engine
+	ws   Ws
+	wt   Wt
+	kind connKind
+}
+
+type connKind int
+
+const (
+	kindWebSocket connKind = iota + 1
+	kindWebTransport
+)
+
+func (s *engineSession) start(ctx context.Context, opts Options, head []byte, kind connKind) error {
+	s.kind = kind
+	eng, err := s.main.ChromeEngineCreate(opts.engineOptions())
+	if err != nil {
+		return err
+	}
+	s.eng = eng
+	switch kind {
+	case kindWebSocket:
+		s.ws, err = s.main.ChromeWsStart(eng, head)
+	default:
+		s.wt, err = s.main.ChromeWtStart(eng, head)
+	}
+	return err
+}
+
+func (s *engineSession) wsWait(ctx context.Context) (code int32, head []byte, id uint64, err error) {
+	stop := context.AfterFunc(ctx, func() { _ = s.main.Conn().Cancel() })
+	defer stop()
+	code, head, id, err = s.main.ChromeWsWait(s.ws, make([]byte, 64<<10))
+	if err == nil && code != 0 {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, nil, 0, ctxErr
+		}
+	}
+	return code, head, id, err
+}
+
+func (s *engineSession) netError(code int32) error { return netErrorOf(s.main, code) }
+
+// netErrorOf names a net::Error through c, whose caller must have exclusive use of it.
+func netErrorOf(c *Client, code int32) error {
+	name, err := c.ChromeNetErrorName(code)
+	if err != nil {
+		name = "ERR_UNKNOWN"
+	}
+	return &NetError{Code: code, Name: name}
+}
+
+// release destroys the handles and closes the session. It is safe to call once.
+func (s *engineSession) release() {
+	if !s.ws.IsNil() {
+		_ = s.main.ChromeWsDestroy(s.ws)
+	}
+	if !s.wt.IsNil() {
+		_ = s.main.ChromeWtDestroy(s.wt)
+	}
+	if !s.eng.IsNil() {
+		_ = s.main.ChromeEngineDestroy(s.eng)
+	}
+	_ = s.main.Close()
+}
+
+// connectHead encodes "URL\n" and one "Name: value\n" line per header.
+func connectHead(rawURL string, header http.Header) ([]byte, error) {
+	if strings.ContainsAny(rawURL, " \r\n") {
+		return nil, fmt.Errorf("chromenet: invalid URL %q", rawURL)
+	}
+	var b strings.Builder
+	b.WriteString(rawURL)
+	b.WriteByte('\n')
+	for name, values := range header {
+		v := strings.Join(values, ", ")
+		if strings.ContainsAny(name, ":\r\n") || strings.ContainsAny(v, "\r\n") {
+			return nil, fmt.Errorf("chromenet: invalid header %q", name)
+		}
+		b.WriteString(name + ": " + v + "\n")
+	}
+	return []byte(b.String()), nil
+}
+
+// parseWebSocketHead decodes "CODE SUBPROTOCOL\nName: value\n...".
+func parseWebSocketHead(raw []byte) (*http.Response, string) {
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	status := http.StatusSwitchingProtocols
+	subprotocol := ""
+	if f := strings.SplitN(lines[0], " ", 2); len(f) > 0 {
+		if n, err := strconv.Atoi(f[0]); err == nil {
+			status = n
+		}
+		if len(f) == 2 {
+			subprotocol = f[1]
+		}
+	}
+	resp := &http.Response{
+		StatusCode: status,
+		Status:     strconv.Itoa(status) + " " + http.StatusText(status),
+		Proto:      "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: make(http.Header),
+		Body:   http.NoBody,
+	}
+	for _, line := range lines[1:] {
+		if name, value, ok := strings.Cut(line, ": "); ok {
+			resp.Header.Add(name, value)
+		}
+	}
+	return resp, subprotocol
+}
+
+func failedHandshakeResponse(raw []byte) *http.Response {
+	status, _ := strconv.Atoi(strings.TrimSpace(strings.SplitN(string(raw), " ", 2)[0]))
+	if status == 0 {
+		return nil
+	}
+	return &http.Response{StatusCode: status, Status: strconv.Itoa(status) + " " + http.StatusText(status), Header: make(http.Header), Body: http.NoBody}
 }
 
 type wsConn struct {
-	conn         net.Conn
-	bufrw        *bufio.ReadWriter
-	writeMu      sync.Mutex
-	readMu       sync.Mutex
-	closed       atomic.Bool
-	maxFrameSize int
+	s      *engineSession
+	reader *Client
+	id     uint64
+
+	writeMu sync.Mutex
+	readMu  sync.Mutex
+	closed  atomic.Bool
+	// gotClose is set once a close frame arrived; readErr is the sticky error of the read side.
+	gotClose bool
+	readErr  error
+	buf      []byte
+	msg      []byte
+	msgType  int
+	// inMessage is true between the first fragment of a message and its last.
+	inMessage bool
+}
+
+// protocolError fails the connection: it sends a close frame with status 1002 and tears the
+// connection down, and the read side reports the error from then on.
+func (c *wsConn) protocolError(msg string) error {
+	c.readErr = fmt.Errorf("websocket: protocol error: %s", msg)
+	if !c.closed.Swap(true) {
+		c.writeMu.Lock()
+		_ = c.writeFrame(CloseMessage, true, []byte{0x03, 0xea})
+		c.writeMu.Unlock()
+		c.teardown()
+	}
+	return c.readErr
+}
+
+func (c *wsConn) writeFrame(opcode int, fin bool, data []byte) error {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	code, err := c.s.main.ChromeWsWrite(c.id, int32(opcode), fin, data)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return c.s.netError(code)
+	}
+	return nil
 }
 
 func (c *wsConn) WriteMessage(messageType int, data []byte) error {
 	if c.closed.Load() {
-		return fmt.Errorf("websocket: write after close")
+		return errors.New("websocket: write after close")
 	}
-	if len(data) > c.maxFrameSize {
-		return fmt.Errorf("websocket: payload size %d exceeds max frame size %d", len(data), c.maxFrameSize)
+	if len(data) > maxMessageSize {
+		return fmt.Errorf("websocket: payload size %d exceeds max message size %d", len(data), maxMessageSize)
 	}
-
+	if messageType == CloseMessage || messageType == PingMessage || messageType == PongMessage {
+		if len(data) > maxControlPayload {
+			return fmt.Errorf("websocket: control frame payload %d exceeds RFC 6455 maximum limit of %d bytes", len(data), maxControlPayload)
+		}
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-
 	if c.closed.Load() {
-		return fmt.Errorf("websocket: write after close")
+		return errors.New("websocket: write after close")
 	}
-
-	return c.writeFrameLocked(messageType, data)
+	// Control frames are never fragmented; other messages go out in frames of at most 1 MiB.
+	if messageType >= CloseMessage || len(data) <= maxChunk {
+		return c.writeFrame(messageType, true, data)
+	}
+	opcode := messageType
+	for len(data) > 0 {
+		n := min(len(data), maxChunk)
+		if err := c.writeFrame(opcode, n == len(data), data[:n]); err != nil {
+			return err
+		}
+		data = data[n:]
+		opcode = opContinuation
+	}
+	return nil
 }
 
 func (c *wsConn) Ping(data []byte) error {
 	if c.closed.Load() {
-		return fmt.Errorf("websocket: ping after close")
+		return errors.New("websocket: ping after close")
 	}
-	if len(data) > 125 {
-		return fmt.Errorf("websocket: control frame payload %d exceeds RFC 6455 maximum limit of 125 bytes", len(data))
+	if len(data) > maxControlPayload {
+		return fmt.Errorf("websocket: control frame payload %d exceeds RFC 6455 maximum limit of %d bytes", len(data), maxControlPayload)
 	}
-
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-
 	if c.closed.Load() {
-		return fmt.Errorf("websocket: ping after close")
+		return errors.New("websocket: ping after close")
 	}
-
-	return c.writeFrameLocked(PingMessage, data)
-}
-
-func (c *wsConn) writeFrameLocked(messageType int, data []byte) error {
-	var maskKey [4]byte
-	if _, err := rand.Read(maskKey[:]); err != nil {
-		return err
-	}
-
-	var header []byte
-	b0 := byte(0x80 | (messageType & 0x0f)) // FIN = 1
-	payloadLen := len(data)
-
-	if payloadLen < 126 {
-		header = append(header, b0, byte(0x80|payloadLen))
-	} else if payloadLen <= 65535 {
-		header = append(header, b0, byte(0x80|126), 0, 0)
-		binary.BigEndian.PutUint16(header[2:], uint16(payloadLen))
-	} else {
-		header = append(header, b0, byte(0x80|127), 0, 0, 0, 0, 0, 0, 0, 0)
-		binary.BigEndian.PutUint64(header[2:], uint64(payloadLen))
-	}
-
-	header = append(header, maskKey[:]...)
-
-	maskedData := make([]byte, payloadLen)
-	for i := 0; i < payloadLen; i++ {
-		maskedData[i] = data[i] ^ maskKey[i%4]
-	}
-
-	if _, err := c.bufrw.Write(header); err != nil {
-		return err
-	}
-	if len(maskedData) > 0 {
-		if _, err := c.bufrw.Write(maskedData); err != nil {
-			return err
-		}
-	}
-	return c.bufrw.Flush()
+	return c.writeFrame(PingMessage, true, data)
 }
 
 func (c *wsConn) ReadMessage() (int, []byte, error) {
-	if c.closed.Load() {
-		return 0, nil, io.EOF
-	}
-
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-
+	if c.readErr != nil {
+		return 0, nil, c.readErr
+	}
 	if c.closed.Load() {
 		return 0, nil, io.EOF
 	}
-
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(c.bufrw.Reader, header); err != nil {
-		return 0, nil, err
+	if c.buf == nil {
+		c.buf = make([]byte, maxChunk)
 	}
-
-	fin := (header[0] & 0x80) != 0
-	rsv := (header[0] & 0x70) >> 4
-	if rsv != 0 {
-		return 0, nil, fmt.Errorf("websocket: non-zero RSV bits: 0x%x", rsv)
-	}
-
-	opcode := int(header[0] & 0x0f)
-	if (opcode >= 0x3 && opcode <= 0x7) || (opcode >= 0xB && opcode <= 0xF) {
-		return 0, nil, fmt.Errorf("websocket: reserved opcode 0x%x", opcode)
-	}
-
-	if (opcode >= 0x8) && !fin {
-		return 0, nil, fmt.Errorf("websocket: fragmented control frame (FIN=0)")
-	}
-
-	isMasked := (header[1] & 0x80) != 0
-	rawLen := int(header[1] & 0x7f)
-
-	var payloadLen int
-	if rawLen == 126 {
-		ext := make([]byte, 2)
-		if _, err := io.ReadFull(c.bufrw.Reader, ext); err != nil {
+	for {
+		data, opcode, fin, code, err := c.reader.ChromeWsRead(c.id, c.buf)
+		if err != nil {
+			c.readErr = err
 			return 0, nil, err
 		}
-		payloadLen = int(binary.BigEndian.Uint16(ext))
-		if payloadLen < 126 {
-			return 0, nil, fmt.Errorf("websocket: non-minimal 16-bit payload length encoding: %d < 126", payloadLen)
+		if code != 0 {
+			if c.closed.Load() {
+				c.readErr = io.EOF
+			} else if code == netErrConnectionClosed || code == -101 {
+				c.readErr = io.ErrUnexpectedEOF
+			} else {
+				c.readErr = c.s.netErrorLocked(code)
+			}
+			return 0, nil, c.readErr
 		}
-	} else if rawLen == 127 {
-		ext := make([]byte, 8)
-		if _, err := io.ReadFull(c.bufrw.Reader, ext); err != nil {
-			return 0, nil, err
+		switch int(opcode) {
+		case opContinuation, TextMessage, BinaryMessage:
+			// The stack validates frames; the order of data frames is the message layer's job.
+			if int(opcode) != opContinuation {
+				if c.inMessage {
+					return 0, nil, c.protocolError("data frame inside a fragmented message")
+				}
+				c.msgType = int(opcode)
+				c.msg = c.msg[:0]
+				c.inMessage = true
+			} else if !c.inMessage {
+				return 0, nil, c.protocolError("continuation frame without a message")
+			}
+			if len(c.msg)+len(data) > maxMessageSize {
+				c.readErr = fmt.Errorf("websocket: message exceeds max message size %d", maxMessageSize)
+				return 0, nil, c.readErr
+			}
+			c.msg = append(c.msg, data...)
+			if fin {
+				out := append([]byte(nil), c.msg...)
+				c.msg = c.msg[:0]
+				c.inMessage = false
+				if c.msgType == TextMessage && !utf8.Valid(out) {
+					return 0, nil, c.protocolError("text message is not valid UTF-8")
+				}
+				return c.msgType, out, nil
+			}
+		case PingMessage:
+			payload := append([]byte(nil), data...)
+			_ = c.WriteMessage(PongMessage, payload)
+			return PingMessage, payload, nil
+		case PongMessage:
+			return PongMessage, append([]byte(nil), data...), nil
+		case CloseMessage:
+			payload := append([]byte(nil), data...)
+			c.gotClose = true
+			c.readErr = io.EOF
+			// Echo the close frame so the peer's closing handshake completes, then drop the
+			// connection.
+			if !c.closed.Swap(true) {
+				c.writeMu.Lock()
+				_ = c.writeFrame(CloseMessage, true, closeEcho(payload))
+				c.writeMu.Unlock()
+				c.teardown()
+			}
+			return CloseMessage, payload, io.EOF
 		}
-		uLen := binary.BigEndian.Uint64(ext)
-		if (uLen & (1 << 63)) != 0 {
-			return 0, nil, fmt.Errorf("websocket: 64-bit frame length has most significant bit set: 0x%x", uLen)
-		}
-		if uLen <= 65535 {
-			return 0, nil, fmt.Errorf("websocket: non-minimal 64-bit payload length encoding: %d <= 65535", uLen)
-		}
-		if uLen > uint64(c.maxFrameSize) {
-			return 0, nil, fmt.Errorf("websocket: payload size %d exceeds max frame size %d", uLen, c.maxFrameSize)
-		}
-		payloadLen = int(uLen)
-	} else {
-		payloadLen = rawLen
 	}
+}
 
-	if opcode >= 0x8 && (rawLen > 125 || payloadLen > 125) {
-		return 0, nil, fmt.Errorf("websocket: control frame payload %d exceeds RFC 6455 limit of 125 bytes", payloadLen)
+// closeEcho returns the payload of the close frame that answers payload: the same status code, no
+// reason.
+func closeEcho(payload []byte) []byte {
+	if len(payload) >= 2 {
+		return payload[:2]
 	}
-
-	if payloadLen > c.maxFrameSize {
-		return 0, nil, fmt.Errorf("websocket: payload size %d exceeds max frame size %d", payloadLen, c.maxFrameSize)
-	}
-
-	var maskKey []byte
-	if isMasked {
-		maskKey = make([]byte, 4)
-		if _, err := io.ReadFull(c.bufrw.Reader, maskKey); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	payload := make([]byte, payloadLen)
-	if payloadLen > 0 {
-		if _, err := io.ReadFull(c.bufrw.Reader, payload); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	if isMasked {
-		for i := 0; i < payloadLen; i++ {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	if opcode == CloseMessage {
-		c.closed.Store(true)
-		_ = c.conn.Close()
-		return CloseMessage, payload, io.EOF
-	}
-
-	if opcode == PingMessage {
-		_ = c.WriteMessage(PongMessage, payload)
-		return PingMessage, payload, nil
-	}
-
-	return opcode, payload, nil
+	return nil
 }
 
 func (c *wsConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-
 	c.writeMu.Lock()
-	_ = c.writeFrameLocked(CloseMessage, []byte{0x03, 0xe8})
+	_ = c.writeFrame(CloseMessage, true, []byte{0x03, 0xe8})
 	c.writeMu.Unlock()
+	c.teardown()
+	return nil
+}
 
-	return c.conn.Close()
+// teardown destroys the connection, which wakes a blocked reader, then closes both sessions.
+func (c *wsConn) teardown() {
+	c.s.mu.Lock()
+	_ = c.s.main.ChromeWsDestroy(c.s.ws)
+	c.s.ws = Ws{}
+	c.s.mu.Unlock()
+	// A reader blocked in ChromeWsRead returns once the connection is gone.
+	go func() {
+		c.readMu.Lock()
+		_ = c.reader.Close()
+		c.readMu.Unlock()
+	}()
+	c.s.mu.Lock()
+	c.s.release()
+	c.s.mu.Unlock()
+}
+
+func (s *engineSession) netErrorLocked(code int32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.netError(code)
 }
