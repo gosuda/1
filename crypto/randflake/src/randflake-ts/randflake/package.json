@@ -1,0 +1,54 @@
+{
+  "name": "randflake",
+  "version": "2.1.0",
+  "description": "TypeScript implementation of randflake ID generator",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./v2": {
+      "types": "./dist/v2.d.ts",
+      "import": "./dist/v2.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "bench": "vitest bench",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/core.js",
+    "dist/core.d.ts",
+    "dist/v2.js",
+    "dist/v2.d.ts"
+  ],
+  "dependencies": {
+    "sparx64": "^2.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.7"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gosuda/randflake.git"
+  },
+  "keywords": [
+    "id-generator",
+    "distributed",
+    "unique-id",
+    "randflake"
+  ],
+  "author": "gosuda",
+  "license": "MIT"
+}
