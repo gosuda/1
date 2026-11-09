@@ -1,0 +1,9 @@
+# Build environment of the Linux-hosted engine targets (linux-*, windows-*). Read by build.sh.
+# rungv is the gvx sandbox CLI (https://github.com/gfire-sigs/gvx); its release archives are
+# verified against these digests (the SHA256SUMS of the release).
+rungv_version=v0.10.10032026110200
+rungv_sha256_linux_amd64=7653c0e5566b8dceaa89cb7e4c7bdc0e30459051c398b3d62ef06df511dd69f1
+rungv_sha256_darwin_arm64=0600d13b97d23f8cf717aba33567606d9b0029268e2d698fd1539bab5fee07a5
+# The guest image, by digest, and the Debian snapshot its packages come from.
+image=debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+debian_snapshot=20261108T000000Z

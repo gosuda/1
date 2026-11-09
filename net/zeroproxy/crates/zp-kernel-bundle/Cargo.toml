@@ -1,0 +1,79 @@
+[package]
+name = "zp-kernel-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Service Worker kernel and transport WASM bundle (rustls, h2, yamux, ml-kem,
+# tokio adapter, and response-body decoders). Instantiated lazily on first
+# `transportFetch` so `zp-bundle` can activate without waiting for transport
+# compilation.
+
+[dependencies]
+zp-shared = { workspace = true }
+zp-transport-codec = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4"
+js-sys = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# base64 decode for the `/zp/api/fp` captured ClientHello spec.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# RFC 6455 `Sec-WebSocket-Accept` = base64(SHA1(key || GUID)).
+sha1 = { version = "0.10", default-features = false }
+
+futures-util = { workspace = true }
+pin-project-lite = { workspace = true }
+bytes = { workspace = true }
+httparse = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rustls-rustcrypto = { workspace = true }
+webpki-roots = { workspace = true }
+getrandom = { workspace = true }
+ml-kem = { version = "0.3", default-features = false, features = ["alloc", "getrandom"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+rand_core = "0.6"
+getrandom_04 = { package = "getrandom", version = "0.4", default-features = false, features = ["wasm_js"] }
+yamux = { workspace = true }
+futures = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+getrandom_02 = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
+
+# Response-body decoders (gzip/deflate/brotli/zstd).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
+ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    "WebSocket",
+    "Headers",
+    "Response",
+    "ResponseInit",
+    "Request",
+    "RequestInit",
+    "ReadableStream",
+    "ReadableStreamDefaultController",
+    "MessageEvent",
+    "Event",
+    "EventTarget",
+    "BinaryType",
+    "CloseEvent",
+    "ErrorEvent",
+    "WorkerGlobalScope",
+    "ServiceWorkerGlobalScope",
+    "Location",
+    "Url",
+    "Blob",
+    "FileReader",
+    "ProgressEvent",
+    "console",
+]

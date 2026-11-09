@@ -1,0 +1,137 @@
+name: Publish Multiplatform SDK
+
+on:
+  push:
+    tags: ["release-*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish verified artifacts (select a matching release-v<version> tag)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate verification eligibility
+        run: python3 scripts/verify-release-gate.py
+      - name: Validate publication tag, version, provenance, and credentials
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+          GPG_KEY_CONTENTS: ${{ secrets.GPG_KEY_CONTENTS }}
+        run: |
+          python3 scripts/verify-release-gate.py --publish
+          for name in MAVEN_CENTRAL_USERNAME MAVEN_CENTRAL_PASSWORD SIGNING_KEY_ID SIGNING_PASSWORD GPG_KEY_CONTENTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required publication secret: $name"
+              exit 1
+            fi
+          done
+
+  verify:
+    needs: release-gate
+    uses: ./.github/workflows/gradle.yml
+
+  publish:
+    name: Publish only after the complete native and consumer matrix passes
+    if: github.event_name == 'push' || inputs.publish
+    needs: [release-gate, verify]
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: native/bridge/go.sum
+      - name: Install pinned Android SDK and NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-linux-x64
+          path: native/desktop/linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-windows-x64
+          path: native/desktop/windows-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-engine-macos-universal
+          path: native/desktop/macos-universal
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-engine-provenance
+          path: native/ios
+      - uses: actions/download-artifact@v4
+        with:
+          name: PortalSDK-ios
+          path: dist
+      - name: Stage final Maven graph and generate API reference
+        run: |
+          ./gradlew publishDesktopSdkToSampleRepository publishAndroidSdkToSampleRepository \
+            publishIosSdkToSampleRepository :portal-sdk:dokkaGenerate \
+            -Pportal.native.requireComplete=true --no-configuration-cache
+          python3 scripts/native-provenance.py collect dist/native-source-lock.json
+          xcodebuild -version > dist/apple-toolchain.txt
+          cd portal-sdk/build/dokka
+          zip -qr "$GITHUB_WORKSPACE/dist/dokka-html.zip" html
+      - name: Upload API reference and release provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: portal-sdk-dokka-and-provenance
+          path: |
+            dist/dokka-html.zip
+            dist/native-source-lock.json
+            dist/apple-toolchain.txt
+          if-no-files-found: error
+      - name: Recheck publication gates and publish signed Maven artifacts
+        run: |
+          python3 scripts/verify-release-gate.py --publish
+          ./gradlew publishAndReleaseToMavenCentral -Pportal.native.requireComplete=true --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_KEY_CONTENTS }}
+      - name: Publish complete Swift package and reference assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=(dist/PortalSDK.xcframework.zip dist/PortalSDK.xcframework.zip.sha256
+                  dist/PortalSDK-swift-package.zip dist/PortalSDK-swift-package.zip.sha256
+                  dist/dokka-html.zip dist/native-source-lock.json dist/apple-toolchain.txt)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "$GITHUB_REF_NAME" --notes "Portal Multiplatform SDK $GITHUB_REF_NAME" "${assets[@]}"
+          fi

@@ -1,0 +1,734 @@
+  function requestTargetURL(input) {
+    const raw = input && typeof input === 'object' && typeof input.url === 'string' ? input.url : String(input);
+    const gated = unleakedTargetRaw(raw);
+    if (gated === null) return virtualURL.href;
+    const parsed = new URL(gated, baseURL);
+    if (parsed.origin === proxyOrigin) return new URL(parsed.pathname + parsed.search + parsed.hash, baseURL).href;
+    return ZP.canonicalTargetURL(parsed.href, baseURL).href;
+  }
+  async function requestBodyBytes(req) {
+    if (req.method === 'GET' || req.method === 'HEAD') return null;
+    const ab = await req.clone().arrayBuffer();
+    return new Uint8Array(ab);
+  }
+  // `/zp/api/v2/fetch` takes a binary envelope: [u32 head length][JSON head][raw body].
+  async function postRuntimeEnvelope(target, payload, bodyBytes, extraInit) {
+    // Wait for pending cookie writes before dispatching the request.
+    const written = cookieWritesSettled();
+    if (written) await written;
+    const label = '?url=' + encodeURLParam(target);
+    return Native.fetch(proxyOrigin + ZP.apiPath('v2/fetch') + label,
+      Object.assign({ method: 'POST', headers: { 'Content-Type': ZP.ENVELOPE_MIME }, body: ZP.encodeEnvelope(payload, bodyBytes) }, extraInit || {}));
+  }
+  // `blob:` and `data:` URLs are inline resources resolved locally by the browser;
+  // routing them through the proxy would replace their content with a proxy response.
+  function inlineSchemeFetchURL(input) {
+    try {
+      const href = typeof input === 'string' ? input
+        : (input && typeof input === 'object' && typeof input.url === 'string') ? input.url
+        : String(input);
+      return /^(?:blob|data):/i.test(String(href).trim()) ? String(href).trim() : null;
+    } catch { return null; }
+  }
+  // `internal.mode` overrides `req.mode` for non-CORS browser requests such as `<a ping>`.
+  // `internal.implicitHeaders` marks browser-injected headers (such as EventSource `Cache-Control: no-cache`)
+  // so they do not trigger a CORS preflight.
+  async function fetchThroughRuntime(input, init = {}, internal) {
+    if (!Native.fetch || !Native.Request || !Native.Headers) throw normalizedError('NetworkError');
+    if (inlineSchemeFetchURL(input)) return Native.fetch(input, init);
+    const target = requestTargetURL(input);
+    try { zpTrace('fetch', target.slice(0, 180)); } catch {}
+    const req = input && typeof input === 'object' && typeof input.url === 'string' && typeof input.clone === 'function' ? new Native.Request(input, init) : new Native.Request(target, init);
+    // Capture before reading a body: history/base may change while that read awaits.
+    const requestEntryId = activeEntryId;
+    const documentURL = virtualURL.href;
+    const referrerPolicy = req.referrerPolicy || documentReferrerPolicy();
+    const bodyBytes = await requestBodyBytes(req);
+    const payload = {
+      tabId: boot.tabId,
+      entryId: requestEntryId,
+      documentURL,
+      url: target,
+      ...(internal && internal.implicitHeaders ? { implicitHeaders: internal.implicitHeaders } : null),
+      // An opaque document's requests are cross-origin to everything, its own site included:
+      // `Origin: null`, and no cookies unless it asks for them.
+      ...(opaqueDocument ? { opaque: true } : null),
+      init: {
+        method: req.method,
+        headers: Array.from(req.headers.entries()),
+        // The body travels in the envelope tail, not in the head.
+        body: null,
+        credentials: req.credentials,
+        mode: (internal && internal.mode) || req.mode,
+        referrer: req.referrer,
+        // Forward the explicit request referrerPolicy or fall back to the document's policy
+        // (`<meta name="referrer">` is not reflected on `Request.prototype.referrerPolicy`,
+        // and early fetches can race ahead of `ZP_REFERRER_POLICY` messages).
+        referrerPolicy,
+        redirect: req.redirect,
+        cache: req.cache,
+        integrity: req.integrity
+      }
+    };
+    const extraInit = req.signal ? { signal: req.signal } : null;
+    // Use an absolute proxy URL so virtual baseURI does not resolve root-relative
+    // paths against the target host. Include `?url=<target>` as a label so
+    // `PerformanceEntry.name` de-proxying can recover the target URL for each request.
+    return postRuntimeEnvelope(target, payload, bodyBytes, extraInit).then(r => {
+      try { zpTrace('fetch:ok', target.slice(0,80) + ' s=' + r.status); } catch {}
+      return decodeFetchResponse(r);
+    }, e => { try { zpTrace('fetch:err', target.slice(0,80) + ' ' + String(e).slice(0,60)); } catch {} throw e; });
+  }
+  function fireEvent(target, type) {
+    let ev;
+    try { ev = new Event(type); } catch { ev = { type }; }
+    return target.dispatchEvent(ev);
+  }
+  function installHTTPAPIs() {
+    if (Native.Response) decodeFetchResponse = ZP.createFetchResponseAdapter(Native.Response, Native.Headers, defineAccessor, define, record => applyCookieChanges(record.cookies));
+    if (Native.fetch && Native.Request && Native.Headers) define(root, 'fetch', function fetch(input, init) { return fetchThroughRuntime(input, init); });
+    if (Native.XMLHttpRequest && Native.fetch && Native.Request && Native.Headers) {
+      const UNSENT = 0, OPENED = 1, HEADERS_RECEIVED = 2, LOADING = 3, DONE = 4;
+      const xhrRecords = newWeakMap();
+      function ZPXMLHttpRequest() {
+        if (!new.target) throw new TypeError("Failed to construct 'XMLHttpRequest': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        // The state lives in a record the instance does not expose: a native request owns no properties.
+        // Native defaults are null, not undefined, so the prototype accessors
+        // below report `null` on an untouched request.
+        xhrRecords.set(this, {
+          readyState: UNSENT, response: '', responseText: '', responseXML: null, onreadystatechange: null, responseType: '',
+          responseURL: '', status: 0, statusText: '', timeout: 0, withCredentials: false, upload: {},
+          headers: [], responseHeaders: null, method: 'GET', url: '', sent: false, controller: null, timer: 0, sync: false,
+        });
+      }
+      const xhrState = xhr => xhrRecords.get(xhr);
+      function xhrReady(xhr, state) {
+        xhrState(xhr).readyState = state;
+        fireEvent(xhr, 'readystatechange');
+      }
+      function xhrDone(xhr, type) {
+        clearTimeout(xhrState(xhr).timer);
+        xhrState(xhr).timer = 0;
+        xhrReady(xhr, DONE);
+        fireEvent(xhr, type);
+        fireEvent(xhr, 'loadend');
+      }
+      installEventMethods(ZPXMLHttpRequest.prototype);
+      // Expose XHR state as prototype accessors over the record, shaped like the native
+      // `XMLHttpRequest.prototype`: the response attributes are read-only, the rest have setters.
+      for (const _n of ['readyState', 'response', 'responseText', 'responseXML', 'responseType',
+        'responseURL', 'status', 'statusText', 'timeout', 'withCredentials', 'upload',
+        'onreadystatechange']) {
+        const nativeAccessor = Native.XMLHttpRequest && Object.getOwnPropertyDescriptor(Native.XMLHttpRequest.prototype, _n);
+        const getter = function () { return xhrState(this)[_n]; };
+        const setter = nativeAccessor && !nativeAccessor.set ? undefined : function (v) { xhrState(this)[_n] = v; };
+        defineAccessor(ZPXMLHttpRequest.prototype, _n, getter, setter, Native.XMLHttpRequest && Native.XMLHttpRequest.prototype);
+      }
+      // Route synchronous XHR through the same-origin `/zp/api/sync-fetch` relay.
+      // The Go server parks the HTTP response while the Service Worker performs
+      // the upstream fetch, keeping egress confined to the worker transport.
+      function sendSyncThroughRelay(xhr, body) {
+        xhrState(xhr).sent = true;
+        let networkError = null;
+        try {
+          const rid = 'sx' + ZP.randomId();
+          let u = proxyOrigin + ZP.apiPath('sync-fetch')
+            + '?rid=' + nativeEncodeURIComponent(rid)
+            + '&u=' + nativeEncodeURIComponent(xhrState(xhr).url)
+            + '&m=' + nativeEncodeURIComponent(xhrState(xhr).method)
+            + '&tab=' + nativeEncodeURIComponent(boot.tabId || '')
+            + '&entry=' + nativeEncodeURIComponent(activeEntryId || '');
+          for (const kv of xhrState(xhr).headers) u += '&h=' + nativeEncodeURIComponent(kv[0] + ':' + kv[1]);
+          if (xhrState(xhr).withCredentials) u += '&wc=1';
+          // Include pending cookie writes that have not yet settled in the worker.
+          const unsent = pendingCookieWrites();
+          if (unsent.length) {
+            u += '&dv=' + nativeEncodeURIComponent(virtualURL.href);
+            for (const w of unsent) u += '&ck=' + nativeEncodeURIComponent(JSON.stringify(w));
+          }
+
+          const nx = new Native.XMLHttpRequest();
+          nx.open(xhrState(xhr).method, u, false);
+          if (xhrState(xhr).responseType === 'arraybuffer' || xhrState(xhr).responseType === 'blob') {
+            // Synchronous XHR does not allow setting `responseType`; receive as text.
+          }
+          nx.send(body != null && xhrState(xhr).method !== 'GET' && xhrState(xhr).method !== 'HEAD' ? body : null);
+          // On a worker-reported network error (such as a failed CORS check), transition
+          // to DONE and throw NetworkError without firing progress events.
+          if (nx.getResponseHeader('X-ZP-Sync-Err') === 'ZP_NETWORK_ERROR') {
+            xhrState(xhr).sent = false;
+            xhrState(xhr).status = 0;
+            xhrState(xhr).statusText = '';
+            xhrState(xhr).readyState = DONE;
+            networkError = normalizedError('NetworkError');
+            throw networkError;
+          }
+          // Apply response cookie deltas immediately so synchronous callers reading
+          // `document.cookie` right after `send()` returns observe them.
+          try {
+            const delta = nx.getResponseHeader('X-ZP-Cookie-Delta');
+            if (delta) {
+              const bin = atob(delta);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              applyCookieChanges(JSON.parse(new TextDecoder().decode(bytes)));
+            }
+          } catch {}
+
+          xhrState(xhr).status = nx.status;
+          xhrState(xhr).statusText = nx.statusText || '';
+          try {
+            const h = new Native.Headers();
+            String(nx.getAllResponseHeaders() || '').split(/\r?\n/).forEach(line => {
+              const i = line.indexOf(':');
+              if (i > 0) { try { h.append(line.slice(0, i).trim(), line.slice(i + 1).trim()); } catch {} }
+            });
+            try { h.delete('X-ZP-Cookie-Delta'); } catch {}
+            // Populate CORS-exposed response headers computed by the worker.
+            const visible = nx.getResponseHeader('X-ZP-Sync-Visible');
+            if (visible) {
+              try {
+                const bin = atob(visible);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const list = JSON.parse(new TextDecoder().decode(bytes));
+                const all = new Native.Headers();
+                for (const kv of list) { try { all.append(kv[0], kv[1]); } catch {} }
+                xhrState(xhr).responseHeaders = all;
+              } catch { xhrState(xhr).responseHeaders = h; }
+            } else xhrState(xhr).responseHeaders = h;
+          } catch {}
+          xhrReady(xhr, HEADERS_RECEIVED);
+          xhrReady(xhr, LOADING);
+          xhrState(xhr).responseText = nx.responseText || '';
+          if (xhrState(xhr).responseType === 'json') {
+            try { xhrState(xhr).response = xhrState(xhr).responseText ? JSON.parse(xhrState(xhr).responseText) : null; } catch { xhrState(xhr).response = null; }
+          } else {
+            xhrState(xhr).response = xhrState(xhr).responseText;
+          }
+          xhrState(xhr).sent = false;
+          xhrDone(xhr, 'load');
+        } catch (e) {
+          if (networkError && e === networkError) throw e;
+          xhrState(xhr).sent = false;
+          xhrState(xhr).status = 0;
+          xhrState(xhr).statusText = '';
+          try {
+            const diag = root.__zp_diagnostics;
+            if (diag && diag.length < 200) diag.push({
+              t: 'sync-xhr-relay-failed',
+              url: String(xhrState(xhr).url || '').slice(0, 160),
+              msg: String((e && e.message) || e).slice(0, 120),
+            });
+          } catch {}
+          xhrDone(xhr, 'error');
+        }
+      }
+      // WebIDL constants on XMLHttpRequest and its prototype are enumerable,
+      // non-writable, and non-configurable (`{ enumerable: true, writable: false, configurable: false }`).
+      for (const [k, v] of [['UNSENT', UNSENT], ['OPENED', OPENED], ['HEADERS_RECEIVED', HEADERS_RECEIVED], ['LOADING', LOADING], ['DONE', DONE]]) {
+        try { Object.defineProperty(ZPXMLHttpRequest.prototype, k, { value: v, enumerable: true, writable: false, configurable: false }); } catch {}
+        try { Object.defineProperty(ZPXMLHttpRequest, k, { value: v, enumerable: true, writable: false, configurable: false }); } catch {}
+      }
+      assignMasked(ZPXMLHttpRequest.prototype, {
+        constructor: ZPXMLHttpRequest,
+        // Stub Chrome Privacy Sandbox methods so prototype key shapes match native Chrome.
+        setAttributionReporting() {},
+        setPrivateToken() {},
+        open(method, url, async = true, user, password) {
+          // Service Workers do not intercept synchronous XHR; mark sync requests
+          // so `send()` routes them through the same-origin relay endpoint.
+          xhrState(this).sync = (async === false);
+          this.abort();
+          xhrState(this).method = String(method || 'GET').toUpperCase();
+          const target = new URL(requestTargetURL(url));
+          if (user != null) target.username = String(user);
+          if (password != null) target.password = String(password);
+          xhrState(this).url = target.href;
+          xhrState(this).responseURL = xhrState(this).url;
+          xhrState(this).headers = [];
+          xhrState(this).responseHeaders = null;
+          xhrState(this).status = 0;
+          xhrState(this).statusText = '';
+          xhrState(this).response = xhrState(this).responseText = '';
+          xhrReady(this, OPENED);
+        },
+        setRequestHeader(name, value) {
+          if (xhrState(this).readyState !== OPENED || xhrState(this).sent) throw normalizedError('InvalidStateError');
+          xhrState(this).headers.push([String(name), String(value)]);
+        },
+        send(body = null) {
+          if (xhrState(this).readyState !== OPENED || xhrState(this).sent) throw normalizedError('InvalidStateError');
+          if (xhrState(this).sync) return sendSyncThroughRelay(this, body);
+          xhrState(this).sent = true;
+          xhrState(this).controller = new AbortController();
+          const init = { method: xhrState(this).method, headers: xhrState(this).headers, credentials: xhrState(this).withCredentials ? 'include' : 'same-origin', signal: xhrState(this).controller.signal };
+          if (body != null && xhrState(this).method !== 'GET' && xhrState(this).method !== 'HEAD') init.body = body;
+          if (xhrState(this).timeout > 0) xhrState(this).timer = setTimeout(() => { try { xhrState(this).controller.abort(); } catch {} xhrState(this).sent = false; xhrDone(this, 'timeout'); }, xhrState(this).timeout);
+          fetchThroughRuntime(xhrState(this).url, init).then(async resp => {
+            if (!xhrState(this).sent) return;
+            xhrState(this).status = resp.status;
+            xhrState(this).statusText = resp.statusText;
+            xhrState(this).responseURL = resp.url || xhrState(this).url;
+            xhrState(this).responseHeaders = resp.headers;
+            xhrReady(this, HEADERS_RECEIVED);
+            xhrReady(this, LOADING);
+            if (xhrState(this).responseType === 'arraybuffer') xhrState(this).response = await resp.arrayBuffer();
+            else if (xhrState(this).responseType === 'blob') xhrState(this).response = await resp.blob();
+            else if (xhrState(this).responseType === 'json') { const text = await resp.text(); try { xhrState(this).response = text ? JSON.parse(text) : null; } catch { xhrState(this).response = null; } }
+            else { xhrState(this).responseText = await resp.text(); xhrState(this).response = xhrState(this).responseText; }
+            xhrState(this).sent = false;
+            xhrDone(this, 'load');
+          }).catch(() => {
+            if (!xhrState(this).sent) return;
+            xhrState(this).sent = false;
+            xhrState(this).status = 0;
+            xhrState(this).statusText = '';
+            xhrDone(this, 'error');
+          });
+        },
+        abort() {
+          if (xhrState(this).controller) { try { xhrState(this).controller.abort(); } catch {} }
+          clearTimeout(xhrState(this).timer);
+          xhrState(this).timer = 0;
+          const active = xhrState(this).sent;
+          xhrState(this).sent = false;
+          xhrState(this).controller = null;
+          if (active) xhrDone(this, 'abort');
+        },
+        getResponseHeader(name) { return xhrState(this).responseHeaders ? xhrState(this).responseHeaders.get(String(name)) : null; },
+        getAllResponseHeaders() { if (!xhrState(this).responseHeaders) return ''; let out = ''; xhrState(this).responseHeaders.forEach((v, k) => { out += k + ': ' + v + '\r\n'; }); return out; },
+        overrideMimeType() {}
+      });
+      maskMethods(ZPXMLHttpRequest.prototype, ['open','setRequestHeader','send','abort','getResponseHeader','getAllResponseHeaders','overrideMimeType']);
+      brandLikeNative(ZPXMLHttpRequest, ZPXMLHttpRequest.prototype, 'XMLHttpRequest');
+      define(root, 'XMLHttpRequest', ZPXMLHttpRequest);
+    }
+    if (Native.EventSource && Native.fetch && Native.Request && Native.Headers) {
+      // WHATWG HTML SSE §9.2: auto-reconnect after soft transport errors using the
+      // server-supplied `retry:` interval, echo `Last-Event-ID` on reconnect,
+      // enforce `text/event-stream` Content-Type, close cleanly on 204, and fail
+      // permanently on non-2xx responses.
+      const CONNECTING = 0, OPEN = 1, CLOSED = 2;
+      const DEFAULT_RECONNECT_MS = 3000;
+      function ZPEventSource(url, init = {}) {
+        this.url = requestTargetURL(url);
+        this.withCredentials = !!(init && init.withCredentials);
+        this.readyState = CONNECTING;
+        this._closed = false;
+        this._controller = new AbortController();
+        this._lastEventId = '';
+        this._reconnectMs = DEFAULT_RECONNECT_MS;
+        this._reconnectTimer = 0;
+        this._init = init || {};
+        runEventSource(this);
+      }
+      installEventMethods(ZPEventSource.prototype);
+      assignMasked(ZPEventSource.prototype, {
+        constructor: ZPEventSource,
+        CONNECTING, OPEN, CLOSED,
+        close() {
+          this._closed = true;
+          this.readyState = CLOSED;
+          if (this._reconnectTimer) { try { clearTimeout(this._reconnectTimer); } catch {} this._reconnectTimer = 0; }
+          try { this._controller.abort(); } catch {}
+        }
+      });
+      maskMethods(ZPEventSource.prototype, ['close']);
+      mirrorNativeProto(ZPEventSource.prototype,
+        ['url', 'withCredentials', 'readyState', 'onopen', 'onmessage', 'onerror'],
+        Native.EventSource && Native.EventSource.prototype);
+      brandLikeNative(ZPEventSource, ZPEventSource.prototype, 'EventSource');
+      define(root, 'EventSource', ZPEventSource);
+
+      function scheduleReconnect(es) {
+        if (es._closed) return;
+        es.readyState = CONNECTING;
+        fireEvent(es, 'error');
+        if (es._closed) return;
+        es._reconnectTimer = setTimeout(() => {
+          es._reconnectTimer = 0;
+          if (es._closed) return;
+          // Allocate a fresh controller per attempt so a prior abort does not poison the next fetch.
+          es._controller = new AbortController();
+          runEventSource(es);
+        }, es._reconnectMs);
+      }
+
+      function runEventSource(es) {
+        const headers = [['Accept', 'text/event-stream'], ['Cache-Control', 'no-cache']];
+        if (es._lastEventId) headers.push(['Last-Event-ID', es._lastEventId]);
+        fetchThroughRuntime(es.url, { method: 'GET', headers, credentials: es._init.withCredentials ? 'include' : 'same-origin', cache: 'no-store', signal: es._controller.signal }, { implicitHeaders: ['cache-control'] }).then(async resp => {
+          if (es._closed) return;
+          // 204 signals end of stream; close cleanly without reconnecting.
+          if (resp.status === 204) {
+            es.readyState = CLOSED;
+            return;
+          }
+          const ct = (resp.headers && resp.headers.get('Content-Type')) || '';
+          // Per spec, wrong MIME or non-2xx is a hard failure with no reconnect.
+          if (!resp.ok || !/^text\/event-stream\b/i.test(ct)) {
+            es.readyState = CLOSED;
+            fireEvent(es, 'error');
+            return;
+          }
+          es.readyState = OPEN;
+          fireEvent(es, 'open');
+          if (!resp.body || !resp.body.getReader) {
+            consumeSSE(es, await resp.text(), true);
+            if (!es._closed) scheduleReconnect(es);
+            return;
+          }
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          try {
+            for (;;) {
+              const part = await reader.read();
+              if (part.done) break;
+              buf = consumeSSE(es, buf + decoder.decode(part.value, { stream: true }), false);
+            }
+            consumeSSE(es, buf + decoder.decode(), true);
+          } catch {}
+          if (!es._closed) scheduleReconnect(es);
+        }).catch(() => {
+          if (es._closed) return;
+          scheduleReconnect(es);
+        });
+      }
+      function consumeSSE(es, text, final) {
+        let buf = String(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          dispatchSSE(es, buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+        }
+        if (final && buf) {
+          dispatchSSE(es, buf);
+          return '';
+        }
+        return buf;
+      }
+      function dispatchSSE(es, block) {
+        if (es._closed) return;
+        let data = '', eventType = 'message', eventLastId = null;
+        for (const line of String(block).split('\n')) {
+          if (!line || line[0] === ':') continue;
+          const colon = line.indexOf(':');
+          const field = colon < 0 ? line : line.slice(0, colon);
+          let value = colon < 0 ? '' : line.slice(colon + 1);
+          if (value[0] === ' ') value = value.slice(1);
+          if (field === 'data') data += value + '\n';
+          else if (field === 'event') eventType = value || 'message';
+          else if (field === 'id') eventLastId = value;
+          else if (field === 'retry') {
+            // Per spec, only digit strings update the reconnect interval.
+            if (/^\d+$/.test(value)) es._reconnectMs = parseInt(value, 10);
+          }
+        }
+        // Per spec, the last event ID buffer updates on every `id` field.
+        if (eventLastId !== null) es._lastEventId = eventLastId;
+        if (!data) return;
+        data = data.slice(0, -1);
+        let ev;
+        const origin = new URL(es.url).origin;
+        try { ev = new MessageEvent(eventType, { data, origin, lastEventId: es._lastEventId }); }
+        catch { ev = new Event(eventType); try { Object.defineProperties(ev, { data: { value: data }, origin: { value: origin }, lastEventId: { value: es._lastEventId } }); } catch {} }
+        es.dispatchEvent(ev);
+      }
+    }
+  }
+  function installWebSocket() {
+    // RFC 6455 WebSocket boundary: sub-protocol selection (§4.2.2), close
+    // code/reason validation (§7.4: code 1000 or [3000, 4999], reason <= 123
+    // UTF-8 bytes), binaryType validation, and bufferedAmount accounting.
+    const CONNECTING = 0, OPEN = 1, CLOSING = 2, CLOSED = 3;
+    const tokenRE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+    function protocolList(protocols) {
+      if (protocols == null) return [];
+      const list = typeof protocols === 'string' ? [protocols] : Array.isArray(protocols) ? protocols.slice() : null;
+      if (!list) throw normalizedError('SyntaxError');
+      const out = [];
+      const seen = newSet();
+      for (const p of list) {
+        const s = String(p);
+        if (!s || !tokenRE.test(s) || seen.has(s)) throw normalizedError('SyntaxError');
+        seen.add(s);
+        out.push(s);
+      }
+      return out;
+    }
+    // RFC 6455 §7.4: close code must be 1000 or in [3000, 4999].
+    function validateCloseCode(code) {
+      if (code === undefined) return;
+      const n = Number(code);
+      if (!Number.isFinite(n) || (n !== 1000 && (n < 3000 || n > 4999))) {
+        throw normalizedError('InvalidAccessError');
+      }
+    }
+    // RFC 6455 §7.4.1: close reason <= 123 UTF-8 bytes.
+    function validateReason(reason) {
+      if (reason === undefined || reason === '') return;
+      const enc = (typeof TextEncoder === 'function') ? new TextEncoder().encode(String(reason)) : null;
+      const len = enc ? enc.length : String(reason).length;
+      if (len > 123) throw normalizedError('SyntaxError');
+    }
+    function utf8ByteLength(s) {
+      if (typeof TextEncoder === 'function') {
+        try { return new TextEncoder().encode(s).length; } catch {}
+      }
+      return s.length;
+    }
+    function payloadByteLength(data) {
+      if (typeof data === 'string') return utf8ByteLength(data);
+      if (data instanceof ArrayBuffer) return data.byteLength;
+      if (Native.Blob && data instanceof Native.Blob) return data.size;
+      if (data && typeof data.byteLength === 'number') return data.byteLength;
+      return 0;
+    }
+    function closeEvent(code, reason, wasClean) {
+      try { return new CloseEvent('close', { code, reason, wasClean }); }
+      catch { const ev = new Event('close'); try { Object.defineProperties(ev, { code: { value: code }, reason: { value: reason }, wasClean: { value: wasClean } }); } catch {} return ev; }
+    }
+    function finish(ws, code, reason, wasClean) {
+      if (ws._closed) return;
+      ws._closed = true;
+      ws.readyState = CLOSED;
+      if (ws._closeGuard != null) { try { Native.clearTimeout(ws._closeGuard); } catch {} ws._closeGuard = null; }
+      if (ws._port) {
+        ws._port.onmessage = null;
+        try { ws._port.close(); } catch {}
+        ws._port = null;
+      }
+      ws.dispatchEvent(closeEvent(code, reason, wasClean));
+    }
+    function abort(ws) {
+      try { if (ws._port) ws._port.postMessage({ type: 'abort' }); } catch {}
+    }
+    function fail(ws) {
+      if (ws._closed) return;
+      abort(ws);
+      ws.dispatchEvent(new Event('error'));
+      finish(ws, 1006, '', false);
+    }
+    function ZPWebSocket(url, protocols) {
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+      this.url = targetWSURL(url);
+      this.protocol = '';
+      this.extensions = '';
+      this.readyState = CONNECTING;
+      this._port = null;
+      this._closed = false;
+      this._closeGuard = null;
+      this._bufferedAmount = 0;
+      this._binaryType = 'blob';
+      const plist = protocolList(protocols);
+      this._requestedProtocols = plist;
+      ctx.bridge.send({ type: ZP.MSG.WS_OPEN, url: this.url, protocols: plist, tabId: boot.tabId, entryId: activeEntryId }).then(reply => {
+        if (this._closed || this.readyState === CLOSING) {
+          // If close() canceled the opening handshake, abort the late kernel stream.
+          try { if (reply.port) reply.port.postMessage({ type: 'abort' }); }
+          finally { if (reply.port) reply.port.close(); }
+          return;
+        }
+        this._port = reply.port;
+        const negotiated = String(reply.protocol || '');
+        // RFC 6455 §4.2.2: server must pick from the offered list.
+        if (negotiated && plist.indexOf(negotiated) < 0) {
+          fail(this);
+          return;
+        }
+        this.protocol = negotiated;
+        this._port.onmessage = ev => {
+          if (this._closed) return;
+          const m = ev.data || {};
+          if (m.type === 'message') {
+            let data = m.data;
+            if (this._binaryType === 'blob' && data instanceof ArrayBuffer && Native.Blob) {
+              data = new Native.Blob([data]);
+            } else if (this._binaryType === 'arraybuffer' && Native.Blob && data instanceof Native.Blob) {
+              data.arrayBuffer().then(buf => {
+                if (this._closed) return;
+                this.dispatchEvent(new MessageEvent('message', { data: buf, origin: new URL(this.url).origin }));
+              }).catch(() => fail(this));
+              return;
+            }
+            this.dispatchEvent(new MessageEvent('message', { data, origin: new URL(this.url).origin }));
+          } else if (m.type === 'error') {
+            fail(this);
+          } else if (m.type === 'close') {
+            finish(this, m.code, m.reason || '', m.code !== 1006);
+          } else if (m.type === 'senddrained' && typeof m.bytes === 'number') {
+            // Decrement bufferedAmount as the kernel drains the send queue.
+            this._bufferedAmount = Math.max(0, this._bufferedAmount - m.bytes);
+          }
+        };
+        this._port.start && this._port.start();
+        this.readyState = OPEN;
+        this.dispatchEvent(new Event('open'));
+      }).catch(() => fail(this));
+    }
+    ZPWebSocket.CONNECTING = CONNECTING; ZPWebSocket.OPEN = OPEN; ZPWebSocket.CLOSING = CLOSING; ZPWebSocket.CLOSED = CLOSED;
+    ZPWebSocket.prototype = { CONNECTING, OPEN, CLOSING, CLOSED };
+    installEventMethods(ZPWebSocket.prototype);
+    assignMasked(ZPWebSocket.prototype, {
+      constructor: ZPWebSocket,
+      send(data) {
+        if (this.readyState === CONNECTING) throw normalizedError('InvalidStateError');
+        if (this.readyState !== OPEN || !this._port) {
+          // In CLOSING/CLOSED state, spec increments bufferedAmount and drops the payload.
+          this._bufferedAmount += payloadByteLength(data);
+          return;
+        }
+        const bytes = payloadByteLength(data);
+        this._bufferedAmount += bytes;
+        if (Native.Blob && data instanceof Native.Blob) {
+          data.arrayBuffer().then(buf => {
+            if (this.readyState === OPEN && this._port) {
+              this._port.postMessage({ type: 'send', data: buf, bytes });
+            } else {
+              this._bufferedAmount = Math.max(0, this._bufferedAmount - bytes);
+            }
+          }).catch(() => fail(this));
+          return;
+        }
+        this._port.postMessage({ type: 'send', data, bytes });
+      },
+      close(code, reason) {
+        validateCloseCode(code);
+        validateReason(reason);
+        if (this._closed || this.readyState === CLOSING || this.readyState === CLOSED) return;
+        const finalCode = code === undefined ? 1000 : Number(code);
+        const finalReason = reason === undefined ? '' : String(reason);
+        this.readyState = CLOSING;
+        if (!this._port) {
+          // Dispatch asynchronously so handlers registered after close() observe the close event.
+          this._closeGuard = Native.setTimeout(() => fail(this), 0);
+          return;
+        }
+        // Wait for the peer's close frame; treat a missing echo as an abnormal close (1006).
+        this._closeGuard = Native.setTimeout(() => {
+          if (this._closed) return;
+          abort(this);
+          finish(this, 1006, '', false);
+        }, 30000);
+        try { this._port.postMessage({ type: 'close', code: finalCode, reason: finalReason }); }
+        catch { fail(this); }
+      }
+    });
+    try {
+      // Define `constructor` as non-enumerable on the fresh prototype literal.
+      Object.defineProperty(ZPWebSocket.prototype, 'constructor', {
+        value: ZPWebSocket, writable: true, enumerable: false, configurable: true,
+      });
+      defineMasked(ZPWebSocket.prototype, 'bufferedAmount', {
+        configurable: false,
+        enumerable: true,
+        get() { return this._bufferedAmount | 0; },
+      });
+    } catch {}
+    // `binaryType` is a strict enum; invalid assignments are ignored per spec.
+    try {
+      defineMasked(ZPWebSocket.prototype, 'binaryType', {
+        configurable: false,
+        enumerable: true,
+        get() { return this._binaryType; },
+        set(v) {
+          const s = String(v);
+          if (s === 'blob' || s === 'arraybuffer') this._binaryType = s;
+        },
+      });
+    } catch {}
+    mirrorNativeProto(ZPWebSocket.prototype,
+      ['url', 'readyState', 'onopen', 'onerror', 'onclose', 'onmessage', 'extensions', 'protocol'],
+      Native.WebSocket && Native.WebSocket.prototype);
+    brandLikeNative(ZPWebSocket, ZPWebSocket.prototype, 'WebSocket');
+    define(root, 'WebSocket', ZPWebSocket);
+  }
+
+  function installWebSocketStream() {
+    if (!root.WebSocket || !root.ReadableStream || !root.WritableStream) return;
+    const states = newWeakMap();
+    const stateOf = receiver => {
+      const state = states.get(receiver);
+      if (!state) throw new TypeError('Illegal invocation');
+      return state;
+    };
+    function ZPWebSocketStream(url, options = {}) {
+      if (!new.target) throw new TypeError("Failed to construct 'WebSocketStream': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (!arguments.length) throw new TypeError('WebSocketStream requires a URL');
+      options = options || {};
+      const ws = new root.WebSocket(url, options.protocols);
+      ws.binaryType = 'arraybuffer';
+      let openResolve, openReject, closeResolve, closeReject;
+      let readableController, writableController;
+      let opened = false, finished = false, canceled = false;
+      const state = {
+        ws,
+        opened: new Promise((resolve, reject) => { openResolve = resolve; openReject = reject; }),
+        closed: new Promise((resolve, reject) => { closeResolve = resolve; closeReject = reject; })
+      };
+      states.set(this, state);
+      // Both promises remain rejectable for consumers; an unused lifecycle
+      // promise must not create an unrelated unhandled rejection.
+      state.opened.catch(() => {});
+      state.closed.catch(() => {});
+      const signal = options.signal;
+      const cleanup = () => { if (signal) signal.removeEventListener('abort', abort); };
+      const fail = error => {
+        if (finished) return;
+        finished = true;
+        cleanup();
+        if (!opened) openReject(error);
+        closeReject(error);
+        if (!canceled) readableController.error(error);
+        writableController.error(error);
+      };
+      const readable = new root.ReadableStream({
+        start(controller) { readableController = controller; },
+        cancel() { canceled = true; ws.close(); return state.closed.then(() => undefined); }
+      });
+      const writable = new root.WritableStream({
+        start(controller) { writableController = controller; },
+        write(chunk) {
+          if (ws.readyState !== 1) throw normalizedError('InvalidStateError');
+          ws.send(chunk);
+        },
+        close() { ws.close(); return state.closed.then(() => undefined); },
+        abort() { ws.close(); return state.closed.then(() => undefined); }
+      });
+      function abort() { fail(signal.reason || normalizedError('AbortError')); ws.close(); }
+      ws.onopen = () => {
+        if (finished) return;
+        opened = true;
+        cleanup();
+        openResolve({ readable, writable, protocol: ws.protocol, extensions: ws.extensions || '' });
+      };
+      ws.onmessage = event => { if (!finished && !canceled) readableController.enqueue(event.data); };
+      ws.onerror = () => fail(normalizedError('NetworkError'));
+      ws.onclose = event => {
+        if (finished) return;
+        if (!opened || !event.wasClean) { fail(normalizedError('NetworkError')); return; }
+        finished = true;
+        cleanup();
+        if (!canceled) readableController.close();
+        closeResolve({ closeCode: event.code, reason: event.reason });
+      };
+      if (signal) {
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+      }
+    }
+    definePropertiesMasked(ZPWebSocketStream.prototype, {
+      url: { get() { return stateOf(this).ws.url; }, enumerable: true },
+      opened: { get() { return stateOf(this).opened; }, enumerable: true },
+      closed: { get() { return stateOf(this).closed; }, enumerable: true }
+    });
+    define(ZPWebSocketStream.prototype, 'close', function close(options = {}) {
+      const ws = stateOf(this).ws;
+      options = options || {};
+      ws.close(options.closeCode, options.reason);
+    });
+    brandLikeNative(ZPWebSocketStream, ZPWebSocketStream.prototype, 'WebSocketStream');
+    define(root, 'WebSocketStream', ZPWebSocketStream);
+  }

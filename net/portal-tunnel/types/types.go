@@ -1,0 +1,76 @@
+package types
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/pelletier/go-toml/v2"
+
+	portaltunnel "github.com/gosuda/portal-tunnel/v2"
+)
+
+const (
+	HeaderAccessToken       = "X-Portal-Access-Token"
+	HeaderAccessCredential  = "X-Portal-Access-Credential"
+	HeaderReverseCapability = "X-Portal-Reverse-Capability"
+	HeaderPortalUser        = "X-Portal-User"
+	HeaderPortalAuth        = "X-Portal-Auth"
+	HeaderPortalProof       = "X-Portal-Proof"
+
+	// ReverseSubprotocol marks a WebSocket carrying reverse connections as yamux streams;
+	// an initial capability rides beside it and every logical stream authenticates again.
+	ReverseSubprotocol = "portal.reverse.v1"
+)
+
+// PortalIdentityHeaders are the request headers Portal sets itself, and so removes
+// from every request it did not authenticate.
+var PortalIdentityHeaders = []string{HeaderPortalUser, HeaderPortalAuth, HeaderPortalProof}
+
+const (
+	DefaultHTTPRedirectAddr = ":80"
+	HTTPRedirectFeatureName = "http-redirect"
+	HTTPRedirectEnabledEnv  = "HTTP_REDIRECT_ENABLED"
+)
+
+// HTTPRedirectConfig controls the optional canonical-portal HTTP listener.
+// The zero value disables redirects and HSTS; an empty Addr defaults to :80.
+type HTTPRedirectConfig struct {
+	Enabled bool
+	Addr    string
+	HSTS    bool
+}
+
+var (
+	ReleaseVersion         string
+	SDKVersion             string
+	DiscoveryVersion       string
+	OfficialReleaseBaseURL string
+	BootstrapRelays        []string
+)
+
+func init() {
+	var m struct {
+		Release struct {
+			Version string `toml:"version"`
+			BaseURL string `toml:"base_url"`
+		} `toml:"release"`
+		Protocol struct {
+			Tunnel    string `toml:"tunnel"`
+			Discovery string `toml:"discovery"`
+		} `toml:"protocol"`
+	}
+	if err := toml.Unmarshal(portaltunnel.ConfigTOML, &m); err != nil {
+		panic(fmt.Errorf("unmarshal config TOML: %w", err))
+	}
+	var registry struct {
+		Relays []string `json:"relays"`
+	}
+	if err := json.Unmarshal(portaltunnel.RegistryJSON, &registry); err != nil {
+		panic(fmt.Errorf("unmarshal registry JSON: %w", err))
+	}
+	ReleaseVersion = m.Release.Version
+	OfficialReleaseBaseURL = m.Release.BaseURL
+	SDKVersion = m.Protocol.Tunnel
+	DiscoveryVersion = m.Protocol.Discovery
+	BootstrapRelays = registry.Relays
+}
