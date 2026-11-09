@@ -1,0 +1,10 @@
+# Build-time manifest, embedded into the binary via go:embed.
+# Bump protocol versions only when wire-level behavior changes.
+
+[release]
+version  = "v2.7.2"
+base_url = "https://github.com/gosuda/portal-tunnel/releases"
+
+[protocol]
+tunnel    = "10"
+discovery = "9"
