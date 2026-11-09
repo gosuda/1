@@ -1,9 +1,10 @@
 {
-  "name": "@gosuda/markdown-editor",
+  "name": "@gosuda/flats-md",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
-  "description": "Reusable single-surface live-preview Markdown editor extracted from Flats",
+  "description": "Flats single-surface live-preview Markdown editor",
   "main": "./dist/index.js",
   "module": "./src/index.js",
   "style": "./dist/index.css",
