@@ -4,7 +4,7 @@ ab8ec1e75c7f74565e9f893212262780abc9174363ce5f1ff670c415e9cd4147  cds/Linux_x64/
 7ac4fb2a7fd4996bbade60ce75835d46f0bc3e89c9d994d0510c81d53b0bb2bf  cds/Mac_arm64/clang-llvmorg-24-init-7747-g62397f8b-67.tar.xz
 71b31b71326d7bf53eef44676f88d759c03677ae382dd9d331615c4f491e0dd1  cds/Mac_arm64/rust-toolchain-1edd55dcfcd573872c727fa3e086369a71661ee0-1125-llvmorg-24-init-7747-g62397f8b.tar.xz
 b207042a5986ea8a684ebea9ea918220bc034d05dc7c86dd0a2712c368358e39  cds/Win/clang-win-runtime-library-llvmorg-24-init-7747-g62397f8b-67.tar.xz
-6f7f34ef0f249374ee959c701a139e5d19860c1c02bc2e04f010e437cc744863  chromium-157.0.8103.38-lite.tar.xz
+6511dc3808736004f03a82397a2fa251757f4b6632e2d848bc79ee25b77c7f0f  chromium-157.0.8103.50-lite.tar.xz
 fdb3c179808a5801ec91469f51c56b12d54aa6795635abc23e604ad0ec5dc7df  cipd/gn/gn/linux-amd64/git_revision:0035961837fbcfe875d855744b3eda4fd2eefb43.zip
 745472bee4253c6c907d648ad8a552c878b3479fce5551ca13c104f9b4d05581  cipd/gn/gn/mac-arm64/git_revision:0035961837fbcfe875d855744b3eda4fd2eefb43.zip
 3f1f1cc0f69a1bcfdf67fb6c2bc7419b1dd812bb8d0e79afa9bfa8a3553b5082  cipd/infra/3pp/tools/ninja/linux-amd64/version:3@1.12.1.chromium.4.zip
