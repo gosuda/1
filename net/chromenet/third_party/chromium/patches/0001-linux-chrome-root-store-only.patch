@@ -1,0 +1,18 @@
+Linux without NSS: verify server certificates against the Chrome Root Store only.
+
+With use_nss_server_certs = false (no libnss3 at run time), //net has no Linux
+platform trust store, so CreateBuiltinWithChromeRootStore uses the Chrome-only
+store, as on ChromeOS.
+
+--- a/net/cert/cert_verify_proc.cc
++++ b/net/cert/cert_verify_proc.cc
+@@ -419,7 +419,8 @@
+   return CreateCertVerifyProcBuiltin(
+       std::move(cert_net_fetcher), std::move(crl_set), std::move(ct_verifier),
+       std::move(ct_policy_enforcer),
+-#if BUILDFLAG(IS_CHROMEOS)
++#if BUILDFLAG(IS_CHROMEOS) || \
++    (BUILDFLAG(IS_LINUX) && !BUILDFLAG(USE_NSS_SERVER_CERTS))
+       CreateChromeOnlySystemTrustStore(std::move(chrome_root)),
+ #else
+       CreateSslSystemTrustStoreChromeRoot(std::move(chrome_root)),

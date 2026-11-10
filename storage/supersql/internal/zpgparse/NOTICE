@@ -1,0 +1,11 @@
+PostgreSQL 18.4 (REL_18_4)
+https://github.com/postgres/postgres/tree/REL_18_4
+Files: internal/zpgparse/internal/neoparse/pg18; testdata/postgres184; testdata/postgres; grammar-derived logic.
+License: LICENSE.POSTGRESQL and testdata/postgres184/COPYRIGHT.
+Source archive sha256=81a81ec695fb0c7901407defaa1d2f7973617154cf27ba74e3a7ab8e64436094
+  url=https://ftp.postgresql.org/pub/source/v18.4/postgresql-18.4.tar.bz2
+  (digest observed with `shasum -a 256`; identical to testdata/postgres184/REVISION and
+  testdata/postgres/embedded_features.json)
+GitHub tag archive sha256=9b4f86dd2ac00b914582e9893d1bad1f54bc9be7108fa794318b8184f921ec08
+  url=https://github.com/postgres/postgres/archive/refs/tags/REL_18_4.tar.gz
+  (same release as a git archive; this digest is not the one the vendored trees were cut from)
