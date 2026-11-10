@@ -1,0 +1,720 @@
+import { RELAY_API_PATHS } from "@/lib/apiPaths";
+import { normalizeExposeName } from "@/lib/exposeName";
+import type { ShareKind } from "@/lib/shareLink";
+
+export type TunnelCommandOS = "unix" | "windows";
+
+export type TunnelAuthMethod =
+  | "none"
+  | "credential"
+  | "siwe"
+  | "oidc"
+  | "saml"
+  | "email";
+
+export const GOOGLE_OIDC_ISSUER = "https://accounts.google.com";
+
+export interface TunnelAuthOptions {
+  method: TunnelAuthMethod;
+  /** Allowlist entries as typed; classifyAuthAllow says what each one is. */
+  allow: string[];
+  identityHeaders: boolean;
+  oidcIssuer: string;
+  oidcClientId: string;
+  samlMetadataURL: string;
+  /** Empty means the default, the metadata URL of each host. */
+  samlEntityId: string;
+  /** Empty means the NameID. */
+  samlSubjectAttribute: string;
+  /** host:port of the SMTP server that sends the email links. */
+  emailSMTPAddr: string;
+  /** Empty for a server that needs no login; the password is never here. */
+  emailSMTPUsername: string;
+  /** The fixed sender of every link. */
+  emailFrom: string;
+}
+
+export const DEFAULT_TUNNEL_AUTH: TunnelAuthOptions = {
+  method: "none",
+  allow: [],
+  identityHeaders: false,
+  oidcIssuer: GOOGLE_OIDC_ISSUER,
+  oidcClientId: "",
+  samlMetadataURL: "",
+  samlEntityId: "",
+  samlSubjectAttribute: "",
+  emailSMTPAddr: "",
+  emailSMTPUsername: "",
+  emailFrom: "",
+};
+
+// The reserved paths a provider sends visitors back to, from
+// sdk/appauth (applicationAuthCallbackPath and the
+// applicationAuthSAML*Path constants).
+export const AUTH_CALLBACK_PATH = "/_portal/auth/callback";
+export const AUTH_SAML_ACS_PATH = "/_portal/auth/saml/acs";
+export const AUTH_SAML_METADATA_PATH = "/_portal/auth/saml/metadata";
+
+/** Sign-in covers HTTP only, so the tunnel refuses to combine it with UDP. */
+export function authBlocksUDP(auth: TunnelAuthOptions): boolean {
+  return auth.method !== "none";
+}
+
+export interface TunnelCommandOptions {
+  currentOrigin: string;
+  target: string;
+  name: string;
+  relayUrls: string[];
+  discovery: boolean;
+  thumbnailURL: string;
+  enableUDP?: boolean;
+  udpPort?: string;
+  os: TunnelCommandOS;
+  /** How the share input was classified; defaults to "port". */
+  shareKind?: ShareKind;
+  /** Local path passed to `--serve` when shareKind is "file". */
+  servePath?: string;
+  /** Who may open the public URL; defaults to no sign-in. */
+  auth?: TunnelAuthOptions;
+}
+
+export function buildTunnelCommand(options: TunnelCommandOptions): string {
+  const { installLine, exposeHead, exposeOptions } =
+    buildTunnelCommandParts(options);
+
+  return joinTunnelCommand(installLine, exposeHead, exposeOptions);
+}
+
+function buildTunnelCommandParts({
+  currentOrigin,
+  discovery,
+  enableUDP = false,
+  name,
+  os,
+  relayUrls,
+  target,
+  thumbnailURL,
+  udpPort = "",
+  shareKind = "port",
+  servePath = "",
+  auth = DEFAULT_TUNNEL_AUTH,
+}: TunnelCommandOptions): {
+  installLine: string;
+  exposeHead: string;
+  exposeOptions: string[];
+} {
+  const isFile = shareKind === "file";
+  const targetValue = target.trim() === "" ? "3000" : target.trim();
+  const normalizedName = normalizeExposeName(name);
+  const relayURLValue =
+    relayUrls.length > 0 ? relayUrls.join(",") : currentOrigin;
+  const leadingArgs = isFile
+    ? ["--serve", formatToken(servePath, os)]
+    : [formatToken(targetValue, os)];
+  const installScriptURL = new URL(
+    RELAY_API_PATHS.install.shell,
+    currentOrigin
+  ).toString();
+  const installPowerShellURL = new URL(
+    RELAY_API_PATHS.install.powershell,
+    currentOrigin
+  ).toString();
+
+  const exposeArgs: string[] = [];
+
+  if (normalizedName !== "") {
+    exposeArgs.push(`--name ${formatToken(normalizedName, os)}`);
+  }
+  if (relayUrls.length > 0) {
+    exposeArgs.push(`--relays ${formatToken(relayURLValue, os)}`);
+  }
+  if (!discovery) {
+    exposeArgs.push("--discovery=false");
+  }
+
+  const normalizedThumbnailURL = normalizeAbsoluteHTTPURL(thumbnailURL);
+  if (normalizedThumbnailURL !== "") {
+    exposeArgs.push(`--thumbnail ${formatToken(normalizedThumbnailURL, os)}`);
+  }
+  if (enableUDP && !authBlocksUDP(auth)) {
+    exposeArgs.push("--udp");
+    const normalizedUDPPort = udpPort.trim();
+    if (normalizedUDPPort !== "") {
+      exposeArgs.push(`--udp-addr ${formatToken(normalizedUDPPort, os)}`);
+    }
+  }
+
+  if (auth.method !== "none") {
+    exposeArgs.push(...buildAuthArgs(auth, os));
+  }
+
+  if (os === "windows") {
+    return {
+      installLine: [
+        `$ProgressPreference = 'SilentlyContinue'`,
+        `irm ${formatToken(installPowerShellURL, os)} | iex`,
+      ].join("\n"),
+      exposeHead: "portal expose",
+      exposeOptions: [...leadingArgs, ...exposeArgs],
+    };
+  }
+
+  const curlFlags = isLocalRelayOrigin(currentOrigin) ? "-ksSL" : "-sSL";
+  return {
+    // bash runs the installer in a subshell, so add its install dirs to this shell's PATH.
+    installLine: `curl ${curlFlags} ${formatToken(installScriptURL, os)} | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`,
+    exposeHead: "portal expose",
+    exposeOptions: [...leadingArgs, ...exposeArgs],
+  };
+}
+
+export function buildTunnelPreviewURL(
+  origin: string,
+  name: string
+): string {
+  const normalized = normalizeExposeName(name);
+  if (normalized === "") {
+    return "";
+  }
+  const baseHost = getRelayOriginHost(origin);
+  if (baseHost === "") {
+    return "";
+  }
+  // The short URL keeps the relay's port (relayAuthority in sdk/listener.go);
+  // a browser leaves out the default 443.
+  const port = new URL(origin).port;
+  const portSuffix = port === "" || port === "443" ? "" : `:${port}`;
+  return `https://${normalized}.${baseHost}${portSuffix}`;
+}
+
+export function buildServiceStatusHostname(
+  origin: string,
+  name: string
+): string {
+  const relayHost = getRelayOriginHost(origin);
+  if (relayHost === "") {
+    return "";
+  }
+  const normalized = normalizeExposeName(name);
+  if (normalized === "") {
+    return "";
+  }
+  return `${normalized}.${relayHost}`;
+}
+
+function buildAuthArgs(auth: TunnelAuthOptions, os: TunnelCommandOS): string[] {
+  const args = [`--auth ${auth.method}`];
+  if (auth.method === "oidc") {
+    args.push(
+      `--auth-oidc-issuer ${valueOrPlaceholder(auth.oidcIssuer, "<issuer>", os)}`,
+      `--auth-oidc-client-id ${valueOrPlaceholder(auth.oidcClientId, "<client-id>", os)}`
+    );
+  }
+  if (auth.method === "saml") {
+    args.push(
+      `--auth-saml-metadata-url ${valueOrPlaceholder(auth.samlMetadataURL, "<metadata-url>", os)}`
+    );
+    if (auth.samlEntityId.trim() !== "") {
+      args.push(`--auth-saml-entity-id ${formatToken(auth.samlEntityId.trim(), os)}`);
+    }
+    if (auth.samlSubjectAttribute.trim() !== "") {
+      args.push(
+        `--auth-saml-subject-attribute ${formatToken(auth.samlSubjectAttribute.trim(), os)}`
+      );
+    }
+  }
+  if (auth.method === "email") {
+    args.push(
+      `--auth-smtp-addr ${valueOrPlaceholder(auth.emailSMTPAddr, "<host:port>", os)}`,
+      `--auth-smtp-from ${valueOrPlaceholder(auth.emailFrom, "<sender>", os)}`
+    );
+    if (auth.emailSMTPUsername.trim() !== "") {
+      args.push(
+        `--auth-smtp-username ${formatToken(auth.emailSMTPUsername.trim(), os)}`
+      );
+    }
+  }
+  const allowFlag = needsAllowlist(auth.method) ? "--auth-email-list" : "--auth-allow";
+  if (needsAllowlist(auth.method) && auth.allow.length === 0) {
+    args.push(
+      auth.method === "email"
+        ? `${allowFlag} <email or @domain>`
+        : `${allowFlag} <email, @domain or sub:id>`
+    );
+  }
+  for (const entry of auth.allow) {
+    args.push(`${allowFlag} ${formatToken(entry, os)}`);
+  }
+  if (auth.identityHeaders) {
+    args.push("--auth-identity-headers");
+  }
+  return args;
+}
+
+// The secrets a sign-in method reads from the environment, and the prompt
+// that asks for each.
+const SECRETS = {
+  oidc: { prompt: "OIDC client secret", variable: "AUTH_OIDC_CLIENT_SECRET" },
+  email: { prompt: "SMTP password", variable: "AUTH_SMTP_PASSWORD" },
+} as const;
+
+/**
+ * Reads the OIDC client secret or the SMTP password at a prompt and exports it
+ * for the next `portal expose` in the same shell. The secret never appears in
+ * the command line (`ps`), in shell history (typed at a prompt, not after
+ * `export`) or in the text that gets copied, so there is no placeholder to
+ * forget.
+ */
+export function buildSecretCommand(
+  secret: keyof typeof SECRETS,
+  os: TunnelCommandOS
+): string {
+  const { prompt, variable } = SECRETS[secret];
+  return os === "windows"
+    ? `$secret = Read-Host '${prompt}' -AsSecureString; $env:${variable} = [System.Net.NetworkCredential]::new('', $secret).Password`
+    : `printf '${prompt}: '; stty -echo; read -r ${variable}; stty echo; echo; export ${variable}`;
+}
+
+function valueOrPlaceholder(
+  value: string,
+  placeholder: string,
+  os: TunnelCommandOS
+): string {
+  const trimmed = value.trim();
+  return trimmed === "" ? placeholder : formatToken(trimmed, os);
+}
+
+type AuthAllowKind =
+  | "link name"
+  | "wallet"
+  | "person"
+  | "domain"
+  | "account id";
+
+type AuthAllowCheck =
+  | { ok: true; kind: AuthAllowKind }
+  | { ok: false; error: string };
+
+/**
+ * An identity provider signs in accounts it does not restrict to the app, and
+ * email would mail a link to any address, so the tunnel refuses to start oidc,
+ * saml or email without an allowlist.
+ */
+export function needsAllowlist(method: TunnelAuthMethod): boolean {
+  return method === "oidc" || method === "saml" || method === "email";
+}
+
+/**
+ * Mirrors what `portal expose --auth-allow` and `--auth-email-list` accept for each method. The Go
+ * owners are normalizeApplicationAuthSubject and normalizeAllowed
+ * (sdk/appauth/credential.go), normalizeProviderPrincipal (sdk/appauth/appauth.go) and
+ * identity.NormalizeEVMAddress. Email takes the email and @domain entries of
+ * oidc and saml, but no sub:<id>, because a mailbox has no other id.
+ * The browser has no Keccak, so a mixed-case wallet address is not checked
+ * against its EIP-55 checksum here; the tunnel rejects a bad one at start.
+ */
+export function classifyAuthAllow(
+  method: TunnelAuthMethod,
+  entry: string
+): AuthAllowCheck {
+  if (method === "credential") {
+    return isPrintableSubject(entry)
+      ? { ok: true, kind: "link name" }
+      : { ok: false, error: "A link name is 1 to 256 printable characters." };
+  }
+  if (method === "siwe") {
+    return /^0[xX][0-9a-fA-F]{40}$/.test(entry)
+      ? { ok: true, kind: "wallet" }
+      : {
+          ok: false,
+          error: `${entry} is not a wallet address: 0x followed by 40 hex characters.`,
+        };
+  }
+
+  if (/^sub:/i.test(entry) && method === "email") {
+    return {
+      ok: false,
+      error: `${entry}: email sign-in takes an email or an @domain, not sub:<id>.`,
+    };
+  }
+  if (/^sub:/i.test(entry)) {
+    return isPrintableSubject(entry.slice("sub:".length))
+      ? { ok: true, kind: "account id" }
+      : { ok: false, error: `${entry} needs an id of 1 to 256 printable characters after sub:.` };
+  }
+  if (!isPrintableSubject(entry)) {
+    return {
+      ok: false,
+      error: `${entry} must be 1 to 256 printable characters.`,
+    };
+  }
+  if (!isASCII(entry)) {
+    return {
+      ok: false,
+      error: `${entry} must be ASCII; write an internationalized domain in punycode.`,
+    };
+  }
+  const at = entry.indexOf("@");
+  const domain = entry.slice(at + 1);
+  if (at < 0 || domain === "" || /[@\s]/.test(domain)) {
+    return {
+      ok: false,
+      error: `${entry} is not an email, an @domain or sub:<id>.`,
+    };
+  }
+  if (method === "email" && !isVisitorEmail(at === 0 ? `a${entry}` : entry)) {
+    return { ok: false, error: `${entry} is not an address a visitor can sign in with.` };
+  }
+  return { ok: true, kind: at === 0 ? "domain" : "person" };
+}
+
+// normalizeVisitorEmail (sdk/appauth/email.go) takes a bare address that net/mail
+// reads back unchanged, without the % and ! that mail servers route on.
+const mailAtom = "[a-zA-Z0-9#$&'*+/=?^_`{|}~-]+";
+const mailAddress = `${mailAtom}(\\.${mailAtom})*@${mailAtom}(\\.${mailAtom})*`;
+const visitorEmail = new RegExp(`^${mailAddress}$`);
+
+// parseSMTPFrom (sdk/appauth/email.go) takes one address the way net/mail reads
+// it: bare, or in angle brackets after a display name.
+const senderName = `(?:"[^"\\\\]*"|[^"<>@,;:()\\[\\]\\\\]+)`;
+const emailSender = new RegExp(`^(?:${mailAddress}|(?:${senderName}\\s*)?<${mailAddress}>)$`);
+
+function isEmailSender(raw: string): boolean {
+  const sender = raw.trim();
+  return !/[\u0000-\u001f\u007f-\u009f]/.test(sender) && emailSender.test(sender);
+}
+
+function isVisitorEmail(entry: string): boolean {
+  return entry.length <= 254 && visitorEmail.test(entry);
+}
+
+function isASCII(value: string): boolean {
+  return ![...value].some((char) => (char.codePointAt(0) ?? 0) > 127);
+}
+
+// The tunnel limits a subject to 256 bytes, not characters.
+function isPrintableSubject(value: string): boolean {
+  const subject = value.trim();
+  if (subject === "" || new TextEncoder().encode(subject).length > 256) {
+    return false;
+  }
+  return ![...subject].some((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    return code < 32 || (code >= 127 && code < 160);
+  });
+}
+
+// normalizeOIDCIssuerURL also accepts http on a loopback host, which the
+// builder does not offer.
+function isOIDCIssuer(raw: string): boolean {
+  try {
+    const parsed = new URL(raw.trim());
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname !== "" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.search === "" &&
+      parsed.hash === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+// normalizeSAMLMetadataURL (sdk/appauth/saml.go) also accepts http on a
+// loopback host, which the builder does not offer. Unlike an issuer, the
+// metadata URL may carry a query.
+function isSAMLMetadataURL(raw: string): boolean {
+  try {
+    const parsed = new URL(raw.trim());
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname !== "" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.hash === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+// validateSMTPAddr (sdk/appauth/email.go) reads host:port the way
+// net.SplitHostPort and strconv.Atoi do: an IPv6 host in brackets, a host
+// without control characters, and a port from 1 to 65535.
+function isEmailSMTPAddr(raw: string): boolean {
+  const match = /^(?:\[([^[\]]*)\]|([^[\]:]*)):([+-]?\d+)$/.exec(raw.trim());
+  if (match === null) {
+    return false;
+  }
+  const host = match[1] ?? match[2] ?? "";
+  const port = Number(match[3]);
+  return (
+    host !== "" &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(host) &&
+    port >= 1 &&
+    port <= 65535
+  );
+}
+
+export type TunnelAuthField =
+  | "allow"
+  | "entries"
+  | "issuer"
+  | "clientId"
+  | "metadataURL"
+  | "smtpAddr"
+  | "from";
+
+export interface TunnelAuthIssue {
+  field: TunnelAuthField;
+  message: string;
+}
+
+/**
+ * What stops the generated command from being run as shown; empty when ready.
+ * The one owner of these rules: the copy gate and the notices next to each
+ * field both render from it.
+ */
+export function validateTunnelAuth(auth: TunnelAuthOptions): TunnelAuthIssue[] {
+  if (auth.method === "none") {
+    return [];
+  }
+  const issues: TunnelAuthIssue[] = [];
+  if (needsAllowlist(auth.method) && auth.allow.length === 0) {
+    issues.push({ field: "allow", message: "Add who may sign in" });
+  }
+  if (auth.method === "oidc") {
+    if (auth.oidcIssuer.trim() === "") {
+      issues.push({ field: "issuer", message: "Add the issuer address" });
+    } else if (!isOIDCIssuer(auth.oidcIssuer)) {
+      issues.push({
+        field: "issuer",
+        message: "The issuer must be an https:// address without a query or fragment",
+      });
+    }
+    if (auth.oidcClientId.trim() === "") {
+      issues.push({ field: "clientId", message: "Add the client ID" });
+    }
+  }
+  if (auth.method === "saml") {
+    if (auth.samlMetadataURL.trim() === "") {
+      issues.push({ field: "metadataURL", message: "Add the metadata address" });
+    } else if (!isSAMLMetadataURL(auth.samlMetadataURL)) {
+      issues.push({
+        field: "metadataURL",
+        message: "The metadata address must be an https:// address without a fragment",
+      });
+    }
+  }
+  if (auth.method === "email") {
+    if (auth.emailSMTPAddr.trim() === "") {
+      issues.push({ field: "smtpAddr", message: "Add the SMTP server" });
+    } else if (!isEmailSMTPAddr(auth.emailSMTPAddr)) {
+      issues.push({
+        field: "smtpAddr",
+        message: "The SMTP server must be host:port, with a port from 1 to 65535",
+      });
+    }
+    if (auth.emailFrom.trim() === "") {
+      issues.push({ field: "from", message: "Add the sender address" });
+    } else if (!isEmailSender(auth.emailFrom)) {
+      issues.push({
+        field: "from",
+        message: "The sender must be one address, such as Portal <login@example.com>",
+      });
+    }
+  }
+  if (auth.allow.some((entry) => !classifyAuthAllow(auth.method, entry).ok)) {
+    issues.push({ field: "entries", message: "Fix the highlighted entries" });
+  }
+  return issues;
+}
+
+/**
+ * Adds typed entries to an allowlist the way the tunnel reads it: emails are
+ * lowercased, the `sub:` prefix is normalized, and entries that name the same
+ * principal are kept once (wallet addresses compare without regard to case).
+ */
+export function addAuthAllow(
+  method: TunnelAuthMethod,
+  current: string[],
+  draft: string
+): string[] {
+  const keyOf = (entry: string) => (method === "siwe" ? entry.toLowerCase() : entry);
+  const next = [...current];
+  const seen = new Set(next.map(keyOf));
+  // The tunnel takes each allowlist value whole, and a link name, a sub: id
+  // or the local part of an email may contain spaces; a wallet address never does.
+  const separator = method === "siwe" ? /[,\s]+/ : /,/;
+  for (const typed of draft.split(separator).map((part) => part.trim())) {
+    if (typed === "") {
+      continue;
+    }
+    const entry = canonicalAuthAllow(method, typed);
+    if (!seen.has(keyOf(entry))) {
+      seen.add(keyOf(entry));
+      next.push(entry);
+    }
+  }
+  return next;
+}
+
+function canonicalAuthAllow(method: TunnelAuthMethod, entry: string): string {
+  if (!needsAllowlist(method)) {
+    return entry;
+  }
+  if (/^sub:/i.test(entry)) {
+    return `sub:${entry.slice("sub:".length)}`;
+  }
+  // Lowercasing maps some non-ASCII letters onto ASCII ones (the Kelvin sign
+  // onto "k"), which would turn a typed lookalike into a different, valid
+  // address; the tunnel refuses such input, so it is kept as typed and flagged.
+  return entry.includes("@") && isASCII(entry) ? entry.toLowerCase() : entry;
+}
+
+/** With names listed, the tunnel lets in only those subjects; with none, any valid one. */
+export function isListedSubject(allow: string[], subject: string): boolean {
+  return allow.length === 0 || allow.includes(subject.trim());
+}
+
+/**
+ * The address at path to register at an identity provider for the short URL
+ * on each relay in the command: the OIDC redirect address, or the SAML ACS or
+ * metadata address. None until the name is known. The gateway builds these
+ * from the host the visitor arrived on, so the address-bound URL Portal
+ * prints, and every relay discovery adds, need their own; those hosts are
+ * known only once Portal prints them.
+ */
+export function buildAuthRedirectURLs(
+  relayUrls: string[],
+  name: string,
+  path: string
+): string[] {
+  const shortURLs = relayUrls
+    .map((relayURL) => buildTunnelPreviewURL(relayURL, name))
+    .filter((url) => url !== "");
+  return [...new Set(shortURLs)].map((url) => `${url}${path}`);
+}
+
+/**
+ * The host a private link is bound to, read from the URL handed to the
+ * visitor the way normalizeHost (sdk/appauth/credential.go) reads
+ * it: an https URL or a bare host, without a path, query or fragment. The URL
+ * parser also drops the `:443` Portal prints, as a browser leaves it out of
+ * the Host it sends. Empty when the address is unusable.
+ */
+export function applicationAuthHost(address: string): string {
+  const raw = address.trim();
+  if (raw === "") {
+    return "";
+  }
+  try {
+    const parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+    const usable =
+      parsed.protocol === "https:" &&
+      parsed.hostname !== "" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.pathname === "/" &&
+      parsed.search === "" &&
+      parsed.hash === "";
+    return usable ? parsed.host.replace(/\.$/, "") : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The command that mints one private link. A link works only on the host it
+ * was issued for, so the host comes from the URL the visitor is sent; empty
+ * until that URL and a subject are usable.
+ */
+export function buildAuthIssueCommand({
+  address,
+  subject,
+  expires,
+  os,
+}: {
+  address: string;
+  subject: string;
+  expires: string;
+  os: TunnelCommandOS;
+}): string {
+  const host = applicationAuthHost(address);
+  const trimmed = subject.trim();
+  if (host === "" || trimmed === "") {
+    return "";
+  }
+  return `portal auth issue ${formatToken(host, os)} --subject ${formatToken(trimmed, os)} --expires ${expires}`;
+}
+
+export function normalizeAbsoluteHTTPURL(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function getRelayOriginHost(origin: string): string {
+  try {
+    const parsed = new URL(origin);
+    return parsed.hostname.trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isLocalRelayOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    return isLocalRelayHostname(parsed.hostname.trim().toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function isLocalRelayHostname(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname.endsWith(".localhost")
+  );
+}
+
+function quoteShellValue(value: string): string {
+  return "'" + value.replace(/'/g, `'"'"'`) + "'";
+}
+
+// PowerShell also reads the typographic quotes U+2018 to U+201B as a single
+// quote, so each of them is doubled like the ASCII one.
+function quotePowerShellValue(value: string): string {
+  return `'${value.replace(/['‘-‛]/g, "$&$&")}'`;
+}
+
+function formatToken(value: string, os: TunnelCommandOS): string {
+  if (/^[A-Za-z0-9:/.=_-]+$/.test(value)) {
+    return value;
+  }
+  return os === "windows" ? quotePowerShellValue(value) : quoteShellValue(value);
+}
+
+function joinTunnelCommand(
+  installLine: string,
+  exposeHead: string,
+  exposeOptions: string[]
+): string {
+  return [installLine, [exposeHead, ...exposeOptions].join(" ")].join("\n");
+}

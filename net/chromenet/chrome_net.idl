@@ -1,0 +1,150 @@
+idl 1;
+
+// chrome_net_server runs Chromium's //net stack (HTTP/1.1, HTTP/2, QUIC/HTTP/3, BoringSSL) in an
+// isolated worker process. Every call below blocks its session thread until the network thread
+// answers; the Go client keeps one request per session.
+@serialize(none)
+service chrome_net;
+
+include "chrome_net.h";
+
+const CHROME_NET_OK: i32 = 0;
+const CHROME_NET_MAX_OPTS: u32 = 65536;
+const CHROME_NET_MAX_HEAD: u32 = 1048576;
+const CHROME_NET_MAX_CHUNK: u32 = 1048576;
+const CHROME_NET_MAX_DATAGRAM: u32 = 65536;
+const CHROME_NET_MAX_REASON: u32 = 1024;
+
+// An engine is one shared URLRequestContext (connection pools, HTTP/2 and QUIC sessions, DNS
+// cache). Engines created with identical options in different sessions share that context.
+@c("chrome_engine_t *")
+handle Engine destroy chrome_engine_destroy;
+
+// A request is one URLRequest. Cancel aborts it with ERR_ABORTED and wakes a blocked call.
+@c("chrome_request_t *")
+@cancel(chrome_request_cancel)
+handle Request owned_by Engine destroy chrome_request_destroy;
+
+// opts holds "key=value" lines: user_agent, accept_language, proxy, quic, http2,
+// force_quic, insecure_skip_verify.
+@error(null)
+fn chrome_engine_create(opts: bytes<=CHROME_NET_MAX_OPTS, opts_len: size @len_of(opts)) -> Engine;
+
+@error(status, ok(CHROME_NET_OK))
+fn chrome_engine_destroy(e: Engine) -> i32;
+
+// head is "METHOD URL\n" followed by "Name: value\n" header lines. body_len is -1 for a chunked
+// body, 0 for no body, or the exact body length.
+@error(null)
+fn chrome_request_start(e: Engine, head: bytes<=CHROME_NET_MAX_HEAD, head_len: size @len_of(head),
+                        body_len: i64) -> Request;
+
+// Appends request body bytes and returns once the network stack consumed them, or the request
+// ended. Returns 0 or a negative net::Error code.
+fn chrome_request_write(r: Request, data: bytes<=CHROME_NET_MAX_CHUNK, data_len: size @len_of(data),
+                        eof: bool) -> i32;
+
+// Waits for the response head and returns 0 or a negative net::Error code. The head is
+// "CODE PROTOCOL REDIRECT\nSTATUS TEXT\n" followed by "Name: value\n" header lines.
+fn chrome_request_wait(r: Request, out head: bytes<=CHROME_NET_MAX_HEAD, head_cap: size @len_of(head),
+                       out head_len: size @len_of(head)) -> i32;
+
+// Reads decoded response body bytes. Sets eof at the end of the body and net_error on failure.
+fn chrome_request_read(r: Request, out buf: bytes<=CHROME_NET_MAX_CHUNK, buf_cap: size @len_of(buf),
+                       out eof: bool, out net_error: i32) -> size @len_of(buf);
+
+@error(status, ok(CHROME_NET_OK))
+fn chrome_request_destroy(r: Request) -> i32;
+
+// Returns the net::Error name of `error`, such as "ERR_NAME_NOT_RESOLVED".
+fn chrome_net_error_name(error: i32) -> str<=128;
+
+// ---- WebSocket -------------------------------------------------------------------------------
+//
+// A WebSocket is a //net WebSocketStream (RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2, RFC 9220
+// over HTTP/3). The handle owns the connection; every other call names it by the `id` that
+// chrome_ws_wait returns, so a reader and a writer can run on different sessions while this one
+// holds the handle. Destroying the handle closes the connection and wakes a blocked reader.
+
+@c("chrome_ws_t *")
+@cancel(chrome_ws_cancel)
+handle Ws owned_by Engine destroy chrome_ws_destroy;
+
+// head is "URL\n" followed by "Name: value\n" header lines. Sec-WebSocket-Protocol lists the
+// requested subprotocols and Origin the origin; both are optional.
+@error(null)
+fn chrome_ws_start(e: Engine, head: bytes<=CHROME_NET_MAX_HEAD, head_len: size @len_of(head)) -> Ws;
+
+// Waits for the opening handshake. On success returns 0 and sets id; head is
+// "CODE SUBPROTOCOL\nName: value\n..." of the 101 response. On failure returns a negative
+// net::Error and head is "CODE\n" with the HTTP status when the server answered, else "0\n".
+fn chrome_ws_wait(w: Ws, out head: bytes<=CHROME_NET_MAX_HEAD, head_cap: size @len_of(head),
+                  out head_len: size @len_of(head), out id: u64) -> i32;
+
+@error(status, ok(CHROME_NET_OK))
+fn chrome_ws_destroy(w: Ws) -> i32;
+
+// Blocks for the next frame. opcode is the RFC 6455 opcode (0 for a continuation); fin is the FIN
+// bit of the last part. A frame larger than buf_cap arrives in parts. Frames are delivered in
+// order, including control frames. When the connection ended and every frame was read, returns 0
+// with a negative net_error.
+fn chrome_ws_read(id: u64, out buf: bytes<=CHROME_NET_MAX_CHUNK, buf_cap: size @len_of(buf),
+                  out opcode: i32, out fin: bool, out net_error: i32) -> size @len_of(buf);
+
+// Sends one frame and returns once the network stack consumed it: 0 or a negative net::Error. One
+// writer at a time.
+fn chrome_ws_write(id: u64, opcode: i32, fin: bool, data: bytes<=CHROME_NET_MAX_CHUNK,
+                   data_len: size @len_of(data)) -> i32;
+
+// ---- WebTransport ----------------------------------------------------------------------------
+//
+// A WebTransport session over HTTP/3 (draft-ietf-webtrans-http3) through //net's
+// WebTransportClient. Like WebSocket, the handle owns the session and the other calls name it by
+// `id`; the Go client keeps one session for events and one for writes.
+
+@c("chrome_wt_t *")
+@cancel(chrome_wt_cancel)
+handle Wt owned_by Engine destroy chrome_wt_destroy;
+
+// head is "URL\n" followed by "Name: value\n" header lines (Origin is optional).
+@error(null)
+fn chrome_wt_start(e: Engine, head: bytes<=CHROME_NET_MAX_HEAD, head_len: size @len_of(head)) -> Wt;
+
+// Waits for the session to open. Returns 0 and sets id, or a negative net::Error. head is
+// "CODE\nName: value\n..." of the CONNECT response.
+fn chrome_wt_wait(w: Wt, out head: bytes<=CHROME_NET_MAX_HEAD, head_cap: size @len_of(head),
+                  out head_len: size @len_of(head), out id: u64) -> i32;
+
+@error(status, ok(CHROME_NET_OK))
+fn chrome_wt_destroy(w: Wt) -> i32;
+
+// Blocks for the next session event. kind: 1 incoming bidirectional stream (stream_id), 2 incoming
+// unidirectional stream (stream_id), 3 datagram (buf), 4 stream data (stream_id, buf, fin),
+// 5 session closed (code, buf is the reason), 6 reset received on a stream (stream_id, code),
+// 7 stop-sending received on a stream (stream_id, code), 8 session error (code is a net::Error).
+// After kind 5 or 8 the call keeps returning that event.
+fn chrome_wt_event(id: u64, out buf: bytes<=CHROME_NET_MAX_CHUNK, buf_cap: size @len_of(buf),
+                   out kind: i32, out stream_id: u64, out fin: bool, out code: u32) -> size @len_of(buf);
+
+// Opens a stream, waiting while the peer's stream limit is reached. 0 or a negative net::Error.
+fn chrome_wt_open_stream(id: u64, bidi: bool, out stream_id: u64) -> i32;
+
+// Queues data on a stream's send side and returns once at most 256 KiB are still waiting for
+// flow control. fin ends the send side after the data.
+fn chrome_wt_stream_write(id: u64, stream_id: u64, data: bytes<=CHROME_NET_MAX_CHUNK,
+                          data_len: size @len_of(data), fin: bool) -> i32;
+
+// mode 1 resets the send side with code, mode 2 sends STOP_SENDING for the receive side.
+fn chrome_wt_stream_abort(id: u64, stream_id: u64, mode: i32, code: u32) -> i32;
+
+// Tells the engine that the caller consumed n received bytes of a stream, which lets it read
+// more from the network (receive window of 1 MiB per stream).
+fn chrome_wt_stream_consume(id: u64, stream_id: u64, n: u32) -> i32;
+
+fn chrome_wt_send_datagram(id: u64, data: bytes<=CHROME_NET_MAX_DATAGRAM, data_len: size @len_of(data)) -> i32;
+
+// The largest datagram the session accepts now, or a negative net::Error.
+fn chrome_wt_max_datagram(id: u64) -> i64;
+
+// Closes the session with an application error code and reason.
+fn chrome_wt_close(id: u64, code: u32, reason: str<=CHROME_NET_MAX_REASON) -> i32;

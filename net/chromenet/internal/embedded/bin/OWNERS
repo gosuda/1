@@ -1,0 +1,4 @@
+# The mirror's release.yml and chromium.yml commit the chrome_net_server binaries as a bot. The grant
+# is per file and lets that bot land its own push inbound; everything else here inherits the parent
+# owners.
+per-file chrome_net_server_*=@github-actions[bot]
