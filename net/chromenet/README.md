@@ -85,8 +85,8 @@ CI runs only on this repository:
 | Workflow | Does |
 |:---|:---|
 | [`engine.yml`](.github/workflows/engine.yml) | Builds all six engines and runs the Go tests against them on each platform. |
-| [`chromium.yml`](.github/workflows/chromium.yml) | Every six hours, pins a new Chromium Stable release (`engine.py pin --version latest-stable`) on a `chromium/<version>` branch and runs `engine.yml` on it. Once all six engines build and pass the tests, it attests them and pushes the pins, the binaries, `hashes.go` and the license texts to `main` as one commit. |
-| [`release.yml`](.github/workflows/release.yml) | On a tag, builds the engines, attests their provenance, commits them with `internal/embedded/hashes.go` and publishes a release. |
+| [`chromium.yml`](.github/workflows/chromium.yml) | Every six hours, pins a new Chromium Stable release (`engine.py pin --version latest-stable`) on a `chromium/<version>` branch and runs `engine.yml` on it. Once all six engines build and pass the tests, it attests them, pushes the pins, binaries, `hashes.go` and license texts to `main`, tags the next release (`engine.py release-tag`) and publishes a GitHub release. |
+| [`release.yml`](.github/workflows/release.yml) | On a tag or manual dispatch, builds the engines, attests their provenance, commits them with `internal/embedded/hashes.go` and publishes a release. |
 
 Both bot commits reach gosuda/0 on their own: the monorepo's `OWNERS` grant `github-actions[bot]` exactly the files they write (`third_party/chromium/{VERSION,SHA256}`, `third_party/chromium/notices/*.txt`, `internal/embedded/hashes.go`, `internal/embedded/bin/chrome_net_server_*`). A change to anything else, such as `WINSDK` or `patches/`, still needs an owner.
 

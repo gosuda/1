@@ -13,8 +13,10 @@ xwin fetches from Microsoft. A download that does not match its pin stops the bu
       sysroots and the Windows SDK the targets need.
   engine.py build     --work DIR --target T --hqq HQQ_C_DIR --out FILE
       Copies engine/ and the HQQ C runtime into //third_party/chromenet and builds the target.
-  engine.py pin       --version V
+  engine.py pin         --version V
       Rewrites VERSION and SHA256 for Chromium release V (used by the upstream tracker).
+  engine.py release-tag [--chromium V]
+      Prints the next Go semver release tag (e.g. v0.2.101570810307800) from existing git tags.
 
 Targets: linux-amd64, linux-arm64, windows-amd64, windows-arm64 (Linux x86-64 host) and
 darwin-arm64, darwin-amd64 (macOS arm64 host).
@@ -665,6 +667,65 @@ def cmd_pin(args):
     print(version)
 
 
+# release-tag -----------------------------------------------------------------------------------
+
+RELEASE_TAG_RE = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+
+
+def encode_chromium_version(version, rev=0):
+    m = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)\.(\d+)', version)
+    if not m:
+        die('bad Chromium version %r' % version)
+    major, minor, build, patch = (int(g) for g in m.groups())
+    if minor != 0:
+        die('unsupported non-zero Chromium minor version in %s' % version)
+    if not (0 <= major <= 9999):
+        die('Chromium major out of range in %s' % version)
+    if not (0 <= build <= 99999):
+        die('Chromium build out of range in %s' % version)
+    if not (0 <= patch <= 999):
+        die('Chromium patch out of range in %s' % version)
+    if not (0 <= rev <= 99):
+        die('release revision out of range: %d' % rev)
+    # Fixed-width 15-digit encoding: 1 + major(4) + build(5) + patch(3) + rev(2).
+    # Strictly greater than earlier 14-digit tags (e.g. 10157081033800) and monotonic across
+    # 3-digit patches (e.g. .105) and major/build rollovers.
+    return '1%04d%05d%03d%02d' % (major, build, patch, rev)
+
+
+def next_release_tag(chromium_version, existing_tags):
+    parsed = []
+    for tag in existing_tags:
+        m = RELEASE_TAG_RE.fullmatch(tag.strip())
+        if m:
+            parsed.append(tuple(int(g) for g in m.groups()))
+    if parsed:
+        api_major, api_minor = max((maj, min_) for maj, min_, _ in parsed)
+        max_patch = max(pat for maj, min_, pat in parsed if (maj, min_) == (api_major, api_minor))
+    else:
+        api_major, api_minor = 0, 1
+        max_patch = -1
+
+    base_str = encode_chromium_version(chromium_version, rev=0)
+    base_patch = int(base_str)
+    if base_patch > max_patch:
+        return 'v%d.%d.%s' % (api_major, api_minor, base_str)
+
+    max_patch_str = str(max_patch)
+    if len(max_patch_str) == len(base_str) and max_patch_str[:-2] == base_str[:-2]:
+        rev = (max_patch % 100) + 1
+        return 'v%d.%d.%s' % (api_major, api_minor, encode_chromium_version(chromium_version, rev=rev))
+
+    die('encoded version %d is not greater than existing tag v%d.%d.%d' % (
+        base_patch, api_major, api_minor, max_patch))
+
+
+def cmd_release_tag(args):
+    version = args.chromium or read_keyvals(os.path.join(PIN_DIR, 'VERSION'))['version']
+    out = subprocess.check_output(['git', 'tag', '-l', 'v*.*.*'], cwd=ROOT, text=True)
+    print(next_release_tag(version, out.splitlines()))
+
+
 def parse_targets(spec):
     targets = [t for t in spec.split(',') if t]
     for t in targets:
@@ -692,8 +753,11 @@ def main():
     b.add_argument('--jobs', type=int, default=0)
     n = sub.add_parser('pin')
     n.add_argument('--version', required=True, help='a Chromium version or latest-stable')
+    r = sub.add_parser('release-tag')
+    r.add_argument('--chromium', default='', help='Chromium version (default: third_party/chromium/VERSION)')
     args = p.parse_args()
-    {'fetch': cmd_fetch, 'toolchain': cmd_toolchain, 'build': cmd_build, 'pin': cmd_pin}[args.cmd](args)
+    {'fetch': cmd_fetch, 'toolchain': cmd_toolchain, 'build': cmd_build, 'pin': cmd_pin,
+     'release-tag': cmd_release_tag}[args.cmd](args)
 
 
 if __name__ == '__main__':

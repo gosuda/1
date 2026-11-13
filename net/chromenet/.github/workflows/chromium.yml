@@ -4,10 +4,11 @@ name: Track Chromium
 #   1. pin: rewrites third_party/chromium with `engine.py pin` and pushes the commit to
 #      chromium/<version>;
 #   2. engine: builds and tests all six engines from that branch (engine.yml);
-#   3. promote: attests the six engines that step 2 built and tested, pins them in
-#      internal/embedded (binaries, hashes.go) with their license texts, and pushes the pins and
-#      the binaries to main as one commit. The bot owns exactly those files in gosuda/0 (per-file
-#      OWNERS), so the lander lands the push into the monorepo tree.
+#   3. promote: attests the six engines that step 2 built and tested, computes the next Go
+#      semver tag (`engine.py release-tag`), pins them in internal/embedded (binaries, hashes.go)
+#      with their license texts, pushes the pins and binaries to main as one commit, tags the
+#      commit, and publishes the GitHub release. The bot owns exactly those files in gosuda/0
+#      (per-file OWNERS), so the lander lands the push into the monorepo tree.
 
 on:
   schedule:
@@ -76,6 +77,7 @@ jobs:
         with:
           ref: ${{ needs.pin.outputs.branch }}
           fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-go@v6.4.0
         with:
           go-version: '1.27.3'
@@ -89,23 +91,36 @@ jobs:
         uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-path: 'dist/chrome_net_server_*'
-      - name: Push the pins and the engines to main as one commit
+      - name: Push pins, tag, and publish GitHub release
         env:
           BRANCH: ${{ needs.pin.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch origin main
+          git fetch origin main --tags
           if ! git merge-base --is-ancestor origin/main HEAD; then
             echo "main moved since the pin was made; rerun this workflow" >&2
             exit 1
           fi
           chromium=$(sed -n 's/^version=//p' third_party/chromium/VERSION)
-          scripts/engine/pin-embedded.sh dist "chromium-$chromium" "$chromium"
+          tag=$(python3 scripts/engine/engine.py release-tag --chromium "$chromium")
+          (cd dist && sha256sum chrome_net_server_* | sort -k2 > SHA256SUMS)
+          cat dist/SHA256SUMS
+          scripts/engine/pin-embedded.sh dist "$tag" "$chromium"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git reset --soft origin/main
           git add third_party/chromium internal/embedded
-          git commit -m "net/chromenet: update to Chromium $chromium" \
+          git commit -m "net/chromenet: update to Chromium $chromium ($tag)" \
             -m "Pins the Chromium $chromium source archive and toolchains, and embeds the six chrome_net_server binaries built and tested from them."
           git push origin "HEAD:refs/heads/main"
           git push origin --delete "$BRANCH"
+          target=$(git rev-parse HEAD)
+          git tag "$tag" "$target"
+          git push origin "refs/tags/$tag"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$target" \
+              --title "$tag" --generate-notes
+          fi
