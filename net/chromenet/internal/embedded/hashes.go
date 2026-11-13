@@ -6,7 +6,7 @@ import "gosuda.org/hqq/secureexec"
 
 const (
 	// Version is the release that built the embedded binaries.
-	Version = "chromium-157.0.8103.78"
+	Version = "v0.2.101570810307800"
 	// ChromiumVersion is the Chromium release whose network stack they contain.
 	ChromiumVersion = "157.0.8103.78"
 )
