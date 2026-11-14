@@ -1,0 +1,30 @@
+go 1.27.3
+toolchain go1.27.3
+
+use (
+	./ai/jimin
+	./corp/rivulet
+	./crypto/keyless_tls
+	./crypto/randflake
+	./crypto/x402-facilitator
+	./crypto/x402-facilitator/cmd
+	./crypto/x402-facilitator/scheme/evm
+	./ipc/hqq/HQQ
+	./ipc/hqq/hqq-sqlite3
+	./ipc/hqq/hqq-zstd
+	./net/autoirc2p
+	./net/chromenet
+	./net/grt
+	./net/ivnp
+	./net/portal-tunnel
+	./net/portalite
+	./storage/supersql
+	./web/flats-md
+	./web/gosuda
+	./web/securl
+	./web/telemetry
+)
+
+replace github.com/gosuda/x402-facilitator v0.0.5 => ./crypto/x402-facilitator
+
+replace github.com/gosuda/x402-facilitator/scheme/evm v0.0.1 => ./crypto/x402-facilitator/scheme/evm

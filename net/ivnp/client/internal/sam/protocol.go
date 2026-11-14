@@ -1,0 +1,707 @@
+package sam
+
+import (
+	"cmp"
+	"context"
+	"encoding/base32"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"gosuda.org/ivnp/dataplane"
+	"gosuda.org/ivnp/foundation"
+	"gosuda.org/ivnp/interfaces/destination"
+	"gosuda.org/ivnp/internal/ingress"
+)
+
+func (s *Server) dispatch(ctx context.Context, connection *serverConnection, cmd command) (bool, error) {
+	if cmd.verb == "PING" {
+		suffix := ""
+		if cmd.argument != "" {
+			suffix = " " + cmd.argument
+		}
+		return false, connection.writeLine("PONG" + suffix)
+	}
+	if cmd.verb == "PONG" {
+		return false, nil
+	}
+	if cmd.verb == "QUIT" || cmd.verb == "STOP" || cmd.verb == "EXIT" {
+		return true, nil
+	}
+	switch cmd.verb + " " + cmd.subverb {
+	case "DEST GENERATE":
+		if connection.root != nil {
+			return false, connection.writeLine("DEST REPLY RESULT=I2P_ERROR MESSAGE=SESSION_ACTIVE")
+		}
+		if !onlyOptions(cmd.values, "SIGNATURE_TYPE") {
+			return false, connection.writeLine("DEST REPLY RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+		}
+		signatureType := cmd.values["SIGNATURE_TYPE"]
+		var local *foundation.LocalDestination
+		var err error
+		switch {
+		case signatureType == "" || signatureType == "7" || strings.EqualFold(signatureType, "EdDSA_SHA512_Ed25519"):
+			local, err = foundation.GenerateLegacyLocalDestination()
+		case signatureType == "11" || strings.EqualFold(signatureType, "RedDSA_SHA512_Ed25519"):
+			local, err = foundation.GenerateEncryptedLocalDestination()
+		default:
+			return false, connection.writeLine("DEST REPLY RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_SIGNATURE_TYPE")
+		}
+		if err != nil {
+			return false, connection.writeLine("DEST REPLY RESULT=I2P_ERROR")
+		}
+		private, err := encodePrivateDestination(local)
+		public := local.Destination()
+		local.ReleaseSensitive()
+		if err != nil {
+			return false, connection.writeLine("DEST REPLY RESULT=I2P_ERROR")
+		}
+		defer clear(private)
+		return false, connection.writeLine("DEST REPLY PUB=" + string(public) + " PRIV=" + string(private))
+	case "NAMING LOOKUP":
+		if !onlyOptions(cmd.values, "NAME") {
+			return false, connection.writeLine("NAMING REPLY RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+		}
+		name := cmd.values["NAME"]
+		if strings.EqualFold(name, "ME") && connection.root != nil {
+			return false, connection.writeLine("NAMING REPLY RESULT=OK NAME=ME VALUE=" + string(connection.root.endpoint.Destination()))
+		}
+		if name == "" || s.config.Resolver == nil {
+			return false, connection.writeLine("NAMING REPLY RESULT=KEY_NOT_FOUND NAME=" + quoteToken(name))
+		}
+		value, err := s.config.Resolver.ResolveDestination(ctx, name)
+		if err != nil {
+			return false, connection.writeLine("NAMING REPLY RESULT=KEY_NOT_FOUND NAME=" + quoteToken(name))
+		}
+		return false, connection.writeLine("NAMING REPLY RESULT=OK NAME=" + quoteToken(name) + " VALUE=" + value)
+	case "SESSION CREATE":
+		return false, s.createSession(ctx, connection, cmd)
+	case "SESSION ADD":
+		return false, s.addSubsession(connection, cmd)
+	case "SESSION REMOVE":
+		return false, s.removeSubsession(connection, cmd)
+	case "STREAM CONNECT", "STREAM ACCEPT", "STREAM FORWARD":
+		return s.handleStream(connection, cmd)
+	case "DATAGRAM SEND", "RAW SEND":
+		return false, s.handleSend(connection, cmd)
+	case "PING PONG":
+		return false, connection.writeLine("PONG")
+	case "QUIT STOP", "QUIT EXIT":
+		return true, nil
+	default:
+		return false, connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_COMMAND")
+	}
+}
+
+func (s *Server) createSession(ctx context.Context, connection *serverConnection, cmd command) error {
+	if !onlyOptions(cmd.values, "ID", "STYLE", "DESTINATION", "IVNP_PREPARE", "PORT", "HOST", "FROM_PORT", "TO_PORT", "PROTOCOL", "HEADER", "SIGNATURE_TYPE", "I2CP.LEASESETTYPE", "I2CP.LEASESETENCTYPE", "I2CP.LEASESETAUTHTYPE", "I2CP.LEASESETSECRET", "I2CP.LEASESETCLIENT.*") {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+	}
+	if connection.root != nil {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=SESSION_ACTIVE")
+	}
+	id := cmd.values["ID"]
+	if !validID(id) {
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_ID")
+	}
+	style, ok := parseStyle(cmd.values["STYLE"])
+	if !ok {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_STYLE")
+	}
+	target, preparationRequested := cmd.values["IVNP_PREPARE"]
+	if preparationRequested && !validPreparationTarget(target) {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=INVALID_OPTION")
+	}
+	fromPort, toPort, listenPort, protocol, listenProtocol, rawHeader, udpTarget, err := s.sessionTransport(connection, style, cmd.values, false)
+	if err != nil {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=INVALID_OPTION")
+	}
+	policy, err := sessionPolicy(cmd.values)
+	if err != nil {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+	}
+	defer clearLeaseSetPolicy(&policy)
+	var local *foundation.LocalDestination
+	destinationValue := cmd.values["DESTINATION"]
+	if destinationValue == "" || strings.EqualFold(destinationValue, "TRANSIENT") {
+		signatureType := cmd.values["SIGNATURE_TYPE"]
+		switch {
+		case signatureType == "":
+		case (signatureType == "7" || strings.EqualFold(signatureType, "EdDSA_SHA512_Ed25519")) && !policy.Encrypted:
+		case (signatureType == "11" || strings.EqualFold(signatureType, "RedDSA_SHA512_Ed25519")) && policy.Encrypted:
+		default:
+			return connection.writeLine("SESSION STATUS RESULT=INVALID_KEY")
+		}
+		if policy.Encrypted {
+			local, err = foundation.GenerateEncryptedLocalDestination()
+		} else {
+			local, err = foundation.GenerateLegacyLocalDestination()
+		}
+	} else {
+		if cmd.values["SIGNATURE_TYPE"] != "" {
+			return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+		}
+		local, err = decodePrivateDestination(destinationValue)
+	}
+	if err != nil {
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_KEY")
+	}
+	var offline *foundation.OfflineSignature
+	if meta, ok := local.OfflineSignature(); ok {
+		meta := meta
+		offline = &meta
+	}
+	if offline != nil {
+		// Blinding an encrypted LeaseSet requires the long-term signing private
+		// key, which an offline destination does not hold, and the legacy
+		// Datagram1 wire format cannot carry the offline signature section
+		// receivers need to verify against the transient key.
+		if policy.Encrypted || style == styleDatagram {
+			local.ReleaseSensitive()
+			return connection.writeLine("SESSION STATUS RESULT=INVALID_KEY")
+		}
+	}
+	private, err := encodePrivateDestination(local)
+	if err != nil {
+		local.ReleaseSensitive()
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_KEY")
+	}
+	defer clear(private)
+	endpoint, err := s.config.Controller.CreateDestination(ctx, destination.DestinationSpec{Local: local, Policy: policy})
+	local.ReleaseSensitive()
+	clearLeaseSetPolicy(&policy)
+	if err != nil {
+		result := "I2P_ERROR"
+		if strings.Contains(err.Error(), "already exists") {
+			result = "DUPLICATED_DEST"
+		}
+		return connection.writeLine("SESSION STATUS RESULT=" + result)
+	}
+	ready, hasReadiness := endpoint.(destination.ReadyDestinationEndpoint)
+	if hasReadiness || preparationRequested {
+		readyCtx, cancel := context.WithTimeout(ctx, s.config.ReadinessTimeout)
+		err = waitReadyConnection(readyCtx, connection, sessionReadiness{server: s, endpoint: endpoint, ready: ready, target: target})
+		cancel()
+		if err != nil {
+			cleanupErr := s.destroyDestination(endpoint)
+			if errors.Is(err, net.ErrClosed) {
+				return errors.Join(err, cleanupErr)
+			}
+			return errors.Join(connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=SESSION_NOT_READY"), cleanupErr)
+		}
+	}
+	root := newRootSession(s, id, style, endpoint, connection, fromPort, toPort, listenPort, protocol, listenProtocol, rawHeader, udpTarget, offline)
+	if err = s.addRoot(root); err != nil {
+		cleanupErr := s.destroyDestination(endpoint)
+		result := "I2P_ERROR"
+		if err.Error() == "DUPLICATED_ID" {
+			result = "DUPLICATED_ID"
+		}
+		if err.Error() == "DUPLICATED_DEST" {
+			result = "DUPLICATED_DEST"
+		}
+		return errors.Join(connection.writeLine("SESSION STATUS RESULT="+result), cleanupErr)
+	}
+	connection.root = root
+	if isDatagramStyle(style) {
+		err = root.startReceiver(destination.DestinationRoute{Protocol: protocol, ToPort: listenPort}, s.config.SessionQueue)
+	}
+	if style == styleRaw {
+		err = root.startReceiver(destination.DestinationRoute{Protocol: listenProtocol, ToPort: listenPort}, s.config.SessionQueue)
+	}
+	if err != nil {
+		connection.root = nil
+		cleanupErr := root.close()
+		return errors.Join(connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=ROUTE_UNAVAILABLE"), cleanupErr)
+	}
+	return connection.writeLine("SESSION STATUS RESULT=OK DESTINATION=" + string(private))
+}
+
+type sessionReadiness struct {
+	server   *Server
+	endpoint destination.DestinationEndpoint
+	ready    destination.ReadyDestinationEndpoint
+	target   string
+}
+
+func (r sessionReadiness) WaitReady(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if r.ready == nil {
+		return ctx.Err()
+	}
+	var preparationDone chan struct{}
+	if prepare, ok := r.endpoint.(destination.PreparingDestinationEndpoint); ok && r.target != "" {
+		preparationDone = make(chan struct{})
+		go func() {
+			defer close(preparationDone)
+			target, err := r.server.resolveTarget(ctx, r.target)
+			if err != nil {
+				return
+			}
+			hash, err := preparationTargetHash(target)
+			if err == nil {
+				// A remote lookup miss must not discard a usable local destination.
+				_ = prepare.PrepareDestination(ctx, hash)
+			}
+		}()
+	}
+	err := errors.Join(r.ready.WaitReady(ctx), ctx.Err())
+	cancel()
+	if preparationDone != nil {
+		<-preparationDone
+	}
+	return err
+}
+
+func preparationTargetHash(target string) (foundation.Hash, error) {
+	var hash foundation.Hash
+	if encoded, ok := strings.CutSuffix(strings.ToLower(target), ".b32.i2p"); ok {
+		decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(encoded))
+		if err != nil || len(decoded) != len(hash) {
+			return hash, ErrAddress
+		}
+		copy(hash[:], decoded)
+		return hash, nil
+	}
+	identity, err := foundation.ParseDestination([]byte(target))
+	if err != nil {
+		return hash, ErrAddress
+	}
+	return identity.Hash(), nil
+}
+
+func validPreparationTarget(target string) bool {
+	if target == "" || len(target) > 4096 || strings.ContainsAny(target, " \t\r\n:\"\\") {
+		return false
+	}
+	if _, err := preparationTargetHash(target); err == nil {
+		return true
+	}
+	hostname := strings.ToLower(target)
+	if strings.HasSuffix(hostname, ".b32.i2p") || len(hostname) > 253 || !strings.HasSuffix(hostname, ".i2p") {
+		return false
+	}
+	for _, label := range strings.Split(hostname, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			letter := c >= 'a' && c <= 'z'
+			digit := c >= '0' && c <= '9'
+			if !letter && !digit && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+func waitReadyConnection(parent context.Context, connection *serverConnection, ready destination.ReadyDestinationEndpoint) error {
+	ctx, stopWatching := watchConnection(parent, connection)
+	defer stopWatching()
+	readyErr := ready.WaitReady(ctx)
+	if err := stopWatching(); err != nil {
+		return err
+	}
+	return readyErr
+}
+
+// watchConnection owns reader until stopWatching joins it. Pipelined bytes stay
+// in the command buffer for the next command or stream relay.
+func watchConnection(parent context.Context, connection *serverConnection) (context.Context, func() error) {
+	ctx, cancel := context.WithCancelCause(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	interrupted := make(chan struct{})
+	interrupt := context.AfterFunc(ctx, func() {
+		_ = connection.SetReadDeadline(time.Now())
+		close(interrupted)
+	})
+	go func() {
+		defer close(done)
+		defer func() {
+			if value := recover(); value != nil {
+				cancel(ingress.Report(value, connection.panicReporter, ingress.BoundarySAMWorker, connection.RemoteAddr()))
+			}
+		}()
+		for {
+			if connection.reader.Buffered() == connection.reader.Size() {
+				// A full pipeline applies bounded backpressure. EOF behind unread
+				// data is observable only after handoff; the context bounds the wait.
+				select {
+				case <-stop:
+				case <-ctx.Done():
+				}
+				return
+			}
+			_, err := connection.reader.Peek(connection.reader.Buffered() + 1)
+			if err == nil {
+				continue
+			}
+			select {
+			case <-stop:
+				if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+					return
+				}
+			default:
+			}
+			cancel(net.ErrClosed)
+			return
+		}
+	}()
+	return ctx, sync.OnceValue(func() error {
+		close(stop)
+		_ = connection.SetReadDeadline(time.Now())
+		<-done
+		err := context.Cause(ctx)
+		cancel(context.Canceled)
+		if !interrupt() {
+			<-interrupted
+		}
+		_ = connection.SetReadDeadline(connection.commandDeadline)
+		return err
+	})
+}
+
+func (s *Server) addSubsession(connection *serverConnection, cmd command) error {
+	if !onlyOptions(cmd.values, "ID", "STYLE", "PORT", "HOST", "FROM_PORT", "TO_PORT", "PROTOCOL", "LISTEN_PORT", "LISTEN_PROTOCOL", "HEADER") {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+	}
+	root := connection.root
+	if root == nil || root.style != stylePrimary {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=NOT_PRIMARY")
+	}
+	id := cmd.values["ID"]
+	if !validID(id) {
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_ID")
+	}
+	style, ok := parseStyle(cmd.values["STYLE"])
+	if !ok || style == stylePrimary {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_STYLE")
+	}
+	if root.offline != nil && style == styleDatagram {
+		// Same restriction as createSession: Datagram1 cannot carry the
+		// offline signature section, so peers would drop every packet.
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_KEY")
+	}
+	fromPort, toPort, listenPort, protocol, listenProtocol, rawHeader, udpTarget, err := s.sessionTransport(connection, style, cmd.values, true)
+	if err != nil {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=INVALID_OPTION")
+	}
+	ctx, cancel := context.WithCancel(root.ctx)
+	child := &samSession{server: s, root: root, id: id, style: style, endpoint: root.endpoint, control: connection, ctx: ctx, cancel: cancel, sourceIP: root.sourceIP, fromPort: fromPort, toPort: toPort, listenPort: listenPort, protocol: protocol, listenProtocol: listenProtocol, rawHeader: rawHeader, udpTarget: udpTarget, now: root.now, children: make(map[string]*samSession), attachments: make(map[net.Conn]struct{}), queueBytes: newByteBudget(s.config.MaxSessionQueueBytes), acceptRequests: make(chan acceptRequest, s.config.SessionQueue)}
+	child.datagramOverhead = datagramOverhead(protocol, root.endpoint, root.offline)
+	if err = s.addChild(child); err != nil {
+		cancel()
+		return connection.writeLine("SESSION STATUS RESULT=DUPLICATED_ID")
+	}
+	root.mu.Lock()
+	root.children[id] = child
+	root.mu.Unlock()
+	if isDatagramStyle(style) {
+		err = child.startReceiver(destination.DestinationRoute{Protocol: protocol, ToPort: listenPort}, s.config.SessionQueue)
+	}
+	if style == styleRaw {
+		err = child.startReceiver(destination.DestinationRoute{Protocol: listenProtocol, ToPort: listenPort}, s.config.SessionQueue)
+	}
+	if err != nil {
+		_ = root.removeChild(id)
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=ROUTE_UNAVAILABLE")
+	}
+	return connection.writeLine("SESSION STATUS RESULT=OK")
+}
+func (s *Server) removeSubsession(connection *serverConnection, cmd command) error {
+	if !onlyOptions(cmd.values, "ID") {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=UNSUPPORTED_OPTIONS")
+	}
+	root := connection.root
+	if root == nil || root.style != stylePrimary {
+		return connection.writeLine("SESSION STATUS RESULT=I2P_ERROR MESSAGE=NOT_PRIMARY")
+	}
+	if err := root.removeChild(cmd.values["ID"]); err != nil {
+		return connection.writeLine("SESSION STATUS RESULT=INVALID_ID")
+	}
+	return connection.writeLine("SESSION STATUS RESULT=OK")
+}
+
+func parseStyle(value string) (sessionStyle, bool) {
+	switch sessionStyle(strings.ToUpper(value)) {
+	case styleStream, styleDatagram, styleDatagram2, styleDatagram3, styleRaw, stylePrimary:
+		return sessionStyle(strings.ToUpper(value)), true
+	}
+	return "", false
+}
+func validID(id string) bool {
+	if id == "" || len(id) > 255 {
+		return false
+	}
+	for i := range len(id) {
+		c := id[i]
+		if c < 0x21 || c > 0x7e || c == '=' || c == '"' {
+			return false
+		}
+	}
+	return true
+}
+
+func onlyOptions(values map[string]string, allowed ...string) bool {
+	for key := range values {
+		found := false
+		for _, candidate := range allowed {
+			if key == candidate || (strings.HasSuffix(candidate, "*") && strings.HasPrefix(key, strings.TrimSuffix(candidate, "*"))) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+func reservedRawProtocol(protocol uint8) bool {
+	return protocol == 0 || protocol == 6 || protocol == 17 || protocol == 19 || protocol == 20
+}
+func quoteToken(value string) string { return fmt.Sprintf("%q", value) }
+
+func sessionPolicy(values map[string]string) (destination.LeaseSetPolicy, error) {
+	policy := destination.LeaseSetPolicy{CryptoTypes: []uint16{7, 6, 4}}
+	if value := values["I2CP.LEASESETTYPE"]; value != "" {
+		switch value {
+		case "3":
+		case "5":
+			policy.Encrypted = true
+		default:
+			return policy, ErrUnsupported
+		}
+	}
+	if value := values["I2CP.LEASESETENCTYPE"]; value != "" {
+		parts := strings.Split(value, ",")
+		if len(parts) == 0 || len(parts) > 3 {
+			return policy, ErrUnsupported
+		}
+		types := make([]uint16, 0, len(parts))
+		seen := make(map[uint16]bool, len(parts))
+		for _, part := range parts {
+			parsed, err := strconv.ParseUint(part, 10, 16)
+			cryptoType := uint16(parsed)
+			sessionPolicyRejected := err != nil || (cryptoType != 7 && cryptoType != 6 && cryptoType != 4)
+			if !sessionPolicyRejected {
+				sessionPolicyRejected = seen[cryptoType]
+			}
+			if sessionPolicyRejected {
+				return policy, ErrUnsupported
+			}
+			seen[cryptoType] = true
+			types = append(types, cryptoType)
+		}
+		policy.CryptoTypes = types
+	}
+	authType := values["I2CP.LEASESETAUTHTYPE"]
+	switch authType {
+	case "", "0":
+	case "1", "2":
+		policy.Encrypted = true
+		keys := make([]string, 0)
+		for key := range values {
+			if strings.HasPrefix(key, "I2CP.LEASESETCLIENT.") {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			encoded := values[key]
+			raw, err := foundation.DecodeI2PBase64([]byte(encoded))
+			if err != nil || len(raw) != 32 {
+				clear(raw)
+				return policy, ErrUnsupported
+			}
+			var client [32]byte
+			copy(client[:], raw)
+			clear(raw)
+			if authType == "1" {
+				policy.DHClients = append(policy.DHClients, client)
+			} else {
+				policy.PSKClients = append(policy.PSKClients, client)
+			}
+		}
+		if len(policy.DHClients)+len(policy.PSKClients) == 0 {
+			return policy, ErrUnsupported
+		}
+	default:
+		return policy, ErrUnsupported
+	}
+	if secret := values["I2CP.LEASESETSECRET"]; secret != "" {
+		policy.Encrypted = true
+		policy.Secret = []byte(secret)
+	}
+	return policy, nil
+}
+
+type sessionTransportConfig struct {
+	fromPort       uint16
+	toPort         uint16
+	listenPort     uint16
+	protocol       uint8
+	listenProtocol uint8
+	rawHeader      bool
+	udpTarget      *net.UDPAddr
+}
+
+func (s *Server) sessionTransport(connection *serverConnection, style sessionStyle, values map[string]string, child bool) (fromPort, toPort, listenPort uint16, protocol, listenProtocol uint8, rawHeader bool, udpTarget *net.UDPAddr, err error) {
+	fromRaw, fromErr := uintValue(values, "FROM_PORT", 16, 0)
+	toRaw, toErr := uintValue(values, "TO_PORT", 16, 0)
+	if fromErr != nil || toErr != nil {
+		return 0, 0, 0, 0, 0, false, nil, ErrProtocol
+	}
+	config := sessionTransportConfig{fromPort: uint16(fromRaw), toPort: uint16(toRaw)}
+	switch style {
+	case styleStream:
+		err = s.configureStreamTransport(&config, values, child)
+	case styleDatagram, styleDatagram2, styleDatagram3, styleRaw:
+		err = s.configurePacketTransport(connection, &config, style, values, child)
+	case stylePrimary:
+		if child || values["PORT"] != "" || values["HOST"] != "" || values["HEADER"] != "" || values["PROTOCOL"] != "" {
+			err = ErrProtocol
+		}
+	default:
+		err = ErrProtocol
+	}
+	return config.fromPort, config.toPort, config.listenPort, config.protocol, config.listenProtocol, config.rawHeader, config.udpTarget, err
+}
+
+func (s *Server) configureStreamTransport(config *sessionTransportConfig, values map[string]string, child bool) error {
+	config.protocol, config.listenProtocol = 6, 6
+	config.listenPort = config.toPort
+	if child {
+		listenRaw, err := uintValue(values, "LISTEN_PORT", 16, uint64(config.fromPort))
+		if err != nil || (listenRaw != 0 && listenRaw != uint64(config.fromPort)) {
+			return ErrProtocol
+		}
+		config.listenPort = uint16(listenRaw)
+	}
+	if values["HOST"] != "" || values["HEADER"] != "" || values["PROTOCOL"] != "" || values["LISTEN_PROTOCOL"] != "" {
+		return ErrProtocol
+	}
+	portValue, exists := values["PORT"]
+	if !exists {
+		return nil
+	}
+	if s.config.UDPAddress != "" {
+		return ErrProtocol
+	}
+	portRaw, err := uintValue(values, "PORT", 16, 0)
+	if err != nil || portValue == "" {
+		return ErrProtocol
+	}
+	config.listenPort = uint16(portRaw)
+	return nil
+}
+
+func (s *Server) configurePacketTransport(connection *serverConnection, config *sessionTransportConfig, style sessionStyle, values map[string]string, child bool) error {
+	if isDatagramStyle(style) {
+		config.protocol = datagramStyleProtocol(style)
+		config.listenProtocol = config.protocol
+		if values["PROTOCOL"] != "" || values["HEADER"] != "" || values["LISTEN_PROTOCOL"] != "" {
+			return ErrProtocol
+		}
+	} else {
+		protocolRaw, err := uintValue(values, "PROTOCOL", 8, uint64(dataplane.DatagramProtocolRaw))
+		if err != nil || reservedRawProtocol(uint8(protocolRaw)) {
+			return ErrProtocol
+		}
+		config.protocol = uint8(protocolRaw)
+		config.listenProtocol = config.protocol
+		config.rawHeader, err = boolValue(values, "HEADER")
+		if err != nil {
+			return err
+		}
+	}
+	config.listenPort = config.fromPort
+	if child {
+		listenRaw, err := uintValue(values, "LISTEN_PORT", 16, uint64(config.fromPort))
+		if err != nil {
+			return ErrProtocol
+		}
+		config.listenPort = uint16(listenRaw)
+		if style == styleRaw {
+			listenProtocolRaw, err := uintValue(values, "LISTEN_PROTOCOL", 8, uint64(config.protocol))
+			if err != nil || reservedRawProtocol(uint8(listenProtocolRaw)) {
+				return ErrProtocol
+			}
+			config.listenProtocol = uint8(listenProtocolRaw)
+		}
+	}
+	return s.configurePacketTarget(connection, config, values)
+}
+
+func (s *Server) configurePacketTarget(connection *serverConnection, config *sessionTransportConfig, values map[string]string) error {
+	portText, exists := values["PORT"]
+	if !exists {
+		if values["HOST"] != "" {
+			return ErrProtocol
+		}
+		return nil
+	}
+	portRaw, err := uintValue(values, "PORT", 16, 0)
+	if err != nil || portRaw == 0 || portText == "" {
+		return ErrProtocol
+	}
+	if s.config.UDPAddress == "" && values["HOST"] == "" {
+		// Compatibility for an explicitly TCP-only bridge: historical
+		// ivnp used PORT as the incoming I2P route selector.
+		config.listenPort = uint16(portRaw)
+		return nil
+	}
+	source := connectionIP(connection.Conn)
+	if !source.IsValid() {
+		return ErrProtocol
+	}
+	host := cmp.Or(values["HOST"], source.String())
+	if !s.samTargetMatchesSource(host, source) {
+		return ErrProtocol
+	}
+	config.udpTarget = &net.UDPAddr{IP: append(net.IP(nil), source.AsSlice()...), Port: int(portRaw)}
+	return nil
+}
+
+func (s *Server) samTargetMatchesSource(host string, source netip.Addr) bool {
+	if !source.IsLoopback() {
+		return false
+	}
+	if targetIP := net.ParseIP(host); targetIP != nil {
+		return targetIP.IsLoopback() && targetIP.String() == source.String()
+	}
+	lookupCtx, cancel := context.WithTimeout(s.ctx, s.config.HandshakeTimeout)
+	addresses, err := net.DefaultResolver.LookupNetIP(lookupCtx, "ip", host)
+	cancel()
+	if err != nil {
+		return false
+	}
+	for _, address := range addresses {
+		if address.Unmap() == source {
+			return true
+		}
+	}
+	return false
+}
+
+func clearLeaseSetPolicy(policy *destination.LeaseSetPolicy) {
+	if policy == nil {
+		return
+	}
+	clear(policy.Secret)
+	for index := range policy.DHClients {
+		clear(policy.DHClients[index][:])
+	}
+	for index := range policy.PSKClients {
+		clear(policy.PSKClients[index][:])
+	}
+	policy.DHClients, policy.PSKClients = nil, nil
+}
