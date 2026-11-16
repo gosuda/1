@@ -1,0 +1,35 @@
+[package]
+name = "zp-rewriter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+zp-shared = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# Uses `percent-encoding` with an ASCII RFC 3986 §5.3 resolver rather than the
+# `url` crate to avoid pulling ICU IDN tables (~250 KB) into the page bundle.
+percent-encoding = "2.3"
+oxc_allocator = { version = "0.133", default-features = false }
+oxc_parser = { version = "0.133", default-features = false }
+oxc_ast = { version = "0.133", default-features = false }
+oxc_ast_visit = { version = "0.133", default-features = false }
+oxc_codegen = { version = "0.133", default-features = false }
+oxc_span = { version = "0.133", default-features = false }
+oxc_str = { version = "0.133", default-features = false }
+oxc_syntax = { version = "0.133", default-features = false }
+# Composes the rewriter source map with the upstream `.map` so DevTools resolves
+# back to original sources.
+sourcemap = { version = "9", default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "rewrite_perf"
+harness = false
