@@ -1,0 +1,10687 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
+const fs = require('node:fs');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const puppeteer = require('puppeteer');
+const { brotliCompressSync, gzipSync } = require('node:zlib');
+
+const { handleRequestContract, runRequestContract } = require('./request-contract');
+const { openThroughLauncher } = require('./launcher');
+const JQUERY_SOURCE = fs.readFileSync(require.resolve('jquery'), 'utf8');
+
+function run(cmd, args, options = {}) {
+  const result = childProcess.spawnSync(cmd, args, {
+    cwd: path.resolve(__dirname, '../..'),
+    env: { ...process.env, ...options.env },
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.status !== 0) {
+    throw new Error(`${cmd} ${args.join(' ')} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+}
+
+function isBenignSocketError(err) {
+  return err && (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ERR_STREAM_PREMATURE_CLOSE');
+}
+
+function ignoreBenignSocketErrors(stream) {
+  stream.on('error', err => {
+    if (!isBenignSocketError(err)) throw err;
+  });
+}
+
+function listen(server, host = '127.0.0.1') {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, host, () => {
+      server.off('error', reject);
+      resolve(server.address().port);
+    });
+  });
+}
+
+function closeServer(server) {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    server.close(done);
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    setTimeout(done, 1000);
+  });
+}
+
+async function waitForHTTP(url, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    try {
+      await new Promise((resolve, reject) => {
+        const req = http.get(url, res => {
+          res.resume();
+          res.on('end', resolve);
+        });
+        req.setTimeout(1000, () => req.destroy(new Error('timeout')));
+        req.on('error', reject);
+      });
+      return;
+    } catch (err) {
+      last = err;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  throw last || new Error(`timed out waiting for ${url}`);
+}
+
+class SocketReader {
+  constructor(socket) {
+    this.socket = socket;
+    this.buf = Buffer.alloc(0);
+    this.waiters = [];
+    socket.on('data', chunk => {
+      this.buf = Buffer.concat([this.buf, chunk]);
+      this.flush();
+    });
+    socket.on('error', err => this.fail(err));
+    socket.on('close', () => this.fail(new Error('socket closed')));
+  }
+  read(n) {
+    if (this.buf.length >= n) return Promise.resolve(this.take(n));
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ n, resolve, reject });
+      this.flush();
+    });
+  }
+  take(n) {
+    const out = this.buf.subarray(0, n);
+    this.buf = this.buf.subarray(n);
+    return out;
+  }
+  flush() {
+    while (this.waiters.length && this.buf.length >= this.waiters[0].n) {
+      const waiter = this.waiters.shift();
+      waiter.resolve(this.take(waiter.n));
+    }
+  }
+  fail(err) {
+    while (this.waiters.length) this.waiters.shift().reject(err);
+  }
+}
+
+// Reports via postMessage which cross-origin window operations succeed or throw SecurityError.
+function xsiteReporter(kind, viaOpener) {
+  const w = viaOpener ? 'opener' : 'parent';
+  const prefix = viaOpener ? 'opener' : 'parent';
+  const ops = viaOpener
+    ? [['openerType', 'window.opener'], ['openerDocument', 'opener.document'], ['openerStorage', 'opener.localStorage'], ['openerEval', 'opener.eval'],
+       ['openerLocationHref', 'opener.location.href'], ['openerClosed', 'opener.closed'], ['openerSelf', 'opener.self === opener'], ['openerTop', 'opener.top === opener'],
+       ['openerIn', '"document" in opener'], ['frameElement', 'window.frameElement'], ['parentIsSelf', 'parent === window']]
+    : [['parentDocument', 'parent.document'], ['parentStorage', 'parent.localStorage'], ['parentEval', 'parent.eval'], ['parentName', 'parent.name'],
+       ['parentLocationHref', 'parent.location.href'], ['parentLocationType', 'parent.location'], ['topDocument', 'top.document'], ['frameElement', 'window.frameElement'],
+       ['parentIsTop', 'parent === top'], ['parentSelf', 'parent.self === parent'], ['parentLength', 'parent.length'], ['parentClosed', 'parent.closed'],
+       ['parentPostMessage', 'parent.postMessage'], ['parentFrames', 'parent.frames'], ['parentIn', '"document" in parent'],
+       ['parentProto', 'Object.getPrototypeOf(parent)'], ['parentSetProp', '(parent.zpProbe = 1, "set")'], ['opener', 'window.opener']];
+  let body = 'var R = {};' +
+    'function op(k, f) { try { var v = f(); R[k] = v === null ? "null" : (typeof v === "object" || typeof v === "function") ? typeof v : (typeof v === "string" ? "string" : String(v)); } catch (e) { R[k] = "threw:" + (e && e.name); } }';
+  for (const [k, expr] of ops) body += 'op(' + JSON.stringify(k) + ', function () { return ' + expr + '; });';
+  body += w + '.postMessage(JSON.stringify({ kind: ' + JSON.stringify(kind) + ', R: R }), "*");';
+  return '<!doctype html><title>x</title><script>' + body + '<\/script>';
+}
+
+// Solid-color PNG of the given dimensions (distinct from a 1x1 placeholder).
+function solidPNG(size) {
+  const zlib = require('node:zlib');
+  const chunk = (type, data) => {
+    const b = Buffer.alloc(12 + data.length);
+    b.writeUInt32BE(data.length, 0);
+    b.write(type, 4, 'latin1');
+    data.copy(b, 8);
+    b.writeUInt32BE(zlib.crc32(b.subarray(4, 8 + data.length)) >>> 0, 8 + data.length);
+    return b;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const stride = size * 4 + 1;
+  const raw = Buffer.alloc(stride * size);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) { raw[y * stride + 1 + x * 4 + 1] = 160; raw[y * stride + 1 + x * 4 + 3] = 255; }
+  return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+// A minimal valid TrueType font (one empty glyph), built byte by byte: enough for Chrome's sanitizer to accept it, so a
+// font load can succeed or be refused in a test without a binary file in the repository.
+function miniTrueTypeFont() {
+  const u16 = n => { const b = Buffer.alloc(2); b.writeUInt16BE(n & 0xffff); return b; };
+  const i16 = n => { const b = Buffer.alloc(2); b.writeInt16BE(n); return b; };
+  const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; };
+  const pad4 = b => (b.length % 4 ? Buffer.concat([b, Buffer.alloc(4 - (b.length % 4))]) : b);
+  const sum = b => { let s = 0; const p = pad4(b); for (let i = 0; i < p.length; i += 4) s = (s + p.readUInt32BE(i)) >>> 0; return s; };
+  const head = Buffer.concat([u32(0x00010000), u32(0x00010000), u32(0), u32(0x5f0f3cf5), u16(0), u16(1000), Buffer.alloc(16),
+    i16(0), i16(0), i16(0), i16(0), u16(0), u16(8), i16(2), i16(0), i16(0)]);
+  const hhea = Buffer.concat([u32(0x00010000), i16(800), i16(-200), i16(0), u16(1000), i16(0), i16(0), i16(0), i16(1), i16(0), i16(0),
+    Buffer.alloc(8), i16(0), u16(1)]);
+  const maxp = Buffer.concat([u32(0x00010000), u16(1), Buffer.alloc(26)]);
+  const hmtx = Buffer.concat([u16(1000), i16(0)]);
+  const seg = Buffer.concat([u16(4), u16(24), u16(0), u16(2), u16(2), u16(0), u16(0), u16(0xffff), u16(0), u16(0xffff), i16(1), u16(0)]);
+  const cmap = Buffer.concat([u16(0), u16(1), u16(3), u16(1), u32(12), seg]);
+  const glyf = Buffer.alloc(4);
+  const loca = Buffer.concat([u16(0), u16(0)]);
+  const names = [[1, 'F'], [2, 'Regular'], [4, 'F'], [6, 'F']].map(([id, s]) => [id, Buffer.from(s, 'utf16le').swap16()]);
+  let strings = Buffer.alloc(0);
+  const records = names.map(([id, s]) => { const r = Buffer.concat([u16(3), u16(1), u16(0x409), u16(id), u16(s.length), u16(strings.length)]); strings = Buffer.concat([strings, s]); return r; });
+  const name = Buffer.concat([u16(0), u16(names.length), u16(6 + 12 * names.length), ...records, strings]);
+  const os2 = Buffer.concat([u16(4), i16(500), u16(400), u16(5), u16(0), i16(650), i16(600), i16(0), i16(75), i16(650), i16(600), i16(0), i16(350), i16(50), i16(300),
+    i16(0), Buffer.alloc(10), u32(1), u32(0), u32(0), u32(0), Buffer.from('NONE'), u16(0x40), u16(0x20), u16(0xffff), i16(800), i16(-200), i16(0), u16(800), u16(200),
+    u32(1), u32(0), i16(500), i16(700), u16(0), u16(32), u16(1)]);
+  const post = Buffer.concat([u32(0x00030000), u32(0), i16(-100), i16(50), u32(0), u32(0), u32(0), u32(0), u32(0)]);
+  const tables = { 'OS/2': os2, cmap, glyf, head, hhea, hmtx, loca, maxp, name, post };
+  const tags = Object.keys(tables).sort();
+  const dirLen = 12 + 16 * tags.length;
+  let offset = dirLen;
+  const dir = [];
+  const bodies = [];
+  let headOffset = 0;
+  for (const tag of tags) {
+    const data = tables[tag];
+    if (tag === 'head') headOffset = offset;
+    dir.push(Buffer.concat([Buffer.from(tag, 'latin1'), u32(sum(data)), u32(offset), u32(data.length)]));
+    const padded = pad4(data);
+    bodies.push(padded);
+    offset += padded.length;
+  }
+  const n = tags.length;
+  let pow = 1, log = 0;
+  while (pow * 2 <= n) { pow *= 2; log++; }
+  const header = Buffer.concat([u32(0x00010000), u16(n), u16(pow * 16), u16(log), u16(n * 16 - pow * 16)]);
+  const font = Buffer.concat([header, ...dir, ...bodies]);
+  font.writeUInt32BE((0xb1b0afba - sum(font)) >>> 0, headOffset + 8);
+  return font;
+}
+
+// Probes serialized into fixture pages via Function.prototype.toString.
+function windowRedefineProbe() {
+  var out = {};
+  var tryIt = function (k, fn) { try { var v = fn(); out[k] = (v && typeof v === 'object') ? JSON.stringify(v) : String(v); } catch (e) { out[k] = '!' + e.name; } };
+  // assigning a [Replaceable] attribute makes it a data property of the window
+  tryIt('assign self', function () { var w = window; w.self = 5; return String(w.self); });
+  tryIt('assign frames', function () { window.frames = 6; return String(window.frames); });
+  tryIt('assign parent', function () { window.parent = 7; return String(window.parent); });
+  tryIt('assign opener', function () { window.opener = 8; return String(window.opener); });
+  tryIt('own after assign', function () { return ['self', 'frames', 'parent', 'opener'].map(function (n) { var d = Object.getOwnPropertyDescriptor(window, n); return n + ':' + (d ? ('value' in d ? 'data=' + d.value : 'accessor') : 'none'); }).join(' '); });
+  ['frameElement', 'parent', 'opener', 'self', 'frames', 'name', 'navigation', 'history'].forEach(function (n) {
+    var bound = function () { return 'mine:' + n; }.bind(null);
+    tryIt(n + '.define', function () { Object.defineProperty(window, n, { get: bound, configurable: false, enumerable: true }); return 'returned'; });
+    tryIt(n + '.read', function () { return window[n]; });
+    tryIt(n + '.bare', function () { return (0, eval)(n); });
+    tryIt(n + '.desc', function () { var d = Object.getOwnPropertyDescriptor(window, n); return d ? { sameGet: d.get === bound, c: d.configurable, e: d.enumerable } : 'none'; });
+  });
+  // a getter that returns its receiver: the window, and never another one
+  Object.defineProperty(window, 'zzFixed', { get: function () { return this; }, configurable: false });
+  tryIt('fixed getter receiver', function () { return window.zzFixed === window; });
+  window.__xredef = out;
+}
+function crossOriginDenialProbe(src) {
+  var f = document.createElement('iframe');
+  f.src = src;
+  f.onload = function () {
+    var w = f.contentWindow, out = {};
+    var norm = function (s) { return String(s).split(location.origin).join('ORIGIN').slice(0, 240); };
+    var t = function (k, fn) { try { var v = fn(); out[k] = 'ok:' + norm(typeof v === 'object' && v ? '[object]' : String(v)); } catch (e) { out[k] = e.name + '|' + e.constructor.name + '|' + norm(e.message); } };
+    var flags = function (d) { return d && [('value' in d) ? 'v:' + typeof d.value : 'get:' + typeof d.get + '/set:' + typeof d.set, 'w:' + d.writable, 'e:' + d.enumerable, 'c:' + d.configurable].join(' '); };
+    ['document', 'foo', 'localStorage', 'eval', 'toString', 'constructor', 'then', '0', '5', 'length', 'closed'].forEach(function (n) { t('read ' + n, function () { return w[n]; }); });
+    ['href', 'origin', 'toString', 'foo', 'assign', 'replace', 'hash'].forEach(function (n) { t('location.' + n, function () { var v = w.location[n]; return typeof v === 'function' ? 'function' : v; }); });
+    t('String(location)', function () { return String(w.location); });
+    t('set foo', function () { w.foo = 1; return 'set'; });
+    t('set document', function () { w.document = 1; return 'set'; });
+    t('set 0', function () { w[0] = 1; return 'set'; });
+    t('set 5', function () { w[5] = 1; return 'set'; });
+    t('set location.foo', function () { w.location.foo = 1; return 'set'; });
+    t('set location.hash', function () { w.location.hash = 'x'; return 'set'; });
+    ['foo', 'document', 'postMessage', '0'].forEach(function (n) { t('in ' + n, function () { return n in w; }); });
+    t('in location.foo', function () { return 'foo' in w.location; });
+    t('in location.href', function () { return 'href' in w.location; });
+    t('keys', function () { return Object.keys(w); });
+    t('ownKeys', function () { return Reflect.ownKeys(w).map(String); });
+    t('location keys', function () { return Object.keys(w.location); });
+    t('location ownKeys', function () { return Reflect.ownKeys(w.location).map(String); });
+    t('gopd document', function () { return Object.getOwnPropertyDescriptor(w, 'document'); });
+    t('gopd 0', function () { return Object.getOwnPropertyDescriptor(w, 0); });
+    t('gopd location.foo', function () { return Object.getOwnPropertyDescriptor(w.location, 'foo'); });
+    ['postMessage', 'close', 'focus', 'blur', 'then', 'location', 'window', 'self', 'length', 'closed', 'top', 'parent', 'opener', 'frames'].forEach(function (n) { t('desc ' + n, function () { return flags(Object.getOwnPropertyDescriptor(w, n)); }); });
+    ['href', 'replace', 'then'].forEach(function (n) { t('desc location.' + n, function () { return flags(Object.getOwnPropertyDescriptor(w.location, n)); }); });
+    t('delete document', function () { return delete w.document; });
+    t('delete foo', function () { return delete w.foo; });
+    t('delete location.href', function () { return delete w.location.href; });
+    t('define x', function () { Object.defineProperty(w, 'x', { value: 1 }); return 'defined'; });
+    t('define location.x', function () { Object.defineProperty(w.location, 'x', { value: 1 }); return 'defined'; });
+    t('setPrototypeOf', function () { return Object.setPrototypeOf(w, {}); });
+    t('preventExtensions', function () { return Object.preventExtensions(w); });
+    t('Reflect.defineProperty', function () { return Reflect.defineProperty(w, 'x', { value: 1 }); });
+    t('Reflect.deleteProperty', function () { return Reflect.deleteProperty(w, 'foo'); });
+    t('JSON.stringify', function () { return JSON.stringify(w); });
+    t('w + ""', function () { return w + ''; });
+    ['asyncIterator', 'iterator', 'match', 'species', 'toPrimitive', 'toStringTag', 'unscopables', 'hasInstance', 'isConcatSpreadable'].forEach(function (n) {
+      t('read Symbol.' + n, function () { return w[Symbol[n]]; });
+      t('read location Symbol.' + n, function () { return w.location[Symbol[n]]; });
+    });
+    t('read Symbol(abc)', function () { return w[Symbol('abc')]; });
+    t('read Symbol()', function () { return w[Symbol()]; });
+    t('set Symbol.iterator', function () { w[Symbol.iterator] = 1; return 'set'; });
+    t('postMessage()', function () { return w.postMessage(); });
+    window.__xdeny = out;
+  };
+  document.body.appendChild(f);
+}
+
+// Membrane DOM scans must not invoke page-installed wrappers on DOM query methods.
+function domScanProbe() {
+  var seen = {}, busy = false;
+  var rec = function (key, args) {
+    if (busy) return; busy = true;
+    try { var k = key + '(' + (typeof args[0] === 'string' ? JSON.stringify(args[0].slice(0, 70)) : typeof args[0]) + ')'; seen[k] = (seen[k] || 0) + 1; } finally { busy = false; }
+  };
+  var wrap = function (proto, name, label) {
+    var f = proto[name];
+    if (typeof f !== 'function') return;
+    proto[name] = function () { rec(label + '.' + name, arguments); return Reflect.apply(f, this, arguments); };
+  };
+  ['querySelectorAll', 'querySelector', 'getElementsByTagName'].forEach(function (n) { wrap(Element.prototype, n, 'Element'); wrap(Document.prototype, n, 'Document'); wrap(DocumentFragment.prototype, n, 'Fragment'); });
+  wrap(Document.prototype, 'createTreeWalker', 'Document');
+  var realEncode = window.encodeURIComponent;
+  window.encodeURIComponent = function (s) { rec('window.encodeURIComponent', [typeof s === 'string' && s.indexOf('http') === 0 ? 'URL' : 'x']); return realEncode.apply(this, arguments); };
+  var root = document.getElementById('root');
+  root.innerHTML = '<a href="/x">a</a><form action="/f"><input formaction="/g"><button formaction="/h">b</button></form><style>a{color:red}</style><img src="/i.png" srcset="/i2.png 2x">';
+  var f = document.createElement('iframe'); f.src = '/xdomscan-child'; root.appendChild(f);
+  var s = document.createElement('script'); s.textContent = 'window.__ranInline = 1'; root.appendChild(s);
+  var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = '/xdomscan.css'; document.head.appendChild(l);
+  document.body.insertAdjacentHTML('beforeend', '<span data-x="1"></span>');
+  root.querySelectorAll('a'); // the page's own call
+  setTimeout(function () { window.__xdomscan = { calls: seen }; }, 1500);
+}
+function childRealmProbe() {
+  var out = {};
+  var t = function (k, fn) { try { out[k] = String(fn()); } catch (e) { out[k] = '!' + e.name; } };
+  var ifr = document.createElement('iframe'); document.body.appendChild(ifr);
+  var W = ifr.contentWindow;
+  ['Object', 'alert', 'Number', 'parseInt', 'setTimeout', 'Array'].forEach(function (n) {
+    t('eval(' + n + ') === frame.' + n, function () { return (0, W.eval)(n) === W[n]; });
+    t('eval(' + n + ') === own ' + n, function () { return (0, W.eval)(n) === window[n]; });
+    t('frame.' + n + ' === own ' + n, function () { return W[n] === window[n]; });
+  });
+  t('frame.Function("return this")() === frame', function () { return W.Function('return this')() === W; });
+  t('eval(globalThis) === frame', function () { return (0, W.eval)('globalThis') === W; });
+  // What a frame's code runs in is pinned above (eval, Function, globalThis). Whether each function the membrane puts into the frame is made in the
+  // frame's realm, and whether the frame has constructors of its own for XMLHttpRequest, WebSocket and EventSource, is not: a frame shares the page's.
+  t('instances of the frame\'s XMLHttpRequest', function () { var x = new W.XMLHttpRequest(); return (x instanceof W.XMLHttpRequest) + '/' + typeof x.open + '/' + W.XMLHttpRequest.UNSENT + W.XMLHttpRequest.DONE; });
+  window.__xrealm = out;
+}
+function builtinShapeProbe() {
+  var out = {};
+  var t = function (k, fn) { try { var v = fn(); out[k] = typeof v === 'function' ? 'fn' : String(v); } catch (e) { out[k] = '!' + e.name; } };
+  t('EventSource.CONNECTING/OPEN/CLOSED', function () { return [EventSource.CONNECTING, EventSource.OPEN, EventSource.CLOSED].join(','); });
+  t('RTCPeerConnection.generateCertificate', function () { return typeof RTCPeerConnection.generateCertificate; });
+  t('globalThis.Proxy.revocable', function () { var r = globalThis.Proxy.revocable({ a: 1 }, {}); var v = r.proxy.a; r.revoke(); return v; });
+  t('BroadcastChannel.prototype.constructor.name', function () { return BroadcastChannel.prototype.constructor.name; });
+  t('RTCPeerConnection.name', function () { return RTCPeerConnection.name; });
+  t('webkitRTCPeerConnection === RTCPeerConnection', function () { return window.webkitRTCPeerConnection === RTCPeerConnection; });
+  t('webkitURL.name', function () { return webkitURL.name; });
+  t('Function.prototype.toString.name', function () { return Function.prototype.toString.name; });
+  t('__defineGetter__.name', function () { return Object.prototype.__defineGetter__.name; });
+  t('URL.canParse.length', function () { return URL.canParse.length; });
+  t('WebSocket.prototype.close.length', function () { return WebSocket.prototype.close.length; });
+  t('fetch.length', function () { return fetch.length; });
+  t('history.pushState.length', function () { return history.pushState.length; });
+  t('addEventListener.length', function () { return addEventListener.length; });
+  t('setTimeout.name', function () { return setTimeout.name; });
+  t('Document.cookie getter name', function () { return Object.getOwnPropertyDescriptor(Document.prototype, 'cookie').get.name; });
+  t('HTMLIFrameElement.contentWindow getter name', function () { return Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow').get.name; });
+  t('frameElement getter name', function () { return Object.getOwnPropertyDescriptor(window, 'frameElement').get.name; });
+  window.__xshape = out;
+}
+// Function.prototype.toString must return the original source across repeated calls.
+function functionTextProbe() {
+  var out = {};
+  var fns = {
+    computed: function (o, k) { return o[k] + 1; },
+    names: function () { return [window.document === document, document.title, location.href, self === window, top === window]; },
+    call: function (a) { return a.concat([1]).map(function (x) { return x * 2; }); },
+    arrow: (a, b) => a + b,
+    klass: class K { m(o) { return o['k' + 1]; } static s() { return window; } },
+    asyncFn: async function (p) { return (await p)['x']; },
+    plain: function () { return 1; }
+  };
+  fns.evaled = (0, eval)('(function (a) { return a["b"] + document.title; })');
+  fns.made = new Function('a', 'return a["c"] + location.href');
+  var read = function (k, f) {
+    var a = String(f), b = Function.prototype.toString.call(f), c = f.toString(), d = String(f);
+    out[k] = [a, b === a, c === a, d === a];
+  };
+  Object.keys(fns).forEach(function (k) { read(k, fns[k]); });
+  read('native', Math.floor);
+  read('native bound', function () {}.bind(null));
+  read('toString itself', Function.prototype.toString);
+  out['times'] = [1, 2, 3].map(function () { return String(fns.computed); }).join('|');
+  window.__xtext = out;
+}
+
+function createTargetServer(requests, pendingResponses) {
+  // Maps request tag to cookie names received by /xck-echo.
+  const xckSeen = new Map();
+  // Maps request tag to request metadata recorded by /xcors-api.
+  const corsLog = new Map();
+  // The captures a fixture keeps per run (`<run>|<key>` entries of a Map), as JSON by key.
+  const serveRunLog = (seen, run, res) => {
+    const out = {};
+    for (const [k, v] of seen) if (k.startsWith(run + '|')) out[k.slice(run.length + 1)] = v;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(out));
+  };
+  const server = http.createServer((req, res) => {
+    ignoreBenignSocketErrors(req);
+    ignoreBenignSocketErrors(res);
+    if (handleRequestContract(req, res, requests)) return;
+    requests.push({ url: req.url, method: req.method, host: req.headers.host || '', userAgent: req.headers['user-agent'] || '', cookie: req.headers.cookie || '', contentType: req.headers['content-type'] || '' });
+    const url = new URL(req.url, 'http://target.local');
+    if (url.pathname === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>E2E Home</title><link rel="stylesheet" href="/site.css"><link id="icon-link" rel="icon" href="/site-icon.png"></head><body>
+        <main id="style-probe" class="root-stylesheet-probe"><h1>E2E Home</h1><img id="image-probe" src="/image-probe.png" alt=""><a id="next" href="/next">Next page</a></main>
+        <script>
+          window.__submitFormFixture = kind => {
+      const f = document.createElement('form');
+      f.method = 'POST';
+      f.enctype = kind === 'multipart' ? 'multipart/form-data' : kind === 'plain' ? 'text/plain' : 'application/x-www-form-urlencoded';
+      f.action = '/form-echo?kind=wrong';
+      const input = document.createElement('input');
+      input.name = 'alpha';
+      input.value = 'one';
+      f.appendChild(input);
+      if (kind === 'multipart') {
+        const file = document.createElement('input');
+        file.type = 'file';
+        file.name = 'upload';
+        const dt = new DataTransfer();
+        dt.items.add(new File(['file-body'], 'hello.txt', { type: 'text/plain' }));
+        file.files = dt.files;
+        f.appendChild(file);
+      }
+      const button = document.createElement('button');
+      button.type = 'submit';
+      button.name = 'submitter';
+      button.value = kind;
+      button.setAttribute('formaction', '/form-echo?kind=' + kind);
+      f.appendChild(button);
+      document.body.appendChild(f);
+      f.requestSubmit(button);
+          };
+          window.__ua = navigator.userAgent;
+          window.__platform = navigator.platform;
+          window.__phase2Location = { href: location.href, windowHref: window.location.href };
+          window.__phase2DynamicFunction = Function('return location.href')();
+          window.__phase2EvalLocation = eval('location.href');
+          window.__messageEvents = [];
+          window.addEventListener('message', ev => {
+            if (ev.data && ev.data.type) window.__messageEvents.push({ type: ev.data.type, origin: ev.origin, href: ev.data.href || '' });
+          });
+          (function(w,d,s,l,i){
+            w[l]=w[l]||[];
+            w[l].push({'gtm.start': Date.now(), event:'gtm.js'});
+            var f=d.getElementsByTagName(s)[0], j=d.createElement(s), dl=l!='dataLayer'?'&l='+l:'';
+            j.async=true;
+            j.id='gtm-fixture';
+            j.src='/gtm.js?id='+i+dl;
+            f.parentNode.insertBefore(j,f || d.head.firstChild);
+          })(window,document,'script','dataLayer','GTM-ZP');
+          const dynamicScript = document.createElement('script');
+          dynamicScript.id = 'dynamic-script-probe';
+          dynamicScript.src = '/dynamic-script.js?from=createElement';
+          document.head.appendChild(dynamicScript);
+          try {
+            const template = document.createElement('template');
+            template.innerHTML = '<link rel="preconnect" href="https://preconnect.invalid">';
+            const first = template.content.firstChild;
+            const clone = first && first.cloneNode(true);
+            if (clone) document.head.appendChild(clone);
+            const rowTemplate = document.createElement('template');
+            rowTemplate.innerHTML = '<tr><td>cell</td></tr>';
+            const row = rowTemplate.content.firstChild;
+            window.__templateLinkFixture = {
+              childCount: template.content.childNodes.length,
+              firstNode: first && first.localName,
+              rel: first && first.getAttribute('rel'),
+              href: first && first.getAttribute('href'),
+              blockedRel: first && first.getAttribute('data-zp-blocked-rel'),
+              blockedURL: first && first.getAttribute('data-zp-blocked-url'),
+              cloneRel: clone && clone.getAttribute('rel'),
+              cloneHref: clone && clone.getAttribute('href'),
+              tableRowNode: row && row.nodeName,
+              tableRowText: row && row.textContent
+            };
+          } catch (err) {
+            window.__templateLinkFixture = { error: err && err.message || String(err) };
+          }
+          window.__urlAttributeFixture = [['link', 'href'], ['img', 'srcset'], ['script', 'src']].map(([tag, key]) => {
+            try {
+              const el = document.createElement(tag);
+              const snapshot = () => [el.getAttribute(key), el.getAttributeNS(null, key), el.hasAttribute(key)];
+              const absent = snapshot();
+              el.toggleAttribute(key, true);
+              const empty = snapshot();
+              el.removeAttribute(key);
+              const removed = snapshot();
+              el.setAttribute(key, '/image-probe.png');
+              el.removeAttribute(key);
+              const removedAfterURL = snapshot();
+              el.toggleAttribute(key, true);
+              const emptyAfterURL = snapshot();
+              return { absent, empty, removed, removedAfterURL, emptyAfterURL };
+            } catch (err) { return { error: err && err.message || String(err) }; }
+          });
+        </script>
+        <script src="/jquery.js"></script>
+        <script src="/jquery-fixture.js"></script>
+        <script src="/rewrite-fixture.js"></script>
+        <script type="module" src="/module-worker.js"></script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/regressions') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><html><head><title>Compatibility Regressions</title></head><body>
+        <h1 id="regressions">Compatibility Regressions</h1>
+        <script src="/regression-fixture.js"></script>
+        <script type="module" src="/module-identity-entry.js"></script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/module-singleton.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`export const evaluationCount = window.__moduleEvaluations = (window.__moduleEvaluations || 0) + 1;
+        export const singleton = { evaluationCount };
+        window.__moduleSingleton = singleton;`);
+      return;
+    }
+    if (url.pathname === '/module-identity-entry.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`import { singleton, evaluationCount } from './module-singleton.js';
+        const snapshot = () => ({ evaluations: window.__moduleEvaluations, evaluationCount,
+          sameSingleton: singleton === window.__moduleSingleton, href: location.href });
+        const load = (src, type) => new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.type = type;
+          script.src = src;
+          script.onload = () => { script.remove(); resolve(); };
+          script.onerror = () => { script.remove(); reject(new Error('script load failed: ' + src)); };
+          document.head.appendChild(script);
+        });
+        (async () => {
+          const initial = snapshot();
+          await load('/module-singleton.js', 'module');
+          const dynamic = snapshot();
+          await load('/classic-ref.js', 'text/javascript');
+          history.pushState({}, '', '/regressions/changed?view=2');
+          await load('/module-singleton.js', 'module');
+          const afterHistory = snapshot();
+          await load('/module-singleton.js', 'module');
+          const repeated = snapshot();
+          await load('/classic-ref.js', 'text/javascript');
+          window.__moduleIdentityFixture = { initial, dynamic, afterHistory, repeated, classic: window.__classicRefs };
+        })().catch(error => { window.__moduleIdentityFixture = { error: error.stack || String(error) }; });`);
+      return;
+    }
+    if (url.pathname === '/classic-ref.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`(window.__classicRefs || (window.__classicRefs = [])).push(location.href);`);
+      return;
+    }
+    if (url.pathname === '/regression-fixture.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`(async () => {
+          const original = { nested: { value: 7 } };
+          original.self = original;
+          const cloned = globalThis.structuredClone(original);
+          const order = [];
+          globalThis.queueMicrotask(() => order.push('microtask'));
+          order.push('sync');
+          await Promise.resolve();
+          const pageMethod = { method() { return this.value; } }.method;
+          globalThis.pageReceiverFixture = pageMethod;
+          class PageConstructor { constructor(value) { this.value = value; } }
+          globalThis.PageConstructorFixture = PageConstructor;
+          const instance = new globalThis.PageConstructorFixture(11);
+          const nativeURL = new globalThis.URL('/receiver-child', location.href);
+          window.__receiverFixture = {
+            clonedValue: cloned.nested.value, cycle: cloned.self === cloned,
+            independent: cloned !== original && cloned.nested !== original.nested, order,
+            pageFunctionSame: globalThis.pageReceiverFixture === pageMethod,
+            pageReceiver: globalThis.pageReceiverFixture.call({ value: 'custom-receiver' }),
+            constructorSame: globalThis.PageConstructorFixture === PageConstructor,
+            constructed: instance instanceof PageConstructor && Object.getPrototypeOf(instance) === PageConstructor.prototype,
+            constructedValue: instance.value, nativeURL: nativeURL.href, nativeInstance: nativeURL instanceof globalThis.URL
+          };
+        })().catch(error => { window.__receiverFixture = { error: error.stack || String(error) }; });
+        window.__startSilentCloseFixture = () => {
+          const ws = new WebSocket('/ws?silent-close=1', ['zp-silent-close']);
+          const result = window.__silentCloseFixture = { opened: false, closes: [] };
+          let closingAt;
+          ws.onopen = () => {
+            result.opened = true;
+            closingAt = performance.now();
+            ws.close(3001, 'unanswered');
+            result.closingState = ws.readyState;
+          };
+          ws.onclose = event => result.closes.push({ code: event.code, reason: event.reason,
+            wasClean: event.wasClean, readyState: ws.readyState, elapsed: performance.now() - closingAt });
+        };
+        window.__startReservedFetchFixture = mode => {
+          const result = window.__reservedFetchFixture = { body: '', done: false };
+          (async () => {
+            const response = await fetch('/reserved-headers?mode=' + mode, { cache: 'no-store' });
+            result.status = response.status;
+            result.headers = Array.from(response.headers.entries());
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            for (;;) {
+              const next = await reader.read();
+              if (next.done) break;
+              result.body += decoder.decode(next.value, { stream: true });
+            }
+            result.body += decoder.decode();
+            result.done = true;
+          })().catch(error => { result.error = error && error.name || String(error); });
+        };
+        window.__startReservedHTMLFixture = () => {
+          const frame = document.createElement('iframe');
+          frame.id = 'reserved-frame';
+          frame.src = '/reserved-headers?mode=html';
+          document.body.appendChild(frame);
+        };`);
+      return;
+    }
+    if (url.pathname === '/reserved-headers') {
+      const mode = url.searchParams.get('mode');
+      const headers = {
+        'Content-Type': mode === 'html' ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-zP-BodY-StReAm': '0',
+        'x-Zp-sTrEaM': mode === 'html' ? '0' : '1',
+        'X-Fixture': 'preserved',
+      };
+      if (mode === 'buffered') {
+        // Brotli uses the real bounded-buffering path, without changing kernel policy.
+        res.writeHead(200, { ...headers, 'Content-Encoding': 'br' });
+        res.end(brotliCompressSync('buffered-complete\n'));
+      } else if (mode === 'truncated') {
+        req.socket.end('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nX-zP-BodY-StReAm: 0\r\nx-Zp-sTrEaM: 1\r\nConnection: close\r\n\r\nshort');
+      } else {
+        pendingResponses.set(mode, res);
+        res.once('close', () => pendingResponses.delete(mode));
+        res.writeHead(200, headers);
+        res.write(mode === 'html'
+          ? '<!doctype html><html><head><title>Reserved Header HTML</title></head><body><p id="reserved-first">html-first</p>'
+          : '<!doctype html><p>raw-first</p>\n');
+      }
+      return;
+    }
+    if (url.pathname === '/next') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><html><head><title>E2E Next</title></head><body>
+        <main><h1>E2E Next</h1><p id="ua"></p></main>
+        <script>document.getElementById('ua').textContent = navigator.userAgent; window.__nextHref = location.href;</script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/site-icon.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'));
+      return;
+    }
+    if (url.pathname === '/site.css') {
+      res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`.root-stylesheet-probe{border-top:7px solid rgb(12, 34, 56); padding-left:13px}`);
+      return;
+    }
+    if (url.pathname === '/image-probe.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'));
+      return;
+    }
+    if (url.pathname === '/gtm.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`window.__gtmFixture = {
+        loaded: true,
+        href: location.href,
+        currentSrc: document.currentScript && document.currentScript.src,
+        currentAttr: document.currentScript && document.currentScript.attributes.getNamedItem('src') && document.currentScript.attributes.getNamedItem('src').value
+      };
+      window.postMessage({ type: 'gtm-loaded', href: location.href }, location.origin);`);
+      return;
+    }
+    if (url.pathname === '/jquery.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JQUERY_SOURCE);
+      return;
+    }
+    if (url.pathname === '/jquery-fixture.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`(($) => {
+        const root = $('<section id="jquery-fixture-root"><button class="trigger">Go</button><ul><li class="item">one</li><li class="item">two</li></ul></section>').appendTo(document.body);
+        const found = root.find('.item');
+        const ended = found.end();
+        let delegated = 0;
+        root.on('click', '.trigger', function() {
+          delegated++;
+          $(this).data('clicked', true).attr('data-clicked', 'yes');
+        });
+        root.find('.trigger').trigger('click');
+        root.append($.parseHTML('<div class="parsed"><span>parsed</span></div>'));
+        const emptyHtml = $('<div id="empty-html-probe"></div>').appendTo(root);
+        emptyHtml.html('<span>filled</span>');
+        const deferred = $.Deferred();
+        const ajax = $.ajax({ url: '/jquery-ajax.json', dataType: 'json' });
+        const script = $.getScript('/jquery-plugin.js');
+        $.globalEval('window.__jqueryGlobalEvalHref = location.href;');
+        deferred.resolve('resolved');
+        $.when(deferred, ajax, script).done(function(deferredValue, ajaxValue) {
+          const ajaxData = Array.isArray(ajaxValue) ? ajaxValue[0] : ajaxValue;
+          window.__jqueryFixture = {
+            ready: true,
+            version: $.fn.jquery,
+            selectorText: found.map(function(_, el) { return $(el).text(); }).get().join(','),
+            endMatchesRoot: ended[0] === root[0],
+            delegated,
+            dataClicked: root.find('.trigger').data('clicked') === true,
+            attrClicked: root.find('.trigger').attr('data-clicked'),
+            parsedText: root.find('.parsed span').text(),
+            param: $.param({ a: 1, b: ['x', 'y'] }),
+            htmlProbeText: emptyHtml.find('span').text(),
+            htmlProbeChildren: emptyHtml.children().length,
+            ajaxData,
+            plugin: window.__jqueryPlugin || null,
+            globalEvalHref: window.__jqueryGlobalEvalHref || null,
+            locationHref: window.location.href
+          };
+        }).fail(function(xhr, status, err) {
+          window.__jqueryFixture = { ready: false, error: String(err || status || 'jquery-failed') };
+        });
+      })(jQuery);`);
+      return;
+    }
+    if (url.pathname === '/jquery-ajax.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, path: '/jquery-ajax.json' }));
+      return;
+    }
+    if (url.pathname === '/jquery-plugin.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`window.__jqueryPlugin = { loaded: true, href: location.href, jquery: !!window.jQuery };`);
+      return;
+    }
+    if (url.pathname === '/dynamic-script.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`window.__dynamicScriptLoaded = {
+        loaded: true,
+        href: location.href,
+        currentSrc: document.currentScript && document.currentScript.src,
+        currentAttr: document.currentScript && document.currentScript.attributes.getNamedItem('src') && document.currentScript.attributes.getNamedItem('src').value
+      };`);
+      return;
+    }
+    if (url.pathname === '/module-worker.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`const worker = new Worker(new URL('/worker-fixture.js', import.meta.url).href, { name: 'module-worker-fixture' });
+        worker.onmessage = ev => { window.__moduleWorkerFixture = ev.data; worker.terminate(); };
+        worker.onerror = ev => { window.__moduleWorkerFixture = { error: ev && ev.message || 'worker-error' }; };`);
+      return;
+    }
+    if (url.pathname === '/worker-fixture.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`postMessage({ loaded: true, href: location.href, userAgent: navigator.userAgent, platform: navigator.platform });`);
+      return;
+    }
+    if (url.pathname === '/frame-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><html><body><p>frame child</p><script>
+        parent.postMessage({ type: 'frame-child-ready', href: location.href, topOrigin: top.location.origin }, location.origin);
+      </script></body></html>`);
+      return;
+    }
+    if (url.pathname === '/fragment-echo') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ href: url.searchParams.get('href'), userAgent: req.headers['user-agent'] }));
+      return;
+    }
+    // Run escape probes in an inline script so they traverse both the rewriter and membrane.
+    if (url.pathname === '/escape-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>E2E Escape Probes</title><body><script>
+        (async () => {
+          const out = {};
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          out.virtual = location.href;
+          out.varShadow = (function(){ var location = 'v-shadow'; return location; })();
+          out.letShadow = (function(){ let location = 'l-shadow'; return location; })();
+          out.fnDeclShadow = (function(){ function location(){ return 'f-shadow'; } return location(); })();
+          try { out.thisComputed = (function(){ return this['location'] && this['location'].href; }).call(undefined); }
+          catch (e) { out.thisComputed = 'throw:' + (e && e.name || e); }
+          try { out.globalComputed = globalThis['loc' + 'ation'].href; } catch (e) { out.globalComputed = 'throw:' + (e && e.name || e); }
+          try { out.fnThis = new Function('return this.location.href')(); } catch (e) { out.fnThis = 'throw:' + (e && e.name || e); }
+          try { out.fnThisNull = new Function('return this.location.href').call(null); } catch (e) { out.fnThisNull = 'throw:' + (e && e.name || e); }
+          try { out.evalHref = eval('location.href'); } catch (e) { out.evalHref = 'throw:' + (e && e.name || e); }
+          try { out.evalArith = eval('40+2'); } catch (e) { out.evalArith = 'throw:' + (e && e.name || e); }
+          try { const d = Object.getOwnPropertyDescriptor(window, 'location'); out.gopdHref = d && d.get ? d.get.call(window).href : 'no-getter'; }
+          catch (e) { out.gopdHref = 'throw:' + (e && e.name || e); }
+          try { const g = window.__lookupGetter__('location'); out.lookupGetter = g ? g.call(window).href : 'no-getter'; }
+          catch (e) { out.lookupGetter = 'throw:' + (e && e.name || e); }
+          try {
+            const f = document.createElement('iframe');
+            document.body.appendChild(f);
+            out.contentDocLocation = f.contentDocument.location.href;
+            f.remove();
+          } catch (e) { out.contentDocLocation = 'throw:' + (e && e.name || e); }
+          try { navigation.navigate('javascript:window.__navEsc=1'); out.navigationJs = 'returned'; }
+          catch (e) { out.navigationJs = 'blocked:' + (e && e.name || e); }
+          out.navEscaped = window.__navEsc === 1 ? 'escaped' : 'clean';
+          out.navCurrentEntry = navigation && navigation.currentEntry ? navigation.currentEntry.url : 'no-entry';
+          try {
+            const c = open('javascript:window.opener.__openEsc=1', '_blank');
+            if (!c) out.openJs = 'null-return';
+            else { try { out.openJs = String(c.location && c.location.href); } catch (e2) { out.openJs = 'inner:' + (e2 && e2.name || e2); } try { c.close(); } catch {} }
+          } catch (e) { out.openJs = 'throw:' + (e && e.name || e); }
+          out.openEscaped = window.__openEsc === 1 ? 'escaped' : 'clean';
+          try {
+            const f2 = document.createElement('iframe');
+            document.body.appendChild(f2);
+            await new Promise(r => { f2.addEventListener('load', r); setTimeout(r, 3000); });
+            try { out.framesIndex = frames[0].location.href; } catch (e) { out.framesIndex = 'throw:' + (e && e.name || e); }
+            f2.remove();
+          } catch (e) { out.framesIndex = 'outer:' + (e && e.name || e); }
+          try {
+            const m = document.createElement('meta');
+            m.setAttribute('http-equiv', 'refresh');
+            m.setAttribute('content', '0;url=javascript:window.__metaEsc=1');
+            document.head.appendChild(m);
+            await sleep(250);
+            out.metaRefresh = window.__metaEsc === 1 ? 'escaped' : 'neutralized';
+            m.remove();
+          } catch (e) { out.metaRefresh = 'throw:' + (e && e.name || e); }
+          out.diagnostics = Array.isArray(window.__zp_diagnostics) ? window.__zp_diagnostics.length : -1;
+          window.__escapeProbes = out;
+        })();
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/compat-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      // Served both directly and through the proxy for differential comparison.
+      res.end(`<!doctype html><title>ZP Compat Probes</title><body><div id="compat-dom"><a id="ca" href="/x">x</a></div><script>
+        (async () => {
+          const out = {};
+          const P = (k, f) => { try { out[k] = 'v:' + String(f()); } catch (e) { out[k] = 'e:' + (e && e.name || e); } };
+          const PA = async (k, f) => { try { out[k] = 'v:' + String(await f()); } catch (e) { out[k] = 'e:' + (e && e.name || e); } };
+          // B — formerly syntax-killed assignment-target / catch / label forms
+          P('forOf', () => { var location; const s = []; for (location of [1, 2, 3]) s.push(location); return s.join(''); });
+          P('forIn', () => { var location; const s = []; for (location in { a: 1, b: 2 }) s.push(location); return s.join(''); });
+          P('arrayTarget', () => { var location; [location] = [42]; return location; });
+          P('objTarget', () => { var location; ({ a: location } = { a: 7 }); return location; });
+          P('nestedTarget', () => { var location; ({ a: { b: location } } = { a: { b: 9 } }); return location; });
+          P('forOfArr', () => { var location; for ([location] of [[5]]) return location; });
+          P('forOfObj', () => { var location; for ({ a: location } of [{ a: 6 }]) return location; });
+          P('defaultTarget', () => { var location; ({ location = 3 } = {}); return location; });
+          P('restTarget', () => { var location; var x; [x, ...location] = [1, 2, 3]; return location.join(''); });
+          P('memberTarget', () => { var location = { x: 0 }; [location.x] = [8]; return location.x; });
+          P('catchParam', () => { try { throw 11 } catch (location) { return location; } });
+          P('switchTarget', () => { var location; switch (1) { case 1: [location] = [8]; break; } return location; });
+          PA('forAwait', async () => { var location; const s = []; for await (location of [Promise.resolve(4), Promise.resolve(5)]) s.push(location); return s.join(''); });
+          P('labelLoop', () => { var n = 0; outer: for (;;) { n++; if (n > 2) break outer; } return 'label:' + n; });
+          // C — scope/binding semantics that must match native
+          P('superProp', () => new (class extends Object { m() { return super.location; } })().m());
+          P('optMemberNull', () => { var x = null; return x?.location; });
+          P('optChainNull', () => { var x = null; return x?.location?.href; });
+          P('optCallNull', () => { var x = null; return x?.location?.(); });
+          P('plainOptCall', () => { var x = { m() { return 3; } }; return x?.m(); });
+          P('computedKey', () => Object.keys({ [location]: 1 })[0] === String(location));
+          P('nullishAssign', () => { var y; y ??= 'k'; location ??= 'z'; return y + '|' + location.hostname; });
+          P('evalDirectLocal', function () { var y = 5; return eval('y'); });
+          P('evalDirectGlobal', () => eval('1+1'));
+          P('hoistedVar', function () { var r; try { r = String(location.href); } catch (e) { r = 'e:' + (e && e.name || e); } var location; return r; });
+          P('deleteMember', () => { var o = { location: 1 }; delete o.location; return 'location' in o; });
+          P('paramDefault', function () { function f(location = location) { return typeof location; } return f(); });
+          P('newTargetFn', () => new Function('return new.target')());
+          P('argumentsAlias', function () { return (function f(a) { arguments[0] = 2; return a; })(1); });
+          // A5 — window object semantics (native: immutable prototype,
+          // unforgeable location). The facade used to "succeed" here.
+          P('setProtoReflect', () => Reflect.setPrototypeOf(window, {}));
+          P('setProtoSame', () => Reflect.setPrototypeOf(window, Object.getPrototypeOf(window)));
+          P('setProtoObject', () => { Object.setPrototypeOf(window, {}); return 'no-throw'; });
+          P('protoIsWindow', () => Object.getPrototypeOf(window) === Window.prototype);
+          P('defPropLocReflect', () => Reflect.defineProperty(window, 'location', { value: 1 }));
+          P('defPropLocObject', () => { Object.defineProperty(window, 'location', { value: 1 }); return 'no-throw'; });
+          P('preventExtWindow', () => Reflect.preventExtensions(window));
+          // I — URL / navigation semantics
+          P('locEqDocLoc', () => location === document.location);
+          P('locHrefEqDocURL', () => location.href === document.URL);
+          P('baseURI', () => document.baseURI);
+          P('locHashWrite', () => { location.hash = 'ch1'; return location.hash; });
+          P('urlCtorRel', () => new URL('p?q=1', location.href).href);
+          P('urlCtorAbs', () => new URL('https://ex.com/a').host);
+          P('urlStatics', () => (typeof URL.canParse) + '|' + (typeof URL.parse));
+          P('winName', () => { window.name = 'nm1'; return window.name; });
+          P('docCookie', () => { document.cookie = 'zpk=zpv'; return document.cookie.includes('zpk=zpv'); });
+          P('anchorProp', () => { var a = document.getElementById('ca'); a.href = '/r?x=1'; return a.href; });
+          P('anchorAttr', () => document.getElementById('ca').getAttribute('href'));
+          P('anchorPing', () => { var a = document.createElement('a'); a.ping = 'http://p.example/x'; return a.ping; });
+          P('domCount', () => document.getElementById('compat-dom').childElementCount);
+          PA('fetchEcho', async () => (await fetch('/compat-echo?n=1')).status);
+          // J — every URL-bearing attribute / CSS form must LOAD through the
+          // proxy exactly when it loads natively. A missed rewrite is caught by
+          // CSP (no escape) but the resource silently fails — that is the
+          // divergence this measures. Evidence: resource-timing entries,
+          // which the membrane reports under target URLs.
+          {
+            const O = location.origin;
+            const img = k => O + '/image-probe.png?j=' + k;
+            const host = document.createElement('div');
+            host.style.cssText = 'position:absolute;left:0;top:0;width:40px;height:40px;overflow:hidden';
+            document.body.appendChild(host);
+            const add = h => { const d = document.createElement('div'); d.innerHTML = h; host.appendChild(d); return d.firstElementChild; };
+            const vid = document.createElement('video'); vid.poster = img('poster'); host.appendChild(vid);
+            const inp = document.createElement('input'); inp.type = 'image'; inp.src = img('inputsrc'); host.appendChild(inp);
+            add('<table><tr><td background="' + img('tdbg') + '">x</td></tr></table>');
+            const pre = document.createElement('link'); pre.rel = 'preload'; pre.as = 'image'; pre.imageSrcset = img('imagesrcset') + ' 1x'; document.head.appendChild(pre);
+            add('<svg width="4" height="4"><image href="' + img('svgimage') + '" width="4" height="4"></image></svg>');
+            const st = document.createElement('style');
+            st.textContent = '#jset{width:4px;height:4px;background-image:image-set(url("' + img('imageset') + '") 1x)}'
+              + '#jmask{width:4px;height:4px;-webkit-mask-image:url("' + img('mask') + '");mask-image:url("' + img('mask') + '")}'
+              + '#jbefore::before{content:url("' + img('before') + '")}'
+              + '#jshape{float:left;width:4px;height:4px;shape-outside:url("' + img('shape') + '")}';
+            document.head.appendChild(st);
+            add('<div id="jset"></div>'); add('<div id="jmask"></div>'); add('<div id="jbefore"></div>'); add('<div id="jshape"></div>');
+            const imp = document.createElement('style'); imp.textContent = '@import url("' + O + '/site.css?j=import");'; document.head.appendChild(imp);
+            const q = document.createElement('q'); q.cite = O + '/j/cite';
+            const btn = document.createElement('button'); btn.formAction = O + '/j/fa';
+            const area = document.createElement('area'); area.href = O + '/j/area';
+            // Serialization keeps the author's literal URL text natively.
+            P('serInner', () => { const d = document.createElement('div'); const a = document.createElement('a'); a.setAttribute('href', '/ser-a'); const i = document.createElement('img'); i.setAttribute('src', 'ser-i.png'); d.appendChild(a); d.appendChild(i); return d.innerHTML; });
+            P('serOuterProp', () => { const a = document.createElement('a'); a.href = 'ser-p'; return a.outerHTML; });
+            P('serParsed', () => { const d = document.createElement('div'); d.innerHTML = '<a href="/ser-x">x</a><img src="/image-probe.png?j=ser">'; return d.innerHTML; });
+            P('serXML', () => { const d = document.createElement('div'); d.innerHTML = '<a href="/ser-y">y</a>'; return new XMLSerializer().serializeToString(d.firstChild); });
+            P('serStyle', () => { const d = document.createElement('div'); d.setAttribute('style', 'background:url(/ser-s.png)'); return d.outerHTML; });
+            P('jCiteProp', () => q.cite + '|' + q.getAttribute('cite'));
+            P('jFormactionProp', () => btn.formAction + '|' + btn.getAttribute('formaction'));
+            P('jAreaProp', () => area.href + '|' + area.getAttribute('href'));
+            P('jPosterProp', () => vid.poster);
+            P('jInputSrcProp', () => inp.src);
+            // IDL write paths that skip the setAttribute hook (measured list).
+            const bodyBgBefore = document.body.getAttribute('background');
+            document.body.background = img('bodybg');
+            P('jBodyBgProp', () => document.body.background);
+            const svgNS = 'http://www.w3.org/2000/svg';
+            const svg2 = document.createElementNS(svgNS, 'svg');
+            const im2 = document.createElementNS(svgNS, 'image');
+            im2.setAttribute('width', '4'); im2.setAttribute('height', '4');
+            im2.href.baseVal = img('svgbaseval');
+            svg2.appendChild(im2); host.appendChild(svg2);
+            P('jSvgBaseVal', () => im2.href.baseVal + '|' + im2.href.animVal + '|' + im2.getAttribute('href'));
+            P('jSvgHrefShape', () => (im2.href === im2.href) + '|' + (im2.href instanceof SVGAnimatedString) + '|' + Object.prototype.toString.call(im2.href));
+            // Loads are judged server-side (the test compares the target's
+            // request log for the native and proxied runs): resource-timing
+            // entries exist even for CSP-blocked fetches, so they cannot tell.
+            await new Promise(r => setTimeout(r, 1500));
+            if (bodyBgBefore === null) document.body.removeAttribute('background'); else document.body.setAttribute('background', bodyBgBefore);
+            host.remove(); pre.remove(); st.remove(); imp.remove();
+          }
+          // history.pushState last — it mutates the document URL
+          P('historyPush', () => { history.pushState({}, '', '?pq=1'); return location.search; });
+          window.__compatProbes = out;
+        })();
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/iframe-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>ZP Iframe Probes</title><body><script>
+        (async () => {
+          const out = { messages: [] };
+          window.addEventListener('message', ev => {
+            try {
+              const rec = { data: ev.data, origin: ev.origin };
+              // Store ev.source on a non-enumerable property because Window references cannot be JSON-serialized.
+              Object.defineProperty(rec, 'src', { value: ev.source, enumerable: false });
+              out.messages.push(rec);
+            } catch (e) { out.messages.push({ data: String(ev.data), origin: 'err' }); }
+          });
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const P = async (k, f) => { window.__probeStage = k; try { out[k] = 'v:' + String(await f()); } catch (e) { out[k] = 'e:' + (e && e.name || e); } };
+          const mk = () => { const f = document.createElement('iframe'); document.body.appendChild(f); window.__lastFrameCW = f.contentWindow; return f; };
+          const load = f => new Promise(r => { f.addEventListener('load', r, { once: true }); setTimeout(r, 5000); });
+          // creation/insertion + ownerDocument + identity
+          await P('createBlank', () => {
+            const f = mk();
+            return [!!f.contentWindow, !!f.contentDocument, f.ownerDocument === document].join(',');
+          });
+          await P('identityStable', () => {
+            const f = mk();
+            // Earlier probe frames remain in document.body, so check collection
+            // membership rather than assuming frames[0] === f.
+            let inFrames = false;
+            for (let i = 0; i < window.frames.length; i++) if (window.frames[i] === f.contentWindow) inFrames = true;
+            return [f.contentWindow === f.contentWindow, inFrames, f.contentWindow.parent === window].join(',');
+          });
+          // navigation through frame src — src is set to about:blank first,
+          // then swapped to the share URL async, so the first load event is
+          // about:blank. Poll for the real content instead.
+          const waitText = async (f, want, ms) => {
+            const end = Date.now() + (ms || 6000);
+            while (Date.now() < end) {
+              try { const t = (f.contentDocument && f.contentDocument.body && f.contentDocument.body.textContent || '').trim(); if (t.includes(want)) return t; } catch {}
+              await sleep(120);
+            }
+            return (f.contentDocument && f.contentDocument.body && f.contentDocument.body.textContent || '').trim();
+          };
+          await P('srcLoad', async () => {
+            const f = mk();
+            f.src = '/frame-child';
+            // textContent includes rewritten inline script source, so check
+            // only for the body marker substring.
+            return (await waitText(f, 'frame child')).includes('frame child');
+          });
+          await P('srcVirtual', async () => {
+            const f = mk();
+            f.src = '/frame-child';
+            await waitText(f, 'frame child');
+            return f.contentDocument.location.href;
+          });
+          // postMessage identity/origin (frame-child posts frame-child-ready)
+          await P('postMessage', async () => {
+            const f = mk();
+            f.src = '/frame-child';
+            await sleep(1500);
+            // Filter by event.source because earlier probe frames post the same message format.
+            const m = out.messages.find(m => m.data && m.data.type === 'frame-child-ready' && m.src === f.contentWindow);
+            return m ? [m.data.href, m.data.topOrigin, m.origin, true].join('|') : 'no-message';
+          });
+          // srcdoc — injected prelude + rewritten script
+          await P('srcdocLoad', async () => {
+            const f = mk(); const done = load(f);
+            f.srcdoc = '<p>inner sd</p>';
+            await done;
+            return (f.contentDocument.body.textContent || '').trim();
+          });
+          await P('srcdocScript', async () => {
+            const f = mk(); const done = load(f);
+            f.srcdoc = '<scr' + 'ipt>window.__sd = "sd-ran";</scr' + 'ipt>';
+            await done;
+            await sleep(300);
+            return f.contentWindow.__sd;
+          });
+          await P('srcdocLocation', async () => {
+            const f = mk(); const done = load(f);
+            f.srcdoc = '<p>x</p>';
+            await done;
+            return f.contentDocument.location.href;
+          });
+          // blob: src must be blocked (fail-closed)
+          await P('blobBlocked', async () => {
+            const f = mk();
+            f.src = URL.createObjectURL(new Blob(['<b>blobbed</b>'], { type: 'text/html' }));
+            await sleep(700);
+            const txt = f.contentDocument && f.contentDocument.body ? f.contentDocument.body.textContent : '';
+            return txt.includes('blobbed') ? 'LOADED-BLOB' : 'contained:' + f.contentDocument.location.href;
+          });
+          // sandbox allow-scripts → opaque origin, script still runs
+          await P('sandboxOpaque', async () => {
+            const f = mk();
+            f.setAttribute('sandbox', 'allow-scripts');
+            f.srcdoc = '<scr' + 'ipt>parent.postMessage("sb-ran","*");</scr' + 'ipt>';
+            let docAccess = 'ok';
+            await sleep(1200);
+            try { void f.contentDocument.body; } catch (e) { docAccess = 'e:' + (e && e.name || e); }
+            const ran = out.messages.some(m => m.data === 'sb-ran');
+            // Native browsers return null for contentDocument on sandboxed
+            // opaque-origin frames rather than throwing.
+            const cd = (() => { try { return f.contentDocument === null ? 'null-doc' : (f.contentDocument ? 'doc' : String(f.contentDocument)); } catch (e) { return 'e:' + (e && e.name || e); } })();
+            return [ran ? 'ran' : 'silent', cd].join('|');
+          });
+          // Nested srcdoc grandchild prelude: send the marker via postMessage
+          // because the cross-window facade blocks arbitrary expando reads.
+          window.__probeStage = 'nested';
+          await P('nested', async () => {
+            const f = mk(); const done = load(f);
+            // Read the grandchild payload from a textarea value so a closing
+            // script tag inside nested srcdoc markup does not terminate the outer script.
+            const inner = '<scr' + 'ipt>top.postMessage("gc-ran","*");</scr' + 'ipt>';
+            f.srcdoc = '<textarea id=t hidden>' + inner + '</textarea><scr' + 'ipt>try{var n=document.createElement("iframe");n.srcdoc=document.getElementById("t").value;document.body.appendChild(n);parent.postMessage("child-did-set","*")}catch(e){parent.postMessage("child-err:"+(e&&(e.name+":"+e.message)||e),"*")}</scr' + 'ipt>';
+            await done;
+            await sleep(1500);
+            let nfo = '';
+            try {
+              const n = f.contentDocument && f.contentDocument.querySelector('iframe');
+              nfo = n ? 'n-scripts=' + (n.contentDocument ? n.contentDocument.scripts.length : 'nodoc') : 'n-absent';
+            } catch (e) { nfo = 'inspect-e:' + (e && e.name || e); }
+            const childMsg = out.messages.map(m => m.data).find(d => typeof d === 'string' && (d === 'child-did-set' || d.startsWith('child-err')));
+            return [out.messages.some(m => m.data === 'gc-ran') ? 'grandchild-ran' : 'no-mark', nfo, String(childMsg || 'no-child-msg')].join('|');
+          });
+          // insert→remove race then clean load
+          await P('removeRace', async () => {
+            const f = mk();
+            f.src = '/frame-child';
+            f.remove();
+            await sleep(300);
+            const f2 = mk();
+            f2.src = '/frame-child';
+            return (await waitText(f2, 'frame child')).includes('frame child');
+          });
+          window.__probeStage = 'done';
+          window.__iframeProbes = out;
+        })().catch(e => { window.__iframeProbes = { __fatal: String(e && (e.stack || e)), __stage: window.__probeStage }; });
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/compat-echo') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('echo');
+      return;
+    }
+    if (url.pathname === '/worker-echo') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('worker-echo');
+      return;
+    }
+    if (url.pathname === '/worker-imported.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`self.__imported = 'imp-ok';`);
+      return;
+    }
+    if (url.pathname === '/probe-module-dep.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`export const marker = 'dep-ok';`);
+      return;
+    }
+    if (url.pathname === '/probe-worker.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`(async () => {
+        const out = {};
+        const P = async (k, f) => { try { out[k] = 'v:' + String(await f()); } catch (e) { out[k] = 'e:' + (e && e.name || e); } };
+        await P('href', () => location.href);
+        await P('locProps', () => [location.protocol, location.host, location.pathname].join('|'));
+        await P('locMethods', () => [typeof location.assign, typeof location.reload, typeof location.toString].join(','));
+        await P('ua', () => navigator.userAgent);
+        await P('platform', () => navigator.platform);
+        await P('fetchEcho', async () => (await fetch('/worker-echo?w=d')).status);
+        await P('xhrShim', async () => {
+          const x = new XMLHttpRequest();
+          return await new Promise(res => { x.onload = () => res(x.status); x.onerror = () => res('xhr-err'); x.open('GET', '/worker-echo?w=x'); x.send(); });
+        });
+        await P('xhrSync', () => { const x = new XMLHttpRequest(); try { x.open('GET', '/worker-echo?w=sync', false); x.send(); return 'status:' + x.status + '|' + String(x.responseText).slice(0, 20); } catch (e) { return 'e:' + (e && e.name || e); } });
+        await P('wsCtor', () => { try { new WebSocket('ws://nonexistent.invalid/'); return 'constructed'; } catch (e) { return 'e:' + (e && e.name || e); } });
+        // Worker WebSocket round-trip relayed through the page Service Worker stream.
+        await P('wsRoundtrip', () => new Promise(res => {
+          try {
+            const ws = new WebSocket('/ws?w=worker');
+            const to = setTimeout(() => { try { ws.close(); } catch (_) {} res('timeout'); }, 6000);
+            ws.onopen = () => { try { ws.send('ping'); } catch (e) { clearTimeout(to); res('send-e:' + (e && e.name || e)); } };
+            ws.onmessage = ev => { clearTimeout(to); try { ws.close(); } catch (_) {} res('msg:' + ev.data); };
+            ws.onerror = () => { clearTimeout(to); res('err'); };
+          } catch (e) { res('e:' + (e && e.name || e)); }
+        }));
+        await P('rtcCtor', () => { try { new RTCPeerConnection(); return 'constructed'; } catch (e) { return 'e:' + (e && e.name || e); } });
+        await P('wtCtor', () => { try { const w = new WebTransport('https://nonexistent.invalid/'); return 'constructed:' + String(w.readyState); } catch (e) { return 'e:' + (e && e.name || e); } });
+        // Worker EventSource receives SSE messages over proxied fetch.
+        await P('esRoundtrip', () => new Promise(res => {
+          try {
+            const es = new EventSource('/sse?w=es');
+            const to = setTimeout(() => { try { es.close(); } catch (_) {} res('timeout'); }, 4000);
+            es.onmessage = ev => { clearTimeout(to); es.close(); res('msg:' + ev.data); };
+            es.onerror = () => { clearTimeout(to); es.close(); res('err'); };
+          } catch (e) { res('e:' + (e && e.name || e)); }
+        }));
+        await P('evalCode', () => eval('1+1'));
+        await P('funcCtor', () => new Function('return 7')());
+        await P('timerFn', () => new Promise(r => setTimeout(() => r('fired'), 10)));
+        await P('timerStr', () => new Promise(r => {
+          try { setTimeout('self.__st=7', 10); setTimeout(() => r(typeof self.__st === 'undefined' ? 'not-ran' : 'ran'), 120); }
+          catch (e) { r('e:' + (e && e.name || e)); }
+        }));
+        await P('importScriptsOK', () => { importScripts('/worker-imported.js'); return self.__imported; });
+        await P('importScriptsData', () => { importScripts('data:text/javascript,self.__di=1'); return 'imported'; });
+        await P('importScriptsBlob', () => { const u = URL.createObjectURL(new Blob(['self.__bi=1'], { type: 'text/javascript' })); importScripts(u); return 'imported'; });
+        await P('idb', () => typeof indexedDB);
+        await P('idbRoundtrip', async () => {
+          const db = await new Promise((res, rej) => { const r = indexedDB.open('wprobe'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+          const dbs = indexedDB.databases ? await indexedDB.databases() : [];
+          db.close();
+          return dbs.some(d => d.name === 'wprobe') ? 'listed-virtual' : 'list=' + JSON.stringify(dbs.map(d => d.name));
+        });
+        await P('cachesRoundtrip', async () => {
+          if (typeof caches === 'undefined') return 'no-caches';
+          const c = await caches.open('wc');
+          const keys = await caches.keys();
+          await caches.delete('wc');
+          return c ? 'open+keys=' + keys.length : 'no';
+        });
+        await P('cookieStore', () => typeof cookieStore);
+        await P('errorStack', () => { try { throw new Error('x'); } catch (e) { return /proxy\\.localhost|zp\\//i.test(e.stack || '') ? 'LEAK' : 'clean'; } });
+        // WorkerGlobalScope virtualized surface probes.
+        await P('origin', () => self.origin);
+        await P('secureCtx', () => String(self.isSecureContext));
+        await P('urlResolve', () => new URL('/w-abs', location.href).href);
+        await P('webkitURLAlias', () => typeof webkitURL === 'function' ? new webkitURL('/wk', location.href).href : 'absent:' + typeof webkitURL);
+        await P('webkitIDB', () => typeof webkitIndexedDB !== 'undefined' && webkitIndexedDB === indexedDB ? 'alias' : 'not-alias:' + typeof webkitIndexedDB);
+        await P('bcName', () => { const c = new BroadcastChannel('wp1'); const n = c.name; c.close(); return n; });
+        await P('opfsName', async () => {
+          if (!navigator.storage || typeof navigator.storage.getDirectory !== 'function') return 'absent';
+          const d = await navigator.storage.getDirectory();
+          return 'name:' + d.name;
+        });
+        await P('webkitFS', () => {
+          const t = typeof self.webkitRequestFileSystem;
+          if (t !== 'function') return t;
+          try { self.webkitRequestFileSystem(0, 0, () => {}, () => {}); return 'fn:ran'; }
+          catch (e) { return 'fn:e:' + (e && e.name || e); }
+        });
+        await P('sharedStorageW', () => typeof self.sharedStorage);
+        postMessage(out);
+      })().catch(e => postMessage({ __fatal: String(e && (e.stack || e)) }));`);
+      return;
+    }
+    if (url.pathname === '/probe-module-worker.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`import { marker } from './probe-module-dep.js';
+      (async () => {
+        const out = {};
+        const P = async (k, f) => { try { out[k] = 'v:' + String(await f()); } catch (e) { out[k] = 'e:' + (e && e.name || e); } };
+        await P('href', () => location.href);
+        await P('importMetaUrl', () => import.meta.url);
+        await P('staticImport', () => marker);
+        await P('fetchEcho', async () => (await fetch('/worker-echo?w=m')).status);
+        await P('evalCode', () => eval('1'));
+        await P('funcCtor', () => new Function('return 1')());
+        // Module worker importScripts throws TypeError.
+        await P('importScriptsStub', () => {
+          if (typeof importScripts !== 'function') return 'absent';
+          try { importScripts('/worker-imported.js'); return 'imported'; } catch (e) { return 'e:' + (e && e.name || e); }
+        });
+        postMessage(out);
+      })().catch(e => postMessage({ __fatal: String(e && (e.stack || e)) }));`);
+      return;
+    }
+    if (url.pathname === '/probe-shared-worker.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`self.onconnect = ev => {
+        const port = ev.ports[0];
+        const out = {};
+        try { out.name = String(self.name); out.href = location.href; out.ua = navigator.userAgent; }
+        catch (e) { out.err = String(e && (e.name + ':' + e.message) || e); }
+        port.postMessage(out);
+      };`);
+      return;
+    }
+    if (url.pathname === '/worker-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>ZP Worker Probes</title><body><script>
+        (async () => {
+          const out = {};
+          const collect = mkw => new Promise(r => {
+            let w;
+            try { w = mkw(); } catch (e) { r({ __ctor: (e && e.name || '') + ':' + (e && e.message || '') }); return; }
+            const t = setTimeout(() => r({ __timeout: 1 }), 10000);
+            w.onmessage = ev => { clearTimeout(t); r(ev.data); };
+            // Module worker graph load failures surface as an error event with
+            // an empty message; delay rejection slightly so diagnostic
+            // postMessage payloads from the boot chain arrive first.
+            w.onerror = ev => { const em = String(ev && ev.message || 'err'); setTimeout(() => { clearTimeout(t); r({ __error: em }); }, 600); };
+          });
+          out.dedicated = await collect(() => new Worker('/probe-worker.js'));
+          out.module = await collect(() => new Worker('/probe-module-worker.js', { type: 'module' }));
+          out.shared = await new Promise(r => {
+            try {
+              const sw = new SharedWorker('/probe-shared-worker.js', { name: 'swprobe' });
+              const t = setTimeout(() => r({ __timeout: 1 }), 10000);
+              sw.port.onmessage = ev => { clearTimeout(t); r(ev.data); };
+              sw.port.start();
+            } catch (e) { r({ __error: (e && e.name || '') + ':' + (e && e.message || '') }); }
+          });
+          window.__workerProbes = out;
+        })().catch(e => { window.__workerProbes = { __fatal: String(e && (e.stack || e)) }; });
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/csp-probes') {
+      // Inline module execution requires blob: in script-src (__ZP_EXEC_INLINE_MODULE).
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>ZP CSP Probes</title><body><script type="module">
+        // Merge into existing __workerProbes if classic probes initialized it first.
+        (window.__cspProbes = window.__cspProbes || { violations: [] }).inlineModule = 'ran';
+      <\/script><script>
+        (async () => {
+          const out = window.__cspProbes = window.__cspProbes || { violations: [] };
+          const violations = out.violations;
+          document.addEventListener('securitypolicyviolation', e => {
+            violations.push(e.effectiveDirective + '|' + String(e.blockedURI).slice(0, 60));
+          });
+          const P = async (k, fn) => { try { out[k] = await fn(); } catch (e) { out[k] = 'e:' + (e && (e.name || e.message) || e); } };
+          const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+          const waitFor = (re, ms) => new Promise(r => setTimeout(() => {
+            const hit = violations.find(v => re.test(v));
+            r(hit ? 'spv:' + hit.split('|')[0] : 'no-spv');
+          }, ms));
+
+          // connect-src blob:/data: requests pass CSP and are handled by the fetch shim.
+          await P('fetchData', async () => { const r = await fetch('data:text/plain,hi'); return r.status + ':' + (await r.text()); });
+          await P('fetchBlob', async () => { const r = await fetch(URL.createObjectURL(new Blob(['bl']))); return r.status + ':' + (await r.text()); });
+
+          // img/style/font/media-src allow data: and blob: URLs without firing SPV.
+          await P('imgData', () => new Promise(r => {
+            const i = new Image(); const t = setTimeout(() => r('timeout'), 3000);
+            i.onload = () => { clearTimeout(t); r('loaded'); };
+            i.onerror = () => { clearTimeout(t); r('load-err'); };
+            i.src = PNG;
+          }));
+          await P('styleData', () => new Promise(r => {
+            const l = document.createElement('link'); const t = setTimeout(() => r('timeout'), 3000);
+            l.rel = 'stylesheet'; l.onload = () => { clearTimeout(t); r('loaded'); };
+            l.onerror = () => { clearTimeout(t); r('err'); };
+            l.href = 'data:text/css,body%7B%7D'; document.head.appendChild(l);
+          }));
+          // Font and media decode errors are expected; CSP pass is judged by absence of SPV.
+          await P('fontData', async () => {
+            try { const f = new FontFace('zpf', 'url(data:font/woff2;base64,AAAA)'); await f.load(); return 'loaded'; }
+            catch (e) { return 'font-err:' + (e && e.name || e); }
+          });
+          await P('mediaData', () => new Promise(r => {
+            const v = document.createElement('video'); const t = setTimeout(() => r('settled'), 1500);
+            v.onerror = () => { clearTimeout(t); r('media-err'); };
+            v.onloadeddata = () => { clearTimeout(t); r('loaded'); };
+            v.src = 'data:video/mp4;base64,AAAA';
+          }));
+
+          // Blocked directives must fire securitypolicyviolation events.
+          await P('objectBlocked', () => {
+            const o = document.createElement('object');
+            o.data = '/csp-payload'; document.body.appendChild(o);
+            return waitFor(/^object-src/, 1200);
+          });
+          await P('baseBlocked', () => {
+            const b = document.createElement('base'); b.href = 'https://evil.invalid/';
+            document.head.appendChild(b); return waitFor(/^base-uri/, 800);
+          });
+          await P('prefetchBlocked', () => {
+            const l = document.createElement('link'); l.rel = 'prefetch'; l.href = '/x';
+            document.head.appendChild(l); return waitFor(/prefetch-src|default-src/, 800);
+          });
+          await P('manifestBlocked', () => {
+            const l = document.createElement('link'); l.rel = 'manifest'; l.href = 'data:application/json,%7B%7D';
+            document.head.appendChild(l); return waitFor(/manifest-src/, 800);
+          });
+
+          // Directives allowed by CSP but blocked earlier by attribute/hook policy.
+          await P('frameDataSrc', () => {
+            const f = document.createElement('iframe');
+            try { f.src = 'data:text/html,<b>x</b>'; document.body.appendChild(f); return 'set:' + String(f.src).slice(0, 40); }
+            catch (e) { return 'blocked:' + (e && e.name || e); }
+          });
+          await P('workerBlob', () => {
+            try {
+              const w = new Worker(URL.createObjectURL(new Blob(['postMessage(1)'], { type: 'text/javascript' })));
+              return 'created';
+            } catch (e) { return 'blocked:' + (e && e.name || e); }
+          });
+
+          // Inline script and eval execution under unsafe-inline and unsafe-eval.
+          await P('inlineHandler', () => new Promise(r => {
+            const b = document.createElement('button');
+            b.setAttribute('onclick', 'window.__cspHandlerRan = 1');
+            document.body.appendChild(b); b.click();
+            setTimeout(() => r(window.__cspHandlerRan ? 'ran' : 'silent'), 400);
+          }));
+          await P('evalPath', () => { try { return 'v:' + eval('40+2'); } catch (e) { return 'e:' + (e && e.name || e); } });
+
+          // Injected <meta> CSP intersection preserves proxy plumbing while enforcing target restrictions.
+          await P('metaNeutralized', () => {
+            const m = document.createElement('meta');
+            m.setAttribute('http-equiv', 'Content-Security-Policy');
+            m.setAttribute('content', "default-src 'none'");
+            document.head.appendChild(m);
+            return new Promise(r => {
+              const i = new Image(); const t = setTimeout(() => r('timeout'), 3000);
+              i.onload = () => { clearTimeout(t); r('img-loaded-after-meta'); };
+              i.onerror = () => { clearTimeout(t); r('img-blocked-after-meta'); };
+              i.src = PNG;
+            });
+          });
+          // Stricter target resource directives such as img-src 'none' are preserved
+          // verbatim when they do not conflict with proxy transport requirements.
+          // (Placed last because a <meta> CSP remains active for subsequent loads.)
+          await P('metaStricter', () => {
+            const m = document.createElement('meta');
+            m.setAttribute('http-equiv', 'Content-Security-Policy');
+            m.setAttribute('content', "img-src 'none'");
+            document.head.appendChild(m);
+            return new Promise(r => {
+              const i = new Image(); const t = setTimeout(() => r('timeout'), 3000);
+              i.onload = () => { clearTimeout(t); r('img-loaded'); };
+              i.onerror = () => { clearTimeout(t); r('img-blocked'); };
+              i.src = PNG;
+            });
+          });
+          out.done = true;
+        })().catch(e => { (window.__cspProbes = window.__cspProbes || { violations: [] }).__fatal = String(e && (e.stack || e)); });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/dyn-mod.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('export const m = 1; export const meta = import.meta.url;');
+      return;
+    }
+    if (/^\/lex-mod-[abc]\.js$/.test(url.pathname)) {
+      // Modules without import/export declarations still have module scope (isolated top-level let bindings).
+      const tag = url.pathname.charAt(9);
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`let e = '${tag}'; window.__lexMod${tag.toUpperCase()} = e;`);
+      return;
+    }
+    if (url.pathname === '/dyn-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>ZP Dynamic Probes</title><body>
+      <button id="staticHandler" onclick="window.__staticHandlerRan = 1"></button>
+      <script type="module" src="/lex-mod-a.js"><\/script>
+      <script type="module" src="/lex-mod-b.js"><\/script>
+      <script>
+        // document.write during parse — inserts into the live pipeline.
+        document.write('<span id="dw">wrote</span>');
+      <\/script>
+      <script>
+        (async () => {
+          const out = window.__dynProbes = {};
+          const P = async (k, fn) => { try { out[k] = await fn(); } catch (e) { out[k] = 'e:' + (e && (e.name || e.message) || e); } };
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          // Direct and indirect eval probes.
+          await P('evalBasic', () => 'v:' + eval('1+1'));
+          await P('evalLocation', () => 'v:' + eval('location.href'));
+          await P('evalVarVisible', () => {
+            eval('var __evv = 42');
+            return 'v:' + (typeof __evv !== 'undefined' ? __evv : 'undefined');
+          });
+          await P('evalStrict', () => 'v:' + eval('"use strict"; location.origin'));
+          await P('evalSyntaxError', () => { try { eval('@@@not code@@@'); return 'no-throw'; } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('evalNonString', () => 'v:' + JSON.stringify([eval(123), eval(undefined), eval(null)]));
+          await P('evalIndirect', () => 'v:' + (0, eval)('location.origin'));
+          await P('evalCall', () => { try { return 'v:' + eval.call(null, '2+3'); } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('evalAsCtor', () => { try { return 'v:' + (new eval()); } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('evalTagged', () => 'v:' + typeof eval\`x\`);
+
+          // Function constructor parameter parsing, receiver binding, new.target, and nested compilation.
+          await P('fnBasic', () => 'v:' + new Function('return 40+2')());
+          await P('fnParams', () => 'v:' + new Function('a', 'b', 'return a*b')(6, 7));
+          await P('fnDefaultParam', () => 'v:' + new Function('a = 5', 'return a')());
+          await P('fnCommentParam', () => 'v:' + new Function('/*c*/x', 'return x')(9));
+          await P('fnThis', () => { const t = new Function('return this')(); return 'v:' + (t && t.location && t.location.href ? t.location.href.slice(0, 30) : typeof t); });
+          await P('fnThisIsWindow', () => { const t = new Function('return this')(); return 'v:' + (t === window); });
+          await P('fnLocation', () => 'v:' + new Function('return location.origin')());
+          await P('fnWith', () => { try { return 'v:' + new Function('with({a:1}) return a')(); } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('fnNestedEval', () => 'v:' + new Function('return eval("3*3")')());
+          await P('asyncFnCtor', () => new Function('return 1').constructor === Function ? 'v:ctor-same' : 'v:ctor-diff');
+          await P('asyncFn', async () => 'v:' + await (Object.getPrototypeOf(async function(){}).constructor)('return 8')());
+
+          // String timer compilation, virtual scope, and syntax error reporting.
+          await P('timerString', () => new Promise(r => { setTimeout('window.__tStr = 7', 0); setTimeout(() => r('v:' + window.__tStr), 300); }));
+          await P('timerVirtual', () => new Promise(r => { setTimeout('window.__tVirt = location.origin', 0); setTimeout(() => r('v:' + window.__tVirt), 300); }));
+          await P('timerThis', () => new Promise(r => { try { setTimeout('window.__tThis = String(this["location"] && this["location"].href).slice(0,30)', 0); } catch (e) { return r('ctor:' + (e && e.name || e)); } setTimeout(() => r('v:' + String(window.__tThis)), 400); }));
+          await P('timerBad', () => new Promise(r => {
+            const errs = [];
+            window.addEventListener('error', h => errs.push(String(h.message || h.type)), { once: true });
+            setTimeout('@@@timer bad@@@', 0);
+            setTimeout(() => r(errs.length ? 'v:error-surfaced' : 'v:silent'), 400);
+          }));
+          await P('intervalString', () => new Promise(r => {
+            const id = setInterval('window.__tInt = (window.__tInt || 0) + 1', 20);
+            setTimeout(() => { clearInterval(id); r('v:' + window.__tInt); }, 300);
+          }));
+
+          // Event handler compilation across content attributes, IDL properties, and addEventListener.
+          await P('handlerStatic', () => { document.getElementById('staticHandler').click(); return 'v:' + (window.__staticHandlerRan || 'silent'); });
+          await P('handlerPropString', () => {
+            const b = document.createElement('button');
+            b.onclick = 'window.__propStr = 9';
+            document.body.appendChild(b); b.click();
+            return 'v:' + (window.__propStr || 'silent');
+          });
+          await P('handlerPropFn', () => {
+            const b = document.createElement('button');
+            b.onclick = function() { window.__propFn = location.origin; };
+            document.body.appendChild(b); b.click();
+            return 'v:' + (window.__propFn || 'silent');
+          });
+
+          // Dynamic DOM script insertion via transformHTML.
+          await P('innerHTMLScript', () => {
+            const d = document.createElement('div');
+            d.innerHTML = '<scr' + 'ipt>window.__ihScr = 5</scr' + 'ipt>';
+            document.body.appendChild(d);
+            return 'v:' + (window.__ihScr || 'silent');
+          });
+          await P('adjacentScript', () => {
+            const d = document.createElement('div');
+            document.body.appendChild(d);
+            d.insertAdjacentHTML('beforeend', '<scr' + 'ipt>window.__adjScr = 6</scr' + 'ipt>');
+            return 'v:' + (window.__adjScr || 'silent');
+          });
+          await P('domParserScript', () => {
+            const doc = new DOMParser().parseFromString('<scr' + 'ipt>window.__dpScr = 1</scr' + 'ipt><b>x</b>', 'text/html');
+            document.body.appendChild(doc.body.firstElementChild || doc.body);
+            return 'v:' + (window.__dpScr || 'silent');
+          });
+          await P('docWrite', () => 'v:' + (document.getElementById('dw') ? 'wrote' : 'missing'));
+
+          // Dynamic import() resolution and blocking.
+          await P('importHttp', async () => { const m = await import('/dyn-mod.js'); return 'v:' + m.m + '|' + m.meta; });
+          // D2/D3: plain page code — the rewriter turns these into
+          // import(__zp_module_url(…)). They used to call that helper by hand,
+          // which made the probe proxy-only (ReferenceError natively) and hid
+          // it from the direct-vs-proxy differential.
+          await P('importData', async () => { try { const m = await import('data:text/javascript,export%20default%201'); return 'v:' + (m && m.default); } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('importBlob', async () => { try { const u = URL.createObjectURL(new Blob(['export default 3'], { type: 'text/javascript' })); const m = await import(u); return 'v:' + (m && m.default); } catch (e) { return 'threw:' + (e && e.name || e); } });
+
+          // Source text leak checks: internal __zp_* identifiers and proxy routes must not be visible.
+          // Use substring checks instead of regex literals so the outer template
+          // literal does not unescape backslash-slash sequences.
+          const leaked = s => s.includes('__zp_') || s.includes('/zp/api') || s.includes('proxy.localhost') || s.includes('worker-script');
+          await P('leakFnToString', () => leaked(new Function('return 1').toString()) ? 'LEAK' : 'v:clean');
+          await P('leakCallee', () => leaked((function(){ return arguments.callee.toString(); })()) ? 'LEAK' : 'v:clean');
+          await P('leakDynStack', () => {
+            let s = '';
+            try { eval('throw new Error("stk")'); } catch (e) { s = String(e.stack || ''); }
+            return leaked(s) ? 'LEAK:' + s.slice(0, 80) : 'v:clean';
+          });
+          await P('leakFnStack', () => {
+            let s = '';
+            try { new Function('throw new Error("fstk")')(); } catch (e) { s = String(e.stack || ''); }
+            return leaked(s) ? 'LEAK:' + s.slice(0, 80) : 'v:clean';
+          });
+
+          // ── ERRATA §E parity found by the native differential (2026-09-29) ──
+          // A runtime throw inside indirect eval must not re-run the code
+          // (an old Function-body fallback executed it twice).
+          await P('evalRuntimeOnce', () => { window.__ero = 0; try { (0, eval)('window.__ero++; throw new Error("x")'); } catch (e) {} return 'v:' + window.__ero; });
+          await P('evalReturnStmt', () => { try { return 'v:' + (0, eval)('return 1'); } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('evalObjectArg', () => { window.__ets = 0; const o = { toString() { window.__ets = 1; return '2+2'; } }; const r = (0, eval)(o); return 'v:' + (r === o) + '|' + window.__ets; });
+          await P('evalEmpty', () => 'v:' + typeof eval('') + '|' + typeof (0, eval)(''));
+          await P('evalSyntaxInstance', () => { try { eval('@@@'); return 'no-throw'; } catch (e) { return 'v:' + (e instanceof SyntaxError); } });
+          await P('fnSyntaxError', () => { try { new Function('if('); return 'no-throw'; } catch (e) { return 'threw:' + (e && e.name || e) + '|' + (e instanceof SyntaxError); } });
+          await P('fnParamSyntax', () => { try { new Function('a b', 'return 1'); return 'no-throw'; } catch (e) { return 'threw:' + (e && e.name || e); } });
+          await P('winHandlerString', () => { window.onmessageerror = 'window.__whs = 1'; const r = 'v:' + window.onmessageerror; window.onmessageerror = null; return r; });
+
+          // Scripts with type="module" remain module-scoped even without import/export syntax.
+          // Two static modules each declare top-level let e in their own module scope;
+          // rewriting them as classic scripts would collide in the shared top-level
+          // lexical registry with "already declared".
+          await P('staticModuleLex', async () => { for (let i = 0; i < 60 && !(window.__lexModA && window.__lexModB); i++) await sleep(50); return 'v:' + window.__lexModA + '|' + window.__lexModB; });
+          // Setting src before type="module" still executes as a module based on type at insertion.
+          // A subsequent classic let e only collides if the module binding leaked into the global registry.
+          await P('dynModuleTypeAfterSrc', async () => {
+            const s = document.createElement('script');
+            Object.assign(s, { src: '/lex-mod-c.js', type: 'module' });
+            await new Promise(res => { s.onload = s.onerror = res; document.head.appendChild(s); });
+            const k = document.createElement('script');
+            k.textContent = "let e = 'k'; window.__lexClassicE = e;";
+            document.head.appendChild(k);
+            return 'v:' + window.__lexModC + '|' + window.__lexClassicE;
+          });
+          // Blob worker source is snapshotted at creation time and still runs
+          // if URL.revokeObjectURL is called immediately afterward.
+          await P('blobWorkerRevoked', () => new Promise((res) => {
+            const u = URL.createObjectURL(new Blob(['postMessage(self.location.protocol + Object.keys({ a: 1 }).join())'], { type: 'text/javascript' }));
+            const w = new Worker(u);
+            URL.revokeObjectURL(u);
+            const t = setTimeout(() => res('timeout'), 8000);
+            w.onmessage = (e) => { clearTimeout(t); w.terminate(); res('v:' + e.data); };
+            w.onerror = (e) => { clearTimeout(t); e.preventDefault(); res('error:' + e.message); };
+          }));
+          // Calling native methods on self inside a worker must unwrap the scope
+          // proxy receiver to avoid Illegal invocation errors, and preserve
+          // Function.prototype on wrapper functions.
+          await P('workerSelfMethods', () => new Promise((res) => {
+            const src = "self.addEventListener('message', function () { postMessage([self.atob('YQ=='), typeof self.setTimeout(function () {}, 1), self.addEventListener === self.addEventListener, Function.prototype.toString.call(self.atob).indexOf('native code') > 0].join()); });";
+            const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            const t = setTimeout(() => res('timeout'), 8000);
+            w.onmessage = (e) => { clearTimeout(t); w.terminate(); res('v:' + e.data); };
+            w.onerror = (e) => { clearTimeout(t); e.preventDefault(); res('error:' + e.message); };
+            w.postMessage(1);
+          }));
+          out.done = true;
+        })().catch(e => { (window.__dynProbes = window.__dynProbes || {}).__fatal = String(e && (e.stack || e)); });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/perf-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Perf Probes</title><body><script>
+        (async () => {
+          const out = window.__perfProbes = {};
+          const P = async (k, fn) => { try { out[k] = 'v:' + (await fn()); } catch (e) { out[k] = 'threw:' + (e && e.name || e); } };
+
+          // 10M loop cap boundary probes.
+          // Loops below the cap complete normally without tripping the guard.
+          await P('underCap', () => {
+            let i = 0;
+            while (true) { i++; if (i >= 5000000) break; }
+            return i;
+          });
+          // Loops exceeding the cap terminate at 10M iterations instead of hanging.
+          await P('cappedWhile', () => {
+            let j = 0;
+            while (true) { j++; }
+            return j;
+          });
+          // Unconditional for(let i=0;;i++) with a break at 12M stops at 10M
+          // when capped (or 12000001 if uncapped).
+          await P('cappedFor', () => {
+            let m = 0;
+            for (m = 0;; m++) { if (m > 12000000) break; }
+            return m;
+          });
+          await P('cappedDo', () => {
+            let d = 0;
+            do { d++; } while (true);
+            return d;
+          });
+          // Negative control: bounded loops must not have loop counter state injected.
+          await P('normalLoop', () => {
+            let n = 0;
+            for (n = 0; n < 3; n++) {}
+            return n;
+          });
+          // Nested loops must not share or clobber the outer loop counter.
+          await P('nestedLoops', () => {
+            let outer = 0, inner = 0;
+            while (true) { outer++; if (outer >= 100) break; while (true) { inner++; if (inner >= outer * 100) break; } }
+            return outer + '|' + inner;
+          });
+
+          // Async polling loop lifetime.
+          // while(true) with await and break must honor break under the loop cap
+          // and stop polling after exit.
+          await P('asyncPollBreak', async () => {
+            let ap = 0;
+            while (true) {
+              ap++;
+              await new Promise(r => setTimeout(r, 1));
+              if (ap >= 20) break;
+            }
+            return ap;
+          });
+          await P('asyncPollFlag', async () => {
+            let polls = 0, flag = false;
+            setTimeout(() => { flag = true; }, 30);
+            while (!flag) {
+              polls++;
+              await new Promise(r => setTimeout(r, 1));
+              if (polls > 5000) break;
+            }
+            const atExit = polls;
+            await new Promise(r => setTimeout(r, 20));
+            return flag + '|' + (atExit === polls) + '|' + (polls <= 5000);
+          });
+
+          // Bulk DOM insertion throughput.
+          await P('bulkDom', () => {
+            const t = performance.now();
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < 5000; i++) {
+              const d = document.createElement('div');
+              d.textContent = 'x' + i;
+              frag.appendChild(d);
+            }
+            document.body.appendChild(frag);
+            const ms = performance.now() - t;
+            return document.querySelectorAll('div').length + '|' + Math.round(ms);
+          });
+
+          // Concurrent iframe load latency.
+          await P('iframes', async () => {
+            const N = 5;
+            const t = performance.now();
+            const results = await Promise.all([...Array(N)].map((_, idx) => new Promise(res => {
+              const f = document.createElement('iframe');
+              f.srcdoc = '<p>f' + idx + '</p>';
+              document.body.appendChild(f);
+              const deadline = setTimeout(() => res('timeout'), 15000);
+              (function poll() {
+                try {
+                  if (f.contentDocument && f.contentDocument.body && f.contentDocument.body.textContent.includes('f' + idx)) {
+                    clearTimeout(deadline); res('loaded'); return;
+                  }
+                } catch {}
+                setTimeout(poll, 20);
+              })();
+            })));
+            const ms = performance.now() - t;
+            return results.join(',') + '|' + Math.round(ms);
+          });
+
+          // Membrane hot-loop property access overhead.
+          // Measure 200k location.href reads via __zp_get for diagnostic reporting
+          // without enforcing a tight wall-clock bound.
+          await P('membraneRead', () => {
+            const t = performance.now();
+            let s = 0;
+            for (let i = 0; i < 200000; i++) s += location.href.length;
+            return Math.round(performance.now() - t) + 'ms|' + s;
+          });
+          // MutationObserver overhead across 2,000 sequential DOM insertions.
+          await P('moOverhead', async () => {
+            const t = performance.now();
+            for (let i = 0; i < 2000; i++) {
+              const d = document.createElement('div');
+              d.setAttribute('data-mo', i);
+              document.body.appendChild(d);
+              d.remove();
+            }
+            await new Promise(r => setTimeout(r, 30));
+            return Math.round(performance.now() - t) + 'ms';
+          });
+          out.done = true;
+        })().catch(e => { (window.__perfProbes = window.__perfProbes || {}).__fatal = String(e && (e.stack || e)); });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/frame-html') {
+      // Reports initial and delayed realm state so parent containment overwrites are caught.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>fh</title><script>parent.__fhSaw = String(location.href); setTimeout(function () { parent.__fhLate = String(location.href); }, 300);<\/script>');
+      return;
+    }
+    if (url.pathname === '/xsite-echo') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      // Bare addEventListener (undefined receiver) replying via e.source.
+      res.end('<!doctype html><title>echo</title><script>addEventListener("message", function (e) { if (e.data === "ping") parent.postMessage("pong", "*"); else if (e.data === "who") e.source.postMessage("who:" + JSON.stringify({ srcIsParent: e.source === parent, srcIsTop: e.source === top, origin: e.origin, trusted: e.isTrusted }), "*"); });<\/script>');
+      return;
+    }
+    if (url.pathname === '/xsite-child' || url.pathname === '/xsite-same' || url.pathname === '/xsite-pop') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(xsiteReporter(url.pathname, url.pathname === '/xsite-pop'));
+      return;
+    }
+    if (url.pathname === '/xsite') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Cross-site access</title><body><script>
+        window.__xsite = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+          var got = {}, pop = null, cross = null, same = null;
+          window.addEventListener('message', function (e) {
+            try {
+              var d = JSON.parse(e.data);
+              var handle = d.kind === '/xsite-child' ? cross && cross.contentWindow : d.kind === '/xsite-same' ? same && same.contentWindow : pop;
+              got[d.kind] = { R: d.R, sourceIsHandle: !!handle && e.source === handle };
+            } catch (x) {}
+          });
+          var mk = function (src) { var f = document.createElement('iframe'); f.src = src; document.body.appendChild(f); return f; };
+          var op = function (f) {
+            try { var v = f(); return v === null ? 'null' : (typeof v === 'object' || typeof v === 'function') ? typeof v : (typeof v === 'string' ? 'string' : String(v)); }
+            catch (e) { return 'threw:' + (e && e.name); }
+          };
+          cross = mk('http://' + other + ':' + location.port + '/xsite-child');
+          same = mk('/xsite-same');
+          var t0 = Date.now();
+          while (Date.now() - t0 < 8000 && !(got['/xsite-child'] && got['/xsite-same'])) await sleep(50);
+          await sleep(300);
+          var frameTable = function (label, f, index) {
+            var w = f.contentWindow;
+            var T = {
+              document: function () { return w.document; }, localStorage: function () { return w.localStorage; }, eval: function () { return w.eval; },
+              name: function () { return w.name; }, origin: function () { return w.origin; }, navigator: function () { return w.navigator; },
+              expando: function () { return w.zpChildVar; }, window: function () { return w.window === w; }, self: function () { return w.self === w; },
+              postMessage: function () { return w.postMessage; }, close: function () { return w.close; }, focus: function () { return w.focus; },
+              closed: function () { return w.closed; }, length: function () { return w.length; }, frames: function () { return w.frames; },
+              top: function () { return w.top === top; }, parent: function () { return w.parent === window; }, opener: function () { return w.opener; },
+              locationType: function () { return w.location; }, locationHref: function () { return w.location.href; }, locationReplace: function () { return w.location.replace; },
+              inDocument: function () { return 'document' in w; }, inPostMessage: function () { return 'postMessage' in w; },
+              proto: function () { return Object.getPrototypeOf(w); }, gopdDocument: function () { return Object.getOwnPropertyDescriptor(w, 'document'); },
+              setProp: function () { w.zpParentSet = 1; return 'set'; }, deleteProp: function () { return delete w.zpParentSet; },
+              contentDocument: function () { return f.contentDocument; }, identity: function () { return f.contentWindow === f.contentWindow; },
+              framesIndex: function () { return window.frames[index] === f.contentWindow; }, windowIndex: function () { return window[index] === f.contentWindow; },
+              stringOf: function () { return String(w); }
+            };
+            for (var k in T) out['p2c.' + label + '.' + k] = op(T[k]);
+          };
+          frameTable('cross', cross, 0);
+          frameTable('same', same, 1);
+          for (var kind in got) {
+            var label = kind === '/xsite-child' ? 'cross' : 'same';
+            for (var k in got[kind].R) out['c2p.' + label + '.' + k] = got[kind].R[k];
+            out['source.' + label] = String(got[kind].sourceIsHandle);
+          }
+          // A popup on another site: its handle, and its view of this window.
+          pop = window.open('http://' + other + ':' + location.port + '/xsite-pop', 'xsitepop');
+          out['pop.opened'] = String(pop !== null);
+          t0 = Date.now();
+          while (pop && Date.now() - t0 < 8000 && !got['/xsite-pop']) await sleep(50);
+          await sleep(300);
+          if (pop) {
+            var PT = {
+              document: function () { return pop.document; }, localStorage: function () { return pop.localStorage; }, eval: function () { return pop.eval; },
+              name: function () { return pop.name; }, closed: function () { return pop.closed; }, postMessage: function () { return pop.postMessage; },
+              locationType: function () { return pop.location; }, locationHref: function () { return pop.location.href; }, inDocument: function () { return 'document' in pop; },
+              setProp: function () { pop.zpX = 1; return 'set'; }, opener: function () { return pop.opener; }, top: function () { return pop.top === pop; },
+              identity: function () { return pop === pop && pop.self === pop; }
+            };
+            for (var pk in PT) out['pop.handle.' + pk] = op(PT[pk]);
+            if (got['/xsite-pop']) {
+              for (var rk in got['/xsite-pop'].R) out['pop.opener.' + rk] = got['/xsite-pop'].R[rk];
+              out['pop.source'] = String(got['/xsite-pop'].sourceIsHandle);
+            }
+            try { pop.close(); } catch (x) {}
+          }
+          // postMessage: a message addressed to an origin the window does not have is
+          // dropped (the proxy rewrote every http(s) target origin to its own).
+          var pongs = 0;
+          window.addEventListener('message', function (e) { if (typeof e.data === 'string' && e.data.indexOf('pong') === 0) pongs++; });
+          var mkNamed = function (src, name) { var f = document.createElement('iframe'); f.name = name; f.src = src; document.body.appendChild(f); return f; };
+          var echoCross = mkNamed('http://' + other + ':' + location.port + '/xsite-echo', 'xechocross');
+          var echoSame = mkNamed('/xsite-echo', 'xechosame');
+          await sleep(1800);
+          var send = async function (w, fn) {
+            var before = pongs, err = '';
+            try { fn(w); } catch (e) { err = 'threw:' + (e && e.name); }
+            await sleep(450);
+            return err || (pongs > before ? 'delivered' : 'dropped');
+          };
+          var crossOrigin = 'http://' + other + ':' + location.port;
+          out['pm.cross.exact'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', crossOrigin); });
+          out['pm.cross.wrong'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', 'http://example.invalid'); });
+          out['pm.cross.ownOrigin'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', location.origin); });
+          out['pm.cross.slash'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', '/'); });
+          out['pm.cross.star'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', '*'); });
+          out['pm.cross.oneArg'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping'); });
+          out['pm.cross.invalid'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', 'not a url'); });
+          out['pm.cross.optionsStar'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', { targetOrigin: '*' }); });
+          out['pm.cross.optionsExact'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', { targetOrigin: crossOrigin }); });
+          out['pm.cross.optionsWrong'] = await send(echoCross.contentWindow, function (w) { w.postMessage('ping', { targetOrigin: 'http://example.invalid' }); });
+          out['pm.same.exact'] = await send(echoSame.contentWindow, function (w) { w.postMessage('ping', location.origin); });
+          out['pm.same.wrong'] = await send(echoSame.contentWindow, function (w) { w.postMessage('ping', crossOrigin); });
+          out['pm.same.optionsExact'] = await send(echoSame.contentWindow, function (w) { w.postMessage('ping', { targetOrigin: location.origin }); });
+          // The child's view of a message from its parent, and its reply through
+          // e.source; the parent sees the reply come from the very handle it holds.
+          var whoGot = {};
+          window.addEventListener('message', function (e) {
+            if (typeof e.data === 'string' && e.data.indexOf('who:') === 0) {
+              whoGot[e.source === echoCross.contentWindow ? 'cross' : e.source === echoSame.contentWindow ? 'same' : 'other'] = e.data.slice(4);
+            }
+          });
+          echoCross.contentWindow.postMessage('who', '*');
+          echoSame.contentWindow.postMessage('who', '*');
+          await sleep(800);
+          out['reply.cross'] = whoGot.cross || 'none';
+          out['reply.same'] = whoGot.same || 'none';
+          out['reply.sources'] = Object.keys(whoGot).sort().join(',');
+          // A frame reached by name is the same handle as its contentWindow.
+          out['named.cross.bracket'] = op(function () { return window.frames['xechocross'].document; });
+          out['named.cross.windowBracket'] = op(function () { return window['xechocross'].document; });
+          out['named.cross.dot'] = op(function () { return window.frames.xechocross.document; });
+          out['named.cross.identity'] = op(function () { return window.frames['xechocross'] === echoCross.contentWindow && window['xechocross'] === echoCross.contentWindow; });
+          out['named.same.identity'] = op(function () { return window.frames['xechosame'] === echoSame.contentWindow; });
+          out['named.same.document'] = op(function () { return window.frames['xechosame'].document; });
+          window.__xsite = out;
+        })().catch(function (e) { window.__xsite = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xtab') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>tab</title><p>tab</p>');
+      return;
+    }
+    if (url.pathname === '/xcookie2-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>cookie child</title><script>' +
+        'function names() { return document.cookie.split("; ").filter(Boolean).map(function (c) { return c.split("=")[0]; }).filter(function (n) { return n.indexOf("ck2_") === 0; }).sort().join(","); }' +
+        'addEventListener("message", function (m) {' +
+        '  if (m.data === "set") { document.cookie = "ck2_child=1; Path=/"; parent.postMessage("cookie2:" + JSON.stringify({ set: names() }), "*"); }' +
+        '  else if (m.data === "read") parent.postMessage("cookie2:" + JSON.stringify({ read: names() }), "*");' +
+        '});' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xcookie2') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Cookies from elsewhere</title><body><script>
+        window.__xcookie2 = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+          var names = function () { return document.cookie.split('; ').filter(Boolean).map(function (c) { return c.split('=')[0]; }).filter(function (n) { return n.indexOf('ck2_') === 0; }).sort().join(','); };
+          var changes = [];
+          cookieStore.addEventListener('change', function (e) {
+            (e.changed || []).forEach(function (c) { if (c.name.indexOf('ck2_') === 0) changes.push('set:' + c.name); });
+            (e.deleted || []).forEach(function (c) { if (c.name.indexOf('ck2_') === 0) changes.push('del:' + c.name); });
+          });
+          var got = {}, same = null, cross = null;
+          window.addEventListener('message', function (e) {
+            if (typeof e.data === 'string' && e.data.indexOf('cookie2:') === 0) {
+              var who = same && e.source === same.contentWindow ? 'same' : cross && e.source === cross.contentWindow ? 'cross' : 'other';
+              got[who] = Object.assign(got[who] || {}, JSON.parse(e.data.slice(8)));
+            }
+          });
+          var mk = function (src) { var f = document.createElement('iframe'); f.src = src; document.body.appendChild(f); return f; };
+          same = mk('/xcookie2-child');
+          cross = mk('http://' + other + ':' + location.port + '/xcookie2-child');
+          await sleep(2200);
+          // The browser starts delivering change events a moment after the first listener
+          // is added — a cookie set before that is not reported natively.
+          await sleep(500);
+          // 1. a frame's own navigation (the response sets a cookie)
+          await new Promise(function (res) { var f = mk('/xsetcookie?n=ck2_frame'); f.addEventListener('load', function () { res(); }); });
+          await sleep(700);
+          out['frame.navigation'] = names();
+          // 2. an image whose response sets a cookie
+          await new Promise(function (res) { var i = new Image(); i.onload = i.onerror = function () { res(); }; i.src = '/xsetcookie?n=ck2_img'; });
+          await sleep(700);
+          out['image'] = names();
+          // 3. a script whose response sets a cookie
+          await new Promise(function (res) { var sc = document.createElement('script'); sc.onload = sc.onerror = function () { res(); }; sc.src = '/xsetcookie?n=ck2_script'; document.head.appendChild(sc); });
+          await sleep(700);
+          out['script'] = names();
+          // 4. a synchronous XHR: its caller reads document.cookie the moment it returns
+          var x = new XMLHttpRequest(); x.open('GET', '/xsetcookie?n=ck2_sync', false); x.send();
+          out['sync.xhr.immediately'] = names();
+          // 5. a same-site frame writes; this document and the other site's frame
+          same.contentWindow.postMessage('set', '*');
+          await sleep(900);
+          out['sibling.write.parent'] = names();
+          // 6. this document writes; the same-site frame reads it, the other site's frame does not
+          document.cookie = 'ck2_parent=1; Path=/';
+          await sleep(900);
+          same.contentWindow.postMessage('read', '*');
+          cross.contentWindow.postMessage('read', '*');
+          await sleep(900);
+          out['child.same.reads'] = got.same && got.same.read || 'none';
+          out['child.cross.reads'] = got.cross && got.cross.read !== undefined ? got.cross.read : 'none';
+          out['changes'] = changes.slice().sort().join(',');
+          window.__xcookie2 = out;
+        })().catch(function (e) { window.__xcookie2 = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xnames-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>names child</title><script>' +
+        'addEventListener("message", function (m) {' +
+        '  if (m.data === "rename") { window.name = "renamed_by_child"; parent.postMessage("names:" + JSON.stringify({ renamed: window.name }), "*"); return; }' +
+        '  if (m.data !== "report") return;' +
+        '  var R = { name: window.name };' +
+        '  navigator.locks.query().then(function (q) { R.held = (q.held || []).map(function (l) { return l.name; }).sort().join(","); R.pending = (q.pending || []).length; })' +
+        '    .catch(function (e) { R.held = "threw:" + e.name; })' +
+        '    .then(function () { parent.postMessage("names:" + JSON.stringify(R), "*"); });' +
+        '});' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xnames') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Names and locks</title><body><script>
+        window.__xnames = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+          var got = {}, plain = null, cross = null, named = null;
+          var who = function (e) { return plain && e.source === plain.contentWindow ? 'plain' : cross && e.source === cross.contentWindow ? 'cross' : named && e.source === named.contentWindow ? 'named' : 'other'; };
+          window.addEventListener('message', function (e) {
+            if (typeof e.data === 'string' && e.data.indexOf('names:') === 0) got[who(e)] = JSON.parse(e.data.slice(6));
+          });
+          window.name = 'parent_window_name';
+          var mk = function (src, name) { var f = document.createElement('iframe'); if (name) f.name = name; f.src = src; document.body.appendChild(f); return f; };
+          plain = mk('/xnames-child');
+          cross = mk('http://' + other + ':' + location.port + '/xnames-child');
+          named = mk('/xnames-child', 'child_named');
+          await sleep(2200);
+          var release, held = new Promise(function (r) { release = r; });
+          navigator.locks.request('zp_names_lock', function () { return held; });
+          await sleep(400);
+          [plain, cross, named].forEach(function (f) { f.contentWindow.postMessage('report', '*'); });
+          await sleep(1500);
+          var show = function (r) { return r ? 'name=' + r.name + ' held=' + r.held + ' pending=' + r.pending : 'none'; };
+          out['child.plain'] = show(got.plain);
+          out['child.cross'] = show(got.cross);
+          out['child.named'] = show(got.named);
+          out['parent.name'] = window.name;
+          out['parent.readsChildName'] = named.contentWindow.name;
+          // A frame that names itself does not rename its parent.
+          plain.contentWindow.postMessage('rename', '*');
+          await sleep(600);
+          out['afterChildRename.parent'] = window.name;
+          out['afterChildRename.child'] = got.plain && got.plain.renamed || 'none';
+          release();
+          window.__xnames = out;
+        })().catch(function (e) { window.__xnames = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xframe-title') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>frame ready</title><p>frame</p>');
+      return;
+    }
+    if (url.pathname === '/xmarkup') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Markup frames</title><body><script>
+        window.__xmarkup = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var title = function (f) { try { return f.contentDocument.title; } catch (e) { return 'threw:' + e.name; } };
+          var settle = async function (f) { for (var i = 0; i < 100 && title(f) !== 'frame ready'; i++) await sleep(100); return title(f); };
+          var holder = function () { var h = document.createElement('div'); document.body.appendChild(h); return h; };
+          var MARK = '<iframe src="/xframe-title" name="m"></iframe>';
+          var h = holder(); h.innerHTML = MARK;
+          out['innerHTML.title'] = await settle(h.firstChild);
+          out['innerHTML.src'] = h.firstChild.getAttribute('src');
+          out['innerHTML.read'] = h.innerHTML;
+          // The page's srcdoc text comes back as written, not as the document the proxy made of it.
+          h = holder(); h.innerHTML = '<iframe srcdoc="<p id=x>from srcdoc</p>"></iframe>';
+          var sd = h.firstChild;
+          out['innerHTML.srcdoc.prop'] = sd.srcdoc;
+          out['innerHTML.srcdoc.attr'] = sd.getAttribute('srcdoc');
+          await sleep(1500);
+          out['innerHTML.srcdoc.body'] = (function () { try { return sd.contentDocument.body.innerHTML; } catch (e) { return 'threw:' + e.name; } })();
+          // setAttribute takes the same markup: srcdoc holds a document, not a URL to resolve against the page.
+          h = holder(); var sa = document.createElement('iframe'); sa.setAttribute('srcdoc', '<p id=y>from setAttribute</p>'); h.appendChild(sa);
+          out['setAttribute.srcdoc.prop'] = sa.srcdoc;
+          out['setAttribute.srcdoc.attr'] = sa.getAttribute('srcdoc');
+          await sleep(1500);
+          out['setAttribute.srcdoc.body'] = (function () { try { return sa.contentDocument.body.innerHTML; } catch (e) { return 'threw:' + e.name; } })();
+          h = holder(); h.insertAdjacentHTML('beforeend', MARK);
+          out['insertAdjacentHTML.beforeend'] = await settle(h.firstChild);
+          h = holder(); var mid = document.createElement('i'); h.appendChild(mid); mid.insertAdjacentHTML('afterend', MARK);
+          out['insertAdjacentHTML.afterend'] = await settle(h.lastChild);
+          h = holder(); mid = document.createElement('i'); h.appendChild(mid); mid.insertAdjacentHTML('beforebegin', MARK);
+          out['insertAdjacentHTML.beforebegin'] = await settle(h.firstChild);
+          h = holder(); h.setHTMLUnsafe(MARK);
+          out['setHTMLUnsafe'] = await settle(h.firstChild);
+          h = holder(); var old = document.createElement('i'); h.appendChild(old); old.outerHTML = MARK;
+          out['outerHTML'] = await settle(h.firstChild);
+          var tpl = document.createElement('template'); tpl.innerHTML = MARK;
+          h = holder(); h.appendChild(document.importNode(tpl.content, true));
+          out['template.import'] = await settle(h.firstChild);
+          out['template.src'] = tpl.content.firstChild.getAttribute('src');
+          h = holder(); var clone = tpl.content.firstChild.cloneNode(true); h.appendChild(clone);
+          out['template.clone'] = await settle(clone);
+          h = holder(); h.appendChild(document.createRange().createContextualFragment(MARK));
+          out['createContextualFragment'] = await settle(h.firstChild);
+          h = holder(); var doc = new DOMParser().parseFromString('<body>' + MARK + '</body>', 'text/html');
+          h.appendChild(document.adoptNode(doc.body.firstChild));
+          out['DOMParser.adopt'] = await settle(h.firstChild);
+          h = holder(); var blank = document.createElement('iframe'); h.appendChild(blank);
+          var bd = blank.contentDocument; bd.open(); bd.write('<body>' + MARK + '</body>'); bd.close();
+          out['document.write'] = await settle(bd.querySelector('iframe'));
+          // Late: the document's own sweeps for parked frames (the first seconds after load) are over, so only
+          // the hook on the setter itself can start this one.
+          await sleep(4000);
+          h = holder(); h.innerHTML = MARK;
+          out['innerHTML.late'] = await settle(h.firstChild);
+          window.__xmarkup = out;
+        })().catch(function (e) { window.__xmarkup = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xinsert') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Insertion doors</title><body><script>
+        window.__xinsert = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var trial = async function (name, insert) {
+            window.__ins = undefined;
+            var s = document.createElement('script');
+            s.textContent = 'window.__ins = location.href;';
+            var h = document.createElement('div'); document.body.appendChild(h);
+            try { insert(h, s); } catch (e) { out[name] = 'threw:' + e.name; return; }
+            await sleep(250);
+            out[name] = window.__ins === undefined ? 'did not run' : window.__ins === location.href ? 'virtual' : 'raw';
+          };
+          var mid = function (h) { var m = document.createElement('i'); h.appendChild(m); return m; };
+          var text = function (h) { var t = document.createTextNode('t'); h.appendChild(t); return t; };
+          await trial('appendChild', function (h, s) { h.appendChild(s); });
+          await trial('insertBefore', function (h, s) { h.insertBefore(s, null); });
+          await trial('replaceChild', function (h, s) { h.replaceChild(s, mid(h)); });
+          await trial('append', function (h, s) { h.append(s); });
+          await trial('prepend', function (h, s) { h.prepend(s); });
+          await trial('replaceChildren', function (h, s) { h.replaceChildren(s); });
+          await trial('insertAdjacentElement', function (h, s) { h.insertAdjacentElement('beforeend', s); });
+          await trial('Range.insertNode', function (h, s) { var r = document.createRange(); r.selectNodeContents(h); r.insertNode(s); });
+          await trial('before', function (h, s) { mid(h).before(s); });
+          await trial('after', function (h, s) { mid(h).after(s); });
+          await trial('replaceWith', function (h, s) { mid(h).replaceWith(s); });
+          await trial('text.before', function (h, s) { text(h).before(s); });
+          await trial('text.after', function (h, s) { text(h).after(s); });
+          await trial('text.replaceWith', function (h, s) { text(h).replaceWith(s); });
+          await trial('DocumentFragment', function (h, s) { var f = document.createDocumentFragment(); f.appendChild(s); h.appendChild(f); });
+          await trial('ShadowRoot.append', function (h, s) { h.attachShadow({ mode: 'open' }).append(s); });
+          await trial('ShadowRoot.replaceChildren', function (h, s) { h.attachShadow({ mode: 'open' }).replaceChildren(s); });
+          await trial('importNode+append', function (h, s) { h.appendChild(document.importNode(s, true)); });
+          await trial('cloneNode+append', function (h, s) { h.appendChild(s.cloneNode(true)); });
+          window.__xinsert = out;
+        })().catch(function (e) { window.__xinsert = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsyncck') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Sync XHR cookies</title><body><script>
+        window.__xsyncck = null;
+        (function () {
+          var out = { rounds: 30, uniqueMissed: [], sharedWrong: [], heldSent: null, heldAfter: null };
+          var echo = function () { var x = new XMLHttpRequest(); x.open('GET', '/cookie-echo?n=' + Math.random(), false); x.send(); return x.responseText; };
+          for (var i = 0; i < out.rounds; i++) {
+            document.cookie = 'su_' + i + '=' + i;
+            if (echo().indexOf('su_' + i + '=' + i) < 0) out.uniqueMissed.push(i);
+            document.cookie = 'sshared=' + i;
+            if (echo().split('; ').indexOf('sshared=' + i) < 0) out.sharedWrong.push(i);
+          }
+          // The same, made certain: the worker is not told of the write until the request is gone. (Natively there
+          // is no worker and nothing to hold.)
+          var proto = typeof ServiceWorker === 'function' ? ServiceWorker.prototype : null;
+          var real = proto && proto.postMessage, held = [];
+          if (proto) proto.postMessage = function (m) { if (m && m.type === 'ZP_COOKIE_SET') { held.push([this, arguments]); return; } return real.apply(this, arguments); };
+          document.cookie = 'sheld=1';
+          out.heldSent = echo().split('; ').indexOf('sheld=1') >= 0;
+          if (proto) { proto.postMessage = real; held.forEach(function (h) { real.apply(h[0], h[1]); }); }
+          // ...and what the late message does to a cookie already sent: nothing.
+          out.heldAfter = document.cookie.split('; ').filter(function (c) { return c.indexOf('sheld=') === 0; }).join('|') + '/' + echo().split('; ').filter(function (c) { return c.indexOf('sheld=') === 0; }).join('|');
+          window.__xsyncck = out;
+        })();
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsamesite' || url.pathname === '/xsamesite-img') {
+      const ss = url.searchParams.get('ss');
+      const cookie = url.searchParams.get('n') + '=1; Path=/' + (ss ? '; SameSite=' + ss : '') + (url.searchParams.get('secure') ? '; Secure' : '');
+      if (url.pathname === '/xsamesite-img') {
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store', 'Set-Cookie': cookie });
+        res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': cookie });
+        res.end('ok');
+      }
+      return;
+    }
+    if (url.pathname === '/xck-echo') {
+      // Records only this test's cookies because the shared proxy session jar holds cookies from earlier tests.
+      const names = (req.headers.cookie || '').split('; ').filter(Boolean).map(c => c.split('=')[0]).filter(n => /^(ss|op)_/.test(n)).sort().join(',');
+      xckSeen.set(url.searchParams.get('tag') || '', names);
+      if (url.searchParams.get('json')) {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(names);
+      } else {
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+        res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'));
+      }
+      return;
+    }
+    if (url.pathname === '/xck-seen') {
+      const out = {};
+      for (const tag of (url.searchParams.get('tags') || '').split(',')) out[tag] = xckSeen.has(tag) ? xckSeen.get(tag) : null;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(out));
+      return;
+    }
+    if (url.pathname === '/xopck-static') {
+      const rid = url.searchParams.get('rid');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>static</title><body>' +
+        '<img src="/xck-echo?tag=' + rid + ':img">' +
+        '<link rel="stylesheet" href="/xck-echo?tag=' + rid + ':css">' +
+        '<img src="/xck-echo?tag=' + rid + ':last"></body>');
+      return;
+    }
+    if (url.pathname === '/xopck-set') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>set</title><body>' +
+        '<img src="/xsamesite-img?n=op_lax&ss=Lax">' +
+        '<img src="/xsamesite-img?n=op_none&ss=None&secure=1">' +
+        '<img src="/xsamesite-img?n=op_def"></body>');
+      return;
+    }
+    if (url.pathname === '/xopck-child') {
+      const rid = url.searchParams.get('rid');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>script child</title><script src="/xck-echo?tag=' + rid + ':script"></script><script>' +
+        'var rid = ' + JSON.stringify(rid) + ';' +
+        'Promise.all([fetch("/xck-echo?tag=" + rid + ":fetch-default&json=1").catch(function () {}), fetch("/xck-echo?tag=" + rid + ":fetch-include&json=1", { credentials: "include" }).catch(function () {})])' +
+        '.then(function () { parent.postMessage("xopck-child-done", "*"); });' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xopck') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Opaque cookies</title><body><script>
+        window.__xopck = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var rid = Math.random().toString(36).slice(2, 10);
+          await fetch('/xsamesite?n=ss_none&ss=None&secure=1');
+          await fetch('/xsamesite?n=ss_lax&ss=Lax');
+          await fetch('/xsamesite?n=ss_strict&ss=Strict');
+          await fetch('/xsamesite?n=ss_def');
+          out.jarHere = await (await fetch('/xck-echo?tag=' + rid + ':here&json=1')).text();
+          var childDone = false;
+          addEventListener('message', function (e) { if (e.data === 'xopck-child-done') childDone = true; });
+          var f1 = document.createElement('iframe'); f1.setAttribute('sandbox', ''); f1.src = '/xopck-static?rid=' + rid; document.body.appendChild(f1);
+          var f2 = document.createElement('iframe'); f2.setAttribute('sandbox', 'allow-scripts'); f2.src = '/xopck-child?rid=' + rid; document.body.appendChild(f2);
+          var tags = ['img', 'css', 'script', 'last', 'fetch-default', 'fetch-include'].map(function (t) { return rid + ':' + t; });
+          var seen = {};
+          for (var i = 0; i < 250; i++) {
+            seen = await (await fetch('/xck-seen?tags=' + tags.join(','))).json();
+            if (tags.every(function (t) { return seen[t] !== null; }) && childDone) break;
+            await sleep(100);
+          }
+          await sleep(1500);
+          for (var k in seen) out[k.split(':')[1]] = seen[k];
+          var f3 = document.createElement('iframe'); f3.setAttribute('sandbox', ''); f3.src = '/xopck-set'; document.body.appendChild(f3);
+          await sleep(3000);
+          out.jarAfter = await (await fetch('/xck-echo?tag=' + rid + ':after&json=1')).text();
+          window.__xopck = out;
+        })().catch(function (e) { window.__xopck = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xcors-log') {
+      const prefix = url.searchParams.get('prefix') || '';
+      const out = {};
+      for (const [tag, entries] of corsLog) if (tag.startsWith(prefix)) out[tag.slice(prefix.length)] = entries;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(out));
+      return;
+    }
+    if (url.pathname === '/xcors-api') {
+      const q = url.searchParams;
+      const tag = q.get('tag') || '';
+      const name = q.get('case') || '';
+      const po = q.get('po') || '';
+      const names = (req.headers.cookie || '').split('; ').filter(Boolean).map(c => c.split('=')[0]).filter(n => n === (q.get('cn') || 'xc')).sort().join(',');
+      if (!corsLog.has(tag)) corsLog.set(tag, []);
+      corsLog.get(tag).push({
+        m: req.method,
+        origin: req.headers.origin || null,
+        acrm: req.headers['access-control-request-method'] || null,
+        acrh: req.headers['access-control-request-headers'] || null,
+        cookies: names,
+        custom: req.headers['x-custom'] || null,
+        auth: req.headers.authorization ? 'yes' : null,
+        ct: (req.headers['content-type'] || '').split(';')[0] || null,
+        // Internal X-ZP-* headers must never reach the target server.
+        zp: Object.keys(req.headers).filter(h => h.startsWith('x-zp')).join(','),
+      });
+      const ACAO = 'Access-Control-Allow-Origin', ACAC = 'Access-Control-Allow-Credentials', ACEH = 'Access-Control-Expose-Headers';
+      const ACAM = 'Access-Control-Allow-Methods', ACAH = 'Access-Control-Allow-Headers', MAXAGE = 'Access-Control-Max-Age';
+      const plain = {
+        'acao-origin': { [ACAO]: po },
+        'acao-star': { [ACAO]: '*' },
+        'acao-null': { [ACAO]: 'null' },
+        'acao-other': { [ACAO]: 'http://example.invalid' },
+        'acao-missing': {},
+        'acao-origin-creds': { [ACAO]: po, [ACAC]: 'true' },
+        'acao-star-creds': { [ACAO]: '*', [ACAC]: 'true' },
+        'expose-none': { [ACAO]: po },
+        'expose-listed': { [ACAO]: po, [ACEH]: 'X-Secret, x-other' },
+        'expose-star': { [ACAO]: po, [ACEH]: '*' },
+        'expose-star-creds': { [ACAO]: po, [ACAC]: 'true', [ACEH]: '*' },
+        'setcookie': { [ACAO]: po, [ACAC]: 'true', 'Set-Cookie': (q.get('cn') || 'xc') + '=1; Path=/; SameSite=None; Secure' },
+        'same': {},
+      };
+      const preflight = {
+        'pf-put-ok': { [ACAO]: po, [ACAM]: 'PUT' },
+        'pf-put-no-acam': { [ACAO]: po },
+        'pf-put-wrong-method': { [ACAO]: po, [ACAM]: 'DELETE' },
+        'pf-put-lower': { [ACAO]: po, [ACAM]: 'put' },
+        'pf-header-ok': { [ACAO]: po, [ACAH]: 'X-Custom' },
+        'pf-header-list': { [ACAO]: po, [ACAH]: 'x-other, x-custom' },
+        'pf-header-missing': { [ACAO]: po, [ACAM]: 'GET' },
+        'pf-header-star': { [ACAO]: po, [ACAH]: '*' },
+        'pf-header-star-creds': { [ACAO]: po, [ACAC]: 'true', [ACAH]: '*' },
+        'pf-auth-star': { [ACAO]: po, [ACAH]: '*' },
+        'pf-auth-listed': { [ACAO]: po, [ACAH]: 'authorization' },
+        'pf-json-ok': { [ACAO]: po, [ACAH]: 'content-type' },
+        'pf-json-no': { [ACAO]: po },
+        'pf-status-403': { [ACAO]: po, [ACAM]: 'PUT' },
+        'pf-no-acao': { [ACAM]: 'PUT' },
+        'pf-methods-star': { [ACAO]: po, [ACAM]: '*' },
+        'pf-methods-star-creds': { [ACAO]: po, [ACAC]: 'true', [ACAM]: '*' },
+        'pf-maxage': { [ACAO]: po, [ACAM]: 'PUT', [MAXAGE]: '60' },
+      };
+      const base = { 'Cache-Control': 'no-store', 'Content-Type': 'text/plain; charset=utf-8', 'X-Secret': '1', 'X-Other': '2' };
+      if (req.method === 'OPTIONS' && req.headers['access-control-request-method']) {
+        if (name === 'pf-redirect') {
+          res.writeHead(302, Object.assign({}, base, { Location: q.get('loc') || '/', [ACAO]: po }));
+        } else {
+          res.writeHead(name === 'pf-status-403' ? 403 : 204, Object.assign({}, base, preflight[name] || {}));
+        }
+        res.end();
+        return;
+      }
+      if (name === 'redir') {
+        const headers = Object.assign({}, base, { Location: q.get('loc') || '/' });
+        if (!q.get('noacao')) Object.assign(headers, { [ACAO]: po, [ACAC]: 'true' });
+        res.writeHead(302, headers);
+        res.end();
+        return;
+      }
+      const allow = name.startsWith('pf-') ? { [ACAO]: po, [ACAC]: 'true' } : (plain[name] || {});
+      const as = q.get('as');
+      if (as === 'img' || as === 'js' || as === 'css' || as === 'font') {
+        const kinds = {
+          img: ['image/png', solidPNG(8)],
+          js: ['text/javascript', '(window.__xcel = window.__xcel || {})[' + JSON.stringify(tag) + '] = 1;'],
+          css: ['text/css', '.xcel { color: red; }'],
+          font: ['font/ttf', miniTrueTypeFont()],
+        };
+        res.writeHead(200, Object.assign({}, base, allow, { 'Content-Type': kinds[as][0] }));
+        res.end(kinds[as][1]);
+        return;
+      }
+      res.writeHead(200, Object.assign({}, base, allow));
+      res.end('ok:' + name + ':' + req.method);
+      return;
+    }
+    if (url.pathname === '/xcors') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>CORS</title><body><script>
+        window.__xcors = null;
+        (async function () {
+          var out = {};
+          var rid = Math.random().toString(36).slice(2, 10);
+          var po = location.origin;
+          var other = location.protocol + '//' + (location.hostname === 'localhost' ? '127.0.0.1' : 'localhost') + ':' + location.port;
+          var nl = String.fromCharCode(10);
+          function api(base, name, cs, extra) {
+            return base + '/xcors-api?tag=' + encodeURIComponent(rid + ':' + name) + '&case=' + cs + '&po=' + encodeURIComponent(po) + (extra || '');
+          }
+          function names(h) {
+            var a = [];
+            h.forEach(function (v, k) { if (['content-length', 'connection', 'keep-alive', 'transfer-encoding', 'date'].indexOf(k) < 0) a.push(k); });
+            return a.sort();
+          }
+          async function f(name, cs, init, extra, base) {
+            try {
+              var r = await fetch(api(base || other, name, cs, extra), init);
+              var text = await r.text();
+              out[name] = { type: r.type, status: r.status, redirected: r.redirected, text: text.slice(0, 40), hdr: r.type === 'cors' ? names(r.headers) : undefined };
+            } catch (e) { out[name] = 'threw:' + (e && e.name) + ':' + (e && e.message); }
+          }
+          function xhr(name, cs, opts) {
+            opts = opts || {};
+            return new Promise(function (resolve) {
+              var x = new XMLHttpRequest();
+              var done = function (kind) {
+                var all = x.getAllResponseHeaders().split(nl).map(function (l) { return l.split(':')[0].trim().toLowerCase(); }).filter(function (k) { return k && ['content-length', 'connection', 'keep-alive', 'transfer-encoding', 'date'].indexOf(k) < 0; }).sort();
+                out[name] = { kind: kind, status: x.status, text: kind === 'load' ? x.responseText.slice(0, 40) : '', secret: x.getResponseHeader('x-secret'), other: x.getResponseHeader('x-other'), all: all };
+                resolve();
+              };
+              x.onload = function () { done('load'); };
+              x.onerror = function () { done('error'); };
+              x.open(opts.method || 'GET', api(other, name, cs), true);
+              if (opts.wc) x.withCredentials = true;
+              if (opts.headers) for (var k in opts.headers) x.setRequestHeader(k, opts.headers[k]);
+              x.send(opts.body || null);
+            });
+          }
+          function xhrSync(name, cs, opts) {
+            opts = opts || {};
+            var x = new XMLHttpRequest();
+            try {
+              x.open(opts.method || 'GET', api(other, name, cs), false);
+              if (opts.wc) x.withCredentials = true;
+              if (opts.headers) for (var k in opts.headers) x.setRequestHeader(k, opts.headers[k]);
+              x.send(opts.body || null);
+              out[name] = { status: x.status, text: x.responseText.slice(0, 40), secret: x.getResponseHeader('x-secret'), state: x.readyState };
+            } catch (e) { out[name] = { threw: e && e.name, state: x.readyState, status: x.status }; }
+          }
+          // who may read what
+          await f('acao-origin', 'acao-origin');
+          await f('acao-star', 'acao-star');
+          await f('acao-null', 'acao-null');
+          await f('acao-other', 'acao-other');
+          await f('acao-missing', 'acao-missing');
+          await f('star-creds', 'acao-star', { credentials: 'include' });
+          await f('star-creds-acac', 'acao-star-creds', { credentials: 'include' });
+          await f('creds-ok', 'acao-origin-creds', { credentials: 'include' });
+          await f('creds-no-acac', 'acao-origin', { credentials: 'include' });
+          await f('set-cookie', 'setcookie', { credentials: 'include' });
+          await f('cookie-include', 'acao-origin-creds', { credentials: 'include' });
+          await f('cookie-default', 'acao-origin');
+          await f('cookie-omit', 'acao-origin', { credentials: 'omit' });
+          await f('expose-none', 'expose-none');
+          await f('expose-listed', 'expose-listed');
+          await f('expose-star', 'expose-star');
+          await f('expose-star-creds', 'expose-star-creds', { credentials: 'include' });
+          // when the browser asks first
+          await f('pf-put-ok', 'pf-put-ok', { method: 'PUT' });
+          await f('pf-put-no-acam', 'pf-put-no-acam', { method: 'PUT' });
+          await f('pf-put-wrong-method', 'pf-put-wrong-method', { method: 'PUT' });
+          await f('pf-put-lower', 'pf-put-lower', { method: 'PUT' });
+          await f('pf-header-ok', 'pf-header-ok', { headers: { 'X-Custom': '1' } });
+          await f('pf-header-list', 'pf-header-list', { headers: { 'X-Custom': '1' } });
+          await f('pf-header-missing', 'pf-header-missing', { headers: { 'X-Custom': '1' } });
+          await f('pf-header-star', 'pf-header-star', { headers: { 'X-Custom': '1' } });
+          await f('pf-header-star-creds', 'pf-header-star-creds', { headers: { 'X-Custom': '1' }, credentials: 'include' });
+          await f('pf-auth-star', 'pf-auth-star', { headers: { Authorization: 'Bearer x' } });
+          await f('pf-auth-listed', 'pf-auth-listed', { headers: { Authorization: 'Bearer x' } });
+          await f('pf-json-ok', 'pf-json-ok', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          await f('pf-json-no', 'pf-json-no', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          await f('pf-status-403', 'pf-status-403', { method: 'PUT' });
+          await f('pf-no-acao', 'pf-no-acao', { method: 'PUT' });
+          await f('pf-methods-star', 'pf-methods-star', { method: 'PUT' });
+          await f('pf-methods-star-creds', 'pf-methods-star-creds', { method: 'PUT', credentials: 'include' });
+          await f('pf-redirect', 'pf-redirect', { method: 'PUT' }, '&loc=' + encodeURIComponent(api(other, 'pf-redirect:b', 'acao-origin')));
+          await f('pf-maxage', 'pf-maxage', { method: 'PUT' });
+          await f('pf-maxage', 'pf-maxage', { method: 'PUT' });
+          await f('simple-text-plain', 'acao-origin', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'x' });
+          await f('simple-range', 'acao-origin', { headers: { Range: 'bytes=0-5' } });
+          // no preflight, and no check, for the document's own origin
+          await f('same-put', 'same', { method: 'PUT', headers: { 'X-Custom': '1' } }, '', po);
+          await f('same-origin-mode', 'acao-origin', { mode: 'same-origin' });
+          await f('no-cors-get', 'acao-missing', { mode: 'no-cors' });
+          await f('no-cors-post', 'acao-missing', { mode: 'no-cors', method: 'POST', body: 'x' });
+          // redirects: every hop is checked, and between two other origins the origin is no longer told
+          await f('redir-cross', 'redir', {}, '&loc=' + encodeURIComponent(api(other, 'redir-cross:b', 'acao-origin')));
+          await f('redir-no-acao', 'redir', {}, '&noacao=1&loc=' + encodeURIComponent(api(other, 'redir-no-acao:b', 'acao-origin')));
+          await f('redir-self-star', 'redir', {}, '&loc=' + encodeURIComponent(api(po, 'redir-self-star:b', 'acao-star')));
+          await f('redir-self-origin', 'redir', {}, '&loc=' + encodeURIComponent(api(po, 'redir-self-origin:b', 'acao-origin')));
+          await f('redir-self-null', 'redir', {}, '&loc=' + encodeURIComponent(api(po, 'redir-self-null:b', 'acao-null')));
+          await f('redir-from-same', 'redir', {}, '&loc=' + encodeURIComponent(api(other, 'redir-from-same:b', 'acao-origin')), po);
+          await f('redir-userinfo', 'redir', {}, '&loc=' + encodeURIComponent(api(other.replace('//', '//u:p@'), 'redir-userinfo:b', 'acao-origin')));
+          // XMLHttpRequest, async and sync
+          await xhr('x-ok', 'acao-origin');
+          await xhr('x-fail', 'acao-missing');
+          await xhr('x-expose', 'expose-listed');
+          await xhr('x-hidden', 'expose-none');
+          await xhr('x-creds', 'acao-origin-creds', { wc: true });
+          await xhr('x-nocreds', 'acao-origin-creds');
+          await xhr('x-preflight', 'pf-put-ok', { method: 'PUT', body: 'x' });
+          await xhr('x-preflight-fail', 'pf-put-no-acam', { method: 'PUT', body: 'x' });
+          xhrSync('sx-ok', 'expose-listed');
+          xhrSync('sx-fail', 'acao-missing');
+          xhrSync('sx-wc', 'acao-origin-creds', { wc: true });
+          xhrSync('sx-nowc', 'acao-origin-creds');
+          xhrSync('sx-preflight', 'pf-header-ok', { headers: { 'X-Custom': '1' } });
+          xhrSync('sx-preflight-fail', 'pf-header-missing', { headers: { 'X-Custom': '1' } });
+          out.__log = await (await fetch('/xcors-log?prefix=' + encodeURIComponent(rid + ':'))).json();
+          window.__xcors = out;
+        })().catch(function (e) { window.__xcors = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xph-img.png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      res.end(solidPNG(8));
+      return;
+    }
+    if (url.pathname === '/xph') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>placeholders</title><body><div id="top"></div><script>
+        window.__xph = null;
+        (async function () {
+          var other = location.protocol + '//' + (location.hostname === 'localhost' ? '127.0.0.1' : 'localhost') + ':' + location.port;
+          var src = function (t) { return other + '/xph-img.png?tag=' + t; };
+          var markup = function (t) { return '<body><img id="i" width="40" height="40" src="' + src(t) + '">'; };
+          var written = document.createElement('iframe');
+          document.body.appendChild(written);
+          var d = written.contentDocument;
+          d.open(); d.write(markup('written')); d.close();
+          var srcdoc = document.createElement('iframe');
+          srcdoc.srcdoc = markup('srcdoc');
+          document.body.appendChild(srcdoc);
+          document.getElementById('top').innerHTML = markup('top');
+          var nested = document.createElement('iframe');
+          document.body.appendChild(nested);
+          var inner = nested.contentDocument;
+          inner.open(); inner.write('<body><div id="slot"></div>'); inner.close();
+          inner.getElementById('slot').innerHTML = markup('nested');
+          await new Promise(function (r) { setTimeout(r, 5000); });
+          var size = function (doc) { var i = doc && doc.getElementById('i'); return i ? i.naturalWidth + 'x' + i.naturalHeight : 'none'; };
+          window.__xph = { written: size(written.contentDocument), srcdoc: size(srcdoc.contentDocument), top: size(document), nested: size(nested.contentDocument) };
+        })().catch(function (e) { window.__xph = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xdyneval') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>dyneval</title><body>
+        <script>window.__xdyneval = null; (0, eval)('function g1(){return 1}');</script>
+        <script>window.eval('function g2(){return 1}');</script>
+        <script>var ev = eval; ev('function g3(){return 1}');</script>
+        <script>eval('function g4(){return 1}');</script>
+        <script>if (true) { eval('var g4b = 4; function g4c(){return 1}'); }</script>
+        <script>(function () { eval('function g5(){return 1}'); })();</script>
+        <script>new Function('function g6(){} window.g6 = g6;')();</script>
+        <script>setTimeout('function g7(){return 1}; var g7b = 7;', 0);</script>
+        <script>(0, eval)('var g8 = function(){return 1}');</script>
+        <script>var fr = document.createElement('iframe'); document.body.appendChild(fr); fr.contentWindow.eval('function g9(){return 1}'); window.__g9in = typeof fr.contentWindow.g9; window.__g9parent = typeof window.g9;</script>
+        <script>
+          // a challenge VM's move: evaluate a decoder in a fresh frame's realm, drop the frame, keep calling it through the window
+          var fr2 = document.createElement('iframe'); document.body.appendChild(fr2); var cw2 = fr2.contentWindow;
+          cw2.eval('function g12(){return 12}');
+          var ind = cw2.eval; ind('var g13 = 13');
+          fr2.remove();
+          window.__g12 = [typeof cw2.g12, typeof window.g12, typeof cw2.g13, typeof window.g13];
+          try { window.__g12.push(cw2.g12.call(cw2)); } catch (e) { window.__g12.push('call ' + e.name); }
+        </script>
+        <script>'use strict'; eval('function g11(){return 1}');</script>
+        <script>var lexA = 5; eval('window.__evalSees = [typeof lexA, typeof g4]');</script>
+        <script>
+          // the global object, however it is reached, is window
+          window.__id = {
+            topThis: this === window, arrowThis: (() => this === window)(), passedThis: (function (g) { return g === window; })(this),
+            indirectEval: (0, eval)('this') === window, directEval: eval('this') === window, windowEval: window.eval('this') === window,
+            functionCtor: Function('return this')() === window, selfAndGlobal: self === window && globalThis === window && window.window === window,
+          };
+          setTimeout('window.__id.timerThis = (this === window)', 0);
+        </script>
+        <script>
+          setTimeout(function () {
+            var names = ['g1', 'g2', 'g3', 'g4', 'g4b', 'g4c', 'g5', 'g6', 'g7', 'g7b', 'g8', 'g11'];
+            var out = { globals: {} };
+            names.forEach(function (n) { out.globals[n] = typeof window[n]; });
+            out.g9in = window.__g9in;
+            out.g9parent = window.__g9parent;
+            out.g12 = window.__g12;
+            out.evalSees = window.__evalSees;
+            out.identity = window.__id;
+            var fsApi = {};
+            ['webkitRequestFileSystem', 'webkitResolveLocalFileSystemURL'].forEach(function (n) {
+              var f = window[n];
+              fsApi[n] = [typeof f, f && f.length, f && f.name, f && /\\[native code\\]/.test(Function.prototype.toString.call(f)), n in window];
+            });
+            out.fs = fsApi;
+            window.__xdyneval = out;
+          }, 600);
+        <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xframe-env') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>frame-env</title><body><script>
+        window.__xframeenv = null;
+        addEventListener('message', function (e) { if (e.data && e.data.probe) window.__xframeenv = e.data.probe; });
+        var f = document.createElement('iframe'); f.src = 'http://127.0.0.1:${req.socket.localPort}/xframe-child'; document.body.appendChild(f);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsf-same') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>same-site frame</title><body><iframe src="/xframe-child"></iframe></body>`);
+      return;
+    }
+    if (url.pathname === '/xframe-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>child</title><body><script src="/xframe-child.js"></script></body>`);
+      return;
+    }
+    if (url.pathname === '/xframe-child.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`
+        // 'a'.replace(…) is a call the rewriter routes through the membrane (the callback runs inside it).
+        function inner() { return 'a'.replace(/a/, function cb() { return new Error('x').stack; }); }
+        function outer() { return inner(); }
+        var stack = String(outer()).split('\\n');
+        var site = function (l) { return l.replace(/:\\d+:\\d+/g, ':L:C').trim(); };
+        parent.postMessage({ probe: {
+          referrer: document.referrer,
+          ancestorOrigins: Array.prototype.slice.call(location.ancestorOrigins),
+          stackHead: stack[0],
+          stackFrames: stack.slice(1).map(site),
+          stackHasPositions: stack.slice(1).every(function (l) { return !/https?:/.test(l) || /:\\d+:\\d+\\)?$/.test(l); }),
+          stackLeaks: stack.some(function (l) { return /__zp_|\\/zp\\/|proxy\\.localhost/.test(l); }),
+        } }, '*');
+      `);
+      return;
+    }
+    if (url.pathname === '/xfm-echo' || url.pathname === '/xfm-frame' || url.pathname === '/xfm') {
+      const fm = JSON.stringify({
+        site: req.headers['sec-fetch-site'] || 'absent', mode: req.headers['sec-fetch-mode'] || 'absent',
+        dest: req.headers['sec-fetch-dest'] || 'absent', user: req.headers['sec-fetch-user'] || 'absent',
+        storage: req.headers['sec-fetch-storage-access'] || 'absent', referer: req.headers.referer ? 'present' : 'absent',
+      });
+      if (url.pathname === '/xfm-echo') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+        res.end(fm);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      if (url.pathname === '/xfm-frame') {
+        res.end(`<!doctype html><title>fm-frame</title><script>parent.postMessage({ fm: ${fm} }, '*');</script>`);
+        return;
+      }
+      res.end(`<!doctype html><title>fm</title><body><script>
+        window.__xfm = null;
+        var out = {};
+        var other = 'http://127.0.0.1:${req.socket.localPort}';
+        var done = function () { if (out.frame && out.sameOrigin && out.crossSite) window.__xfm = out; };
+        addEventListener('message', function (e) { if (e.data && e.data.fm) { out.frame = e.data.fm; done(); } });
+        fetch('/xfm-echo').then(function (r) { return r.json(); }).then(function (j) { out.sameOrigin = j; done(); });
+        fetch(other + '/xfm-echo').then(function (r) { return r.json(); }).then(function (j) { out.crossSite = j; done(); });
+        var f = document.createElement('iframe'); f.src = other + '/xfm-frame'; document.body.appendChild(f);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xwenv' || url.pathname === '/xwenv-worker.js') {
+      const probe = `(function () {
+        var out = {};
+        var P = function (k, f) { try { out[k] = f(); } catch (e) { out[k] = 'ERR ' + (e && e.name); } };
+        var src = function (f) { try { return Function.prototype.toString.call(f); } catch (e) { return 'ERR ' + e.name; } };
+        var nav = navigator, navProto = Object.getPrototypeOf(nav);
+        var shape = function (o, k) {
+          var d = Object.getOwnPropertyDescriptor(o, k);
+          if (!d) return 'none';
+          var f = d.get || d.value;
+          return [typeof d.get, d.enumerable, d.configurable, typeof f === 'function' ? src(f) : typeof f, typeof f === 'function' && 'prototype' in f].join('|');
+        };
+        P('ua', function () { return nav.userAgent; });
+        P('appVersion', function () { return nav.appVersion; });
+        P('platform', function () { return nav.platform; });
+        P('languages', function () { return JSON.stringify(nav.languages); });
+        P('hwc', function () { return nav.hardwareConcurrency; });
+        P('mem', function () { return nav.deviceMemory; });
+        P('uaData', function () { return nav.userAgentData ? JSON.stringify([nav.userAgentData.brands, nav.userAgentData.mobile, nav.userAgentData.platform]) : 'none'; });
+        P('navOwn', function () { return Object.getOwnPropertyNames(nav).join(','); });
+        P('navProtoKeys', function () { return Object.getOwnPropertyNames(navProto).sort().join(','); });
+        P('uaShape', function () { return shape(navProto, 'userAgent'); });
+        P('platformShape', function () { return shape(navProto, 'platform'); });
+        P('uaDataShape', function () { return shape(navProto, 'userAgentData'); });
+        P('globalCtor', function () { return self.constructor && self.constructor.name; });
+        P('globalOwnCount', function () { return Object.getOwnPropertyNames(self).length; });
+        P('globalOwn', function () { return Object.getOwnPropertyNames(self).sort().join(','); });
+        P('globalKeys', function () { return Object.keys(self).sort().join(','); });
+        P('globalSyms', function () { return Object.getOwnPropertySymbols(self).length; });
+        P('thisIsSelf', function () { return [this === self, (function () { return this; })() === self, globalThis === self].join(','); });
+        // What tells a worker from a page: a library asks typeof window. A worker's global has no window, document, top,
+        // parent, frames, opener (reCAPTCHA's worker took its document.body branch because ours answered).
+        P('typeofWindowNames', function () { return [typeof window, typeof document, typeof top, typeof parent, typeof frames, typeof opener].join(','); });
+        P('inSelf', function () { return ['window', 'document', 'top', 'parent', 'frames', 'opener', 'closed', 'length', 'self', 'globalThis', 'navigator', 'location'].map(function (n) { return n in self; }).join(','); });
+        P('selfMembers', function () { return [self.window, self.document, self.top, self.parent, self.frames, self.opener].map(function (v) { return v === undefined ? 'u' : (v === self ? 'self' : 'other'); }).join(','); });
+        P('globalThisMembers', function () { return ['window', 'document', 'top', 'parent', 'frames', 'opener'].map(function (n) { return typeof globalThis[n]; }).join(','); });
+        P('location', function () { return typeof WorkerGlobalScope === 'function' && self instanceof WorkerGlobalScope ? [location.protocol, typeof location.href].join(' ') : 'page'; });
+        P('origin', function () { return self.origin; });
+        P('secure', function () { return [isSecureContext, crossOriginIsolated].join(','); });
+        P('prepareStackTrace', function () { return typeof Error.prepareStackTrace; });
+        P('stackShape', function () { return String(new Error('x').stack).split(String.fromCharCode(10)).length > 1; });
+        // The names are the page's own URLs; the proxy's own loads (/zp/ paths, blob: bootstraps) are listed too and are not compared.
+        P('perfNames', function () { return performance.getEntries().filter(function (e) { return !/[/]zp[/]|^blob:/.test(e.name); }).map(function (e) { return e.entryType + ':' + e.name.replace(/^[a-z]+:[/][/][^/]+/, ''); }).join(' | '); });
+        P('srcFetch', function () { return src(fetch); });
+        P('srcSetTimeout', function () { return src(setTimeout); });
+        P('srcPostMessage', function () { return src(self.postMessage); });
+        P('srcImportScripts', function () { return typeof importScripts === 'function' ? src(importScripts) : 'none'; });
+        P('srcXHROpen', function () { return src(XMLHttpRequest.prototype.open); });
+        P('srcFunction', function () { return src(Function); });
+        P('srcEval', function () { return src(eval); });
+        P('fnCtor', function () { return (function () {}).constructor === Function; });
+        // the members a worker's code calls are the ones on WorkerGlobalScope.prototype — nothing native left behind them
+        P('protoMembers', function () {
+          if (typeof WorkerGlobalScope !== 'function') return 'page';
+          var p = WorkerGlobalScope.prototype, d = Object.getOwnPropertyDescriptor(p, 'location');
+          return [p.fetch === fetch, p.setTimeout === setTimeout, p.importScripts === importScripts, d ? typeof d.get : 'none'].join(',');
+        });
+        P('zpNames', function () { return Object.getOwnPropertyNames(self).filter(function (k) { return /zp/i.test(k); }).join(','); });
+        P('bootstrapBinding', function () { return typeof __zp_worker_params; });
+        P('tz', function () { return Intl.DateTimeFormat().resolvedOptions().timeZone; });
+        P('trustedTypes', function () { return typeof self.trustedTypes; });
+        P('offscreen', function () {
+          if (typeof OffscreenCanvas !== 'function') return 'none';
+          var c = new OffscreenCanvas(60, 20), x = c.getContext('2d');
+          x.font = '14px Arial'; x.fillStyle = '#f60'; x.fillText('Cwm fjord', 2, 15);
+          var d = x.getImageData(0, 0, 60, 20).data, h = 0;
+          for (var i = 0; i < d.length; i++) h = (h * 31 + d[i]) | 0;
+          return h;
+        });
+        return out;
+      })()`;
+      const workerScript = `postMessage(${probe});`;
+      if (url.pathname === '/xwenv-worker.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+        res.end(workerScript);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>wenv</title><body><script>
+        var out = { page: ${probe} };
+        var settle = function (key, w) {
+          w.onmessage = function (e) { out[key] = e.data; if (out.blob && out.file) window.__xwenv = out; };
+          w.onerror = function () { out[key] = 'error'; if (out.blob && out.file) window.__xwenv = out; };
+        };
+        settle('blob', new Worker(URL.createObjectURL(new Blob([${JSON.stringify(workerScript)}], { type: 'text/javascript' }))));
+        settle('file', new Worker('/xwenv-worker.js'));
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xtt') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>tt</title><body><script>
+        var out = {};
+        var pol = trustedTypes.createPolicy('xtt', { createScript: function (s) { return s; } });
+        out.indirect = (0, eval)(pol.createScript('1 + 1'));
+        out.direct = (function () { var k = 40; return eval(pol.createScript('k + 2')); })();
+        (0, eval)(pol.createScript('function xttDecl() { return 7; }'));
+        out.declared = typeof xttDecl === 'function' && xttDecl();
+        var plain = {};
+        out.plainObject = eval(plain) === plain;
+        out.fn = Function(pol.createScript('return 3'))();
+        setTimeout(pol.createScript('window.__xttT1 = location.href'), 0);
+        setTimeout({ toString: function () { return 'window.__xttT2 = location.href'; } }, 0);
+        setTimeout(['window.__xttT3 = location.href'], 0);
+        setTimeout(function () {
+          out.timers = [window.__xttT1, window.__xttT2, window.__xttT3];
+          window.__xtt = out;
+        }, 50);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xtte') {
+      // A document that enforces Trusted Types and registers a recording default policy: every string a sink receives reaches the policy.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "require-trusted-types-for 'script'; trusted-types rec default" });
+      res.end(`<!doctype html><title>tte</title><body><script>
+        var out = { calls: [] };
+        var flat = function (s) { return String(s).slice(0, 26).split(String.fromCharCode(10)).join('~'); };
+        var rec = function (kind) { return function (s, type, sink) { out.calls.push(kind + '|' + type + '|' + sink + '|' + flat(s)); return s; }; };
+        trustedTypes.createPolicy('default', { createHTML: rec('H'), createScript: rec('S'), createScriptURL: rec('U') });
+        var t = function (k, fn) { try { var v = fn(); out[k] = v === undefined ? 'ok' : String(v).slice(0, 60); } catch (e) { out[k] = 'threw:' + e.name + ':' + String(e.message).slice(0, 90); } };
+        var d = document.body;
+        t('names', function () {
+          var r = [];
+          ['rec', 'nope', 'default'].forEach(function (n) { try { trustedTypes.createPolicy(n, {}); r.push(n + ':ok'); } catch (e) { r.push(n + ':' + e.name + ':' + String(e.message).slice(0, 60)); } });
+          return r.join(',');
+        });
+        t('surface', function () { return [trustedTypes.getAttributeType('script', 'src'), trustedTypes.getPropertyType('div', 'innerHTML'), trustedTypes.isHTML(trustedTypes.emptyHTML), trustedTypes.isScript('x'), trustedTypes.defaultPolicy.name].join(','); });
+        t('innerHTML', function () { d.innerHTML = '<i id=a>x</i>'; return document.getElementById('a') ? 'built' : 'missing'; });
+        t('insertAdjacentHTML', function () { d.insertAdjacentHTML('beforeend', '<u id=b>y</u>'); return !!document.getElementById('b'); });
+        t('outerHTML', function () { var e = document.createElement('p'); d.appendChild(e); e.outerHTML = '<p id=c>z</p>'; return !!document.getElementById('c'); });
+        t('srcdoc', function () { var f = document.createElement('iframe'); f.srcdoc = '<b>q</b>'; d.appendChild(f); return f.getAttribute('srcdoc'); });
+        t('eval', function () { return eval('1 + 2'); });
+        t('indirectEval', function () { return (0, eval)('3 + 4'); });
+        t('Function', function () { return new Function('a', 'return a * 5')(2); });
+        t('scriptText', function () { var s = document.createElement('script'); s.text = 'window.__st = 6'; d.appendChild(s); return window.__st; });
+        t('scriptSrc', function () { var s = document.createElement('script'); s.src = '/xtte-none.js'; return s.getAttribute('src'); });
+        t('onclickAttr', function () { var b = document.createElement('button'); b.setAttribute('onclick', 'window.__oc = 1'); d.appendChild(b); b.click(); return window.__oc; });
+        t('parse', function () { return new DOMParser().parseFromString('<p>w</p>', 'text/html').body.innerHTML; });
+        t('fragment', function () { return document.createRange().createContextualFragment('<p>v</p>').childNodes.length; });
+        setTimeout('window.__t = 1', 0);
+        setTimeout(function () { out.timer = window.__t; window.__xtte = out; }, 150);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xttn') {
+      // Enforced, with no default policy: a string at a sink is refused, a Trusted value is accepted. The directive arrives by header or by <meta>.
+      const via = url.searchParams.get('via');
+      const meta = via === 'meta';
+      const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
+      // A report-only policy reports and enforces nothing: the page behaves as if it had none.
+      if (via === 'report-only') headers['Content-Security-Policy-Report-Only'] = "require-trusted-types-for 'script'";
+      else if (!meta) headers['Content-Security-Policy'] = "require-trusted-types-for 'script'";
+      res.writeHead(200, headers);
+      res.end(`<!doctype html><title>ttn</title>${meta ? `<meta http-equiv="Content-Security-Policy" content="require-trusted-types-for 'script'">` : ''}<body><script>
+        var out = {};
+        var pol = trustedTypes.createPolicy('p', { createHTML: function (s) { return s; }, createScript: function (s) { return s; }, createScriptURL: function (s) { return s; } });
+        var t = function (k, fn) { try { var v = fn(); out[k] = v === undefined ? 'ok' : String(v).slice(0, 60); } catch (e) { out[k] = 'threw:' + e.name + ':' + String(e.message).slice(0, 160); } };
+        var d = document.body;
+        t('stringHTML', function () { d.innerHTML = '<i>x</i>'; });
+        t('trustedHTML', function () { d.innerHTML = pol.createHTML('<i id=a>x</i>'); return !!document.getElementById('a'); });
+        t('stringAdjacent', function () { d.insertAdjacentHTML('beforeend', '<u>y</u>'); });
+        t('stringEval', function () { return eval('1 + 1'); });
+        t('trustedEval', function () { return eval(pol.createScript('1 + 1')); });
+        t('stringFunction', function () { return new Function('return 1'); });
+        t('stringTimeout', function () { setTimeout('1', 0); });
+        t('stringScriptSrc', function () { var s = document.createElement('script'); s.src = '/xttn-none.js'; });
+        t('trustedScriptSrc', function () { var s = document.createElement('script'); s.src = pol.createScriptURL('/xttn-none.js'); return s.getAttribute('src'); });
+        t('stringScriptText', function () { var s = document.createElement('script'); s.text = 'window.__bad = 1'; });
+        t('trustedScriptText', function () { var s = document.createElement('script'); s.text = pol.createScript('window.__good = 1'); d.appendChild(s); return window.__good; });
+        t('stringSrcdoc', function () { var f = document.createElement('iframe'); f.srcdoc = '<b>q</b>'; });
+        t('stringHandler', function () { var b = document.createElement('button'); b.setAttribute('onclick', 'window.__oc = 1'); });
+        t('trustedHandler', function () { var b = document.createElement('button'); b.setAttribute('onclick', pol.createScript('window.__oc = 2')); d.appendChild(b); b.click(); return window.__oc; });
+        t('stringWorker', function () { new Worker('/xttn-none.js'); });
+        t('stringParse', function () { return new DOMParser().parseFromString('<p>w</p>', 'text/html').body.innerHTML; });
+        t('stringFragment', function () { return document.createRange().createContextualFragment('<p>v</p>').childNodes.length; });
+        t('identity', function () { var h = pol.createHTML('<b>'); return [trustedTypes.isHTML(h), trustedTypes.isScript(h), String(h), JSON.stringify(h), Object.prototype.toString.call(h)].join('|'); });
+        t('plainText', function () { d.textContent = 'plain'; return d.textContent; });
+        out.policies = (function () { try { trustedTypes.createPolicy('q', {}); return 'q:ok'; } catch (e) { return 'q:' + e.name; } })();
+        window.__xttn = out;
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xcspeval') {
+      // A target policy that refuses string evaluation (no 'unsafe-eval'): `eval`, `Function` and a string timer are refused as the engine refuses them,
+      // and the document hears of each as a `securitypolicyviolation` event. The proxy's own policy has to allow eval for the membrane.
+      const variant = url.searchParams.get('v') || 'header';
+      const policy = "script-src 'self' 'unsafe-inline'";
+      const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
+      if (variant === 'header') headers['Content-Security-Policy'] = policy;
+      if (variant === 'allowed') headers['Content-Security-Policy'] = policy + " 'unsafe-eval'";
+      res.writeHead(200, headers);
+      const meta = variant === 'meta' ? `<meta http-equiv="content-security-policy" content="${policy}">` : '';
+      res.end(`<!doctype html>${meta}<title>cspeval</title><body><script>
+var out = { events: [] };
+document.addEventListener('securitypolicyviolation', function (e) { out.events.push(e.violatedDirective + '|' + e.effectiveDirective + '|' + e.blockedURI + '|' + e.disposition); });
+var T = function (k, f) { try { out[k] = String(f()); } catch (e) { out[k] = e.name + ': ' + e.message; } };
+T('eval', function () { return eval('1+1'); });
+T('directScope', function () { var local = 5; return eval('local + 1'); });
+T('indirect', function () { return (0, eval)('2+1'); });
+T('Function', function () { return new Function('return 4')(); });
+T('FunctionCall', function () { return Function('a', 'return a * 2')(4); });
+T('AsyncFunction', function () { return Object.getPrototypeOf(async function () {}).constructor('return 1').name; });
+T('functionObject', function () { return typeof eval + ',' + typeof Function; });
+T('timer', function () { setTimeout('window.__timerRan = 1', 0); return 'scheduled'; });
+T('notAString', function () { return eval(42); });
+setTimeout(function () { out.timerRan = String(window.__timerRan); }, 150);
+setTimeout(function () { window.__xcsp = out; }, 400);
+<\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xcspsrcdoc') {
+      // The same refusal in a frame whose policy is its own `<meta>`: called from the embedder and from inside the frame.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      const child = `<meta http-equiv="content-security-policy" content="script-src 'unsafe-inline'"><script>window.__inside = (function () { var r = {}; try { r.eval = String(eval('1+1')); } catch (e) { r.eval = e.name; } try { r.fn = String(new Function('return 2')()); } catch (e) { r.fn = e.name; } return JSON.stringify(r); })();<\/script>`;
+      res.end(`<!doctype html><title>cspsrcdoc</title><body><script>
+var out = { events: [] };
+var T = function (k, f) { try { out[k] = String(f()); } catch (e) { out[k] = e.name + ': ' + e.message; } };
+var f = document.createElement('iframe');
+f.setAttribute('sandbox', 'allow-same-origin allow-scripts');
+f.srcdoc = ${JSON.stringify(child).replace(/</g, '\\u003c')};
+f.addEventListener('load', function () {
+  var cw = f.contentWindow, cd = f.contentDocument;
+  cd.addEventListener('securitypolicyviolation', function (e) { out.events.push(e.violatedDirective + '|' + e.effectiveDirective + '|' + e.blockedURI + '|' + e.disposition); });
+  T('inside', function () { return cw.__inside; });
+  T('eval', function () { return cw.eval('1+1'); });
+  T('indirect', function () { return (0, cw.eval)('2+1'); });
+  T('Function', function () { return new cw.Function('return 4')(); });
+  T('own', function () { return eval('1+1'); });
+  setTimeout(function () { window.__xcsp = out; }, 300);
+});
+document.body.appendChild(f);
+<\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xframes') {
+      // How a blank or srcdoc frame reports itself.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>frames</title><body><script>
+var out = {};
+var T = function (k, f) { try { var v = f(); out[k] = v === undefined ? 'undefined' : String(v); } catch (e) { out[k] = 'threw ' + e.name + ': ' + e.message; } };
+var report = function (label, f) {
+  var cw = f.contentWindow, cd = f.contentDocument;
+  T(label + '.href', function () { return cw.location.href; });
+  T(label + '.parts', function () { return [cw.location.origin, cw.location.protocol, cw.location.host, cw.location.pathname, String(cw.location)].join(' ; '); });
+  T(label + '.document', function () { return [cd.URL, cd.documentURI, cd.baseURI === document.baseURI].join(' ; '); });
+  T(label + '.referrer', function () { return cd.referrer; });
+  T(label + '.origin', function () { return cw.origin === location.origin; });
+};
+var blank = document.createElement('iframe'); document.body.appendChild(blank);
+report('blank', blank);
+var made = document.implementation.createHTMLDocument('x');
+T('createHTMLDocument', function () { return [made.URL, made.documentURI, made.referrer].join(' ; '); });
+var doc = document.createElement('iframe'); doc.srcdoc = '<p>x</p>';
+doc.addEventListener('load', function () {
+  report('srcdoc', doc);
+  window.__xframes = out;
+});
+document.body.appendChild(doc);
+<\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xevid') {
+      // Window identity across events, as page code reads it.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>evid</title><body><script>
+        var out = {}; var rec = function (k, v) { out[k] = v; };
+        var cmp = function () { return Array.prototype.map.call(arguments, function (b) { return b ? 1 : 0; }).join(''); };
+        window.addEventListener('zpt', function (e) { rec('window listener: target,currentTarget,srcElement,this,windowEvent,path', cmp(e.target === window, e.currentTarget === window, e.srcElement === window, this === window, window.event === e, e.composedPath().indexOf(window) >= 0)); });
+        document.addEventListener('zpt', function (e) { rec('document listener: target,currentTarget,this,pathHasWindow', cmp(e.target === document.body, e.currentTarget === document, this === document, e.composedPath().indexOf(window) >= 0)); });
+        window.dispatchEvent(new Event('zpt'));
+        document.body.dispatchEvent(new Event('zpt', { bubbles: true, composed: true }));
+        ['UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'WheelEvent', 'CompositionEvent'].forEach(function (name) {
+          try { var e = new window[name]('x', { view: window, bubbles: true }); rec(name + ' view:window -> view===window,===self,===defaultView,===top', cmp(e.view === window, e.view === self, e.view === document.defaultView, e.view === top)); }
+          catch (x) { rec(name + ' view:window', 'threw:' + x.name); }
+        });
+        try { var le = document.createEvent('MouseEvents'); le.initMouseEvent('click', true, true, window, 0, 0, 0, 0, 0, false, false, false, false, 0, null); rec('initMouseEvent(view=window)', cmp(le.view === window)); } catch (x) { rec('initMouseEvent(view=window)', 'threw:' + x.name); }
+        try { var ue = document.createEvent('UIEvents'); ue.initUIEvent('x', true, true, window, 0); rec('initUIEvent(view=window)', cmp(ue.view === window)); } catch (x) { rec('initUIEvent(view=window)', 'threw:' + x.name); }
+        document.body.addEventListener('click', function (e) { rec('real click: view===window,view===defaultView,target===body', cmp(e.view === window, e.view === document.defaultView, e.target === document.body)); });
+        document.body.click();
+        class MyMouse extends MouseEvent {}
+        rec('subclass of MouseEvent', (function () { var e = new MyMouse('c', { view: window }); return [e instanceof MouseEvent, e instanceof UIEvent, e.constructor === MyMouse, e.view === window].map(Number).join(''); })());
+        rec('shape: constructor,parent,name,length', cmp(new MouseEvent('c').constructor === MouseEvent, Object.getPrototypeOf(MouseEvent) === UIEvent, MouseEvent.name === 'MouseEvent', MouseEvent.length === 1) + String(MouseEvent.prototype.constructor === MouseEvent));
+        rec('toString', Function.prototype.toString.call(MouseEvent).replace(/\\s+/g, ' '));
+        window.addEventListener('message', function (e) { rec('message: source===window,target===window,currentTarget===window', cmp(e.source === window, e.target === window, e.currentTarget === window)); });
+        window.postMessage('x', '*');
+        setTimeout(function () { window.__xevid = out; }, 300);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xttm') {
+      // A default policy that changes what it is given: the engine compiles the changed text for eval, runs it for a timer, uses it for markup,
+      // and refuses the Function constructor (whose text was already parsed) and a policy that answers null.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "require-trusted-types-for 'script'; trusted-types default" });
+      res.end(`<!doctype html><title>ttm</title><body><script>
+        var out = {};
+        trustedTypes.createPolicy('default', {
+          createHTML: function (s) { return s + '<!--p-->'; },
+          createScript: function (s, type, sink) {
+            if (sink === 'Function') return s + ' ';
+            if (sink === 'eval') return String(s).replace('1', '40');
+            if (sink === 'Window setTimeout') return 'window.__t = 2';
+            return s;
+          },
+          createScriptURL: function (s) { return s; }
+        });
+        var t = function (k, fn) { try { var v = fn(); out[k] = v === undefined ? 'ok' : String(v).slice(0, 60); } catch (e) { out[k] = 'threw:' + e.name + ':' + String(e.message).slice(0, 110); } };
+        var d = document.body;
+        t('new Function changed', function () { return new Function('return 5')(); });
+        t('Function changed', function () { return Function('return 6')(); });
+        t('eval changed', function () { return eval('1 + 2'); });
+        t('indirect eval changed', function () { return (0, eval)('1 + 3'); });
+        t('innerHTML changed', function () { d.innerHTML = '<i>x</i>'; return d.innerHTML; });
+        setTimeout('window.__t = 1', 0);
+        setTimeout(function () { out.timer = window.__t; window.__xttm = out; }, 120);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xttf') {
+      // A srcdoc frame of a document that enforces Trusted Types is bound by the same policy and has a default policy of its own (none).
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "require-trusted-types-for 'script'; trusted-types rec" });
+      res.end(`<!doctype html><title>ttf</title><body><script>
+        var pol = trustedTypes.createPolicy('rec', { createHTML: function (s) { return s; } });
+        var child = [
+          "var out = {};",
+          "var t = function (k, fn) { try { var v = fn(); out[k] = v === undefined ? 'ok' : String(v).slice(0, 60); } catch (e) { out[k] = 'threw:' + e.name + ':' + String(e.message).slice(0, 140); } };",
+          "t('innerHTML', function () { document.body.innerHTML = '<i>x</i>'; });",
+          "t('eval', function () { return eval('1 + 1'); });",
+          "t('Function', function () { return new Function('return 2')(); });",
+          "t('timeout', function () { setTimeout('1', 0); });",
+          "t('scriptText', function () { var s = document.createElement('script'); s.text = '1'; });",
+          "t('policy', function () { var r = []; ['rec', 'nope'].forEach(function (n) { try { trustedTypes.createPolicy(n, {}); r.push(n + ':ok'); } catch (e) { r.push(n + ':' + e.name); } }); return r.join(','); });",
+          "t('has', function () { return String(trustedTypes.defaultPolicy); });",
+          "parent.postMessage(JSON.stringify(out), '*');",
+        ].join(String.fromCharCode(10));
+        window.addEventListener('message', function (e) { try { window.__xttf = JSON.parse(e.data); } catch (x) {} });
+        var f = document.createElement('iframe');
+        f.srcdoc = pol.createHTML('<body><script>' + child + '<\\/script></body>');
+        document.body.appendChild(f);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xttw.js') {
+      // The worker body, also served as a script URL: a worker started from a URL has its own response's policy, a blob worker inherits its creator's.
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end([
+        "var out = {};",
+        "var t = function (k, fn) { try { var v = fn(); out[k] = v === undefined ? 'ok' : String(v).slice(0, 60); } catch (e) { out[k] = 'threw:' + e.name + ':' + String(e.message).slice(0, 160); } };",
+        "t('has', function () { return typeof trustedTypes + ',' + (self.trustedTypes ? String(self.trustedTypes.defaultPolicy) : 'none'); });",
+        "t('eval', function () { return eval('1 + 1'); });",
+        "t('Function', function () { return new Function('return 2')(); });",
+        "t('timeout', function () { setTimeout('1', 0); });",
+        "t('importScripts', function () { try { importScripts('/xttw-none.js'); } catch (e) { return e.name + ':' + (String(e.message).indexOf('TrustedScriptURL') >= 0 ? 'trusted' : 'other'); } });",
+        "t('policy', function () { var r = []; ['rec', 'nope'].forEach(function (n) { try { trustedTypes.createPolicy(n, {}); r.push(n + ':ok'); } catch (e) { r.push(n + ':' + e.name); } }); return r.join(','); });",
+        "postMessage(out);",
+      ].join('\n'));
+      return;
+    }
+    if (url.pathname === '/xttw') {
+      // A document that enforces Trusted Types starts one worker from a blob and one from a URL; each reports what it may do.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "require-trusted-types-for 'script'; trusted-types rec" });
+      res.end(`<!doctype html><title>ttw</title><body><script>
+        var out = {};
+        var pol = trustedTypes.createPolicy('rec', { createScriptURL: function (s) { return s; } });
+        var run = function (k, src) {
+          return new Promise(function (resolve) {
+            var w = new Worker(pol.createScriptURL(src));
+            w.onmessage = function (e) { out[k] = e.data; resolve(); };
+            w.onerror = function (e) { out[k] = 'error:' + e.message; resolve(); };
+          });
+        };
+        fetch('/xttw.js').then(function (r) { return r.text(); }).then(function (body) {
+          return run('blob', URL.createObjectURL(new Blob([body], { type: 'text/javascript' })));
+        }).then(function () { return run('url', '/xttw.js'); }).then(function () { window.__xttw = out; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xdeval') {
+      const cases = `
+        var out = {};
+        var t = function (k, fn) { try { var v = fn(); out[k] = v; } catch (e) { out[k] = 'threw:' + e.name; } };
+        t('read', function () { return (function (a) { var x = 10; let y = 20; return eval('a + x + y'); })(1); });
+        t('write', function () { return (function () { var n = 1; eval('n = n + 41'); return n; })(); });
+        t('declares', function () { return (function () { eval('var made = 7'); return typeof made; })(); });
+        t('closure', function () { return (function () { var c = 5; return eval('(function () { return c * 2; })')(); })(); });
+        t('args', function () { return (function () { return eval('arguments.length'); })(1, 2, 3); });
+        t('this', function () { return (function () { return eval('this') === window; })(); });
+        t('globalVar', function () { return (function () { return eval('typeof out'); })(); });
+        t('rebound', function () { return (function () { var eval = function (s) { return 'mine:' + s; }; return eval('a'); })(); });
+        t('deleteLocal', function () { return (function () { var d = 1; return [eval('delete d'), d]; })(); });
+        t('sameLetTwice', function () { return (function () { eval('let q = 1'); eval('let q = 2'); return 'ok'; })(); });
+        t('topLevelTwice', function () { eval('let z = 1; z'); return eval('let z = 2; z'); });
+        t('strictCaller', function () { return (function () { 'use strict'; var s = 3; return eval('var u = s * 2; u'); })(); });
+        t('strictSource', function () { return (function () { var s = 3; return eval('"use strict"; var u = s * 2; u'); })(); });
+        t('strictWrite', function () { return (function () { 'use strict'; var w = 1; eval('w = w + 1'); return w; })(); });
+        t('strictOwnVars', function () { return (function () { 'use strict'; eval('var leaked = 1'); return typeof leaked; })(); });
+        t('strictArgs', function () { return (function () { 'use strict'; return eval('arguments.length'); })(1, 2); });
+        t('strictRebound', function () { return (function () { 'use strict'; var f = function (s) { return 'f:' + s; }; var g = f; return g('x'); })(); });
+        t('strictThrows', function () { return (function () { 'use strict'; var m = 1; try { eval('undeclaredName = m'); } catch (e) { return e.name; } return 'no throw'; })(); });
+      `;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>direct eval</title><body><script>
+        ${cases}
+        window.__xdeval = { page: out };
+        var f = document.createElement('iframe');
+        document.body.appendChild(f);
+        var d = f.contentWindow.document;
+        d.open();
+        d.write('<!doctype html><body><scr' + 'ipt>' + ${JSON.stringify(cases)}.split('<\\/').join('<\\/') + ' parent.postMessage({ childOut: out }, "*");<\/scr' + 'ipt>');
+        d.close();
+        addEventListener('message', function (e) { if (e.data && e.data.childOut) window.__xdeval.child = e.data.childOut; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xdomscan' || url.pathname === '/xdomscan-child' || url.pathname === '/xdomscan.css') {
+      if (url.pathname === '/xdomscan.css') { res.writeHead(200, { 'Content-Type': 'text/css', 'Cache-Control': 'no-store' }); res.end('a{color:blue}'); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      if (url.pathname === '/xdomscan-child') { res.end('<!doctype html><title>child</title><body>child</body>'); return; }
+      res.end('<!doctype html><title>domscan</title><body><div id="root"></div><script>(' + domScanProbe.toString() + ')()<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xstrict' || url.pathname === '/xstrict-ext.js') {
+      // A strict script's top-level var and function declarations are properties of the global, whoever reads them: later scripts, an external script,
+      // an event-handler attribute (a strict `eval` keeps them to itself unless the runtime hands them over).
+      const reads = 'function reads() { var o = {};' +
+        ['sVar', 'sUnset', 'sObj', 'sFn', 'sOther'].map(n => ' try { o.' + n + ' = typeof ' + n + " === 'undefined' ? 'undef' : (typeof " + n + " === 'function' ? " + n + '() : JSON.stringify(' + n + ')); } catch (e) { o.' + n + " = 'ERR ' + e.name; }").join('') +
+        " o.inWindow = 'sVar' in window; o.unsetInWindow = 'sUnset' in window; o.keys = Object.keys(window).indexOf('sVar') >= 0; o.windowVar = String(window.sVar); o.windowFn = typeof window.sFn; return o; }";
+      if (url.pathname === '/xstrict-ext.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+        res.end(reads + ' window.__ext = reads();');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>strict</title><body>' +
+        "<script>'use strict'; var sVar = 'v'; var sUnset; var sObj = { n: 1 }; function sFn() { return 'f1'; } function getSVar() { return sVar; } function setSVar(v) { sVar = v; } function getSObj() { return sObj; }</script>" +
+        "<script>'use strict'; function sFn() { return 'f2'; } var sOther = 'o';</script>" +
+        // a strict script that declares a name an earlier one made again is the same binding: it starts from the value and `var x = x || {}` keeps it
+        "<script>'use strict'; var early = sVar; var sObj = sObj || { n: 'fresh' }; var sUnset; window.__redecl = [early, sObj.n, getSObj() === sObj, typeof sUnset];</script>" +
+        '<script>' + reads + " window.__inline = reads(); sVar = 'changed-by-inline'; window.__live = [getSVar(), sVar, window.sVar]; setSVar('changed-by-function'); window.__live2 = [sVar, window.sVar];</script>" +
+        '<script src="/xstrict-ext.js"></script>' +
+        '<button id="b" onclick="window.__handler = reads()">b</button>' +
+        '<script>window.__done = true;</script></body>');
+      return;
+    }
+    if (url.pathname.startsWith('/xpreload-') && url.pathname.endsWith('.css')) {
+      res.writeHead(200, { 'Content-Type': 'text/css', 'Cache-Control': 'no-store' });
+      res.end(url.pathname === '/xpreload-b.css' ? '#probe{display:block;width:7px}' : '#unused{color:red}');
+      return;
+    }
+    if (url.pathname === '/xpreload') {
+      // A hint link a page makes at runtime: the page waits on its load or error (React 19 holds its first commit on the stylesheet preload it creates; the loadCSS idiom switches rel in onload).
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>preload</title><body><div id="probe">p</div><script>' +
+        "const out = window.__out = { events: [] };" +
+        "const a = document.createElement('link'); a.rel = 'preload'; a.as = 'style'; a.href = '/xpreload-a.css?j=a';" +
+        "a.addEventListener('load', () => out.events.push('a:load')); a.addEventListener('error', () => out.events.push('a:error')); document.head.appendChild(a);" +
+        "const b = document.createElement('link'); b.rel = 'preload'; b.as = 'style'; b.href = '/xpreload-b.css?j=b';" +
+        "b.onload = function () { b.onload = null; b.rel = 'stylesheet'; }; document.head.appendChild(b);" +
+        "const c = document.createElement('link'); c.setAttribute('href', '/xpreload-c.css?j=c'); c.setAttribute('as', 'style'); c.setAttribute('rel', 'preload');" +
+        "c.addEventListener('load', () => out.events.push('c:load')); c.addEventListener('error', () => out.events.push('c:error')); document.head.appendChild(c);" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xcss-import.css') {
+      res.writeHead(200, { 'Content-Type': 'text/css', 'Cache-Control': 'no-store' });
+      res.end('#xcss-import-probe{width:9px}');
+      return;
+    }
+    if (url.pathname === '/xcssurls') {
+      // A protocol-relative URL in CSS the page makes at runtime resolves against the proxy's own address unless the membrane resolves it against the target first.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>css urls</title><body><script>' +
+        "const H = location.host; const forms = ['textContent-before', 'textContent-after', 'appendText-before', 'appendText-after', 'insertBefore-text', 'append-text', 'innerHTML', 'insertRule', 'replaceSync', 'elstyle-prop', 'style-attr'];" +
+        "const make = form => {" +
+        " const id = 'e_' + form; const el = document.createElement('div'); el.id = id; el.style.cssText = 'width:8px;height:8px'; const u = '//' + H + '/image-probe.png?j=prcss-' + form; const rule = '#' + id + '{background-image:url(' + u + ')}';" +
+        " if (form === 'elstyle-prop') { document.body.appendChild(el); el.style.backgroundImage = 'url(' + u + ')'; return; }" +
+        " if (form === 'style-attr') { el.setAttribute('style', 'width:8px;height:8px;background-image:url(' + u + ')'); document.body.appendChild(el); return; }" +
+        " document.body.appendChild(el);" +
+        " if (form === 'replaceSync') { const sh = new CSSStyleSheet(); sh.replaceSync(rule); document.adoptedStyleSheets = [...document.adoptedStyleSheets, sh]; return; }" +
+        " const st = document.createElement('style');" +
+        " if (form === 'textContent-before') { st.textContent = rule; document.head.appendChild(st); }" +
+        " else if (form === 'textContent-after') { document.head.appendChild(st); st.textContent = rule; }" +
+        " else if (form === 'appendText-before') { st.appendChild(document.createTextNode(rule)); document.head.appendChild(st); }" +
+        " else if (form === 'appendText-after') { document.head.appendChild(st); st.appendChild(document.createTextNode(rule)); }" +
+        " else if (form === 'insertBefore-text') { document.head.appendChild(st); st.insertBefore(document.createTextNode(rule), null); }" +
+        " else if (form === 'append-text') { st.append(document.createTextNode(rule)); document.head.appendChild(st); }" +
+        " else if (form === 'innerHTML') { st.innerHTML = rule; document.head.appendChild(st); }" +
+        " else if (form === 'insertRule') { document.head.appendChild(st); st.sheet.insertRule(rule, 0); }" +
+        "};" +
+        // A layout read after the insert brings the style recalculation, and so the image fetch, forward of any MutationObserver callback: the rewrite has to be done by then.
+        "for (const form of forms) { make(form); getComputedStyle(document.getElementById('e_' + form)).backgroundImage; }" +
+        "const probe = document.createElement('div'); probe.id = 'xcss-import-probe'; document.body.appendChild(probe);" +
+        "const q = String.fromCharCode(39); const imp = document.createElement('style'); imp.textContent = '@import url(' + q + '//' + H + '/xcss-import.css?j=prcss-import' + q + ')'; document.head.appendChild(imp);" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xblobdep.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('export const dep = "dep-loaded";');
+      return;
+    }
+    if (url.pathname === '/xblobmodule') {
+      // Code a page builds in blobs: a module that statically imports another blob (and a data: URL), a blob module script made the way es-module-shims feature-detects, a blob classic
+      // script, and a computed import() from inside a blob module. Every one of them must run rewritten, so what they read of `location` is the page's, as natively.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>blobmodule</title><body><script type="module">' +
+        "const out = window.__blobs = { errors: [] };" +
+        "const blob = src => URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));" +
+        "const tryStep = async (name, fn) => { try { out[name] = await fn(); } catch (e) { out.errors.push(name + ':' + (e && e.name || e)); } };" +
+        'const inner = blob("window.__innerHref = location.href; export const v = 7; export default u => import(u);");' +
+        "const outer = blob(\"import * as m from '\" + inner + \"'; window.__outerSeen = m.v; self._esmsi = m;\");" +
+        "await tryStep('dynamic', async () => { await import(outer); return [window.__innerHref, window.__outerSeen]; });" +
+        "await tryStep('dataImport', async () => { await import(blob(\"import 'data:text/javascript,window.__dataHref%3Dlocation.href%3B';\")); return window.__dataHref; });" +
+        "const load = el => new Promise(r => { el.addEventListener('load', () => r('load')); el.addEventListener('error', () => r('error')); document.head.appendChild(el); });" +
+        "await tryStep('moduleScript', async () => { const inner2 = blob('window.__innerHref2 = location.href; export const v = 8;'); const outer2 = blob(\"import * as m from '\" + inner2 + \"'; self._esmsi = m;\"); const s = Object.assign(document.createElement('script'), { type: 'module', src: outer2 }); const ev = await load(s); return [ev, s.src === outer2, self._esmsi && self._esmsi.v, window.__innerHref2]; });" +
+        "await tryStep('classicScript', async () => { const s = document.createElement('script'); s.src = blob('window.__classicHref = location.href;'); const ev = await load(s); return [ev, s.src.startsWith('blob:'), window.__classicHref]; });" +
+        "await tryStep('computedImport', async () => { const di = (await import(inner)).default; const m = await di(new URL('/xblobdep.js', location.href).href); return m.dep; });" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xjsurl') {
+      // `javascript:` links and forms, in the markup and made at runtime. The URL is the link's default action: it runs after the click has been dispatched, not when a listener
+      // cancelled it, and the page's own handlers on the same link still run (`href="javascript:void(0)"` with an onclick is the common shape).
+      const box = 'style="display:block;width:90px;height:24px"';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>jsurl</title><body><script>window.__js = [];</script>' +
+        `<a id="sa" href="javascript:window.__js.push('static-a')" ${box}>sa</a>` +
+        `<form id="sf" action="javascript:window.__js.push('static-form')"><button id="sfb" type="submit" ${box}>go</button></form>` +
+        `<a id="so" href="javascript:void(0)" onclick="window.__js.push('onclick')" ${box}>so</a>` +
+        `<a id="sp" href="javascript:window.__js.push('must-not-run')" onclick="event.preventDefault(); window.__js.push('prevented')" ${box}>sp</a>` +
+        `<a id="ev" href="javascript:void(0)" data-zp-jsurl="window.__forged = location.href" data-zp-jsurl-kind="anchor" ${box}>ev</a>` +
+        '<div id="host"></div><script>' +
+        "document.addEventListener('click', function (e) { if (e.target.id) window.__js.push('doc:' + e.target.id); });" +
+        "var host = document.getElementById('host');" +
+        "window.tagRa = 'runtime-inner';" +
+        'host.innerHTML = \'<a id="ra" href="javascript:window.__js.push(window.tagRa)" style="display:block;width:90px;height:24px">ra</a>\';' +
+        "var mk = function (id) { var a = document.createElement('a'); a.id = id; a.textContent = id; a.style.cssText = 'display:block;width:90px;height:24px'; host.appendChild(a); return a; };" +
+        "mk('rb').setAttribute('href', \"javascript:window.__js.push('runtime-attr')\");" +
+        "mk('rc').href = \"javascript:window.__js.push('runtime-prop')\";" +
+        // the same internal attributes written by the page itself: nothing may run because of them
+        "var host2 = document.createElement('div'); document.body.appendChild(host2);" +
+        'host2.innerHTML = \'<a id="ev2" href="javascript:void(0)" data-zp-jsurl="window.__forged = location.href" data-zp-jsurl-kind="anchor" style="display:block;width:90px;height:24px">ev2</a>\';' +
+        "var e3 = document.createElement('a'); e3.id = 'ev3'; e3.textContent = 'ev3'; e3.style.cssText = 'display:block;width:90px;height:24px'; e3.href = 'javascript:void(0)'; host2.appendChild(e3);" +
+        "e3.dataset.zpJsurl = 'window.__forged = location.href'; e3.setAttributeNS(null, 'data-zp-jsurl-kind', 'anchor'); e3.setAttributeNode(Object.assign(document.createAttribute('data-zp-jsurl'), { value: 'window.__forged = location.href' }));" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xhookping') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+      res.end('pong');
+      return;
+    }
+    if (url.pathname === '/xhookdefine') {
+      // Members the page wraps with Object.defineProperty (Google redefines setInterval; instrumentation libraries do the same to fetch, setTimeout, innerHTML): the descriptor flags
+      // read as they do natively, the redefinition succeeds, and the wrapper sits in the call path.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>hookdefine</title><body><script>' +
+        "var out = window.__hooks = { calls: [], errors: [] };" +
+        "var flags = function (o, k) { var d = Object.getOwnPropertyDescriptor(o, k); return d ? [('value' in d) ? 'data' : 'accessor', d.configurable, d.enumerable, d.writable].join(',') : 'none'; };" +
+        "out.flags = {};" +
+        "[['window', window, ['setTimeout', 'setInterval', 'fetch', 'XMLHttpRequest', 'eval']], ['Element', Element.prototype, ['innerHTML', 'setAttribute', 'getAttribute', 'append']], ['Node', Node.prototype, ['appendChild', 'textContent']], ['HTMLElement', HTMLElement.prototype, ['innerText']]," +
+        " ['EventTarget', EventTarget.prototype, ['addEventListener']], ['History', History.prototype, ['pushState']], ['Document', Document.prototype, ['createElement', 'cookie']]].forEach(function (g) {" +
+        "  out.flags[g[0]] = {}; g[2].forEach(function (k) { out.flags[g[0]][k] = flags(g[1], k); });" +
+        "});" +
+        "var wrap = function (o, k) { var d = Object.getOwnPropertyDescriptor(o, k); try { var orig = d.value; Object.defineProperty(o, k, { value: function () { out.calls.push(k); return orig.apply(this, arguments); }, configurable: true, enumerable: d.enumerable, writable: true }); } catch (e) { out.errors.push(k + ':' + e.name); } };" +
+        "['setTimeout', 'setInterval', 'fetch'].forEach(function (k) { wrap(window, k); });" +
+        "wrap(Element.prototype, 'setAttribute'); wrap(EventTarget.prototype, 'addEventListener');" +
+        // YouTube wraps innerText this way: the descriptor's own getter and setter, configurable
+        "try { var g = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'innerText'); Object.defineProperty(HTMLElement.prototype, 'innerText', { enumerable: g.enumerable, configurable: true, get: g.get, set: function (v) { out.calls.push('innerText'); g.set.call(this, v); } }); } catch (e) { out.errors.push('innerText:' + e.name); }" +
+        "var d2 = document.createElement('div'); d2.innerText = 'hello'; out.innerText = d2.innerText;" +
+        "var div = document.createElement('div'); div.innerHTML = '<b id=\"x\">x</b>'; div.setAttribute('data-a', '1'); out.html = div.innerHTML; out.attr = div.getAttribute('data-a');" +
+        "document.addEventListener('zpping', function () { out.event = 'heard'; }); document.dispatchEvent(new Event('zpping'));" +
+        "var tid = setInterval(function () { clearInterval(tid); out.interval = 'ran'; }, 5);" +
+        "setTimeout(function () { out.timeout = 'ran'; }, 5);" +
+        "fetch('/xhookping').then(function (r) { return r.text(); }).then(function (t) { out.fetch = t; }).catch(function (e) { out.errors.push('fetch:' + e.name); });" +
+        // Deleting a hook must leave nothing underneath: natively each of these is deletable and the name is gone from the object (no ancestor has it), so a hook that left a
+        // native member showing through, or could not be deleted, reads differently.
+        "setTimeout(function () {" +
+        "  out.deleted = {};" +
+        "  [[Element.prototype, 'Element.setAttribute', 'setAttribute'], [Element.prototype, 'Element.querySelector', 'querySelector'], [Node.prototype, 'Node.appendChild', 'appendChild'], [Node.prototype, 'Node.insertBefore', 'insertBefore'], [Document.prototype, 'Document.write', 'write'], [Document.prototype, 'Document.createElement', 'createElement'], [EventTarget.prototype, 'EventTarget.addEventListener', 'addEventListener'], [History.prototype, 'History.pushState', 'pushState'], [History.prototype, 'History.replaceState', 'replaceState'], [CSSStyleSheet.prototype, 'CSSStyleSheet.insertRule', 'insertRule'], [Navigator.prototype, 'Navigator.sendBeacon', 'sendBeacon']].forEach(function (h) {" +
+        "    try { out.deleted[h[1]] = [delete h[0][h[2]], h[2] in h[0]]; } catch (e) { out.deleted[h[1]] = 'threw ' + e.name; }" +
+        "  });" +
+        "  window.__done = true;" +
+        "}, 600);" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xael') {
+      // EventTarget methods kept by the page and called on `window` (Polymer's shady DOM does `window.__shady_native_addEventListener(…)`; libraries use
+      // `EventTarget.prototype.addEventListener.call(window, …)`): each shape registers a listener that must then hear the event.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>ael</title><body><script>' +
+        "var out = window.__ael = { shapes: {}, heard: [] };" +
+        "var shape = function (name, register, fire) { try { var type = 'zp-' + name; register(type, function () { out.heard.push(name); }); (fire || function (t) { window.dispatchEvent(new Event(t)); })(type); out.shapes[name] = 'ok'; } catch (e) { out.shapes[name] = e.name + ': ' + e.message; } };" +
+        "var ET = EventTarget.prototype;" +
+        "shape('protoCopyOnProto', function (t, f) { ET.__nat1 = ET.addEventListener; window.__nat1(t, f); });" +
+        "shape('protoCopyOnWindow', function (t, f) { window.__nat2 = ET.addEventListener; window.__nat2(t, f); });" +
+        "shape('windowCopy', function (t, f) { window.__nat3 = window.addEventListener; window.__nat3(t, f); });" +
+        "shape('callWindow', function (t, f) { ET.addEventListener.call(window, t, f); });" +
+        "shape('applyWindow', function (t, f) { ET.addEventListener.apply(window, [t, f, false]); });" +
+        "shape('globalThis', function (t, f) { globalThis.addEventListener(t, f); });" +
+        "shape('dispatchCall', function (t, f) { window.addEventListener(t, f); }, function (t) { ET.dispatchEvent.call(window, new Event(t)); });" +
+        "shape('dispatchCopy', function (t, f) { window.addEventListener(t, f); }, function (t) { ET.__nat4 = ET.dispatchEvent; window.__nat4(new Event(t)); });" +
+        "shape('removeCall', function (t, f) { window.addEventListener(t, f); ET.removeEventListener.call(window, t, f); });" +
+        "shape('removeCopy', function (t, f) { window.addEventListener(t, f); ET.__nat5 = ET.removeEventListener; window.__nat5(t, f); });" +
+        "shape('onDocument', function (t, f) { ET.addEventListener.call(document, t, f); }, function (t) { document.dispatchEvent(new Event(t)); });" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xcookiestore') {
+      // A page that wraps `cookieStore.addEventListener` and calls the original it found on the prototype chain on `cookieStore` (Sentry's browser API errors, under Transcend's
+      // airgap on Notion). The page's `cookieStore` is a facade over the virtual cookie jar, which the native EventTarget methods refuse.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>cookiestore</title><body><script>' +
+        'var out = window.__cs = { wrapped: 0, fired: 0, removedFired: 0 };' +
+        'var t = function (name, fn) { try { out[name] = fn(); } catch (e) { out[name] = "threw " + e.name + ": " + String(e.message).slice(0, 60); } };' +
+        'var proto = Object.getPrototypeOf(cookieStore);' +
+        'var origAdd = proto.addEventListener, origRemove = proto.removeEventListener, origDispatch = proto.dispatchEvent;' +
+        'var wrapAdd = function (type, listener, options) { out.wrapped++; return origAdd.apply(this, [type, listener, options]); };' +
+        'cookieStore.addEventListener = wrapAdd;' +
+        'var onChange = function () { out.fired++; }, removed = function () { out.removedFired++; };' +
+        't("add through the wrapper", function () { cookieStore.addEventListener("change", onChange); return "ok"; });' +
+        't("add and remove", function () { cookieStore.addEventListener("change", removed); origRemove.call(cookieStore, "change", removed); return "ok"; });' +
+        't("dispatch through the prototype", function () { return origDispatch.call(cookieStore, new Event("change")); });' +
+        'setTimeout(function () {' +
+        '  t("delivered", function () { return out.fired === 1; });' +
+        '  t("removed listener silent", function () { return out.removedFired === 0; });' +
+        '  window.__done = true;' +
+        '}, 300);' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xstackalias') {
+      // Bundles alias `Error` and libraries save its stack hook, install their own and fall back to the saved one (Transcend's airgap, which Notion loads): natively nothing is saved
+      // until the page assigns a hook, and the saved value must not be the membrane's own sanitizer.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>stackalias</title><body><script>' +
+        'var out = window.__stk = {};' +
+        'var t = function (name, fn) { try { out[name] = fn(); } catch (e) { out[name] = "threw " + e.name + ": " + String(e.message).slice(0, 60); } };' +
+        'var E = Error;' +
+        't("saved hook type", function () { return typeof E.prepareStackTrace; });' +
+        't("hook is listed", function () { return Object.keys(E).indexOf("prepareStackTrace") >= 0; });' +
+        't("hook receives frames", function () { var prev = E.prepareStackTrace; E.prepareStackTrace = function (e, sites) { return typeof sites + ":" + Array.isArray(sites); }; var v = new E("a").stack; E.prepareStackTrace = prev; return v; });' +
+        't("chain to the saved hook", function () { var saved = E.prepareStackTrace; E.prepareStackTrace = function (e, sites) { return saved ? saved(e, sites) : "default:" + typeof sites; }; var v = new E("b").stack; E.prepareStackTrace = saved; return v; });' +
+        't("airgap capture", function () {' +
+        '  var call = Function.prototype.call.bind(Function.prototype.call);' +
+        '  var capture = function () { var prev = E.prepareStackTrace, got; E.prepareStackTrace = function () { var c = arguments; got = c[1]; return prev ? call(prev, c[0], c[1]) : "x"; }; var o = {}; E.captureStackTrace(o); void o.stack; E.prepareStackTrace = prev; return got; };' +
+        '  var sites = capture(); return Array.isArray(sites) && sites.length > 0 && typeof sites[0].getFileName;' +
+        '});' +
+        't("restored type", function () { return typeof E.prepareStackTrace; });' +
+        't("stack is a string", function () { return typeof new E("c").stack; });' +
+        'window.__done = true;' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xdatascript') {
+      // Scripts whose code is in their address: Instagram's bootstrap stubs are `<script src="data:application/x-javascript;…;base64,…">`, es-module-shims probes with `<script type=module src=data:…>`,
+      // and a module may `import 'data:…'`. They must run, rewritten (`location` is the target's), and in the page's order.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>datascript</title><body>' +
+        '<script>window.__dat = { order: [] };</script>' +
+        '<script src="data:text/javascript,__dat.order.push(%22plain%22);__dat.plainHref=location.href;__dat.plainWindowTop=(window.top===window)"></script>' +
+        '<script src="data:application/x-javascript; charset=utf-8;base64,X19kYXQub3JkZXIucHVzaCgiYjY0Iik7X19kYXQuY3VycmVudFNyYz1kb2N1bWVudC5jdXJyZW50U2NyaXB0LnNyYy5zbGljZSgwLDQwKQ=="></script>' +
+        '<script type="module" src="data:text/javascript,import %22data:text/javascript,globalThis.__dat.order.push(%2522inner%2522)%22;__dat.order.push(%22module%22);__dat.moduleUrl=import.meta.url.slice(0,40)"></script>' +
+        '<script type="module">import "data:text/javascript,globalThis.__dat.order.push(%22inline-import%22)"; __dat.order.push("inline-module");</script>' +
+        '<script>var d = document.createElement("script"); d.src = "data:text/javascript,__dat.order.push(%22dynamic%22)"; d.onload = function () { __dat.dynamicLoaded = true; }; document.body.appendChild(d);' +
+        'var a = document.createElement("script"); a.setAttribute("src", "data:text/javascript,__dat.order.push(%22attribute%22)"); document.body.appendChild(a);' +
+        '__dat.srcReadback = d.src.slice(0, 40); __dat.attributeReadback = a.getAttribute("src").slice(0, 40);' +
+        'window.addEventListener("load", function () { setTimeout(function () { __dat.order.sort(); window.__done = true; }, 300); });</script>' +
+        '</body>');
+      return;
+    }
+    if (url.pathname === '/xwinaccessor') {
+      // The "wrap the original accessor" idiom (TikTok's privacy framework wraps `screen` and the cookie accessors this way): the descriptor's getter is kept and called with the receiver the
+      // wrapper is given. Natively that receiver is the window; the page's window here is a facade, which a native getter refuses.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>winaccessor</title><body><script>' +
+        'var out = window.__acc = {}; var hits = 0;' +
+        'var t = function (name, fn) { try { out[name] = fn(); } catch (e) { out[name] = "threw " + e.name + ": " + String(e.message).slice(0, 60); } };' +
+        'var wrap = function (obj, name) {' +
+        '  var d, owner = obj; while (owner && !(d = Object.getOwnPropertyDescriptor(owner, name))) owner = Object.getPrototypeOf(owner);' +
+        '  var g = d.get, s = d.set;' +
+        '  Object.defineProperty(owner, name, { get: function () { hits++; return g.call(this); }, set: s && function (v) { s.call(this, v); }, enumerable: d.enumerable, configurable: true });' +
+        '};' +
+        't("wrap screen", function () { wrap(window, "screen"); return "ok"; });' +
+        't("screen.width via window", function () { return typeof window.screen.width; });' +
+        't("screen.width bare", function () { return typeof screen.width; });' +
+        't("screen.width via self", function () { return typeof self.screen.width; });' +
+        't("wrapped getter ran", function () { return hits >= 3; });' +
+        't("wrap onclick", function () { wrap(window, "onclick"); return "ok"; });' +
+        't("onclick round trip", function () { var f = function () {}; window.onclick = f; var same = window.onclick === f; window.onclick = null; return same; });' +
+        'var dpr = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");' +
+        't("getter.call(window)", function () { return typeof dpr.get.call(window); });' +
+        't("getter.call(self)", function () { return typeof dpr.get.call(self); });' +
+        't("getter.call(globalThis)", function () { return typeof dpr.get.call(globalThis); });' +
+        't("getter identity", function () { return Object.getOwnPropertyDescriptor(window, "devicePixelRatio").get === dpr.get; });' +
+        't("getter name", function () { return dpr.get.name; });' +
+        't("getter source", function () { return /\\[native code\\]/.test(Function.prototype.toString.call(dpr.get)); });' +
+        't("getter on a foreign object", function () { return dpr.get.call({}); });' +
+        'var om = Object.getOwnPropertyDescriptor(window, "onerror");' +
+        't("setter.call(window)", function () { var f = function () {}; om.set.call(window, f); var same = om.get.call(window) === f; om.set.call(window, null); return same; });' +
+        't("descriptors keys", function () { var all = Object.getOwnPropertyDescriptors(window); return typeof all.innerWidth.get + " " + typeof all.onclick.set; });' +
+        't("reflect descriptor", function () { return typeof Reflect.getOwnPropertyDescriptor(window, "innerHeight").get.call(window); });' +
+        'var tick = function () { hits += 1000; };' +
+        't("setTimeout.bind(window)", function () { setTimeout.bind(window)(tick, 0); return "ok"; });' +
+        't("timers object (react-idle-timer)", function () { var timers = { setTimeout: setTimeout.bind(window), clearTimeout: clearTimeout.bind(window), setInterval: setInterval.bind(window), clearInterval: clearInterval.bind(window) }; var id = timers.setTimeout(tick, 1000); timers.clearTimeout(id); var iv = timers.setInterval(tick, 1000); timers.clearInterval(iv); return typeof id; });' +
+        't("setTimeout.call(window)", function () { setTimeout.call(window, tick, 0); return "ok"; });' +
+        't("setTimeout.apply(window)", function () { setTimeout.apply(window, [tick, 0]); return "ok"; });' +
+        't("requestAnimationFrame.bind(window)", function () { requestAnimationFrame.bind(window)(tick); return "ok"; });' +
+        't("addEventListener.call(window)", function () { addEventListener.call(window, "zp-w", tick); window.dispatchEvent(new Event("zp-w")); return "ok"; });' +
+        't("getComputedStyle.call(window)", function () { return typeof getComputedStyle.call(window, document.body).color; });' +
+        't("atob.call(window)", function () { return atob.call(window, "aGk="); });' +
+        't("structuredClone.bind(window)", function () { return JSON.stringify(structuredClone.bind(window)({ a: 1 })); });' +
+        't("queueMicrotask.call(window)", function () { queueMicrotask.call(window, tick); return "ok"; });' +
+        'window.__done = true;' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xifrnative') {
+      // The "untainted native" idiom (rrweb and Sentry Replay, Datadog, zone.js escapes): a method of a fresh iframe's window, called with this page's window as the receiver.
+      // Sentry Replay takes setTimeout this way (`e6("setTimeout")` = `iframe.contentWindow.setTimeout.bind(window)`), and Tistory's React app broke on its first input.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>ifrnative</title><body><script>' +
+        'var out = window.__ifr = {}; var hits = 0; var tick = function () { hits++; };' +
+        'var t = function (name, fn) { try { out[name] = fn(); } catch (e) { out[name] = "threw " + e.name + ": " + String(e.message).slice(0, 60); } };' +
+        'var f = document.createElement("iframe"); document.head.appendChild(f); var cw = f.contentWindow;' +
+        't("setTimeout.bind(window)", function () { cw.setTimeout.bind(window)(tick, 0); return "ok"; });' +
+        't("setTimeout.call(window)", function () { cw.setTimeout.call(window, tick, 0); return "ok"; });' +
+        't("setTimeout.apply(window)", function () { cw.setTimeout.apply(window, [tick, 0]); return "ok"; });' +
+        't("setTimeout.call(cw)", function () { cw.setTimeout.call(cw, tick, 0); return "ok"; });' +
+        't("setInterval.bind(window)", function () { var id = cw.setInterval.bind(window)(tick, 5); cw.clearInterval.bind(window)(id); return "ok"; });' +
+        't("requestAnimationFrame.bind(window)", function () { cw.requestAnimationFrame.bind(window)(tick); return "ok"; });' +
+        't("clearTimeout.bind(window)", function () { var id = setTimeout(tick, 1000); cw.clearTimeout.bind(window)(id); return "ok"; });' +
+        't("addEventListener.call(window)", function () { cw.addEventListener.call(window, "zp-x", tick); window.dispatchEvent(new Event("zp-x")); return "ok"; });' +
+        't("removeEventListener.call(window)", function () { var g = function () { hits += 100; }; cw.addEventListener.call(window, "zp-y", g); cw.removeEventListener.call(window, "zp-y", g); window.dispatchEvent(new Event("zp-y")); return "ok"; });' +
+        't("getComputedStyle.call(window)", function () { return typeof cw.getComputedStyle.call(window, document.body).color; });' +
+        't("atob.bind(window)", function () { return cw.atob.bind(window)("aGk="); });' +
+        't("btoa.call(window)", function () { return cw.btoa.call(window, "hi"); });' +
+        't("structuredClone.bind(window)", function () { return JSON.stringify(cw.structuredClone.bind(window)({ a: 1 })); });' +
+        't("queueMicrotask.bind(window)", function () { cw.queueMicrotask.bind(window)(tick); return "ok"; });' +
+        't("matchMedia.call(window)", function () { return typeof cw.matchMedia.call(window, "(min-width: 1px)").matches; });' +
+        't("MutationObserver ctor", function () { var mo = new cw.MutationObserver(function () {}); mo.observe(document.body, { childList: true }); mo.disconnect(); return "ok"; });' +
+        't("window.setTimeout is not the iframe\'s", function () { return String(cw.setTimeout === window.setTimeout); });' +
+        'var d = document.createElement("div"); var inp = document.createElement("input"); inp.type = "checkbox";' +
+        // React's value tracker plus rrweb's setter hook on the same property: the shape of the Tistory failure
+        'var proto = HTMLInputElement.prototype; var orig = Object.getOwnPropertyDescriptor(proto, "checked");' +
+        'var untaintedTimeout = cw.setTimeout.bind(window);' +
+        't("rrweb hookSetter on checked", function () { Object.defineProperty(proto, "checked", { set: function (v) { untaintedTimeout(function () { hits += 1000; }, 0); orig.set.call(this, v); }, get: orig.get, configurable: true }); inp.checked = true; return String(inp.checked); });' +
+        'setTimeout(function () { out.hits = hits; f.remove(); window.__done = true; }, 500);' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname.startsWith('/xinert-')) {
+      res.writeHead(200, { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store' });
+      res.end(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
+      return;
+    }
+    if (url.pathname === '/xinertdoc') {
+      // Documents with no window (a template's content, DOMParser, createHTMLDocument) load nothing, so an image the page puts in one is not requested (FAST templates hold
+      // `fast-x{…}fast-x` placeholders in src attributes and Bing's MSN widgets made ninety failing requests); the nodes load once a document adopts them.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>inertdoc</title><body><script>' +
+        'var out = window.__inert = {}; var origin = location.origin;' +
+        'var count = function (needle) { return performance.getEntriesByType("resource").filter(function (e) { try { return decodeURIComponent(e.name).indexOf(needle) >= 0; } catch (x) { return false; } }).length; };' +
+        'var t = document.createElement("template");' +
+        't.innerHTML = "<img src=\'" + origin + "/xinert-innerhtml.gif\'><video poster=\'" + origin + "/xinert-poster.gif\'></video><img src=\'fast-x{fast-x-1}fast-x/xinert-placeholder.gif\'>";' +
+        'var img = document.createElement("img"); t.content.appendChild(img); img.setAttribute("src", origin + "/xinert-setattribute.gif"); img.src = origin + "/xinert-property.gif";' +
+        'var doc = document.implementation.createHTMLDocument("x"); var i2 = doc.createElement("img"); i2.src = origin + "/xinert-otherdoc.gif"; doc.body.appendChild(i2);' +
+        'var dp = new DOMParser().parseFromString("<img src=\'" + origin + "/xinert-domparser.gif\'>", "text/html");' +
+        'out.readback = [t.content.firstChild.getAttribute("src"), t.content.childNodes[1].getAttribute("poster"), t.content.childNodes[2].getAttribute("src"), img.getAttribute("src"), i2.getAttribute("src"), dp.images[0].getAttribute("src")];' +
+        'setTimeout(function () {' +
+        '  out.beforeAdopt = count("xinert-");' +
+        '  var t2 = document.createElement("template"); t2.innerHTML = "<img id=\'adopted\' src=\'" + origin + "/xinert-adopted.gif\'>"; document.body.appendChild(document.importNode(t2.content, true));' +
+        '  var t3 = document.createElement("template"); t3.innerHTML = "<img id=\'inserted\' src=\'" + origin + "/xinert-inserted.gif\'>"; document.body.appendChild(t3.content);' +
+        '  setTimeout(function () {' +
+        '    out.afterAdopt = { adopted: count("xinert-adopted"), inserted: count("xinert-inserted"), other: count("xinert-") - count("xinert-adopted") - count("xinert-inserted") };' +
+        '    out.adoptedRead = [document.getElementById("adopted").getAttribute("src"), document.getElementById("inserted").getAttribute("src")];' +
+        '    window.__done = true;' +
+        '  }, 800);' +
+        '}, 800);' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xmediasession') {
+      // Media metadata with artwork (every media site sets it; the Twitch player stopped on it): the setter takes a MediaMetadata, so a copy with proxied artwork URLs has to be one.
+      const site = `http://${req.headers.host}`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>mediasession</title><body><script>' +
+        'var out = window.__ms = {};' +
+        'try { navigator.mediaSession.metadata = new MediaMetadata({ title: "T", artist: "A", album: "B", artwork: [{ src: "' + site + '/art.png", sizes: "96x96", type: "image/png" }, { src: "/rel.png", sizes: "128x128" }] }); out.set = "ok"; } catch (e) { out.set = e.name + ": " + e.message; }' +
+        'var m = navigator.mediaSession.metadata;' +
+        'out.title = m && m.title; out.artist = m && m.artist; out.album = m && m.album; out.count = m && m.artwork.length;' +
+        'out.sizes = m && m.artwork.map(function (a) { return a.sizes; }).join(","); out.type0 = m && m.artwork[0].type; out.abs = m && m.artwork[0].src; out.rel = m && m.artwork[1].src;' +
+        'try { navigator.mediaSession.metadata = new MediaMetadata({ title: "x", artwork: [{ src: "' + site + '/a.png" }] }); navigator.mediaSession.metadata.title = "live"; out.live = navigator.mediaSession.metadata.title; } catch (e) { out.live = e.name; }' +
+        'try { navigator.mediaSession.metadata = new MediaMetadata({ title: "plain" }); out.plain = navigator.mediaSession.metadata.title; } catch (e) { out.plain = e.name; }' +
+        'try { navigator.mediaSession.metadata = null; out.cleared = String(navigator.mediaSession.metadata); } catch (e) { out.cleared = e.name; }' +
+        'try { navigator.mediaSession.metadata = { title: "not a MediaMetadata" }; out.plainObject = "accepted"; } catch (e) { out.plainObject = e.name; }' +
+        'window.__done = true;' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xemptydoc') {
+      // A charset other than UTF-8 sends the document down the buffered path, where an empty transform output used to read as a failure.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=iso-8859-1', 'Cache-Control': 'no-store' });
+      res.end('');
+      return;
+    }
+    if (url.pathname === '/xemptyframe') {
+      // A document with no bytes (Bing's hidden token frame answers its form POST this way): a 200 and a blank document, not an error page.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>emptyframe</title><body><iframe id="f" src="/xemptydoc"></iframe><script>' +
+        'var out = window.__empty = {};' +
+        'var f = document.getElementById("f");' +
+        'var read = function () { var d = f.contentDocument; out.readyState = d.readyState; out.bodyText = d.body ? d.body.textContent : null; out.bodyChildren = d.body ? d.body.childNodes.length : -1; out.title = d.title; out.hasError = /POLICY|MALFORMED|ZeroProxy/.test(d.documentElement.textContent); };' +
+        'f.addEventListener("load", function () { read(); fetch("/xemptydoc").then(function (r) { return r.text().then(function (t) { out.fetched = r.status + ":" + t.length; window.__done = true; }); }); });' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xsel.js' || url.pathname === '/xsel.css') {
+      res.writeHead(200, { 'Content-Type': url.pathname.endsWith('.js') ? 'text/javascript' : 'text/css', 'Cache-Control': 'no-store' });
+      res.end(url.pathname.endsWith('.js') ? 'window.__selLoads = (window.__selLoads || 0) + 1;' : 'body { margin: 0 }');
+      return;
+    }
+    if (url.pathname === '/xurlselect') {
+      // Attribute selectors on URL-bearing attributes (`script[src="…"]`, `a[href^="http"]`): loaders look their own element up this way to avoid loading a script or a
+      // stylesheet twice. Elements come from the server HTML and from every runtime path, and the selectors use every operator, a flag, negation, grouping and nesting.
+      const site = `http://${req.headers.host}`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>urlselect</title><body>' +
+        '<link id="l1" rel="stylesheet" href="/xsel.css"><link id="l2" rel="icon" href="/xsel-icon.png"><script id="s1" src="/xsel.js"></script>' +
+        '<div id="box"><a id="a1" href="/xsel-page">a1</a><a id="a2" href="' + site + '/xsel-abs">a2</a><a id="a3" href="#top">a3</a><a id="a4" href="mailto:x@y.example">a4</a>' +
+        '<a id="a6" href="/xsel-old">a6</a><a id="a7" href="/xsel-gone">a7</a><img id="i1" src="/xsel.png"><img id="i2" srcset="/xsel-1x.png 1x, /xsel-2x.png 2x"><form id="f1" action="/xsel-post"></form><b id="b1" title="abc" data-x="1">b</b></div>' +
+        '<script>' +
+        'var out = window.__sel = {};' +
+        'var site = location.origin;' +
+        'var head = document.head, box = document.getElementById("box");' +
+        'var mk = function (tag, id) { var e = document.createElement(tag); e.id = id; return e; };' +
+        // runtime paths: setAttribute (absolute, relative), property, innerHTML, cloneNode, icon links
+        'var r1 = mk("script", "r1"); r1.setAttribute("src", site + "/xsel.js"); head.appendChild(r1);' +
+        'var r2 = mk("script", "r2"); r2.src = site + "/xsel.js?r2"; head.appendChild(r2);' +
+        'var r3 = mk("link", "r3"); r3.rel = "stylesheet"; r3.href = site + "/xsel.css?r3"; head.appendChild(r3);' +
+        'var r4 = mk("link", "r4"); r4.setAttribute("rel", "stylesheet"); r4.setAttribute("href", "/xsel.css?r4"); head.appendChild(r4);' +
+        'var r5 = mk("link", "r5"); r5.rel = "icon"; r5.href = site + "/xsel-icon5.png"; head.appendChild(r5);' +
+        'var r6 = mk("link", "r6"); r6.setAttribute("rel", "icon"); r6.setAttribute("href", "/xsel-icon6.png"); head.appendChild(r6);' +
+        'var host = mk("div", "host"); host.innerHTML = \'<a id="r7" href="/xsel-inner">r7</a>\'; box.appendChild(host);' +
+        'var r8 = mk("a", "r8"); r8.href = "/xsel-prop"; box.appendChild(r8);' +
+        'var r9 = mk("img", "r9"); r9.src = "/xsel-img-prop.png"; box.appendChild(r9);' +
+        'var r11 = r8.cloneNode(true); r11.id = "r11"; box.appendChild(r11);' +
+        'var r12 = mk("a", "r12"); r12.setAttributeNS(null, "href", "http://other.example/path?q=1"); box.appendChild(r12);' +
+        // an attribute rewritten and then set to something that is not: the old value must be gone
+        'document.getElementById("a6").setAttribute("href", "#changed");' +
+        'document.getElementById("a7").removeAttribute("href");' +
+        'var queries = [' +
+        '  "script[src=\\"/xsel.js\\"]", "script[src=\\"" + site + "/xsel.js\\"]", "[src$=\\"/xsel.js\\"]", "[src^=\\"/xsel\\"]", "[src*=\\"xsel\\"]", "script[src|=\\"/xsel.js\\"]", "[src~=\\"x\\"]",' +
+        '  "link[href=\\"/xsel.css\\"]", "link[href$=\\".css\\"]", "link[rel=\\"stylesheet\\"][href*=\\"xsel\\"]", "link[href=\\"" + site + "/xsel.css?r3\\"]", "link[rel~=icon][href$=\\"png\\"]", "link[href=\\"/xsel-icon6.png\\"]", "link[href=\\"/xsel-icon.png\\"]",' +
+        '  "a[href^=\\"http\\"]", "a[href^=\\"/\\"]", "a[href=\\"#top\\"]", "a[href^=\\"mailto:\\"]", "a:not([href^=\\"/\\"])", "a[href$=\\"-prop\\"]", "a[HREF = \'/xsel-page\' i]", "a[href=\\"/xsel-old\\"]", "a[href=\\"#changed\\"]", "a[href=\\"/xsel-gone\\"]",' +
+        '  "img[src^=\\"/xsel\\"]", "img[srcset*=\\"2x\\"]", "form[action=\\"/xsel-post\\"]", "form[action$=post]",' +
+        '  "[href=\\"/xsel-inner\\"], [src=\\"/xsel.js\\"]", "#box > a[href^=\\"/\\"]", ":is(a,link)[href$=\\"page\\"]", ":not(:is(a,link,img))[title^=a]", "#box :is(a):not([href^=\\"http\\"])", "a[href]",' +
+        '  "[title^=\\"a\\"]", "[data-x=\\"1\\"]", "[id=\\"r8\\"]", "a[href=\\"/x]y\\"]", "a[href=\\"a\\\\\\"b\\"]", "a[href=xsel-page]", "a[href^=\\"/xsel-p\\"][href$=\\"age\\"]"' +
+        '];' +
+        'var ids = function (list) { return Array.prototype.map.call(list, function (e) { return e.id || e.tagName; }); };' +
+        'var snapshot = function () {' +
+        '  var snap = { all: {}, first: {}, within: {}, matches: {}, closest: {}, errors: {} };' +
+        '  queries.forEach(function (q) {' +
+        '    snap.all[q] = ids(document.querySelectorAll(q));' +
+        '    var f = document.querySelector(q); snap.first[q] = f ? f.id || f.tagName : null;' +
+        '    snap.within[q] = ids(box.querySelectorAll(q));' +
+        '    snap.matches[q] = ["a2", "a3", "r8", "r7", "i1", "l1", "r12"].filter(function (id) { return document.getElementById(id).matches(q); });' +
+        '    var c = document.getElementById("r7").closest(q); snap.closest[q] = c ? c.id || c.tagName : null;' +
+        '  });' +
+        '  ["a[href=\\"x\\"", "a[href=]", "a[href=\\"x\\"]]", "a[href=\\"x\\" j]"].forEach(function (q) {' +
+        '    snap.errors[q] = [];' +
+        '    [function () { document.querySelector(q); }, function () { document.querySelectorAll(q); }, function () { box.matches(q); }, function () { box.closest(q); }].forEach(function (call) { try { call(); snap.errors[q].push("no error"); } catch (e) { snap.errors[q].push(e.name + ": " + e.message); } });' +
+        '  });' +
+        '  snap.values = {};' +
+        '  ["a1", "a2", "a3", "a6", "a7", "l2", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r11", "r12", "l1", "s1", "i1"].forEach(function (id) { var e = document.getElementById(id); snap.values[id] = [e.getAttribute("href"), e.getAttribute("src")]; });' +
+        '  return snap;' +
+        '};' +
+        'out.sync = snapshot();' +
+        'setTimeout(function () { out.later = snapshot(); out.selLoads = window.__selLoads || 0; window.__done = true; }, 800);' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xinlinemod-a.js' || url.pathname === '/xinlinemod-b.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end(url.pathname === '/xinlinemod-a.js' ? 'export const v = "static-ok";' : 'export const w = "dynamic-ok";');
+      return;
+    }
+    if (url.pathname === '/xinlinemod') {
+      // An inline module that imports modules of its own site by absolute address, as a Remix / React Router page does (Medium): the proxied page runs it as a blob, which has no base
+      // to resolve a root-relative proxy address against.
+      const site = `http://${req.headers.host}`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>inlinemod</title><body><script type="module">' +
+        `import { v } from '${site}/xinlinemod-a.js'; window.__inline = { v };` +
+        `import('${site}/xinlinemod-b.js').then(function (m) { window.__inline.w = m.w; window.__done = true; }, function (e) { window.__inline.error = String(e && e.message || e).slice(0, 120); window.__done = true; });` +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xnavigate') {
+      // Listeners a page puts on the Navigation API: a function, an object with handleEvent, one removed again, and the onnavigate property.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>navigate</title><body><script>' +
+        "const out = window.__nav = { fn: [], obj: [], removed: [], on: [], error: null };" +
+        "const hashOf = e => String(e.destination.url).split('#')[1] || '';" +
+        "navigation.addEventListener('navigate', e => out.fn.push([e.type, e.navigationType, hashOf(e), e.target === navigation, typeof e.intercept]));" +
+        "navigation.addEventListener('navigate', { handleEvent(e) { out.obj.push(e.type + ':' + hashOf(e)); } });" +
+        "const gone = () => out.removed.push('fired'); navigation.addEventListener('navigate', gone); navigation.removeEventListener('navigate', gone);" +
+        "navigation.onnavigate = e => out.on.push(e.navigationType + ':' + hashOf(e));" +
+        "try { location.hash = 'h1'; history.pushState({}, '', '#h2'); history.replaceState({}, '', '#h3'); } catch (e) { out.error = String(e && e.message || e); }" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xstorage') {
+      // What localStorage and sessionStorage answer for names inherited from Object.prototype and Storage.prototype (Taboola calls localStorage.hasOwnProperty), and their enumeration.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>storage</title><body><script>' +
+        "const out = window.__st = {}; const t = (k, f) => { try { out[k] = f(); } catch (e) { out[k] = 'THROW ' + e.name; } };" +
+        "for (const [label, S] of [['local', localStorage], ['session', sessionStorage]]) {" +
+        " S.clear(); S.setItem('a', '1'); S.setItem('b', '2');" +
+        " t(label + ' typeof hasOwnProperty', () => typeof S.hasOwnProperty);" +
+        " t(label + ' hasOwnProperty a/zz/getItem', () => [S.hasOwnProperty('a'), S.hasOwnProperty('zz'), S.hasOwnProperty('getItem')].join());" +
+        " t(label + ' toString', () => String(S));" +
+        " t(label + ' typeof valueOf/propertyIsEnumerable/isPrototypeOf', () => [typeof S.valueOf, typeof S.propertyIsEnumerable, typeof S.isPrototypeOf].join());" +
+        " t(label + ' constructor is Storage', () => S.constructor === Storage);" +
+        " t(label + ' proto is Storage.prototype', () => Object.getPrototypeOf(S) === Storage.prototype);" +
+        " t(label + ' in', () => ['hasOwnProperty' in S, 'getItem' in S, 'a' in S, 'zz' in S].join());" +
+        " t(label + ' keys sorted', () => Object.keys(S).sort().join());" +
+        " t(label + ' for-in members after keys', () => { const k = []; for (const x in S) if (x !== 'a' && x !== 'b') k.push(x); return k.join(); });" +
+        " t(label + ' length', () => S.length);" +
+        " t(label + ' a and zz', () => S.a + '|' + S.zz);" +
+        " t(label + ' hasOwnProperty stored as a key', () => { S.setItem('hasOwnProperty', 'x'); const v = typeof S.hasOwnProperty + ':' + S.getItem('hasOwnProperty'); S.removeItem('hasOwnProperty'); return v; });" +
+        " t(label + ' Object.prototype.hasOwnProperty.call', () => Object.prototype.hasOwnProperty.call(S, 'a'));" +
+        " S.clear();" +
+        "}" +
+        "window.__done = true;" +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xnested') {
+      // A script in a blank child frame makes an iframe of another site (the shape of an ad container that builds its creative's frame).
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>nested</title><body><script>' +
+        'var c = document.createElement("iframe"); document.body.appendChild(c);' +
+        'var d = c.contentDocument, f = d.createElement("iframe"); f.setAttribute("src", "http://127.0.0.1:' + req.socket.localPort + '/xframe-title"); d.body.appendChild(f);' +
+        '</script></body>');
+      return;
+    }
+    if (url.pathname === '/xrealm') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>realm</title><body><script>(' + childRealmProbe.toString() + ')()<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xshape') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>shape</title><body><script>(' + builtinShapeProbe.toString() + ')()<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xtext') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>text</title><body><script>(' + functionTextProbe.toString() + ')()<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xredef') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>redefine</title><body><script>(' + windowRedefineProbe.toString() + ')()<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xdeny' || url.pathname === '/xdeny-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      if (url.pathname === '/xdeny-child') { res.end('<!doctype html><title>child</title><body>child</body>'); return; }
+      res.end('<!doctype html><title>deny</title><body><script>(' + crossOriginDenialProbe.toString() + ')(' + JSON.stringify('http://127.0.0.1:' + req.socket.localPort + '/xdeny-child') + ')<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xhist') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>history</title><body><script>
+        var out = {};
+        var t = function (k, fn) { try { var v = fn(); out[k] = 'ok:' + String(v).slice(0, 50); } catch (e) { out[k] = e.name + ': ' + String(e.message).replace(/https?:[^ '"]*/g, 'URL').replace(/origin 'URL'/g, "origin 'ORIGIN'").slice(0, 160); } };
+        t('push other origin', function () { history.pushState({ a: 1 }, '', 'https://example.org/'); return location.pathname; });
+        t('replace other origin', function () { history.replaceState({ a: 1 }, '', 'https://example.org/x'); return location.pathname; });
+        t('push other host', function () { history.pushState(null, '', 'http://example.net:81/p'); return location.pathname; });
+        t('push other scheme', function () { history.pushState(null, '', 'ftp://example.com/'); return location.pathname; });
+        t('push data url', function () { history.pushState(null, '', 'data:text/html,x'); return location.pathname; });
+        t('push javascript url', function () { history.pushState(null, '', 'javascript:void 0'); return location.pathname; });
+        t('push about:blank', function () { history.pushState(null, '', 'about:blank'); return location.pathname; });
+        t('push relative', function () { history.pushState(null, '', '/rel/path?q=1#h'); return location.pathname + location.search + location.hash; });
+        t('push same origin absolute', function () { history.pushState(null, '', location.origin + '/abs'); return location.pathname; });
+        t('push query only', function () { history.pushState(null, '', '?only=1'); return location.pathname + location.search; });
+        t('push hash only', function () { history.pushState(null, '', '#only'); return location.hash; });
+        t('push user info', function () { history.pushState(null, '', 'http://user:pw@' + location.host + '/u'); return location.pathname; });
+        t('push other port', function () { history.pushState(null, '', location.protocol + '//' + location.hostname + ':65000/p'); return location.pathname; });
+        t('push blob url', function () { history.pushState(null, '', 'blob:' + location.origin + '/xyz'); return location.pathname; });
+        t('push state not cloneable', function () { history.pushState(function () {}, '', '/f'); return 'x'; });
+        window.__xhist = out;
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xnf' || url.pathname === '/xnf-anchor' || url.pathname === '/xnf-challenge') {
+      const other = `http://127.0.0.1:${req.socket.localPort}`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      const show = `var show = function (fn) { try { var v = fn(); return v === undefined ? 'undefined' : (typeof v === 'object' && v !== null) ? (v === window ? 'self' : 'object') : String(v); } catch (e) { return 'threw:' + e.name; } };
+        var flags = function (w, k) { var d = Object.getOwnPropertyDescriptor(w, k); return d ? [typeof d.value, d.writable, d.enumerable, d.configurable].join(',') : 'none'; };`;
+      if (url.pathname === '/xnf-anchor') {
+        res.end(`<!doctype html><title>anchor</title><body><script>
+          var g = document.createElement('iframe'); g.name = 'grand'; document.body.appendChild(g);
+          parent.postMessage({ anchorReady: 1 }, '*');
+        <\/script></body>`);
+        return;
+      }
+      if (url.pathname === '/xnf-challenge') {
+        res.end(`<!doctype html><title>challenge</title><body><script>
+          ${show}
+          var r = {};
+          r.byName = show(function () { return parent['anchor']; });
+          r.byFrames = show(function () { return parent.frames['anchor']; });
+          r.has = show(function () { return 'anchor' in parent; });
+          r.hasMissing = show(function () { return 'nope' in parent; });
+          r.getMissing = show(function () { return parent['nope']; });
+          r.flags = show(function () { return flags(parent, 'anchor'); });
+          r.sameAsIndex = show(function () { return parent['anchor'] === parent[0]; });
+          r.siblingDocument = show(function () { return parent['anchor'].document.body.children.length; });
+          r.siblingChild = show(function () { return parent['anchor']['grand']; });
+          r.keys = show(function () { return Object.keys(parent).join(','); });
+          r.names = show(function () { return parent['challenge'] === window; });
+          parent.postMessage({ challengeReport: r }, '*');
+        <\/script></body>`);
+        return;
+      }
+      res.end(`<!doctype html><title>named frames</title><body><script>
+        window.__xnf = null;
+        ${show}
+        var out = {};
+        addEventListener('message', function (e) {
+          if (!e.data || typeof e.data !== 'object') return;
+          if (e.data.anchorReady) {
+            var cw = a.contentWindow;
+            out['p.byName'] = show(function () { return cw['grand']; });
+            out['p.has'] = show(function () { return 'grand' in cw; });
+            out['p.sameAsIndex'] = show(function () { return cw['grand'] === cw[0]; });
+            out['p.flags'] = show(function () { return flags(cw, 'grand'); });
+            out['p.childDocument'] = show(function () { return cw['grand'].document; });
+            out['p.missingGet'] = show(function () { return cw['nope']; });
+            out['p.missingHas'] = show(function () { return 'nope' in cw; });
+            var c = document.createElement('iframe'); c.name = 'challenge'; c.src = '${other}/xnf-challenge'; document.body.appendChild(c);
+          }
+          if (e.data.challengeReport) { for (var k in e.data.challengeReport) out['c.' + k] = e.data.challengeReport[k]; window.__xnf = out; }
+        });
+        var a = document.createElement('iframe'); a.name = 'anchor'; a.src = '${other}/xnf-anchor'; document.body.appendChild(a);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xtables') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>tables</title><body><script>
+        var calls = 0, seenProxy = [], origins = {};
+        var isOtherWindow = function (v) { return v !== window && Object.prototype.toString.call(v) === '[object Window]' && String(v.location && v.location.href).indexOf('proxy.localhost') >= 0; };
+        var isRealLocation = function (v) { return Object.prototype.toString.call(v) === '[object Location]' && String(v.href).indexOf('proxy.localhost') >= 0; };
+        var show = function (tag, v) {
+          if (typeof v === 'string' && (v.indexOf('/zp/') >= 0 || v.indexOf('proxy.localhost') >= 0)) seenProxy.push(tag + ': ' + v.slice(0, 60));
+          else if (v && typeof v === 'object' && (isOtherWindow(v) || isRealLocation(v))) seenProxy.push(tag + ': a real window or location');
+        };
+        var wrap = function (proto, name, label) {
+          var orig = proto[name];
+          origins[label + '.' + name] = orig;
+          proto[name] = function () {
+            calls++;
+            show(label + '.' + name + ' this', this);
+            for (var i = 0; i < arguments.length; i++) show(label + '.' + name + ' arg' + i, arguments[i]);
+            var r = orig.apply(this, arguments);
+            show(label + '.' + name + ' result', r);
+            return r;
+          };
+        };
+        [['get', 'has', 'set', 'delete', 'clear', 'forEach'].map(function (n) { wrap(Map.prototype, n, 'Map'); }),
+         ['add', 'has', 'delete', 'clear', 'forEach'].map(function (n) { wrap(Set.prototype, n, 'Set'); }),
+         ['get', 'has', 'set', 'delete'].map(function (n) { wrap(WeakMap.prototype, n, 'WeakMap'); }),
+         ['add', 'has', 'delete'].map(function (n) { wrap(WeakSet.prototype, n, 'WeakSet'); })];
+        var seenBefore = calls;
+        (async function () {
+          var out = { survived: true };
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          // the membrane at work: names, scripts of its own, frames, messages, storage, dynamic code, workers
+          var run = async function (k, fn) { try { var v = fn(); if (v && typeof v.then === 'function') v = await v; out[k] = v === undefined ? 'ok' : 'ok'; } catch (e) { out[k] = 'threw:' + e.name; } };
+          await run('names', function () { var q = 1; return [typeof q, eval('q + 1'), (0, eval)('typeof location'), new Function('return location.href')()]; });
+          await run('location', function () { location.hash = '#t'; return [location.href, location.origin, String(location)]; });
+          await run('storage', function () { localStorage.setItem('k', 'v'); sessionStorage.setItem('k', 'v'); return localStorage.getItem('k'); });
+          await run('cookie', function () { document.cookie = 'tk=1; path=/'; return document.cookie; });
+          await run('markup', function () { var d = document.createElement('div'); d.innerHTML = '<a href="/p">x</a><img src="/i.png">'; document.body.appendChild(d); return d.firstChild.href; });
+          await run('iframe', function () { return new Promise(function (r) { var f = document.createElement('iframe'); f.srcdoc = '<script>parent.postMessage("child", "*")<\\/script>'; document.body.appendChild(f); var h = function (e) { removeEventListener('message', h); r([e.data, f.contentWindow === e.source]); }; addEventListener('message', h); }); });
+          await run('frames', function () { var f = document.createElement('iframe'); document.body.appendChild(f); var d = f.contentWindow.document; d.open(); d.write('<p>x</p>'); d.close(); return [window.length, parent === window, top === window, f.contentWindow.parent === window]; });
+          await run('postMessage', function () { return new Promise(function (r) { var h = function (e) { removeEventListener('message', h); r(e.source === window); }; addEventListener('message', h); postMessage('hi', '*'); }); });
+          await run('worker', function () { return new Promise(function (r) { var w = new Worker(URL.createObjectURL(new Blob(['postMessage(1)']))); w.onmessage = function () { w.terminate(); r(1); }; setTimeout(function () { r(0); }, 3000); }); });
+          await run('fetch', function () { return fetch('/xtables-ping').then(function (r) { return r.status; }); });
+          await sleep(200);
+          out.calls = calls > seenBefore ? 'wrapped methods ran' : 'never ran';
+          out.seenProxy = seenProxy.slice(0, 20);
+          window.__xtables = out;
+        })().catch(function (e) { window.__xtables = { survived: false, error: String(e && (e.stack || e)).slice(0, 300) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xwinown') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>own window</title><script>
+        var out = {};
+        var isOtherWindow = function (v) { return v !== window && Object.prototype.toString.call(v) === '[object Window]'; };
+        Object.defineProperty(window, 'frameElement', { get: Object.prototype.valueOf, configurable: true });
+        out.frameElement = isOtherWindow(window.frameElement) ? 'another window' : 'ok';
+        out.bareFrameElement = isOtherWindow(frameElement) ? 'another window' : 'ok';
+        Object.defineProperty(window, 'parent', { get: Object.prototype.valueOf, configurable: true });
+        out.parent = isOtherWindow(window.parent) ? 'another window' : 'ok';
+        Object.defineProperty(window, 'opener', { get: Object.prototype.valueOf, configurable: true });
+        out.opener = isOtherWindow(window.opener) ? 'another window' : 'ok';
+        window.__xwinown = out;
+      </script>`);
+      return;
+    }
+    if (url.pathname === '/xempty.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('');
+      return;
+    }
+    if (url.pathname === '/xempty') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>empty</title><script>window.__errs = []; addEventListener('error', function (e) { __errs.push(String(e.message)); });</script>
+        <script src="/xempty.js"></script><script>window.__xempty = { errors: __errs, after: 1 };</script>`);
+      return;
+    }
+    if (url.pathname === '/xhelper') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>helpers</title><body><button id="xb">b</button><script>
+        window.__xh = { leaks: [], ran: [] };
+        window.__xhGrab = function (name) {
+          var foreign = function (a) { return a !== null && typeof a === 'object' && a !== window && Object.prototype.toString.call(a) === '[object Window]'; };
+          return function () {
+            for (var i = 0; i < arguments.length; i++) if (foreign(arguments[i])) window.__xh.leaks.push(name);
+            if (foreign(this)) window.__xh.leaks.push(name + ':this');
+            return arguments[0];
+          };
+        };
+      </script>
+      <script>__xh.ran.push('localShadow'); (function () { var __zp_get = __xhGrab('localShadow'); return location.href; })();</script>
+      <script>__xh.ran.push('paramShadow'); (function (__zp_this) { return function () { return this; }; })(__xhGrab('paramShadow'))();</script>
+      <script>__xh.ran.push('globalWrite'); __zp_get = __xhGrab('globalWrite');</script>
+      <script>__xh.ran.push('executorWrite'); __ZP_EXEC_EVENT = __xhGrab('executorWrite');</script>
+      <script>
+        __xh.ran.push('facade');
+        try { window.__zp_get = __xhGrab('facadeSet'); } catch (e) {}
+        try { window['__zp_' + 'call'] = __xhGrab('facadeSetComputed'); } catch (e) {}
+        try { Object.defineProperty(window, '__zp_set', { value: __xhGrab('facadeDefine') }); } catch (e) {}
+        try { Reflect.set(window, '__ZP_EXEC_EVENT', __xhGrab('facadeReflect')); } catch (e) {}
+        try { delete window.__zp_this; } catch (e) {}
+        // dynamic code names them too
+        try { new Function('__zp_get', 'return location')(__xhGrab('functionParam')); __xh.functionParam = 'compiled'; } catch (e) { __xh.functionParam = e.name; }
+        try { (0, eval)('var __zp_call = __xhGrab("evalBinding")'); __xh.evalBinding = 'ran'; } catch (e) { __xh.evalBinding = e.name; }
+        __xh.withRead = (function () {
+          with ({ __zp_get: __xhGrab('with:get'), __zp_with_get: __xhGrab('with:withGet'), __zp_this: __xhGrab('with:this'), __zp_call: __xhGrab('with:call') }) {
+            return [location.href, (function () { return this; })() === window, document.title];
+          }
+        })();
+        document.__ZP_EXEC_EVENT = __xhGrab('documentExpando');
+        document.body.__ZP_EXEC_EVENT = __xhGrab('bodyExpando');
+        var b = document.getElementById('xb');
+        b.__ZP_EXEC_EVENT = __xhGrab('buttonExpando');
+        b.setAttribute('onclick', 'window.__xh.click = this.id');
+        document.body.setAttribute('onmessage', 'window.__xh.message = [this === window, event.data]');
+        b.click();
+        postMessage('m', '*');
+        setTimeout(function () { __xh.after = location.href; window.__xhDone = __xh; }, 300);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname.startsWith('/xfp')) {
+      // Excludes unload because its cross-origin default depends on Chrome field-trial state in headless vs user profiles.
+      const other = `http://127.0.0.1:${req.socket.localPort}`;
+      const probe = `<script>(async function () {
+        var cross = location.host.indexOf('127.0.0.1') === 0, out = { where: location.pathname };
+        try { out.notif = Notification.permission; } catch (e) { out.notif = e.name; }
+        if (cross) { try { out.request = await Notification.requestPermission(); } catch (e) { out.request = e.name; } }
+        out.perm = {};
+        for (var n of ['notifications', 'geolocation', 'camera', 'microphone', 'midi', 'persistent-storage', 'storage-access']) {
+          try { var st = await navigator.permissions.query({ name: n }); out.perm[n] = st.state + (Object.getOwnPropertyNames(st).length ? ' own:' + Object.getOwnPropertyNames(st) : ''); } catch (e) { out.perm[n] = e.name; }
+        }
+        out.queryOwn = Object.prototype.hasOwnProperty.call(navigator.permissions, 'query');
+        var fp = document.featurePolicy;
+        out.allowed = fp.allowedFeatures().filter(function (f) { return f !== 'unload'; }).sort().join(',');
+        out.allowsCamera = fp.allowsFeature('camera') + ' ' + fp.allowsFeature('camera', 'https://other.example') + ' ' + fp.allowsFeature('sync-xhr', 'https://other.example');
+        out.allowlist = ['camera', 'fullscreen', 'sync-xhr', 'payment'].map(function (f) { return f + '=' + JSON.stringify(fp.getAllowlistForFeature(f)); }).join(' ');
+        // What the policy-gated APIs answer where their feature is refused (the cross-origin frame without delegation): the
+        // browser's own error, at once. The frame that is delegated only reads the values that follow from 'fullscreen'.
+        out.fullscreenEnabled = document.fullscreenEnabled;
+        if (location.pathname === '/xfp-cross') {
+          out.gated = {};
+          var settle = function (name, f) {
+            return Promise.race([Promise.resolve().then(f), new Promise(function (r) { setTimeout(function () { r('TIMEOUT'); }, 3000); })]).then(
+              function (v) { out.gated[name] = 'ok ' + (v === 'TIMEOUT' ? v : typeof v === 'object' && v ? v.constructor.name : String(v)); },
+              function (e) { out.gated[name] = e.name + ': ' + e.message; });
+          };
+          var tests = [
+            ['keyboard.getLayoutMap', function () { return navigator.keyboard.getLayoutMap(); }],
+            ['requestMIDIAccess', function () { return navigator.requestMIDIAccess(); }],
+            ['requestMediaKeySystemAccess', function () { return navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ initDataTypes: ['cenc'], videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }] }]); }],
+            ['getDisplayMedia', function () { return navigator.mediaDevices.getDisplayMedia({ video: true }); }],
+            ['getUserMedia', function () { return navigator.mediaDevices.getUserMedia({ audio: true }); }],
+            ['usb', function () { return navigator.usb.getDevices(); }],
+            ['hid', function () { return navigator.hid.getDevices(); }],
+            ['serial', function () { return navigator.serial.getPorts(); }],
+            ['bluetooth', function () { return navigator.bluetooth.getAvailability(); }],
+            ['wakeLock', function () { return navigator.wakeLock.request('screen'); }],
+            ['queryLocalFonts', function () { return window.queryLocalFonts(); }],
+            ['share', function () { return navigator.share({ title: 'x' }); }],
+            ['canShare', function () { return navigator.canShare({ title: 'x' }); }],
+            ['xr', function () { return navigator.xr.isSessionSupported('immersive-vr'); }],
+            ['requestFullscreen', function () { return document.documentElement.requestFullscreen(); }],
+            ['showOpenFilePicker', function () { return window.showOpenFilePicker(); }],
+            ['payment', function () { return new PaymentRequest([{ supportedMethods: 'basic-card' }], { total: { label: 'x', amount: { currency: 'USD', value: '1' } } }); }],
+          ];
+          ['Accelerometer', 'Gyroscope', 'Magnetometer', 'LinearAccelerationSensor', 'AbsoluteOrientationSensor'].forEach(function (n) { if (window[n]) tests.push(['new ' + n, function () { return new window[n](); }]); });
+          [['Translator', { sourceLanguage: 'en', targetLanguage: 'ko' }], ['Summarizer'], ['LanguageDetector'], ['LanguageModel']].forEach(function (a) {
+            if (!window[a[0]]) return;
+            tests.push([a[0] + '.availability', function () { return window[a[0]].availability(a[1]); }]);
+            tests.push([a[0] + '.create', function () { return window[a[0]].create(a[1]); }]);
+          });
+          for (var t of tests) await settle(t[0], t[1]);
+          // the construction is the sync path: it throws, it does not reject
+          try { new Gyroscope(); out.gated.gyroSync = 'constructed'; } catch (e) { out.gated.gyroSync = e.name; }
+          out.gated.ctorIdentity = (Object.getPrototypeOf(Gyroscope.prototype) === Sensor.prototype) + ' ' + (Gyroscope.prototype.constructor === Gyroscope) + ' ' + Gyroscope.name + ' ' + Gyroscope.length + ' ' + Function.prototype.toString.call(Gyroscope);
+        }
+        // delegated with the allow attribute: the browser own answer, the one the top frame gets
+        if (location.pathname === '/xfp-cross-allow') { try { out.delegated = await Translator.availability({ sourceLanguage: 'en', targetLanguage: 'ko' }); } catch (e) { out.delegated = e.name; } }
+        if (window.top === window) window.__xfpAdd(out); else parent.postMessage({ xfp: out }, '*');
+      })();</script>`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      if (url.pathname === '/xfp') {
+        res.end(`<!doctype html><title>fp</title><script>window.__xfpAdd = function (o) { window.__xfpOut = (window.__xfpOut || []).concat([o]); if (window.__xfpOut.length === 4) window.__xfp = window.__xfpOut.slice().sort(function (a, b) { return a.where < b.where ? -1 : 1; }); };
+          addEventListener('message', function (e) { if (e.data && e.data.xfp) window.__xfpAdd(e.data.xfp); });</script>${probe}
+          <iframe src="/xfp-same"></iframe><iframe src="${other}/xfp-cross"></iframe><iframe src="${other}/xfp-cross-allow" allow="fullscreen; autoplay; camera; translator"></iframe>`);
+        return;
+      }
+      res.end(`<!doctype html><title>fp</title>${probe}`);
+      return;
+    }
+    if (url.pathname === '/xxml') {
+      // A document the page makes with DOMParser from an XML type, and what its elements serialize as: the XML serializer's
+      // text (self-closing tags, CDATA sections, the namespace attributes), not the HTML one's. An HTML parse is the control.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>xml</title><script>
+        (function () {
+          var out = {};
+          var cases = [
+            ['application/xml', '<root><br/><![CDATA[a<b]]><x xmlns="urn:x" a="&' + 'amp;"/></root>'],
+            ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg"><desc><![CDATA[x]]></desc><circle r="1"/></svg>'],
+            ['text/xml', '<div data-foo="&' + '#34;"></div>'],
+            ['text/xml', '<p>a</div>'],
+            ['application/xhtml+xml', '<html xmlns="http://www.w3.org/1999/xhtml"><body><br/><p>a</p></body></html>'],
+          ];
+          cases.forEach(function (c, i) {
+            var d = new DOMParser().parseFromString(c[1], c[0]), de = d.documentElement;
+            out[i + ' outer'] = de.outerHTML;
+            out[i + ' inner'] = de.innerHTML;
+            out[i + ' serial'] = new XMLSerializer().serializeToString(d);
+            out[i + ' child'] = de.firstElementChild ? de.firstElementChild.outerHTML : '';
+          });
+          out.html = new DOMParser().parseFromString('<p>a<br>b</p><img src=x>', 'text/html').body.innerHTML;
+          window.__xxml = out;
+        })();
+      </script>`);
+      return;
+    }
+    if (url.pathname.startsWith('/xch')) {
+      const seen = globalThis.__chSeen || (globalThis.__chSeen = new Map());
+      const run = url.searchParams.get('run') || '';
+      const other = `http://127.0.0.1:${req.socket.localPort}`;
+      if (url.pathname === '/xch-log') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(seen.get(run) || []));
+        return;
+      }
+      // Omit HTTP/2-only priority, renderer-ordered accept-language in Puppeteer, and session-dependent cookie headers.
+      const names = []; const hints = {};
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        const k = req.rawHeaders[i].toLowerCase();
+        if (k === 'host' || k === 'connection' || k === 'content-length' || k === 'priority' || k === 'accept-language' || k === 'cookie') continue;
+        names.push(k);
+        if (k.startsWith('sec-ch-')) hints[k] = req.rawHeaders[i + 1];
+      }
+      const who = (req.headers.host || '').startsWith('127.0.0.1') ? 'other' : 'self';
+      if (!seen.has(run)) seen.set(run, []);
+      seen.get(run).push({ who, method: req.method, path: url.pathname, names: names.join(' '), hints });
+      const CH = 'Sec-CH-UA-Bitness, Sec-CH-UA-Arch, Sec-CH-UA-Full-Version, Sec-CH-UA-Mobile, Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform, Sec-CH-UA';
+      if (url.pathname === '/xch') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Accept-CH': CH, 'Critical-CH': CH });
+        res.end(`<!doctype html><title>ch</title><script src="/xch-sub.js?run=${run}"></script>
+          <img src="/xch-img?run=${run}"><img src="${other}/xch-img?run=${run}">
+          <script>
+            Promise.all([
+              fetch('/xch-api?run=${run}').then(function (r) { return r.text(); }),
+              new Promise(function (res) { var x = new XMLHttpRequest(); x.open('POST', '/xch-post?run=${run}'); x.setRequestHeader('content-type', 'text/plain;charset=UTF-8'); x.onloadend = function () { res(x.status); }; x.send('payload'); }),
+              fetch('${other}/xch-api?run=${run}', { mode: 'no-cors' }).then(function () { return 1; }, function () { return 0; }),
+              fetch('http://localhost:9/x', { mode: 'no-cors' }).then(function (r) { return 'resolved ' + r.status; }, function (e) { return 'rejected ' + e.name; }),
+              new Promise(function (res) { var x = new XMLHttpRequest(); x.open('GET', 'http://localhost:9/x'); x.onload = function () { res('load ' + x.status); }; x.onerror = function () { res('error ' + x.status); }; x.send(); }),
+              navigator.userAgentData.getHighEntropyValues(['wow64', 'architecture', 'uaFullVersion', 'bitness', 'formFactors', 'fullVersionList', 'model', 'platformVersion']),
+            ]).then(function (r) {
+              setTimeout(function () { window.__xch = { neterr: [r[3], r[4]], heKeys: Object.keys(r[5]).join(','), he: r[5] }; }, 300);
+            });
+          </script>`);
+        return;
+      }
+      if (url.pathname === '/xch-sub.js') { res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' }); res.end('void 0'); return; }
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+      res.end('ok');
+      return;
+    }
+    if (url.pathname.startsWith('/xref')) {
+      const seen = globalThis.__refSeen || (globalThis.__refSeen = new Map());
+      const run = url.searchParams.get('run') || '';
+      const other = `http://127.0.0.1:${req.socket.localPort}`;
+      const html = (body, extra) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...extra }); res.end(`<!doctype html><title>ref</title><body>${body}</body>`); };
+      const collect = keys => `<script>window.__xref = {}; addEventListener('message', function (e) {
+          if (e.data && e.data.xref) { window.__xref[e.data.xref.k] = e.data.xref.ref; if (Object.keys(window.__xref).length === ${keys}) window.__xrefDone = true; }
+        });</script>`;
+      const child = (k, base, attr) => `<iframe ${attr || ''} src="${base || ''}/xref-child?k=${k}&run=${run}"></iframe>`;
+      if (url.pathname === '/xref-child' || url.pathname === '/xref-landing') {
+        const k = url.searchParams.get('k') || 'landing';
+        seen.set(run + '|' + k, req.headers.referer || '');
+        if (url.pathname === '/xref-landing') return html(`<script>window.__xreflanding = document.referrer;</script>`);
+        return html(`<script>parent.postMessage({ xref: { k: ${JSON.stringify(k)}, ref: document.referrer } }, '*');</script>`);
+      }
+      if (url.pathname === '/xref-log') return serveRunLog(seen, run, res);
+      if (url.pathname === '/xref') {
+        return html(collect(4) + child('cross', other) + child('same') + child('crossUnsafe', other, 'referrerpolicy="unsafe-url"')
+          + child('sameNone', '', 'referrerpolicy="no-referrer"'), { 'Referrer-Policy': 'same-origin' });
+      }
+      if (url.pathname === '/xref-meta') return html(`<meta name="referrer" content="origin">` + collect(2) + child('metaSame') + child('metaCross', other));
+      if (url.pathname === '/xref-nav') return html(`<script>location.href = '/xref-landing?run=${run}&from=nav';</script>`);
+    }
+    // A form submitted after the page moved its own address with history.replaceState (a Cloudflare challenge does this and checks the
+    // Referer against it): same-origin and cross-origin sinks, each answering 308 then 302 so the redirect hops are recorded too.
+    if (url.pathname.startsWith('/xsub')) {
+      const seen = globalThis.__subSeen || (globalThis.__subSeen = new Map());
+      const run = url.searchParams.get('run') || '';
+      const k = url.searchParams.get('k') || '';
+      const page = body => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(`<!doctype html><title>sub</title><body>${body}</body>`); };
+      if (url.pathname === '/xsub-log') return serveRunLog(seen, run, res);
+      if (url.pathname === '/xsub-sink' || url.pathname === '/xsub-sink2') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+          const hop = url.pathname === '/xsub-sink' ? 'first' : 'second';
+          seen.set(`${run}|${k}|${hop}`, { method: req.method, referer: req.headers.referer || '', contentType: req.headers['content-type'] || '', origin: req.headers.origin || '', site: req.headers['sec-fetch-site'] || '', body });
+          if (hop === 'first') { res.writeHead(308, { Location: `/xsub-sink2?run=${run}&k=${k}`, 'Cache-Control': 'no-store' }); res.end(); return; }
+          res.writeHead(302, { Location: `/xsub-done?run=${run}&k=${k}`, 'Cache-Control': 'no-store' });
+          res.end();
+        });
+        return;
+      }
+      if (url.pathname === '/xsub-done') return page('<script>window.__xsubDone = true;</script>');
+      if (url.pathname === '/xsub') {
+        const other = `http://127.0.0.1:${req.socket.localPort}`;
+        const base = k === 'cross' ? other : '';
+        return page(`<script>
+          history.replaceState(null, '', '/xsub?run=${run}&k=${k}&tok=1#frag');
+          var f = document.createElement('form'); f.method = 'POST'; f.action = ${JSON.stringify(base)} + '/xsub-sink?run=${run}&k=${k}';
+          var i = document.createElement('input'); i.name = 'a'; i.value = 'b c'; f.appendChild(i);
+          document.body.appendChild(f);
+          setTimeout(function () { f.submit(); }, 100);
+        </script>`);
+      }
+    }
+    if (url.pathname === '/xfm2' || url.pathname === '/xfm2-r' || url.pathname === '/xfm2-log') {
+      const seen = globalThis.__fmSeen || (globalThis.__fmSeen = new Map());
+      const run = url.searchParams.get('run') || '';
+      if (url.pathname === '/xfm2-r') {
+        const n = url.searchParams.get('n') || '';
+        seen.set(run + '|' + n, {
+          site: req.headers['sec-fetch-site'] || 'absent', mode: req.headers['sec-fetch-mode'] || 'absent',
+          dest: req.headers['sec-fetch-dest'] || 'absent', user: req.headers['sec-fetch-user'] || 'absent',
+          storage: req.headers['sec-fetch-storage-access'] || 'absent',
+        });
+        const cors = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+        if (/^img/.test(n)) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'image/gif' });
+          res.end(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
+        } else if (/^css/.test(n)) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'text/css' });
+          res.end('body{}');
+        } else if (/^(script|worker)/.test(n)) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'text/javascript' });
+          res.end('/* ok */');
+        } else {
+          res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
+          res.end('ok');
+        }
+        return;
+      }
+      if (url.pathname === '/xfm2-log') return serveRunLog(seen, run, res);
+      const other = `http://127.0.0.1:${req.socket.localPort}`;
+      const q = n => `/xfm2-r?n=${n}&run=${run}`;
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>fm2</title><body>
+        <img src="${q('img-same')}"><img src="${other}${q('img-cross')}">
+        <link rel="stylesheet" href="${other}${q('css-cross')}">
+        <script src="${q('script-same')}"></script>
+        <script src="${other}${q('script-cross')}"></script>
+        <script crossorigin="anonymous" src="${other}${q('script-cors')}"></script>
+        <script>
+          window.__xfm2 = null;
+          fetch('${other}${q('fetch-nocors')}', { mode: 'no-cors' });
+          fetch('${other}${q('fetch-cors')}');
+          var x = new XMLHttpRequest(); x.open('GET', '${q('xhr-same')}'); x.send();
+          navigator.sendBeacon('${q('beacon-same')}', 'x');
+          try { new Worker('${q('worker-same')}'); } catch (e) {}
+          setTimeout(function () {
+            fetch('/xfm2-log?run=${run}').then(function (r) { return r.json(); }).then(function (j) { window.__xfm2 = j; });
+          }, 2500);
+        </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xcoep' || url.pathname === '/xcoep-worker.js') {
+      const isolation = { 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cross-Origin-Opener-Policy': 'same-origin', 'Cache-Control': 'no-store' };
+      if (url.pathname === '/xcoep-worker.js') {
+        res.writeHead(200, { ...isolation, 'Content-Type': 'text/javascript' });
+        res.end(`postMessage('file-ok:' + self.crossOriginIsolated);`);
+        return;
+      }
+      res.writeHead(200, { ...isolation, 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!doctype html><title>coep</title><body><script>
+        window.__xcoep = null;
+        var out = { isolated: self.crossOriginIsolated };
+        var done = function () { if (out.blob && out.file) window.__xcoep = out; };
+        var settle = function (key, w) {
+          w.onmessage = function (e) { out[key] = e.data; done(); };
+          w.onerror = function () { out[key] = 'error'; done(); };
+        };
+        settle('blob', new Worker(URL.createObjectURL(new Blob(["postMessage('blob-ok:' + self.crossOriginIsolated)"], { type: 'text/javascript' }))));
+        settle('file', new Worker('/xcoep-worker.js'));
+        setTimeout(function () { out.blob = out.blob || 'timeout'; out.file = out.file || 'timeout'; done(); }, 8000);
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xstack') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>stack</title><body><script>
+        var site = function (st) { return String(st).split('\\n').slice(1).map(function (l) { return l.replace(/:\\d+:\\d+/g, ':L:C').trim(); }); };
+        var out = {};
+        out.top = site(new Error('t').stack);
+        function named() { return site(new Error('n').stack); }
+        out.named = named();
+        out.anon = (function () { return site(new Error('a').stack); })();
+        var o = { m: function () { return site(new Error('m').stack); } };
+        out.method = o.m();
+        out.callWindow = (function () { return site(new Error('w').stack); }).call(window);
+        out.callback = [0].map(function cb() { return site(new Error('c').stack); })[0];
+        window.__xstack = out;
+      </script></body>`);
+      return;
+    }
+    if (url.pathname === '/xthis' || url.pathname === '/xthis.js' || url.pathname === '/xthis-worker.js') {
+      const stackProbe = `(function () {
+        var view = function () {
+          var d = Object.getOwnPropertyDescriptor(Error, 'prepareStackTrace');
+          return [typeof Error.prepareStackTrace, 'prepareStackTrace' in Error, Object.getOwnPropertyNames(Error).indexOf('prepareStackTrace') >= 0,
+            Object.keys(Error).join(','), d ? [typeof d.value, d.writable, d.enumerable, d.configurable, typeof d.get].join(',') : 'none'];
+        };
+        var s = {};
+        s.before = view();
+        Error.prepareStackTrace = function (e, frames) { return 'custom ' + (frames.length > 0) + ' ' + typeof frames[0].getFileName; };
+        s.assigned = view();
+        s.customStack = new Error('x').stack;
+        delete Error.prepareStackTrace;
+        s.deleted = view();
+        var st = String(new Error('y').stack);
+        s.plainStack = [st.split('\\n')[0], st.indexOf('/zp/') < 0, /^    at /.test(st.split('\\n')[1] || '')];
+        Error.prepareStackTrace = undefined;
+        s.undef = view();
+        delete Error.prepareStackTrace;
+        return s;
+      })()`;
+      if (url.pathname === '/xthis-worker.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+        res.end(`postMessage(${stackProbe});`);
+        return;
+      }
+      const probe = `(function () {
+        var r = {};
+        r.plain = (function () { return this === window; })();
+        r.ctor = Function('return this')() === window;
+        r.map = [0].map(function () { return this === window; })[0];
+        r.arrow = (function () { return (() => this === window)(); })();
+        var o = { m: function () { return this; } };
+        r.method = o.m() === o;
+        r.strict = typeof (function () { 'use strict'; return this; })();
+        r.keys = Object.keys(window).filter(function (k) { return /^(window|self|document|location|top|frames|__xthis)$/.test(k); });
+        var d = Object.getOwnPropertyDescriptor(location, 'href');
+        r.href = d && [typeof d.get, typeof d.set, d.enumerable, d.configurable, String(d.get), 'prototype' in d.get, d.get.call(location) === location.href];
+        var od = Object.getOwnPropertyDescriptor(location, 'origin');
+        r.origin = od && [typeof od.get, typeof od.set, String(od.get)];
+        r.locKeys = Object.keys(location).join(',');
+        var names = function (list) { return Array.prototype.map.call(list, function (n) { return n.nodeName; }).join(','); };
+        r.dom = [names(document.head.childNodes), names(document.body.childNodes), document.scripts.length,
+          document.getElementsByTagName('script').length, document.body.firstElementChild && document.body.firstElementChild.nodeName];
+        r.stackHook = ${stackProbe};
+        return r;
+      })()`;
+      if (url.pathname === '/xthis.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+        res.end(`window.__xthis.external = ${probe};`);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>this</title><body><script>window.__xthis = { inline: ${probe} };
+        new Worker('/xthis-worker.js').onmessage = function (e) { window.__xthis.worker = e.data; };
+      </script><script src="/xthis.js"></script></body>`);
+      return;
+    }
+    if (url.pathname === '/xrawtext') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>rawtext</title><body><script>
+        window.__xrawtext = null;
+        var code = 'var n = 0, i = 3, o = 0, t = { a: 1 }; for (; n<i;n++)for(var k in t){o++} if (n<i||n>i) o += 100; window.__helmet = (window.__helmet || 0) + o;';
+        var out = {};
+        var s = document.createElement('script'); s.setAttribute('data-rh', 'true'); s.innerHTML = code; document.head.appendChild(s);
+        out.script = { kids: s.childNodes.length, kidType: s.firstChild && s.firstChild.nodeType, text: s.textContent === code, ran: window.__helmet };
+        var late = document.createElement('script'); document.head.appendChild(late); late.innerHTML = 'window.__late = 7;';
+        out.late = { ran: window.__late || null };
+        var ta = document.createElement('textarea'); ta.innerHTML = '<b>x</b> & <i>'; out.textarea = [ta.value, ta.childNodes.length];
+        var ti = document.createElement('title'); ti.innerHTML = '<u>t</u>'; out.title = [ti.textContent, ti.childNodes.length];
+        var ns = document.createElement('noscript'); ns.innerHTML = '<img src="https://other.example/x.png">'; out.noscript = [ns.childNodes.length, ns.firstChild && ns.firstChild.nodeType, ns.textContent];
+        var d = document.createElement('div'); d.innerHTML = '<b>kept</b>'; out.div = [d.childNodes.length, d.firstChild.nodeName];
+        window.__xrawtext = out;
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xhls-reset') {
+      for (const k of [...xckSeen.keys()]) if (k.startsWith('hls:')) xckSeen.delete(k);
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+      res.end('ok');
+      return;
+    }
+    if (url.pathname.startsWith('/xhls/')) {
+      xckSeen.set('hls:' + url.pathname, 'hit');
+      const host = String(req.headers.host || '');
+      const otherHost = host.startsWith('localhost') ? host.replace('localhost', '127.0.0.1') : host.replace('127.0.0.1', 'localhost');
+      const playlist = body => {
+        if (req.headers.range) {
+          xckSeen.set('hls:ranged:' + url.pathname, String(req.headers.range));
+          res.writeHead(206, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store', 'Accept-Ranges': 'bytes', 'Content-Range': 'bytes 0-' + (Buffer.byteLength(body) - 1) + '/' + Buffer.byteLength(body) });
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store', 'Accept-Ranges': 'bytes' });
+        }
+        res.end(body);
+      };
+      if (url.pathname === '/xhls/master.m3u8') {
+        playlist('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=320x180\nv0.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1600000,RESOLUTION=640x360\nhttp://' + otherHost + '/xhls/v1.m3u8?x=1&y=2\n');
+      } else if (url.pathname === '/xhls/v0.m3u8') {
+        playlist('#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n#EXTINF:2.0,\nseg0.ts\n#EXTINF:2.0,\nhttp://' + otherHost + '/xhls/seg1.ts\n#EXT-X-ENDLIST\n');
+      } else if (url.pathname === '/xhls/key.bin') {
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' });
+        res.end(Buffer.alloc(16, 7));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Cache-Control': 'no-store' });
+        res.end(Buffer.alloc(188 * 4, 0x47));
+      }
+      return;
+    }
+    if (url.pathname === '/xhls') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>hls</title><body><video id="v" muted preload="auto" src="/xhls/master.m3u8"></video><script>
+        window.__xhls = null;
+        setTimeout(async function () {
+          var tags = ['master.m3u8', 'v0.m3u8', 'key.bin', 'seg0.ts'].map(function (n) { return 'hls:/xhls/' + n; }).concat(['hls:ranged:/xhls/master.m3u8', 'hls:ranged:/xhls/v0.m3u8']);
+          window.__xhls = await (await fetch('/xck-seen?tags=' + tags.join(','))).json();
+        }, 7000);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xdocparse') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>docparse</title><body><script>
+        window.__xdocparse = null;
+        var full = '<!doctype html><html lang="ko" class="ha"><head><title>T</title></head><body class="b1" style="margin:0" data-x="1"><p>hi</p></body></html>';
+        function describe(doc) {
+          return { lang: doc.documentElement.getAttribute('lang'), hcls: doc.documentElement.className, bcls: doc.body && doc.body.className,
+            bstyle: doc.body && doc.body.getAttribute('style'), bdata: doc.body && doc.body.getAttribute('data-x'), compat: doc.compatMode, title: doc.title,
+            kids: doc.body ? doc.body.children.length : -1 };
+        }
+        var out = {};
+        out.domparser = describe(new DOMParser().parseFromString(full, 'text/html'));
+        out.fragment = describe(new DOMParser().parseFromString('<p>a</p><p>b</p>', 'text/html'));
+        out.parseUnsafe = Document.parseHTMLUnsafe ? describe(Document.parseHTMLUnsafe(full)) : 'n/a';
+        var f = document.createElement('iframe');
+        f.srcdoc = full.replace('<p>hi</p>', '<p>hi</p><script>window.__saw = [document.body && document.body.className, document.compatMode].join("|")</' + 'script>');
+        document.body.appendChild(f);
+        // the same document written into a blank frame, whole and in pieces
+        var wf = document.createElement('iframe'); document.body.appendChild(wf);
+        var wd = wf.contentDocument; wd.open(); wd.write(full.replace('<p>hi</p>', '<p>hi</p><script>window.__saw = [document.body && document.body.className, document.compatMode].join("|")</' + 'script>')); wd.close();
+        var pf = document.createElement('iframe'); document.body.appendChild(pf);
+        var pd = pf.contentDocument; pd.open(); pd.write('<!doctype html>'); pd.write('<html lang="ko"><head><title>T</title></head>'); pd.write('<body class="b1" style="margin:0" data-x="1"><p>hi</p></body></html>'); pd.close();
+        setTimeout(function () {
+          out.srcdoc = describe(f.contentDocument); out.srcdoc.saw = f.contentWindow.__saw;
+          out.written = describe(wf.contentDocument); out.written.saw = wf.contentWindow.__saw;
+          out.pieces = describe(pf.contentDocument);
+          window.__xdocparse = out;
+        }, 3000);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xdestr') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>destr</title><body><script>
+        window.__xdestr = null;
+        window.dotcom = { data: {} };
+        var out = {};
+        function run(name, fn) { try { out[name] = fn(); } catch (e) { out[name] = 'threw: ' + (e && e.name) + ': ' + (e && e.message); } }
+        run('array members', function () { [window.dotcom.data.a, window.dotcom.data.b] = ['x', 'y']; return window.dotcom.data.a + window.dotcom.data.b; });
+        run('array holes', function () { [,,, window.dotcom.data.c] = 'p/q/r/s'.split('/'); return window.dotcom.data.c; });
+        run('object member', function () { ({ k: window.dotcom.data.d } = { k: 'ok' }); return window.dotcom.data.d; });
+        run('rest member', function () { ({ ...window.dotcom.data.rest } = { m: 1, n: 2 }); return JSON.stringify(window.dotcom.data.rest); });
+        run('array default', function () { var v; [v = window.dotcom.data.a] = []; return v; });
+        run('member default', function () { [window.dotcom.data.dflt = document.title] = []; return window.dotcom.data.dflt; });
+        run('shorthand default', function () { var w; ({ w = document.title } = {}); return w; });
+        run('computed member key', function () { var t = {}; [t[location.pathname]] = ['z']; return Object.keys(t).join() + ':' + t[location.pathname]; });
+        run('computed pattern key', function () { var v; window.kk = 'p'; ({ [window.kk]: v } = { p: 7 }); return v; });
+        run('document member', function () { [document.title] = ['T2']; return document.title; });
+        run('for-of member', function () { for (window.dotcom.data.it of ['i1', 'i2']); return window.dotcom.data.it; });
+        run('for-in member', function () { for (window.dotcom.data.fk in { f: 1 }); return window.dotcom.data.fk; });
+        run('target and receiver', function () { var q; [window.dotcom.data.e, q] = ['E', 'Q']; return window.dotcom.data.e + q; });
+        window.__xdestr = out;
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xnullish') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>nullish</title><body><script>
+        window.__xnullish = null;
+        var uncaught = [];
+        addEventListener('error', function (e) { uncaught.push([e.message, e.filename === location.href ? 'page' : e.filename, typeof e.lineno]); });
+        var cases = {
+          'get location': function (n) { return n.location; },
+          'get href': function (n) { return n.href; },
+          'get document': function (n) { return n.document.title; },
+          'get top': function (n) { return n.top; },
+          'chain': function (n) { return n.location.href; },
+          'set href': function (n) { n.href = 'x'; return 'ok'; },
+          'set location': function (n) { n.location = 'x'; return 'ok'; },
+          'update href': function (n) { n.href++; return 'ok'; },
+          'compound href': function (n) { n.href += 'x'; return 'ok'; },
+          'logical href': function (n) { n.href ||= 'x'; return 'ok'; },
+          'call postMessage': function (n) { return n.postMessage('x', '*'); },
+          'call open': function (n) { return n.open(); },
+          'delete location': function (n) { return delete n.location; },
+          'in location': function (n) { return 'location' in n; },
+          'keys': function (n) { return Object.keys(n); },
+          'names': function (n) { return Object.getOwnPropertyNames(n); },
+          'descriptor': function (n) { return Object.getOwnPropertyDescriptor(n, 'location'); },
+          'ownKeys': function (n) { return Reflect.ownKeys(n); },
+          'Reflect.has': function (n) { return Reflect.has(n, 'location'); },
+          'Reflect.get plain': function (n) { return Reflect.get(n, 'foo'); },
+          'Reflect.set plain': function (n) { return Reflect.set(n, 'foo', 'x'); },
+          'Reflect.get literal': function (n) { return Reflect.get(n, 'location'); },
+          'Reflect.get receiver': function (n) { return Reflect.get(n, 'location', {}); },
+          'Reflect.set literal': function (n) { return Reflect.set(n, 'location', 'x'); },
+          'Reflect.get computed': function (n) { var k = 'x'; return Reflect.get(n, k); },
+          'Reflect.set computed': function (n) { var k = 'x'; return Reflect.set(n, k, 1); },
+          'optional get': function (n) { return n?.location; },
+          'optional chain': function (n) { return n?.href.x; },
+          'optional call': function (n) { return n?.postMessage('x'); },
+          'optional delete': function (n) { return delete n?.location; },
+          'plain prop': function (n) { return n.foo; },
+          'plain call': function (n) { return n.foo(); }
+        };
+        var out = {};
+        [['null', null], ['undefined', undefined], ['object', {}], ['number', 5]].forEach(function (rec) {
+          Object.keys(cases).forEach(function (name) {
+            var key = rec[0] + ' / ' + name;
+            if (rec[0] === 'number' && !/^Reflect/.test(name)) return; // primitives are fine for member operations; only Reflect.* refuses them
+            if (rec[0] === 'object' && /call/.test(name)) return; // the message V8 gives for calling a non-function differs by the helper's name (ERRATA residual)
+            try { var r = cases[name](rec[1]); out[key] = 'ok:' + (typeof r === 'object' && r !== null ? 'object' : String(r)).slice(0, 24); }
+            catch (e) { out[key] = (e && e.name) + ': ' + (e && e.message) + ' | ' + (e instanceof TypeError); }
+          });
+        });
+        setTimeout(function () { var n = null; n.href; }, 0);
+        setTimeout(function () { var u; u.location = 'x'; }, 10);
+        setTimeout(function () { window.__xnullish = { out: out, uncaught: uncaught }; }, 400);
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsdjs-lib.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('window.__lib = (window.__lib || 0) + 1;');
+      return;
+    }
+    if (url.pathname === '/xsdjs-mod.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end("import { v } from './xsdjs-dep.js'; window.__mod = v;");
+      return;
+    }
+    if (url.pathname === '/xsdjs-dep.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('export const v = 7;');
+      return;
+    }
+    if (url.pathname === '/xsdjs-dyn2.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('window.__dyn2 = 1;');
+      return;
+    }
+    if (url.pathname === '/xsdjs-dyn.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('window.__dyn = 1;');
+      return;
+    }
+    if (url.pathname === '/xsdjs') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>srcdoc scripts</title><body><script>' +
+        'window.__xsdjs = null;' +
+        'var f = document.createElement("iframe");' +
+        'f.srcdoc = "<body><script>window.__inline = 1; window.__body = document.body ? document.body.nodeName + \':\' + document.readyState : \'null\';</" + "script><script src=\'/xsdjs-lib.js\'></" + "script><script>window.__after = window.__lib;</" + "script><script type=module src=\'/xsdjs-mod.js\'></" + "script><script>var d = document.createElement(\'script\'); d.src = \'/xsdjs-dyn.js\'; document.head.appendChild(d);</" + "script>";' +
+        'document.body.appendChild(f);' +
+        'var g = document.createElement("iframe");' +
+        'g.srcdoc = "<body><script>var d = document.createElement(\'script\'); d.src = \'/xsdjs-dyn2.js\'; document.head.appendChild(d);</" + "script>";' +
+        'document.body.appendChild(g);' +
+        'setTimeout(function () { var w = f.contentWindow; window.__xsdjs = { inline: w.__inline, body: w.__body, lib: w.__lib, after: w.__after, mod: w.__mod, dyn: w.__dyn, dyn2: g.contentWindow.__dyn2 }; }, 4000);' +
+        '<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xclen-echo') {
+      const tag = url.searchParams.get('tag') || '';
+      const chunks = [];
+      req.on('data', d => chunks.push(d));
+      req.on('end', () => {
+        const got = Buffer.concat(chunks);
+        corsLog.set('clen:' + tag, { m: req.method, cl: req.headers['content-length'] === undefined ? null : req.headers['content-length'], te: req.headers['transfer-encoding'] || null, bytes: got.length, ct: (req.headers['content-type'] || '').split(';')[0] || null });
+        res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        res.end('ok');
+      });
+      return;
+    }
+    if (url.pathname === '/xclen-log') {
+      const prefix = 'clen:' + (url.searchParams.get('run') || '') + '-';
+      const out = {};
+      for (const [k, v] of corsLog) if (k.startsWith(prefix)) out[k.slice(prefix.length)] = v;
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(out));
+      return;
+    }
+    if (url.pathname === '/xclen') {
+      const run = url.searchParams.get('run');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>content-length</title><body><script>
+        window.__xclen = null;
+        (async function () {
+          var run = ${JSON.stringify(run)};
+          function u(tag) { return '/xclen-echo?tag=' + run + '-' + tag; }
+          await fetch(u('get'));
+          await fetch(u('post-empty'), { method: 'POST' });
+          await fetch(u('put-empty'), { method: 'PUT' });
+          await fetch(u('delete'), { method: 'DELETE' });
+          await fetch(u('post-string'), { method: 'POST', body: 'hello world' });
+          await fetch(u('post-json'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ a: 1, b: 'x'.repeat(2000) }) });
+          await fetch(u('post-blob'), { method: 'POST', body: new Blob([new Uint8Array(300)], { type: 'application/octet-stream' }) });
+          await fetch(u('post-form'), { method: 'POST', body: new URLSearchParams({ q: 'a b' }) });
+          await fetch(u('patch'), { method: 'PATCH', body: 'p' });
+          await new Promise(function (resolve) { var x = new XMLHttpRequest(); x.open('POST', u('xhr-string')); x.onload = resolve; x.send('xhr body'); });
+          await new Promise(function (resolve) { var x = new XMLHttpRequest(); x.open('POST', u('xhr-empty')); x.onload = resolve; x.send(); });
+          navigator.sendBeacon(u('beacon'), 'beacon body');
+          await new Promise(function (r) { setTimeout(r, 600); });
+          window.__xclen = await (await fetch('/xclen-log?run=' + run)).json();
+        })().catch(function (e) { window.__xclen = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xwdyn-pix') {
+      xckSeen.set('wdynpix:' + url.searchParams.get('tag'), 'hit');
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64'));
+      return;
+    }
+    if (url.pathname === '/xwdyn.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('window.__wdyn = (window.__wdyn || 0) + 1;');
+      return;
+    }
+    if (url.pathname === '/xwdyn') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>written frame, dynamic script</title><body><script>' +
+        'window.__xwdyn = null;' +
+        'var other = location.protocol + "//" + (location.hostname === "localhost" ? "127.0.0.1" : "localhost") + ":" + location.port;' +
+        'var f = document.createElement("iframe"); document.body.appendChild(f);' +
+        'var d = f.contentDocument; d.open();' +
+        'd.write("<body><script>window.__loads = 0; var s = document.createElement(\'script\'); s.onload = function () { window.__loads++; }; s.onerror = function () { window.__errors = 1; }; s.src = \'" + other + "/xwdyn.js\'; document.head.appendChild(s);</" + "script>");' +
+        'd.close();' +
+        'var fw = f.contentWindow;' +
+        'var ps = f.contentDocument.createElement("script"); ps.onload = function () { window.__ploads = (window.__ploads || 0) + 1; }; f.contentDocument.head.appendChild(ps); ps.src = other + "/xwdyn.js";' +
+        'var g = document.createElement("iframe"); g.style.display = "none"; document.body.appendChild(g);' +
+        'var gd = g.contentDocument; gd.open(); gd.write("<html><head><script src=\\"" + other + "/xwdyn.js\\"></" + "script></head><body></body></html>"); gd.close();' +
+        'function inner() {' +
+        ' function hidden() { var h = document.createElement("iframe"); h.style.display = "none"; document.body.appendChild(h); return h; }' +
+        ' var a = hidden(); var d = a.contentDocument; d.open(); d.write("<html><head><script src=\\"" + OTHER + "/xwdyn.js\\"></" + "script></head><body></body></html>"); d.close();' +
+        ' var b = hidden(); var sb = b.contentDocument.createElement("script"); sb.src = OTHER + "/xwdyn.js"; b.contentDocument.head.appendChild(sb);' +
+        ' var c = hidden(); var sc = c.contentDocument.createElement("script"); c.contentDocument.head.appendChild(sc); sc.src = OTHER + "/xwdyn.js";' +
+        ' setTimeout(function () { window.__nestedRan = [a.contentWindow.__wdyn, b.contentWindow.__wdyn, c.contentWindow.__wdyn].join(); }, 3000);' +
+        ' }' +
+        'var sd = document.createElement("iframe"); sd.srcdoc = "<body><script>var OTHER=" + JSON.stringify(other) + ";try{(" + inner.toString() + ")();}catch(e){window.__nestedErr=String(e.stack).slice(0,300)}</" + "script>"; document.body.appendChild(sd);' +
+        'window.__ticks = 0; var hb = setInterval(function () { window.__ticks++; }, 50); setTimeout(function () { clearInterval(hb); }, 4500);' +
+        'new fw.Image().src = other + "/xwdyn-pix?tag=new-image";' +
+        'var im = f.contentDocument.createElement("img"); im.src = other + "/xwdyn-pix?tag=unattached";' +
+        'var im2 = f.contentDocument.createElement("img"); im2.src = other + "/xwdyn-pix?tag=attached"; f.contentDocument.body.appendChild(im2);' +
+        'setTimeout(async function () { var w = f.contentWindow; var seen = await (await fetch("/xck-seen?tags=wdynpix:new-image,wdynpix:unattached,wdynpix:attached")).json(); window.__xwdyn = { ran: w.__wdyn, loads: w.__loads, errors: w.__errors, ploads: window.__ploads, markup: g.contentWindow.__wdyn, nested: sd.contentWindow.__nestedRan, nestedErr: sd.contentWindow.__nestedErr, alive: window.__ticks > 20, pixels: seen }; }, 5000);' +
+        '<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xscr-probe.js') {
+      xckSeen.set('scr:' + url.searchParams.get('run') + ':' + url.searchParams.get('tag'), 'seen');
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end('/* probe */');
+      return;
+    }
+    if (url.pathname === '/xscr-seen') {
+      const prefix = 'scr:' + url.searchParams.get('run') + ':';
+      const out = [];
+      for (const k of xckSeen.keys()) if (k.startsWith(prefix)) out.push(k.slice(prefix.length));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(out.sort()));
+      return;
+    }
+    if (url.pathname === '/xscr-frame') {
+      const q = 'run=' + url.searchParams.get('run') + '&tag=' + url.searchParams.get('tag');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>f</title><body><script src="/xscr-probe.js?' + q + '-script"></script><img src="/xscr-probe.js?' + q + '-img">');
+      return;
+    }
+    if (url.pathname === '/xscr') {
+      const run = url.searchParams.get('run');
+      const variants = [['m-empty', 'sandbox=""'], ['m-same', 'sandbox="allow-same-origin"'], ['m-forms', 'sandbox="allow-forms"'], ['m-scripts', 'sandbox="allow-scripts"'], ['m-scripts-same', 'sandbox="allow-scripts allow-same-origin"'], ['m-none', '']];
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>scriptless frames</title><body>' +
+        variants.map(v => '<iframe ' + v[1] + ' src="/xscr-frame?run=' + run + '&tag=' + v[0] + '"></iframe>').join('') +
+        '<div id="host"></div><script>(function () {' +
+        ' [["d-empty", ""], ["d-same", "allow-same-origin"], ["d-scripts", "allow-scripts"]].forEach(function (v) {' +
+        '  var f = document.createElement("iframe"); f.setAttribute("sandbox", v[1]); f.src = "/xscr-frame?run=' + run + '&tag=" + v[0]; document.body.appendChild(f); });' +
+        ' document.getElementById("host").innerHTML = \'<iframe sandbox="" src="/xscr-frame?run=' + run + '&tag=h-empty"></iframe>\';' +
+        ' })();<\/script></body>');
+      return;
+    }
+    if (url.pathname === '/xcorsel-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>opaque</title><body><script>
+        (async function () {
+          var q = new URLSearchParams(location.search);
+          var other = q.get('other'), rid = q.get('rid'), po = q.get('po');
+          var out = {};
+          function load(name, cs) {
+            return new Promise(function (resolve) {
+              var i = new Image();
+              i.crossOrigin = 'anonymous';
+              var t = setTimeout(function () { out[name] = 'timeout'; resolve(); }, 15000);
+              i.onload = function () { clearTimeout(t); out[name] = 'load'; resolve(); };
+              i.onerror = function () { clearTimeout(t); out[name] = 'error'; resolve(); };
+              i.src = other + '/xcors-api?tag=' + encodeURIComponent(rid + ':' + name) + '&case=' + cs + '&po=' + encodeURIComponent(po) + '&as=img';
+            });
+          }
+          await load('o-origin', 'acao-origin');
+          await load('o-star', 'acao-star');
+          await load('o-null', 'acao-null');
+          await load('o-missing', 'acao-missing');
+          parent.postMessage('xcorsel:' + JSON.stringify(out), '*');
+        })();
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xcorsel') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>CORS elements</title><body><script>
+        window.__xcorsel = null;
+        window.__xcel = {};
+        (async function () {
+          var out = {};
+          var rid = Math.random().toString(36).slice(2, 10);
+          var po = location.origin;
+          var other = location.protocol + '//' + (location.hostname === 'localhost' ? '127.0.0.1' : 'localhost') + ':' + location.port;
+          function api(base, name, cs, as, extra) {
+            return base + '/xcors-api?tag=' + encodeURIComponent(rid + ':' + name) + '&case=' + cs + '&po=' + encodeURIComponent(po) + '&as=' + as + '&cn=xce' + (extra || '');
+          }
+          function settle(el) {
+            return new Promise(function (resolve) {
+              var t = setTimeout(function () { resolve('timeout'); }, 15000);
+              el.onload = function () { clearTimeout(t); resolve('load'); };
+              el.onerror = function () { clearTimeout(t); resolve('error'); };
+            });
+          }
+          async function img(name, cs, attr, extra) {
+            var i = new Image();
+            if (attr !== null) i.crossOrigin = attr;
+            var p = settle(i);
+            i.src = api(other, name, cs, 'img', extra);
+            out[name] = await p;
+          }
+          async function script(name, cs, attr, module, extra) {
+            var s = document.createElement('script');
+            if (module) s.type = 'module';
+            if (attr !== null) s.crossOrigin = attr;
+            var p = settle(s);
+            s.src = api(other, name, cs, 'js', extra);
+            document.head.appendChild(s);
+            var r = await p;
+            out[name] = r + (window.__xcel[rid + ':' + name] ? '+ran' : '');
+          }
+          async function css(name, cs, attr) {
+            var l = document.createElement('link');
+            l.rel = 'stylesheet';
+            if (attr !== null) l.crossOrigin = attr;
+            var p = settle(l);
+            l.href = api(other, name, cs, 'css');
+            document.head.appendChild(l);
+            out[name] = await p;
+          }
+          async function font(name, cs, base) {
+            try {
+              var f = new FontFace('f' + name.replace(/[^a-z0-9]/gi, ''), 'url(' + api(base || other, name, cs, 'font') + ')');
+              await f.load();
+              out[name] = 'loaded';
+            } catch (e) { out[name] = 'err:' + e.name; }
+          }
+          async function fontCSS(name, cs) {
+            var fam = 'g' + name.replace(/[^a-z0-9]/gi, '');
+            var st = document.createElement('style');
+            st.textContent = '@font-face{font-family:"' + fam + '";src:url("' + api(other, name, cs, 'font') + '")}';
+            document.head.appendChild(st);
+            try { var r = await document.fonts.load('12px "' + fam + '"'); out[name] = 'loaded:' + r.length; }
+            catch (e) { out[name] = 'err:' + e.name; }
+          }
+          await (await fetch(api(other, 'set-cookie', 'setcookie', 'txt'), { credentials: 'include' })).text();
+          // images
+          await img('i-anon-acao', 'acao-origin', 'anonymous');
+          await img('i-anon-star', 'acao-star', 'anonymous');
+          await img('i-anon-missing', 'acao-missing', 'anonymous');
+          await img('i-anon-null', 'acao-null', 'anonymous');
+          await img('i-anon-other', 'acao-other', 'anonymous');
+          await img('i-plain-missing', 'acao-missing', null);
+          await img('i-creds-ok', 'acao-origin-creds', 'use-credentials');
+          await img('i-creds-star', 'acao-star', 'use-credentials');
+          await img('i-creds-noacac', 'acao-origin', 'use-credentials');
+          await img('i-anon-cookie', 'acao-origin', 'anonymous');
+          await img('i-plain-cookie', 'acao-missing', null);
+          await img('i-redir-ok', 'redir', 'anonymous', '&loc=' + encodeURIComponent(api(other, 'i-redir-ok:b', 'acao-origin', 'img')));
+          await img('i-redir-noacao', 'redir', 'anonymous', '&noacao=1&loc=' + encodeURIComponent(api(other, 'i-redir-noacao:b', 'acao-origin', 'img')));
+          await img('i-redir-self-star', 'redir', 'anonymous', '&loc=' + encodeURIComponent(api(po, 'i-redir-self-star:b', 'acao-star', 'img')));
+          await img('i-redir-self-origin', 'redir', 'anonymous', '&loc=' + encodeURIComponent(api(po, 'i-redir-self-origin:b', 'acao-origin', 'img')));
+          // the document's own origin: nothing to check, whatever the target says
+          async function same(name, as, make) {
+            var u = api(po, name, 'same', as);
+            out[name] = await make(u);
+          }
+          await same('i-same', 'img', function (u) { var i = new Image(); i.crossOrigin = 'anonymous'; var p = settle(i); i.src = u; return p; });
+          await same('s-same', 'js', function (u) { var s = document.createElement('script'); s.crossOrigin = 'anonymous'; var p = settle(s); s.src = u; document.head.appendChild(s); return p; });
+          await same('m-same', 'js', function (u) { var s = document.createElement('script'); s.type = 'module'; var p = settle(s); s.src = u; document.head.appendChild(s); return p; });
+          await same('c-same', 'css', function (u) { var l = document.createElement('link'); l.rel = 'stylesheet'; l.crossOrigin = 'anonymous'; var p = settle(l); l.href = u; document.head.appendChild(l); return p; });
+          // scripts and modules
+          await script('s-anon-acao', 'acao-origin', 'anonymous', false);
+          await script('s-anon-missing', 'acao-missing', 'anonymous', false);
+          await script('s-plain-missing', 'acao-missing', null, false);
+          await script('s-creds-ok', 'acao-origin-creds', 'use-credentials', false);
+          await script('s-creds-star', 'acao-star', 'use-credentials', false);
+          await script('m-acao', 'acao-origin', null, true);
+          await script('m-star', 'acao-star', null, true);
+          await script('m-missing', 'acao-missing', null, true);
+          // stylesheets
+          await css('c-anon-acao', 'acao-origin', 'anonymous');
+          await css('c-anon-missing', 'acao-missing', 'anonymous');
+          await css('c-plain-missing', 'acao-missing', null);
+          // fonts: the FontFace API and an @font-face rule
+          await font('f-acao', 'acao-origin');
+          await font('f-star', 'acao-star');
+          await font('f-missing', 'acao-missing');
+          await font('f-same', 'same', po);
+          await fontCSS('fc-acao', 'acao-origin');
+          await fontCSS('fc-missing', 'acao-missing');
+          // Frames the worker does not answer itself — a blank frame a script writes into, a srcdoc frame — hold their
+          // elements to the same rules: image, stylesheet and script, allowed and not, looked at where they end up.
+          var frames = [];
+          function inFrame(how, kind, ok) {
+            var name = how + '-' + kind + '-' + (ok ? 'ok' : 'missing');
+            var url = api(other, name, ok ? 'acao-origin' : 'acao-missing', kind).replace(/&/g, '&amp;');
+            var html = kind === 'img' ? '<img id="i" crossorigin="anonymous" src="' + url + '">'
+              : kind === 'css' ? '<link rel="stylesheet" crossorigin="anonymous" href="' + url + '"><div class="xcel" id="d">x</div>'
+              : '<script crossorigin="anonymous" src="' + url + '"></' + 'script>';
+            var f = document.createElement('iframe');
+            if (how === 'srcdoc') { f.srcdoc = '<body>' + html; document.body.appendChild(f); }
+            else { document.body.appendChild(f); var d = f.contentDocument; d.open(); d.write('<body>' + html); d.close(); }
+            frames.push([name, f, kind]);
+          }
+          // ...and one made with the DOM in a written frame: allowed and not
+          ['ok', 'missing'].forEach(function (which) {
+            var name = 'written-dom-img-' + which;
+            var f = document.createElement('iframe');
+            document.body.appendChild(f);
+            var d = f.contentDocument;
+            d.open(); d.write('<body>'); d.close();
+            var im = d.createElement('img');
+            im.crossOrigin = 'anonymous';
+            im.src = api(other, name, which === 'ok' ? 'acao-origin' : 'acao-missing', 'img');
+            d.body.appendChild(im);
+            frames.push([name, f, 'domimg', im]);
+          });
+          ['written', 'srcdoc'].forEach(function (how) {
+            ['img', 'css', 'js'].forEach(function (kind) { inFrame(how, kind, true); inFrame(how, kind, false); });
+          });
+          await new Promise(function (r) { setTimeout(r, 6000); });
+          frames.forEach(function (rec) {
+            var name = rec[0], f = rec[1], kind = rec[2], d = f.contentDocument, w = f.contentWindow;
+            try {
+              if (kind === 'domimg') { var di = rec[3]; out[name] = !di.complete ? 'pending' : di.naturalWidth === 8 ? 'load' : di.naturalWidth > 0 ? 'placeholder' : 'error'; }
+              else if (kind === 'img') { var im = d.getElementById('i'); out[name] = !im ? 'none' : !im.complete ? 'pending' : im.naturalWidth === 8 ? 'load' : im.naturalWidth > 0 ? 'placeholder' : 'error'; }
+              else if (kind === 'css') out[name] = w.getComputedStyle(d.getElementById('d')).color === 'rgb(255, 0, 0)' ? 'applied' : 'not applied';
+              else out[name] = w.__xcel && w.__xcel[rid + ':' + name] ? 'ran' : 'not run';
+            } catch (e) { out[name] = 'threw:' + e.name; }
+          });
+          // an opaque frame: Origin is "null"
+          var got = null;
+          addEventListener('message', function (e) { if (typeof e.data === 'string' && e.data.indexOf('xcorsel:') === 0) got = JSON.parse(e.data.slice(8)); });
+          var fr = document.createElement('iframe');
+          fr.setAttribute('sandbox', 'allow-scripts');
+          fr.src = '/xcorsel-child?rid=' + encodeURIComponent(rid) + '&other=' + encodeURIComponent(other) + '&po=' + encodeURIComponent(po);
+          document.body.appendChild(fr);
+          for (var k = 0; k < 300 && !got; k++) await new Promise(function (r) { setTimeout(r, 100); });
+          out.opaque = got || 'no report';
+          out.__log = await (await fetch('/xcors-log?prefix=' + encodeURIComponent(rid + ':'))).json();
+          window.__xcorsel = out;
+        })().catch(function (e) { window.__xcorsel = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xpopop-popup') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>popup</title><script>' +
+        'var R = {};' +
+        'function op(k, f) { try { var v = f(); R[k] = v === null ? "null" : (typeof v === "object" || typeof v === "function") ? typeof v : String(v).slice(0, 60); } catch (e) { R[k] = "threw:" + (e && e.name); } }' +
+        'op("self.origin", function () { return self.origin; });' +
+        'op("location.pathname", function () { return location.pathname; });' +
+        'op("localStorage", function () { localStorage.setItem("zpop", "1"); return localStorage.getItem("zpop"); });' +
+        'op("sessionStorage", function () { return sessionStorage.length; });' +
+        'op("document.cookie", function () { return document.cookie.split("; ").filter(function (c) { return c.indexOf("xpopck=") === 0; }).join("; "); });' +
+        'op("indexedDB.open", function () { return indexedDB.open("x"); });' +
+        'op("caches", function () { return caches; });' +
+        'op("serviceWorker", function () { return navigator.serviceWorker; });' +
+        'op("document.domain", function () { return document.domain; });' +
+        'op("opener.document", function () { return opener.document; });' +
+        'op("opener.location.href", function () { return opener.location.href; });' +
+        'op("opener is parent", function () { return parent === window && top === window; });' +
+        'op("frameElement", function () { return frameElement; });' +
+        'try { opener.postMessage("xpop:" + JSON.stringify(R), "*"); } catch (e) {}' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xpopop-child') {
+      const flags = url.searchParams.get('flags') || '';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>popup opener</title><script>' +
+        'var got = null;' +
+        'addEventListener("message", function (e) { if (typeof e.data === "string" && e.data.indexOf("xpop:") === 0 && !got) { got = JSON.parse(e.data.slice(5)); } });' +
+        'var w = null; try { w = open("/xpopop-popup"); } catch (e) {}' +
+        'function after(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }' +
+        'function poll(n) { return got || n <= 0 ? Promise.resolve() : after(100).then(function () { return poll(n - 1); }); }' +
+        '(w ? poll(150) : Promise.resolve()).then(function () { return after(500); }).then(function () {' +
+        '  var H = {};' +
+        '  H.opened = w ? "yes" : "no";' +
+        '  try { H.handleDocument = typeof w.document; } catch (e) { H.handleDocument = "threw:" + e.name; }' +
+        '  try { H.handleLocation = w ? String(w.location.href).slice(0, 5) : "null"; } catch (e) { H.handleLocation = "threw:" + e.name; }' +
+        '  try { H.handleClosed = String(w.closed); } catch (e) { H.handleClosed = "threw:" + e.name; }' +
+        '  try { w.close(); } catch (e) {}' +
+        '  parent.postMessage("xpopop:" + JSON.stringify({ report: got, handle: H }), "*");' +
+        '});' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xpopop') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Popups of sandboxed frames</title><body><script>
+        window.__xpopop = null;
+        (async function () {
+          var out = {};
+          document.cookie = 'xpopck=1; path=/';
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var variants = [['opaque popup', 'allow-scripts allow-popups'], ['escaping popup', 'allow-scripts allow-popups allow-popups-to-escape-sandbox'], ['no popups', 'allow-scripts']];
+          for (var v = 0; v < variants.length; v++) {
+            var got = null;
+            var handler = function (e) { if (typeof e.data === 'string' && e.data.indexOf('xpopop:') === 0) got = JSON.parse(e.data.slice(7)); };
+            addEventListener('message', handler);
+            var f = document.createElement('iframe'); f.setAttribute('sandbox', variants[v][1]); f.src = '/xpopop-child'; document.body.appendChild(f);
+            for (var i = 0; i < 300 && !got; i++) await sleep(100);
+            removeEventListener('message', handler);
+            out[variants[v][0]] = got || 'no report';
+            f.remove();
+          }
+          window.__xpopop = out;
+        })().catch(function (e) { window.__xpopop = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsbchild') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>sandbox child</title><body><script>
+        // ?tamper=1: the frame first redefines its own window's \`frameElement\` — natively that changes nothing of the
+        // sandbox. The membrane walked \`frameElement\` to find its sandbox flags and read the page's answer: no embedder,
+        // no sandbox, and the top window navigated.
+        if (location.search.indexOf('tamper=1') >= 0) {
+          Object.defineProperty(window, 'frameElement', { get: function () { return null; }, configurable: true });
+        }
+        var R = {}, jobs = [];
+        var show = function (v) { return v === null ? 'null' : v === undefined ? 'undefined' : (typeof v === 'object' || typeof v === 'function') ? typeof v : String(v).slice(0, 60); };
+        var op = function (k, fn, into) {
+          var o = into || R;
+          try {
+            var v = fn();
+            if (v && typeof v.then === 'function') jobs.push(v.then(function (x) { o[k] = 'resolved:' + show(x); }, function (e) { o[k] = 'rejected:' + (e && e.name); }));
+            else o[k] = show(v);
+          } catch (e) { o[k] = 'threw:' + (e && e.name); }
+        };
+        op('self.origin', function () { return self.origin; });
+        op('location.origin', function () { return location.origin; });
+        op('location.pathname', function () { return location.pathname; });
+        op('isSecureContext', function () { return self.isSecureContext; });
+        op('localStorage', function () { return localStorage; });
+        op('sessionStorage', function () { return sessionStorage; });
+        op('document.cookie', function () { return document.cookie; });
+        op('document.cookie=', function () { document.cookie = 'sb=1'; return 'no throw'; });
+        op('indexedDB.open', function () { return indexedDB.open('x'); });
+        op('indexedDB.databases', function () { return indexedDB.databases(); });
+        op('caches', function () { return caches; });
+        op('cookieStore.getAll', function () { return cookieStore.getAll(); });
+        op('storage.estimate', function () { return navigator.storage.estimate(); });
+        op('storage.getDirectory', function () { return navigator.storage.getDirectory(); });
+        op('locks.request', function () { return navigator.locks.request('x', function () { return 1; }); });
+        op('locks.query', function () { return navigator.locks.query(); });
+        op('serviceWorker', function () { return navigator.serviceWorker; });
+        op('Notification.permission', function () { return Notification.permission; });
+        op('permissions.query', function () { return navigator.permissions.query({ name: 'geolocation' }).then(function (s) { return s.state; }); });
+        op('document.domain', function () { return document.domain; });
+        op('window.name', function () { return window.name; });
+        op('parent.document', function () { return parent.document; });
+        op('parent.location.href', function () { return parent.location.href; });
+        op('top.location.href', function () { return top.location.href; });
+        op('top.document', function () { return top.document; });
+        op('frameElement', function () { return frameElement; });
+        op('window.frameElement', function () { return window.frameElement; });
+        op('self.frameElement', function () { return self.frameElement; });
+        op('globalThis.frameElement', function () { return globalThis.frameElement; });
+        op('alias.frameElement', function () { var w = window; return w.frameElement; });
+        op('typeof frameElement', function () { return typeof frameElement; });
+        op('opener', function () { return opener; });
+        op('window.open', function () { var w = window.open('about:blank'); try { if (w) w.close(); } catch (e) {} return w; });
+        op('alert', function () { return alert('x'); });
+        op('top.location.assign', function () { top.location.assign('http://example.invalid/'); return 'no throw'; });
+        if (location.search.indexOf('egress=1') >= 0) op('history.pushState', function () { history.pushState({}, '', '#x'); return location.hash; });
+        op('createElement iframe sandbox length', function () { return document.createElement('iframe').sandbox.length; });
+        op('postMessage parent', function () { parent.postMessage('hello', '*'); return 'ok'; });
+        op('own blank frame contentDocument', function () { var f = document.createElement('iframe'); document.body.appendChild(f); return f.contentDocument === null ? 'null' : 'object'; });
+        op('own blank frame contentWindow.document', function () { var f = document.createElement('iframe'); document.body.appendChild(f); return typeof f.contentWindow.document; });
+        op('own srcdoc frame', function () { var f = document.createElement('iframe'); f.srcdoc = '<p>x</p>'; document.body.appendChild(f); return f.contentDocument === null ? 'null' : 'object'; });
+        op('sibling frame document', function () { var s = parent.frames[parent.frames.length - 1]; return s === window ? 'self' : typeof s.document; });
+        if (location.search.indexOf('egress=1') >= 0) {
+          jobs.push(new Promise(function (r) {
+            var i = new Image();
+            i.onload = function () { R['egress.img'] = 'load'; r(); };
+            i.onerror = function () { R['egress.img'] = 'error'; r(); };
+            i.src = '/image-probe.png?sb=' + Math.random().toString(36).slice(2);
+          }));
+          jobs.push(new Promise(function (r) {
+            try {
+              var w = new WebSocket('ws://' + location.host + '/ws?sb=1');
+              w.onopen = function () { R['egress.ws'] = 'open'; w.close(); r(); };
+              w.onerror = function () { R['egress.ws'] = 'error'; r(); };
+              setTimeout(function () { if (!R['egress.ws']) { R['egress.ws'] = 'timeout'; r(); } }, 6000);
+            } catch (e) { R['egress.ws'] = 'threw:' + e.name; r(); }
+          }));
+          op('egress.beacon', function () { return navigator.sendBeacon('/xsb-beacon', 'x'); });
+          // What the sandbox's own rules allow, tried by every route a script has. Natively several of these
+          // fail on CORS grounds (the origin is "null"); what matters here is where they go — the
+          // upstream sees each one only if it came through the proxy, and the suite's last test fails the
+          // run if anything left for another origin. Outcomes are not compared.
+          jobs.push(fetch('/xsb-egress-fetch').then(function () {}, function () {}));
+          jobs.push(new Promise(function (r) { try { var x = new XMLHttpRequest(); x.open('GET', '/xsb-egress-xhr'); x.onloadend = function () { r(); }; x.send(); } catch (e) { r(); } }));
+          jobs.push(new Promise(function (r) { var s = document.createElement('script'); s.onload = s.onerror = function () { r(); }; s.src = '/xsb-egress-script.js'; document.head.appendChild(s); }));
+          jobs.push(new Promise(function (r) { var l = document.createElement('link'); l.rel = 'stylesheet'; l.onload = l.onerror = function () { r(); }; l.href = '/xsb-egress-style.css'; document.head.appendChild(l); }));
+          jobs.push(import('/xsb-egress-module.js').then(function () {}, function () {}));
+          jobs.push(new Promise(function (r) {
+            try {
+              var wu = URL.createObjectURL(new Blob(['fetch("/xsb-egress-worker").then(function () {}, function () {}); postMessage("ran");']));
+              var wk = new Worker(wu);
+              wk.onmessage = function () { r(); };
+              wk.onerror = function () { r(); };
+              setTimeout(r, 6000);
+            } catch (e) { r(); }
+          }));
+        }
+        var send = function () { parent.postMessage('sb:' + JSON.stringify(R), '*'); };
+        Promise.all(jobs).then(function () { setTimeout(send, 400); });
+        addEventListener('message', function (m) {
+          if (m.data !== 'go') return;
+          var N = {};
+          op('top.location.href=', function () { top.location.href = '/xsb-nav-top'; return 'no throw'; }, N);
+          op('top.location.replace', function () { top.location.replace('/xsb-nav-top2'); return 'no throw'; }, N);
+          op('parent.location.href=', function () { parent.location.href = '/xsb-nav-parent'; return 'no throw'; }, N);
+          op('self.location.hash=', function () { location.hash = '#self'; return location.hash; }, N);
+          setTimeout(function () { parent.postMessage('sbnav:' + JSON.stringify(N), '*'); }, 600);
+        });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsandbox') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Sandboxed frames</title><body><script>
+        window.__xsandbox = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var got = [];
+          addEventListener('message', function (e) {
+            if (typeof e.data === 'string' && e.data.indexOf('sb:') === 0) got.push({ source: e.source, origin: e.origin, data: JSON.parse(e.data.slice(3)) });
+          });
+          var norm = function (o) { return Object.keys(o).sort().map(function (k) { return k + '=' + o[k]; }).join('\\n'); };
+          var reportOf = function (f) {
+            var r = got.filter(function (g) { try { return g.source === f.contentWindow; } catch (e) { return false; } })[0];
+            return r ? 'origin=' + r.origin + '\\n' + norm(r.data) : 'no report';
+          };
+          var wait = async function (f, ms) {
+            for (var t0 = Date.now(); Date.now() - t0 < ms && reportOf(f) === 'no report'; ) await sleep(100);
+            await sleep(300);
+          };
+          var variant = async function (name, build, ms) {
+            var h = document.createElement('div'); document.body.appendChild(h);
+            var f = build(h);
+            await wait(f, ms === undefined ? 15000 : ms);
+            out[name + '.connected'] = String(f.isConnected);
+            out[name + '.contentDocument'] = f.contentDocument === null ? 'null' : typeof f.contentDocument;
+            out[name + '.report'] = reportOf(f);
+            return f;
+          };
+          var mk = function (setup) { return function (h) { var f = document.createElement('iframe'); setup(f); h.appendChild(f); return f; }; };
+          var CHILD = '/xsbchild';
+          var a = await variant('attr', mk(function (f) { f.setAttribute('sandbox', 'allow-scripts'); f.src = CHILD + '?egress=1'; }));
+          out['attr.sandbox'] = a.getAttribute('sandbox') + '|' + a.sandbox.value + '|' + a.sandbox.length + '|' + a.sandbox.contains('allow-same-origin') + '|' + a.sandbox.contains('allow-scripts');
+          out['attr.outerHTML'] = a.outerHTML;
+          out['attr.contentWindow.document'] = (function () { try { return typeof a.contentWindow.document; } catch (e) { return 'threw:' + e.name; } })();
+          out['attr.contentWindow.location'] = (function () { try { return String(a.contentWindow.location.href); } catch (e) { return 'threw:' + e.name; } })();
+          out['attr.contentWindow.length'] = (function () { try { return String(a.contentWindow.length); } catch (e) { return 'threw:' + e.name; } })();
+          await variant('property', mk(function (f) { f.sandbox = 'allow-scripts'; f.src = CHILD; }));
+          await variant('tokens', mk(function (f) { f.sandbox.add('allow-scripts'); f.src = CHILD; }));
+          await variant('src first', mk(function (f) { f.src = CHILD; f.setAttribute('sandbox', 'allow-scripts'); }));
+          await variant('parsed', function (h) { h.innerHTML = '<iframe sandbox="allow-scripts" src="' + CHILD + '"></iframe>'; return h.firstChild; });
+          await variant('insertAdjacentHTML', function (h) { h.insertAdjacentHTML('beforeend', '<iframe sandbox="allow-scripts" src="' + CHILD + '"></iframe>'); return h.firstChild; });
+          await variant('srcdoc', mk(function (f) {
+            f.setAttribute('sandbox', 'allow-scripts');
+            f.srcdoc = '<script>parent.postMessage("sb:" + JSON.stringify({ ran: "srcdoc", origin: self.origin }), "*")<\\/script>';
+          }));
+          await variant('parsed srcdoc', function (h) {
+            // The attribute value is built, not written: an inline script's text is entity-decoded by the
+            // membrane (a documented trade-off), so no entity may stand in this source.
+            var inner = '<script>parent.postMessage("sb:" + JSON.stringify({ ran: "parsed srcdoc", origin: self.origin }), "*")<\\/script>';
+            var attr = inner.replace(/&/g, '&' + 'amp;').replace(/"/g, '&' + 'quot;');
+            h.innerHTML = '<iframe sandbox="allow-scripts" srcdoc="' + attr + '"></iframe>';
+            return h.firstChild;
+          });
+          await variant('inert', mk(function (f) { f.setAttribute('sandbox', ''); f.src = CHILD; }), 2500);
+          await variant('forms and popups', mk(function (f) { f.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups'); f.src = CHILD; }));
+          var h2 = document.createElement('div'); document.body.appendChild(h2);
+          var s1 = document.createElement('iframe'); s1.setAttribute('sandbox', 'allow-scripts'); s1.src = CHILD; h2.appendChild(s1);
+          var s2 = document.createElement('iframe'); s2.setAttribute('sandbox', 'allow-scripts'); s2.src = CHILD; h2.appendChild(s2);
+          await wait(s1, 15000); await wait(s2, 15000);
+          out['sibling.first'] = reportOf(s1);
+          out['sibling.second'] = reportOf(s2);
+          // Navigating the top window or the embedder is the sandbox's to refuse.
+          var run = async function (flags, query) {
+            var nf = document.createElement('iframe'); nf.setAttribute('sandbox', flags); nf.src = CHILD + (query || ''); document.body.appendChild(nf);
+            await wait(nf, 15000);
+            var navGot = null;
+            var onNav = function (e) { if (typeof e.data === 'string' && e.data.indexOf('sbnav:') === 0 && e.source === nf.contentWindow) navGot = e.data.slice(6); };
+            addEventListener('message', onNav);
+            nf.contentWindow.postMessage('go', '*');
+            for (var t1 = Date.now(); !navGot && Date.now() - t1 < 8000; ) await sleep(100);
+            removeEventListener('message', onNav);
+            return navGot ? norm(JSON.parse(navGot)) : 'none';
+          };
+          out['nav.scripts'] = await run('allow-scripts');
+          out['nav.userActivation'] = await run('allow-scripts allow-top-navigation-by-user-activation');
+          out['nav.tampered'] = await run('allow-scripts', '?tamper=1');
+          out['nav.pathAfter'] = location.pathname;
+          window.__xsandbox = out;
+        })().catch(function (e) { window.__xsandbox = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xsetcookie') {
+      const n = url.searchParams.get('n') || 'xsrf';
+      const attrs = 'Path=/' + (url.searchParams.get('httponly') ? '; HttpOnly' : '') + (url.searchParams.get('maxage') !== null ? '; Max-Age=' + url.searchParams.get('maxage') : '');
+      if (url.searchParams.get('redirect')) {
+        res.writeHead(302, { 'Location': '/xsetcookie-final', 'Set-Cookie': n + '=tok; ' + attrs, 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Set-Cookie': n + '=' + (url.searchParams.get('v') || 'tok') + '; ' + attrs });
+      res.end('ok');
+      return;
+    }
+    if (url.pathname === '/xsetcookie-final') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('final');
+      return;
+    }
+    if (url.pathname === '/xcookie') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Server-set cookies</title><body><script>
+        window.__xcookie = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var names = function () { return document.cookie.split('; ').filter(Boolean).map(function (c) { return c.split('=')[0]; }).filter(function (n) { return n.indexOf('ck_') === 0; }).sort().join(','); };
+          var val = function (n) { var m = document.cookie.split('; ').filter(function (c) { return c.split('=')[0] === n; })[0]; return m ? m.slice(n.length + 1) : 'absent'; };
+          var changes = [];
+          if (self.cookieStore) cookieStore.addEventListener('change', function (e) { (e.changed || []).forEach(function (c) { changes.push('set:' + c.name); }); (e.deleted || []).forEach(function (c) { changes.push('del:' + c.name); }); });
+          // The browser starts delivering change events a moment after the first listener
+          // is added — a cookie set before that is not reported natively.
+          await sleep(500);
+          await fetch('/xsetcookie?n=ck_fetch');
+          out['fetch.visible'] = val('ck_fetch');
+          await fetch('/xsetcookie?n=ck_fetch_ho&httponly=1');
+          out['fetch.httpOnly.visible'] = val('ck_fetch_ho');
+          out['xhr.visible'] = await new Promise(function (res) { var x = new XMLHttpRequest(); x.open('GET', '/xsetcookie?n=ck_xhr'); x.onloadend = function () { res(val('ck_xhr')); }; x.send(); });
+          await fetch('/xsetcookie?n=ck_redirect&redirect=1');
+          out['redirect.visible'] = val('ck_redirect');
+          await fetch('/xsetcookie?n=ck_omit', { credentials: 'omit' });
+          out['omit.visible'] = val('ck_omit');
+          await fetch('/xsetcookie?n=ck_update&v=one');
+          await fetch('/xsetcookie?n=ck_update&v=two');
+          out['update.value'] = val('ck_update');
+          await fetch('/xsetcookie?n=ck_gone');
+          out['gone.before'] = val('ck_gone');
+          await fetch('/xsetcookie?n=ck_gone&maxage=0');
+          out['gone.after'] = val('ck_gone');
+          out['store.get'] = self.cookieStore ? ((await cookieStore.get('ck_fetch')) ? 'present' : 'absent') : 'n/a';
+          document.cookie = 'ck_script=1';
+          var echoed = await (await fetch('/cookie-echo')).text();
+          out['sent.back'] = ['ck_fetch', 'ck_xhr', 'ck_redirect', 'ck_update', 'ck_script'].every(function (n) { return echoed.indexOf(n + '=') >= 0; }) && echoed.indexOf('ck_omit=') < 0 && echoed.indexOf('ck_gone=') < 0 ? 'as expected' : 'unexpected';
+          await sleep(300);
+          out['names'] = names();
+          out['changes'] = changes.slice().sort().join(',');
+          window.__xcookie = out;
+        })().catch(function (e) { window.__xcookie = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/xstore-child') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>store child</title><script>' +
+        'var ev = [];' +
+        'addEventListener("storage", function (e) { ev.push({ k: e.key, o: e.oldValue, n: e.newValue, area: e.storageArea === localStorage ? "local" : e.storageArea === sessionStorage ? "session" : "other", trusted: e.isTrusted, sameSiteUrl: !!e.url && new URL(e.url).origin === location.origin }); });' +
+        'addEventListener("message", function (m) {' +
+        '  var d = m.data;' +
+        '  if (d === "write") { localStorage.setItem("k_child", "v1"); sessionStorage.setItem("s_child", "v1"); }' +
+        '  else if (d === "rewrite") { localStorage.setItem("k_child", "v1"); }' +
+        '  else if (d === "update") { localStorage.setItem("k_child", "v2"); }' +
+        '  else if (d === "remove") { localStorage.removeItem("k_child"); }' +
+        '  else if (d === "report") parent.postMessage("store:" + JSON.stringify(ev), "*");' +
+        '});' +
+        '<\/script>');
+      return;
+    }
+    if (url.pathname === '/xstore') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Storage events</title><body><script>
+        window.__xstore = null;
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var other = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+          var mine = [], viaHandler = [], got = {}, same = null, cross = null;
+          var describe = function (e) {
+            return [String(e.key), String(e.oldValue), String(e.newValue), e.storageArea === localStorage ? 'local' : e.storageArea === sessionStorage ? 'session' : 'other', String(e.isTrusted)].join('|');
+          };
+          window.addEventListener('storage', function (e) { mine.push(describe(e)); });
+          window.onstorage = function (e) { viaHandler.push(e.key); };
+          window.addEventListener('message', function (e) {
+            if (typeof e.data === 'string' && e.data.indexOf('store:') === 0) {
+              got[same && e.source === same.contentWindow ? 'same' : cross && e.source === cross.contentWindow ? 'cross' : 'other'] = e.data.slice(6);
+            }
+          });
+          var mk = function (src) { var f = document.createElement('iframe'); f.src = src; document.body.appendChild(f); return f; };
+          same = mk('/xstore-child');
+          cross = mk('http://' + other + ':' + location.port + '/xstore-child');
+          await sleep(1800);
+          // The two areas deliver in no fixed order: compare a sorted snapshot.
+          var snap = function () { var r = mine.slice().sort().join(','); mine.length = 0; return r; };
+          mine.length = 0; viaHandler.length = 0;
+          cross.contentWindow.postMessage('write', '*');
+          await sleep(800);
+          out['cross.write'] = snap();
+          same.contentWindow.postMessage('write', '*');
+          await sleep(800);
+          out['same.write'] = snap();
+          same.contentWindow.postMessage('rewrite', '*');
+          await sleep(800);
+          out['same.rewrite'] = snap();
+          same.contentWindow.postMessage('update', '*');
+          await sleep(800);
+          out['same.update'] = snap();
+          same.contentWindow.postMessage('remove', '*');
+          await sleep(800);
+          out['same.remove'] = snap();
+          out['onstorage.keys'] = viaHandler.slice().sort().join(',');
+          localStorage.setItem('k_parent', 'p1');
+          sessionStorage.setItem('s_parent', 'p1');
+          await sleep(800);
+          same.contentWindow.postMessage('report', '*');
+          cross.contentWindow.postMessage('report', '*');
+          await sleep(900);
+          var norm = function (json) { try { return JSON.parse(json).map(function (e) { return [String(e.k), String(e.o), String(e.n), e.area, String(e.trusted), String(e.sameSiteUrl)].join('|'); }).sort().join(','); } catch (x) { return 'none'; } };
+          out['child.same.heard'] = norm(got.same);
+          out['child.cross.heard'] = norm(got.cross);
+          // An event the page builds and dispatches itself is its own business.
+          var synth = '';
+          window.addEventListener('storage', function once(e) { if (!e.isTrusted) { synth = e.key + '|' + e.newValue + '|' + String(e.storageArea); window.removeEventListener('storage', once); } });
+          window.dispatchEvent(new StorageEvent('storage', { key: 'synthetic', newValue: 'x' }));
+          out['synthetic'] = synth;
+          window.__xstore = out;
+        })().catch(function (e) { window.__xstore = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/frame-loads') {
+      // Parking a frame on about:blank while preparing its route must not emit extra load events or history entries.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Frame Loads</title><body>
+      <iframe id="s1" src="/frame-plain" onload="window.__statOnload = (window.__statOnload || 0) + 1"></iframe>
+      <iframe id="s2" src="/frame-plain?two"></iframe>
+      <script>
+        window.__frameLoads = null;
+        var __l2 = 0;
+        document.getElementById('s2').addEventListener('load', function () { __l2++; });
+        (async function () {
+          var out = {};
+          var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+          var title = function (f) { try { var d = f.contentDocument; return d && d.readyState === 'complete' ? d.title : ''; } catch (e) { return '?'; } };
+          // Wait for the destination, then a little longer: a stray late load is the bug.
+          var settle = async function (f, want) {
+            var t0 = Date.now();
+            while (Date.now() - t0 < 8000 && title(f) !== want) await sleep(50);
+            await sleep(500);
+          };
+          var counted = function () {
+            var ev = []; var f = document.createElement('iframe');
+            f.addEventListener('load', function () { ev.push('L'); });
+            f.onload = function () { ev.push('o'); };
+            return { f: f, ev: ev };
+          };
+          await settle(document.getElementById('s1'), 'fp');
+          await settle(document.getElementById('s2'), 'fp');
+          out.staticOnload = String(window.__statOnload || 0);
+          out.staticListener = String(__l2);
+          var a = counted(); a.f.src = '/frame-plain'; document.body.appendChild(a.f);
+          await settle(a.f, 'fp'); out.srcBeforeAppend = a.ev.join('');
+          var b = counted(); document.body.appendChild(b.f); b.f.src = '/frame-plain';
+          await settle(b.f, 'fp'); out.srcAfterAppend = b.ev.join('');
+          var c = counted(); document.body.appendChild(c.f); c.f.src = '/frame-plain'; c.f.src = '/frame-html';
+          await settle(c.f, 'fh'); out.rapidSwap = c.ev.join('') + '|' + title(c.f);
+          var d = counted(); d.f.src = '/frame-plain'; document.body.appendChild(d.f);
+          await settle(d.f, 'fp');
+          var h0 = history.length; d.f.src = '/frame-html';
+          await settle(d.f, 'fh');
+          out.srcChange = d.ev.join(''); out.historyDelta = String(history.length - h0);
+          window.__frameLoads = out;
+        })().catch(function (e) { window.__frameLoads = { __fatal: String(e && (e.stack || e)) }; });
+      <\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/frame-outer') {
+      // Inner link targets _parent so the outer frame navigates instead of the top page.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>fo</title><iframe srcdoc="<a id=up href=\'/frame-plain\' target=_parent>up</a>"></iframe>');
+      return;
+    }
+    if (url.pathname === '/frame-plain') {
+      // Document without html/head/body/script tags still receives prelude injection.
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('<!doctype html><title>fp</title><p>plain</p>');
+      return;
+    }
+    if (url.pathname === '/surface-probes') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Surface Probes</title><head>
+      <script type="importmap">{"imports":{"x-mod":"/dyn-mod.js"}}<\/script>
+      <script type="speculationrules">{"prefetch":[{"source":"list","urls":["/dyn-mod.js"]}]}<\/script>
+      <link rel="stylesheet" href="/site.css">
+      </head><body>
+      <div id="sdhost"><template shadowrootmode="open"><img src="/dyn-mod.js" id="sdimg"><p>sd</p></template></div>
+      <svg><image id="svgimg" href="/dyn-mod.js"/><a id="svga" xlink:href="/dyn-mod.js"></a></svg>
+      <script>
+        window.__surfaceProbes = {};
+        window.__surfaceErrs = [];
+        window.addEventListener('error', e => { window.__surfaceErrs.push('err:' + e.filename + '|' + e.lineno + '|' + e.message); });
+        window.addEventListener('unhandledrejection', e => { window.__surfaceErrs.push('rej:' + String(e.reason && e.reason.stack || e.reason)); });
+        let ZXC7 = 7;   // cross-script lexical binding visible to subsequent scripts
+        var ZXC8 = 8;   // cross-script var binding persisted on the global object
+        const ZXC9 = 9; // cross-script const binding persisted and read-only
+        class ZXC10 {}  // cross-script class binding persisted across scripts
+      <\/script>
+      <script>
+        (async () => {
+          const out = window.__surfaceProbes;
+          const P = async (k, fn) => { try { out[k] = 'v:' + (await fn()); } catch (e) { out[k] = 'threw:' + (e && e.name || e) + ':' + String(e && e.message || '').slice(0, 80); } };
+          const tick = () => new Promise(r => setTimeout(r, 30));
+          const leaked = s => s.includes('__zp_') || s.includes('/zp/api') || s.includes('proxy.localhost') || s.includes('worker-script');
+
+          // Transformer surface probes.
+          await P('importmapText', () => {
+            const t = document.querySelector('script[type=importmap]').textContent;
+            return t.includes('/zp/') ? 'rewritten' : 'raw';
+          });
+          await P('specrulesText', () => {
+            const t = document.querySelector('script[type=speculationrules]').textContent;
+            return t.includes('/zp/') ? 'rewritten' : 'raw';
+          });
+          await P('shadowDom', () => {
+            const host = document.querySelector('#sdhost');
+            if (!host.shadowRoot) return 'no-shadowroot';
+            const img = host.shadowRoot.getElementById('sdimg');
+            return img ? 'shadow-img:' + (leaked(img.getAttribute('src') || '') ? 'LEAK' : 'clean') : 'no-img';
+          });
+          await P('svgImage', () => {
+            const a = document.querySelector('#svgimg').getAttribute('href');
+            return leaked(a || '') ? 'LEAK:' + a : 'clean:' + a;
+          });
+          await P('svgAnchor', () => {
+            const a = document.querySelector('#svga').getAttribute('xlink:href');
+            return leaked(a || '') ? 'LEAK:' + a : 'clean:' + a;
+          });
+
+          // Transferable and structuredClone probes.
+          await P('cloneLocation', () => {
+            try { const c = structuredClone(location); return 'cloned:' + String(c && c.href || c); }
+            catch (e) { return 'threw:' + e.name; }
+          });
+          await P('weakRefLocation', () => {
+            const w = new WeakRef(location);
+            const d = w.deref();
+            return d === location ? 'same-proxy' : 'other:' + String(d && d.href);
+          });
+          await P('portMsgLocation', async () => {
+            const c = new MessageChannel();
+            const got = new Promise(r => { c.port2.onmessage = e => r(e.data); });
+            try { c.port1.postMessage(location); } catch (e) { return 'threw:' + e.name; }
+            const v = await Promise.race([got, tick().then(() => 'timeout')]);
+            if (v === 'timeout') return 'timeout';
+            return v === location ? 'same-proxy' : 'other:' + (v && v.href ? String(v.href) : typeof v);
+          });
+          await P('cloneDocument', () => {
+            try { structuredClone(document); return 'cloned'; } catch (e) { return 'threw:' + e.name; }
+          });
+          await P('cloneWindow', () => {
+            try { structuredClone(window); return 'cloned'; } catch (e) { return 'threw:' + e.name; }
+          });
+
+          // Named and indexed frame access probes.
+          const nf = document.createElement('iframe');
+          nf.name = 'nf'; nf.srcdoc = '<p>nfx</p>';
+          document.body.appendChild(nf);
+          await (async () => { for (let i = 0; i < 100; i++) { try { if (nf.contentDocument && nf.contentDocument.body && nf.contentDocument.body.textContent.includes('nfx')) return; } catch {} await new Promise(r => setTimeout(r, 20)); } })();
+          await P('framesByName', () => {
+            const d = '|attr:' + nf.getAttribute('name') + '|cw:' + (nf.contentWindow ? 'y' : 'n');
+            const w = frames['nf'];
+            if (!w) return 'undefined' + d;
+            return (leaked(String(w.location.href)) ? 'LEAK:' + w.location.href : 'clean:' + w.location.href) + d;
+          });
+          await P('framesItem', () => {
+            const w = frames.item(0);
+            if (!w) return 'undefined';
+            return leaked(String(w.location.href)) ? 'LEAK' : 'clean';
+          });
+          await P('selfIndex', () => {
+            const w = self[0];
+            if (!w) return 'undefined';
+            return leaked(String(w.location.href)) ? 'LEAK' : 'clean';
+          });
+          await P('thisIndex', () => {
+            const w = this[0];
+            if (!w) return 'undefined';
+            return leaked(String(w.location.href)) ? 'LEAK' : 'clean';
+          });
+          await P('windowByName', () => {
+            const w = window['nf'];
+            if (!w) return 'undefined';
+            return leaked(String(w.location.href)) ? 'LEAK:' + w.location.href : 'clean:' + w.location.href;
+          });
+
+          // Legacy Object.prototype accessor probes.
+          await P('defineGetterLoc', () => {
+            try { window.__defineGetter__('location', () => 'fake'); return 'installed|href:' + location.href.slice(0, 40); }
+            catch (e) { return 'threw:' + e.name; }
+          });
+          await P('defineSetterLoc', () => {
+            try { window.__defineSetter__('location', v => { window.__setterTrap = v; }); return 'installed'; }
+            catch (e) { return 'threw:' + e.name; }
+          });
+          await P('lookupGetterLoc', () => {
+            const g = window.__lookupGetter__('location');
+            if (g === undefined) return 'none';
+            return leaked(String(g)) ? 'LEAK' : 'fn';
+          });
+          await P('lookupSetterLoc', () => {
+            const s = window.__lookupSetter__('location');
+            if (s === undefined) return 'none';
+            return leaked(String(s)) ? 'LEAK' : 'fn';
+          });
+
+          // Error event argument and ownKeys hygiene probes.
+          await P('ownKeysLeak', () => {
+            // Harness bindings Puppeteer injects into the page it drives are not ours.
+            const ks = Object.getOwnPropertyNames(window).filter(k => !/^(__aria|puppeteer)/.test(k));
+            const bad = ks.filter(k => k.indexOf('zp') === 0 || k.includes('__zp'));
+            return bad.length ? 'LEAK:' + bad.slice(0, 5).join(',') : 'clean:' + ks.length;
+          });
+          try { eval('nonexistent_xyz()'); } catch {}
+          Promise.reject(new Error('surf-rej'));
+          setTimeout(() => { throw new Error('surf-uncaught'); }, 10);
+          await new Promise(r => setTimeout(r, 120));
+
+          // ── T1-6: a.ping + import.meta.resolve ──
+          // The ping setter stashes the value in a WeakMap and strips the live
+          // attribute; verify via attribute state without triggering navigation.
+          await P('anchorPing', () => {
+            const a = document.createElement('a');
+            a.href = '/ping-dest';
+            a.ping = 'https://evil.example/track';
+            document.body.appendChild(a);
+            const attr = a.getAttribute('ping');
+            const marker = a.getAttribute('data-zp-blocked-ping');
+            const prop = a.ping;
+            return 'attr:' + attr + '|marker:' + (marker || 'none') + '|prop:' + prop;
+          });
+
+          // Second document.write document execution under virtual location.
+          await P('docWriteFrame', async () => {
+            const f = document.createElement('iframe');
+            document.body.appendChild(f);
+            await new Promise(r => setTimeout(r, 100));
+            f.contentDocument.open();
+            f.contentDocument.write('<scr' + 'ipt>window.__dwLoc = String(location.href); parent.__dwChild = window.__dwLoc;</scr' + 'ipt><p>dwx</p>');
+            f.contentDocument.close();
+            await new Promise(r => setTimeout(r, 200));
+            const v = window.__dwChild;
+            if (v === undefined) return 'script-inert';
+            return leaked(String(v)) ? 'LEAK:' + v : 'clean:' + v;
+          });
+
+          // Additional iframe containment probes.
+          await P('iframeCspAttr', () => {
+            const f = document.createElement('iframe');
+            f.setAttribute('csp', "default-src 'none'");
+            f.srcdoc = '<p>c</p>';
+            document.body.appendChild(f);
+            return 'attr:' + (f.getAttribute('csp') || 'stripped');
+          });
+          await P('iframeCredentialless', () => {
+            const f = document.createElement('iframe');
+            f.credentialless = true;
+            f.srcdoc = '<p>cl</p>';
+            document.body.appendChild(f);
+            return 'set';
+          });
+          // Named target navigation confinement probes.
+          // A named target used to load the '?via=' LAUNCHER into the proxied
+          // frame, which never reached the target. Reading only the frame's URL
+          // passed anyway — 'via=' decodes to the target — so every probe here
+          // waits for the destination DOCUMENT (/frame-dest is a text/plain 404).
+          const frameDoc = f => { try { const d = f.contentDocument; return d && d.readyState === 'complete' && d.body ? d : null; } catch { return null; } };
+          const landed = async (f, path) => {
+            const t0 = Date.now();
+            let href = 'none';
+            while (Date.now() - t0 < 8000) {
+              try { href = f.contentWindow && f.contentWindow.location ? String(f.contentWindow.location.href) : 'none'; }
+              catch (e) { return 'threw:' + e.name; }
+              const d = href.includes(path) ? frameDoc(f) : null;
+              if (d) return 'navigated:' + href + '|' + d.body.textContent.trim();
+              await new Promise(r => setTimeout(r, 100));
+            }
+            return 'not-navigated:' + href;
+          };
+          const namedFrame = name => { const f = document.createElement('iframe'); f.name = name; document.body.appendChild(f); return f; };
+          await P('targetFramename', async () => {
+            const f = document.createElement('iframe');
+            f.name = 'tfn'; f.srcdoc = '<p>home</p>';
+            document.body.appendChild(f);
+            const a = document.createElement('a');
+            a.href = '/frame-dest'; a.target = 'tfn'; a.textContent = 'go';
+            document.body.appendChild(a);
+            a.click();
+            return landed(f, '/frame-dest');
+          });
+          // setAttribute('target') used to be rewritten to '_self' (name stashed):
+          // the link navigated the whole page and read back '_self'.
+          await P('targetFramenameAttr', async () => {
+            const f = namedFrame('tfn2');
+            const a = document.createElement('a');
+            a.setAttribute('href', '/frame-dest'); a.setAttribute('target', 'tfn2'); a.textContent = 'go';
+            document.body.appendChild(a);
+            a.click();
+            return (await landed(f, '/frame-dest')) + '|' + a.getAttribute('target') + '|' + a.target;
+          });
+          await P('targetAttrReadback', () => {
+            const a = document.createElement('a');
+            a.setAttribute('target', '_blank');
+            const area = document.createElement('area');
+            area.setAttribute('target', '_top');
+            const form = document.createElement('form');
+            form.setAttribute('target', 'x');
+            return [a.getAttribute('target'), a.target, area.target, form.target].join('|');
+          });
+          // A link in a nested frame targeting _parent moves the OUTER frame
+          // (the inner frame's ancestor), through that frame's own membrane.
+          await P('parentTargetLink', async () => {
+            const outer = document.createElement('iframe');
+            outer.src = '/frame-outer';
+            document.body.appendChild(outer);
+            const t0 = Date.now();
+            let link = null;
+            while (Date.now() - t0 < 8000 && !link) {
+              try {
+                const inner = frameDoc(outer) && frameDoc(outer).querySelector('iframe');
+                const d = inner && inner.contentDocument;
+                link = d && d.readyState === 'complete' ? d.getElementById('up') : null;
+              } catch {}
+              if (!link) await new Promise(r => setTimeout(r, 50));
+            }
+            if (!link) return 'no-link';
+            link.click();
+            return landed(outer, '/frame-plain');
+          });
+          // Forms honor target too: the result loads in the frame and this page
+          // stays. They used to replace THIS document whatever the target.
+          const targetForm = (name, method, action, field, value) => {
+            const form = document.createElement('form');
+            form.method = method; form.action = action; form.target = name;
+            const i = document.createElement('input'); i.name = field; i.value = value;
+            form.appendChild(i); document.body.appendChild(form);
+            return form;
+          };
+          await P('formTargetGet', async () => {
+            const f = namedFrame('ftg');
+            targetForm('ftg', 'get', '/frame-plain', 'q', 'one two').submit();
+            return landed(f, '/frame-plain');
+          });
+          await P('formTargetPost', async () => {
+            const f = namedFrame('ftp');
+            targetForm('ftp', 'post', '/post-echo', 'a', 'b c').submit();
+            return landed(f, '/post-echo');
+          });
+          // A popup's final document matches native; the launcher it used to run
+          // first is gone (raw while it redirected — see ERRATA item 27).
+          await P('popupRouted', async () => {
+            const w = window.open('/frame-plain', 'zp-popup-probe');
+            if (!w) return 'blocked';
+            const t0 = Date.now();
+            let title = '';
+            while (Date.now() - t0 < 8000 && title !== 'fp') {
+              try { title = w.document && w.document.readyState === 'complete' ? w.document.title : ''; } catch (e) { title = 'threw:' + e.name; break; }
+              await new Promise(r => setTimeout(r, 50));
+            }
+            let href = '', ev = '';
+            try { href = String(w.location.href); } catch (e) { href = 'threw:' + e.name; }
+            try { ev = String(w.eval('location.href')); } catch (e) { ev = 'threw:' + e.name; }
+            try { w.close(); } catch {}
+            return title + '|' + href + '|' + (leaked(ev) ? 'LEAK:' + ev : ev);
+          });
+          await P('baseTargetFrame', async () => {
+            const f = namedFrame('btf');
+            const b = document.createElement('base');
+            b.setAttribute('target', 'btf');
+            document.head.appendChild(b);
+            const a = document.createElement('a');
+            a.href = '/frame-dest'; a.textContent = 'go';
+            document.body.appendChild(a);
+            a.click();
+            b.remove();
+            return landed(f, '/frame-dest');
+          });
+          await P('namedOpen', async () => {
+            const f = namedFrame('tfn3');
+            const w = window.open('/frame-dest', 'tfn3');
+            return (await landed(f, '/frame-dest')) + '|' + (w === f.contentWindow);
+          });
+          // A frame sent by contentWindow.location boots its own membrane. The
+          // parent's next contentWindow read used to install ITS containment over
+          // it, so the child's code read the parent's URL from then on.
+          await P('childLocAssign', async () => {
+            const f = document.createElement('iframe');
+            document.body.appendChild(f);
+            window.__fhSaw = ''; window.__fhLate = '';
+            f.contentWindow.location.href = '/frame-html';
+            const t0 = Date.now();
+            while (!window.__fhLate && Date.now() - t0 < 8000) { void f.contentWindow; await new Promise(r => setTimeout(r, 50)); }
+            let seen = 'none';
+            try { seen = String(f.contentWindow.location.href); } catch (e) { seen = 'threw:' + e.name; }
+            return window.__fhSaw + '|' + window.__fhLate + '|' + seen;
+          });
+          // Escapes (2026-10-01): each of these child windows used to run page
+          // code RAW at the proxy origin — 'location' came back as the real
+          // /zp/p/ URL or a bare about:blank.
+          const plainFrame = async () => {
+            const f = document.createElement('iframe');
+            f.src = '/frame-plain';
+            document.body.appendChild(f);
+            const t0 = Date.now();
+            while (Date.now() - t0 < 8000 && !(frameDoc(f) && frameDoc(f).title === 'fp')) await new Promise(r => setTimeout(r, 50));
+            return f;
+          };
+          await P('routedPlainEval', async () => {
+            const f = await plainFrame();
+            const v = String(f.contentWindow.eval('location.href'));
+            return leaked(v) ? 'LEAK:' + v : v;
+          });
+          await P('staleBlankEval', async () => {
+            const f = await plainFrame();
+            f.src = 'about:blank';
+            const t0 = Date.now();
+            while (Date.now() - t0 < 8000 && (!frameDoc(f) || frameDoc(f).title === 'fp')) await new Promise(r => setTimeout(r, 50));
+            return String(f.contentWindow.eval('location.href'));
+          });
+          await P('pendingRouteEval', async () => {
+            const f = document.createElement('iframe');
+            f.src = '/frame-plain';
+            document.body.appendChild(f);
+            return String(f.contentWindow.eval('location.href'));
+          });
+          // ── explicit resource management: 'using' is a declaration the rewriter
+          // must keep intact (it was an unverified ERRATA row until 2026-10-01).
+          await P('usingDecl', () => { const log = []; { using r = { [Symbol.dispose]() { log.push('d'); } }; log.push('in'); } return log.join(','); });
+          await P('awaitUsing', async () => { const log = []; { await using r = { async [Symbol.asyncDispose]() { log.push('ad'); } }; log.push('in'); } return log.join(','); });
+          await P('usingEval', () => (0, eval)('{ const log = []; { using r = { [Symbol.dispose]() { log.push("d"); } }; log.push("in"); } log.join(","); }'));
+          await P('usingFunction', () => new Function('const log = []; { using r = { [Symbol.dispose]() { log.push("d"); } }; } return log.join(",");')());
+          await P('disposableStack', () => { const s = new DisposableStack(); const log = []; s.defer(() => log.push('x')); s.dispose(); return log.join(',') + '|' + s.disposed; });
+          await P('childSharedWorker', async () => {
+            const f = document.createElement('iframe');
+            f.srcdoc = '<scr' + 'ipt>try{ parent.__childSW = "wrote"; const w = new SharedWorker("/sw-shared.js?name=child"); w.port.onmessage = e => parent.__childSW = String(e.data); w.onerror = e => parent.__childSW = "err:" + e.message; }catch(e){ parent.__childSW = "threw:" + e.name; }</scr' + 'ipt>';
+            document.body.appendChild(f);
+            await new Promise(r => setTimeout(r, 4000));
+            const v = window.__childSW;
+            return v === undefined ? 'silent' : (leaked(String(v)) ? 'LEAK:' + v : 'clean:' + v);
+          });
+          // with(obj) scope resolution: own properties on obj take precedence over virtualized globals.
+          await P('withShadow', () => {
+            const fake = { href: 'fake-marker' };
+            let r; with ({ location: fake }) r = location;
+            return r === fake ? 'obj-first' : 'wrong:' + String(r && r.href);
+          });
+          await P('withDocIdentity', () => {
+            let r; with (document) r = (location === window.location);
+            return r ? 'identity-ok' : 'identity-broken';
+          });
+          await P('withDocWrite', () => {
+            // Assigning document.location = '#frag' forwards to location and updates only the hash.
+            let r;
+            with (document) { location = '#withfrag'; }
+            r = location.hash === '#withfrag' ? 'forwarded' : 'swallowed:' + location.hash;
+            return r;
+          });
+          await P('withEvalScope', () => {
+            // Direct eval inside with(obj) does not observe the with-object bindings (pinned divergence).
+            let r; with ({ location: 'WITHOBJ' }) r = eval('typeof location === "string" ? location : "virtual"');
+            return r;
+          });
+          // Scope resolution: local declarations shadow virtualized globals.
+          await P('scopeHoistVar', () => {
+            // Hoisted var location resolves to local undefined before initialization.
+            const f = function () { let x; try { x = location.href; var location; return 'read:' + x; } catch (e) { return 'threw:' + e.name; } };
+            return f();
+          });
+          await P('scopeTDZ', () => {
+            try { let r; { r = location.href; let location; } return 'read:' + r; } catch (e) { return 'threw:' + e.name; }
+          });
+          await P('scopeCatch', () => {
+            try { throw 42; } catch (location) { return 'bound:' + location; }
+          });
+          await P('scopeDestructParam', () => {
+            const f = function ({ location }) { return location; };
+            return f({ location: 'dp' }) === 'dp' ? 'bound' : 'leaked';
+          });
+          // Cross-script binding persistence for top-level let, var, const, and class.
+          await P('crossScriptLet', () => typeof ZXC7);
+          await P('crossScriptVar', () => typeof ZXC8 + ':' + ZXC8);
+          // Top-level let, const, and class bindings persist in the shared global lexical environment.
+          await P('crossScriptConst', () => ZXC9);
+          await P('crossScriptClass', () => typeof ZXC10);
+          await P('crossScriptLetWrite', () => { ZXC7 = 42; return ZXC7; });
+          await P('crossScriptConstWrite', () => { ZXC9 = 1; return 'no-throw'; });
+          await P('lexRedeclare', () => __surfaceErrs.filter(e => e.includes('has already been declared')).length);
+          // Direct eval reads bindings from the caller function scope.
+          await P('evalCallerScope', () => { const lc = 'LOCAL'; return eval('typeof lc === "string" ? lc : "global-only"'); });
+          // Direct eval caller scope parity.
+          await P('evalCallerWrite', () => { let w = 1; eval('w = 7'); return w; });
+          await P('evalCallerVar', () => { const g = function () { var v = 'VV'; return eval('v'); }; return g(); });
+          await P('evalCallerConst', () => { const g = function () { const c = 'C'; try { eval('c = 9'); return 'no-throw:' + c; } catch (e) { return e.name + ':' + c; } }; return g(); });
+          await P('evalThis', () => { const o = { m: function () { return eval('this === this.__zp_sentinel ? "obj" : (this.marker || "other")'); }, marker: 'OBJMARK', __zp_sentinel: null }; o.__zp_sentinel = o; return o.m(); });
+          await P('evalArgs', () => { const g = function () { return eval('arguments.length'); }; return g(1, 2, 3); });
+          await P('evalNonString', () => JSON.stringify([eval(42), eval(null), eval({}) instanceof Object, eval()]));
+          await P('evalVirtual', () => { const g = function () { const location = 'LOCALLOC'; return eval('location'); }; return g(); });
+          await P('evalVirtualGlobal', () => eval('typeof location === "string" ? location : (location && location.hostname)'));
+          // Indirect eval executes in global scope and must not read caller local bindings.
+          await P('evalIndirectNoScope', () => { const lc = 'LOCAL'; const e = eval; return e('typeof lc === "string" ? lc : "global-only"'); });
+          await P('evalOptionalNoScope', () => { const lc = 'LOCAL'; return eval?.('typeof lc === "string" ? lc : "global-only"'); });
+          await P('evalShadowed', () => { const g = function () { const eval = s => 'shadow:' + s; return eval('x'); }; return g(); });
+          // Sloppy-mode block-scoped and labeled function declarations follow strict
+          // lexical semantics under the rewriter (pinned divergence from Annex B).
+          await P('annexBSloppy', () => { const g = function () { if (1) { function location() { return 'fn'; } } return typeof location; }; return g(); });
+          await P('labeledFnDecl', () => { const g = function () { lbl: function location() {} return typeof location; }; return g(); });
+          // Sloppy direct eval hoists var declarations into the caller var environment.
+          await P('evalVarLocal', () => { const g = function () { eval('var history = 1'); return typeof history; }; return g(); });
+          // Strict-mode with statements are preserved by the rewriter so the engine
+          // throws a parse-time SyntaxError matching native behavior.
+          await P('strictWith', () => { try { new Function('"use strict"; with({}){}'); return 'no-error'; } catch (e) { return e.name; } });
+          // CSS stylesheet href deproxying and insertRule url() rewriting.
+          await P('sheetHref', () => {
+            const s = document.styleSheets[0];
+            return s ? String(s.href) : 'no-sheet';
+          });
+          await P('insertRuleUrl', async () => {
+            const sh = new CSSStyleSheet();
+            sh.replaceSync('#zpcssx{background:url(http://css-leak.example/a.png)}');
+            // Attach a matching element so the browser issues an actual fetch,
+            // verifying wire-level proxy routing rather than read-back alone.
+            //
+            const d = document.createElement('div'); d.id = 'zpcssx';
+            document.body.appendChild(d);
+            document.adoptedStyleSheets = [...document.adoptedStyleSheets, sh];
+            await new Promise(r => setTimeout(r, 300));
+            const css = sh.cssRules[0].cssText;
+            document.adoptedStyleSheets = document.adoptedStyleSheets.filter(s => s !== sh);
+            d.remove();
+            return css;
+          });
+          await P('styleAttrUrl', async () => {
+            const d = document.createElement('div');
+            d.style.cssText = 'background-image:url(http://css-leak.example/b.png)';
+            document.body.appendChild(d);
+            await new Promise(r => setTimeout(r, 200));
+            const got = d.style.backgroundImage;
+            d.remove();
+            return got;
+          });
+          // External scheme, modal dialog stub, and dynamic <base> sealing.
+          await P('mailtoNav', () => {
+            try { location.assign('mailto:probe@example.invalid'); return 'no-throw'; }
+            catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('dialogStubs', () => {
+            const a = alert('x'), c = confirm('x'), p = prompt('x', 'd');
+            return 'alert:' + a + '|confirm:' + c + '|prompt:' + p;
+          });
+          await P('webAuthn', async () => {
+            if (typeof PublicKeyCredential !== 'function' || !navigator.credentials) return 'absent';
+            try {
+              // Bound with Promise.race in case headless Chrome stalls on the authenticator prompt.
+              const r = await Promise.race([
+                navigator.credentials.create({ publicKey: {
+                  challenge: new Uint8Array(32), rp: { name: 'x' },
+                  user: { id: new Uint8Array(16), name: 'x', displayName: 'x' },
+                  pubKeyCredParams: [{ type: 'public-key', alg: -7 }]
+                }}).then(() => 'created').catch(e => 'e:' + (e && e.name || e)),
+                new Promise(res => setTimeout(() => res('pending'), 2500))
+              ]);
+              return r;
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('dynamicBase', () => {
+            const b = document.createElement('base');
+            b.href = 'http://evil-base.invalid/';
+            document.head.appendChild(b);
+            const r = document.baseURI;
+            b.remove();
+            return r;
+          });
+          // ── T3-2: identity/semantic parity ──
+          await P('locIdentity', () => location === document.location);
+          await P('optCallChain', () => String(({})?.location?.()) + '|' + String(null?.location?.()));
+          await P('deleteLoc', () => String(delete window.location) + '|' + String(delete location));
+          await P('newEval', () => { try { new eval(); return 'obj'; } catch (e) { return 'e:' + (e && e.name || e); } });
+          await P('anchorLiteral', () => {
+            const a = document.createElement('a');
+            a.setAttribute('href', '/rel-x');
+            return a.getAttribute('href');
+          });
+          // Fingerprint and residual surface probes.
+          await P('consoleString', () => String(location));
+          await P('perfNavEntry', () => {
+            const e = performance.getEntriesByType('navigation')[0];
+            return e ? e.name : 'none';
+          });
+          await P('realProps', () => [
+            typeof performance.memory === 'object' ? 'mem' : 'no-mem',
+            navigator.hardwareConcurrency, navigator.deviceMemory,
+            document.characterSet, document.lastModified.slice(-4)
+          ].join('|'));
+          await P('swRegs', async () => {
+            if (!navigator.serviceWorker) return 'no-sw';
+            const rs = await navigator.serviceWorker.getRegistrations();
+            return 'count:' + rs.length;
+          });
+          await P('registerPH', () => {
+            if (typeof navigator.registerProtocolHandler !== 'function') return 'absent';
+            try { navigator.registerProtocolHandler('web+zptest', 'http://localhost/x?u=%s'); return 'ok'; }
+            catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          // Same-origin virtual URLs pass validation and resolve silently without
+          // exposing the proxy origin in a browser protocol-handler prompt.
+          await P('registerPHSameOrigin', () => {
+            if (typeof navigator.registerProtocolHandler !== 'function') return 'absent';
+            try { navigator.registerProtocolHandler('web+zptest', location.origin + '/x?u=%s'); return 'ok'; }
+            catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          // ShadowRealm, CredentialsContainer, WebAssembly streaming, and Web Locks probes.
+          await P('shadowRealmEval', () => {
+            if (typeof ShadowRealm !== 'function') return 'absent';
+            try {
+              const r = new ShadowRealm();
+              // Verify whether ShadowRealm.prototype.evaluate can access virtual
+              // location without going through the rewriter.
+              const v = r.evaluate('typeof location');
+              return 'evaluated:' + v;
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('shadowRealmImport', async () => {
+            if (typeof ShadowRealm !== 'function') return 'absent';
+            try {
+              const r = new ShadowRealm();
+              const v = await Promise.race([
+                r.importValue('https://sr-leak.invalid/mod.js', 'x').then(() => 'imported').catch(e => 'e:' + (e && e.name || e)),
+                new Promise(res => setTimeout(() => res('timeout'), 2500))
+              ]);
+              return v;
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('credGet', async () => {
+            if (!navigator.credentials || typeof navigator.credentials.get !== 'function') return 'absent';
+            try {
+              const c = await Promise.race([
+                navigator.credentials.get({ password: true }),
+                new Promise(res => setTimeout(() => res('pending'), 2500))
+              ]);
+              return 'got:' + (c ? (c.type || 'cred') : 'null');
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('wasmStreamUrl', async () => {
+            if (typeof WebAssembly === 'undefined' || typeof WebAssembly.instantiateStreaming !== 'function') return 'absent';
+            try {
+              const v = await Promise.race([
+                WebAssembly.instantiateStreaming('https://wasm-leak.invalid/x.wasm').then(() => 'compiled').catch(e => 'e:' + (e && e.name || e)),
+                new Promise(res => setTimeout(() => res('timeout'), 2500))
+              ]);
+              return v;
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('navLocks', async () => {
+            if (!navigator.locks || typeof navigator.locks.request !== 'function') return 'absent';
+            try {
+              const r = await navigator.locks.request('zp-lock-probe', () => 'held');
+              return 'got:' + r;
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          // Virtualized Window and Navigator surface audit probes.
+          await P('secureCtx', () => String(self.isSecureContext));
+          await P('webkitURLAlias', () => typeof webkitURL === 'function' ? new webkitURL('/wk-page', location.href).href : 'absent:' + typeof webkitURL);
+          await P('webkitIDB', () => typeof webkitIndexedDB !== 'undefined' && webkitIndexedDB === indexedDB ? 'alias' : 'not-alias:' + typeof webkitIndexedDB);
+          await P('webkitFS', () => [typeof self.webkitRequestFileSystem, typeof self.webkitResolveLocalFileSystemURL, typeof self.webkitPersistentStorage, typeof self.webkitTemporaryStorage].join('|'));
+          await P('fetchLaterType', () => typeof self.fetchLater);
+          await P('fetchLaterCall', async () => {
+            if (typeof self.fetchLater !== 'function') return 'absent';
+            try {
+              const r = await self.fetchLater('/compat-echo', { method: 'GET' });
+              return 'activated:' + String(r && r.activated);
+            } catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('opfsName', async () => {
+            if (!navigator.storage || typeof navigator.storage.getDirectory !== 'function') return 'absent';
+            const d = await navigator.storage.getDirectory();
+            return 'name:' + d.name;
+          });
+          await P('customEl', async () => {
+            if (typeof customElements === 'undefined') return 'absent';
+            class XProbeEl extends HTMLElement {}
+            customElements.define('x-probe-el', XProbeEl);
+            const el = document.createElement('x-probe-el');
+            document.body.appendChild(el);
+            const found = document.querySelector('x-probe-el');
+            const sameCtor = customElements.get('x-probe-el') === XProbeEl;
+            const upgraded = el instanceof XProbeEl;
+            const names = el.localName + '|' + el.tagName;
+            const byTag = document.getElementsByTagName('x-probe-el').length;
+            el.remove();
+            return 'ctor:' + sameCtor + '|up:' + upgraded + '|names:' + names + '|qs:' + (found === el) + '|tag:' + byTag;
+          });
+          // Custom element upgrade of parser-created elements: elements queried
+          // before customElements.define must upgrade in place (preserving node
+          // identity) and match tag-name selectors in closest(), matches(), and CSS.
+          //
+          await P('customElUpgrade', async () => {
+            if (typeof customElements === 'undefined') return 'absent';
+            const host = document.createElement('div');
+            host.innerHTML = '<style>x-cat-el{display:block;width:7px}</style><x-cat-el><scr' + 'ipt type="application/json" data-target="x-cat-el.embeddedData">{"ok":1}</scr' + 'ipt></x-cat-el>';
+            document.body.appendChild(host);
+            const pre = host.querySelector('x-cat-el');
+            let target = 'none';
+            class XCatEl extends HTMLElement {
+              connectedCallback() {
+                const tag = this.tagName.toLowerCase();
+                for (const t of this.querySelectorAll('[data-target~="' + tag + '.embeddedData"]')) if (t.closest(tag) === this) { target = t.textContent; break; }
+              }
+            }
+            customElements.define('x-cat-el', XCatEl);
+            const now = host.querySelector('x-cat-el');
+            const r = 'same:' + (pre === now) + '|up:' + (pre instanceof XCatEl) + '|target:' + target + '|matches:' + now.matches('x-cat-el') + '|w:' + getComputedStyle(now).width;
+            host.remove();
+            return r;
+          });
+          await P('permGeo', async () => {
+            if (!navigator.permissions || typeof navigator.permissions.query !== 'function') return 'absent';
+            try { const s = await navigator.permissions.query({ name: 'geolocation' }); return 'state:' + s.state; }
+            catch (e) { return 'e:' + (e && e.name || e); }
+          });
+          await P('paSurfaces', async () => [
+            typeof self.sharedStorage,
+            // document.browsingTopics resolves to an empty array without throwing.
+            typeof document.browsingTopics === 'function' ? 'fn:' + JSON.stringify(await document.browsingTopics()) : typeof document.browsingTopics,
+            typeof self.runAdAuction,
+            typeof self.joinAdInterestGroup,
+            typeof self.privateToken,
+            typeof self.queryLocalFonts === 'function' ? 'fn-gated' : typeof self.queryLocalFonts
+          ].join('|'));
+          await P('setHTMLHook', () => {
+            // Default Sanitizer strips <img>, so test via <a href> where the
+            // .href getter resolves against the virtual base URL.
+            if (typeof document.createElement('div').setHTML !== 'function') return 'absent';
+            const d = document.createElement('div');
+            d.setHTML('<a href="/set-html-probe.png">x</a>');
+            const a = d.querySelector('a');
+            return a ? String(a.href) : 'no-a';
+          });
+          await P('parseHTMLUnsafeHook', () => {
+            if (typeof Document.parseHTMLUnsafe !== 'function') return 'absent';
+            const doc2 = Document.parseHTMLUnsafe('<a href="/parse-unsafe.png">x</a>');
+            const a = doc2.querySelector('a');
+            return a ? String(a.href) : 'no-a';
+          });
+          await P('getHTMLClean', () => {
+            const d = document.createElement('div');
+            const a = document.createElement('a');
+            a.setAttribute('href', '/get-html-x');
+            d.appendChild(a);
+            if (typeof d.getHTML !== 'function') return 'absent';
+            const ser = d.getHTML();
+            return leaked(ser) ? 'LEAK:' + ser : 'clean:' + ser;
+          });
+          out.done = true;
+        })().catch(e => { (window.__surfaceProbes = window.__surfaceProbes || {}).__fatal = String(e && (e.stack || e)); });
+      <\/script>
+      <script>let ZXC7 = 99; window.__redecl1 = true;<\/script>
+      <script>var ZXC9 = 1; window.__redecl2 = true;<\/script>
+      <script type="module">
+        (window.__surfaceProbes = window.__surfaceProbes || {}).moduleRan = 'v:yes';
+        try { const m = await import('x-mod'); window.__surfaceProbes.importmapBare = 'v:' + m.m + '|' + m.meta; }
+        catch (e) { window.__surfaceProbes.importmapBare = 'threw:' + (e && e.name || e); }
+        try { window.__surfaceProbes.importMetaResolve = 'v:' + String(import.meta.resolve('./x')); }
+        catch (e) { window.__surfaceProbes.importMetaResolve = 'threw:' + (e && e.name || e) + ':' + String(e && e.message || '').slice(0, 80); }
+        window.__surfaceProbes.moduleDone = true;
+      <\/script>
+      </body>`);
+      return;
+    }
+    if (url.pathname === '/err-doc') {
+      res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>err</title><body><script>window.__errDoc = String(location.href);<\/script></body>`);
+      return;
+    }
+    if (url.pathname === '/trunc-doc') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>trunc</title><body><script>window.__truncDoc = String(location.href);<\/script><div>`);
+      return;
+    }
+    if (url.pathname === '/sw-shared.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'no-store' });
+      res.end(`self.onconnect = e => { e.ports[0].postMessage('sw:' + self.name + ':' + self.location.href); };`);
+      return;
+    }
+    if (url.pathname === '/cross-origin-location-probe') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Cross-origin Location</title><script>
+        let read;
+        try { read = top.location.href; } catch (error) { read = error.name; }
+        parent.postMessage({ type: 'cross-origin-location', read, replace: typeof top.location.replace }, '*');
+      <\/script>`);
+      return;
+    }
+    if (url.pathname === '/srcdoc-probe') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`<!doctype html><title>Srcdoc Probe</title><button id="navigate">Navigate top</button><script>
+        const child = document.createElement('iframe');
+        window.__srcdocProgress = [];
+        window.addEventListener('message', event => {
+          if (event.data && event.data.type === 'srcdoc-ready') window.__srcdocProbe = event.data;
+          if (event.data && event.data.type === 'srcdoc-navigation') window.__srcdocProgress.push(event.data);
+        });
+        child.srcdoc = ${JSON.stringify(`<script>
+          parent.postMessage({ type: 'srcdoc-ready', href: top.location.href, origin: top.location.origin }, '*');
+          window.addEventListener('message', event => {
+            if (event.data !== 'navigate-top') return;
+            parent.postMessage({ type: 'srcdoc-navigation', stage: 'received' }, '*');
+            try {
+              top.location.href = 'http://127.0.0.1:${server.address().port}/next';
+              parent.postMessage({ type: 'srcdoc-navigation', stage: 'requested' }, '*');
+            } catch (error) {
+              parent.postMessage({ type: 'srcdoc-navigation', stage: 'error', error: error.stack || String(error) }, '*');
+            }
+          });
+        </script>`).replace(/</g, '\\u003c')};
+        document.body.appendChild(child);
+        document.querySelector('#navigate').addEventListener('click', () => {
+          window.__srcdocSent = true;
+          child.contentWindow.postMessage('navigate-top', '*');
+        });
+      </script>`);
+      return;
+    }
+    if (url.pathname === '/rewrite-fixture.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(`(() => {
+        const NativeWebSocket = window.WebSocket;
+        window.__rewriteAdvanced = { initialHref: window.location.href, constructorSource: NativeWebSocket.toString() };
+        window.__runFragmentProbe = async () => {
+          delete window.__rangeFragmentResult;
+          const range = document.createRange();
+          range.selectNodeContents(document.body);
+          const fragment = range.createContextualFragment(${JSON.stringify(`<script>
+            window.__rangeFragmentResult = fetch(new URL('/fragment-echo?href=' + encodeURIComponent(location.href), location.href))
+              .then(response => response.json())
+              .then(echo => ({ href: location.href, origin: location.origin, echo }));
+          </script>`)});
+          const beforeInsertion = window.__rangeFragmentResult === undefined;
+          document.body.appendChild(fragment);
+          return { beforeInsertion, result: await window.__rangeFragmentResult };
+        };
+        location.href += '#compound';
+        window.location.hash += '-tail';
+        window.__rewriteAdvanced.compoundHref = location.href;
+        window.__rewriteAdvanced.compoundHash = location.hash;
+        const ws = new NativeWebSocket('/ws', ['zp-rewrite']);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => ws.send('rewrite-script');
+        ws.onmessage = ev => {
+          window.__rewriteAdvanced.wsURL = ws.url;
+          window.__rewriteAdvanced.wsProtocol = ws.protocol;
+          window.__rewriteAdvanced.wsMessage = String(ev.data);
+          ws.close(1000, 'done');
+        };
+        ws.onerror = () => { window.__rewriteAdvanced.wsError = true; };
+        function JQueryLike() { return { length: 0 }; }
+        JQueryLike.prototype = {
+          constructor: JQueryLike,
+          pushStack() { return this.constructor(); }
+        };
+        window.__rewriteAdvanced.jqueryConstructorLength = Object.create(JQueryLike.prototype).pushStack().length;
+        try {
+          window.__rewriteAdvanced.constructorEscapeHref = ({}).constructor.constructor('return location.href')();
+        } catch (err) {
+          window.__rewriteAdvanced.constructorEscapeHref = 'error:' + (err && err.message || String(err));
+        }
+      })();`);
+      return;
+    }
+    if (url.pathname === '/set-cookie') {
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Set-Cookie': 'target_server=from-target; Path=/; SameSite=Lax',
+      });
+      res.end('set-cookie-ok');
+      return;
+    }
+    if (url.pathname === '/cookie-echo') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(req.headers.cookie || '');
+      return;
+    }
+    if (url.pathname === '/stream') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.write('chunk-one\n');
+      setTimeout(() => res.end('chunk-two\n'), 600);
+      return;
+    }
+    if (url.pathname === '/stream-trailers') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', Trailer: 'X-Stream-End' });
+      res.write('payload');
+      res.addTrailers({ 'X-Stream-End': 'yes' });
+      res.end();
+      return;
+    }
+    if (url.pathname === '/stream-bodyless') {
+      const status = Number(url.searchParams.get('status') || 200);
+      res.writeHead(status, status === 204 ? {} : { 'Content-Length': '123' });
+      res.end();
+      return;
+    }
+    if (url.pathname === '/stream-truncated') {
+      req.socket.end('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort');
+      return;
+    }
+    if (url.pathname === '/stream-gzip-truncated') {
+      const compressed = gzipSync('gzip-payload');
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Encoding': 'gzip' });
+      res.end(compressed.subarray(0, compressed.length - 4));
+      return;
+    }
+    if (url.pathname === '/stream-cancel') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.write('first');
+      req.socket.once('close', () => requests.push({ url: '/stream-cancel', canceled: true }));
+      return;
+    }
+    if (url.pathname === '/sse') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
+      res.end('data: sse-ok\n\n');
+      return;
+    }
+    if (url.pathname === '/form-echo') {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        const kind = url.searchParams.get('kind') || '';
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(`<!doctype html><html><head><title>Form Echo ${kind}</title></head><body>
+          <main id="form-result" data-method="${req.method}" data-kind="${kind}" data-content-type="${req.headers['content-type'] || ''}">
+            <pre id="form-body">${body.replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]))}</pre>
+            <a id="next" href="/next">Next page</a>
+          </main>
+          <script>window.__formEcho=${JSON.stringify({ kind, method: req.method, contentType: req.headers['content-type'] || '', body })};</script>
+        </body></html>`);
+      });
+      return;
+    }
+    if (url.pathname === '/post-echo') {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(Buffer.concat(chunks).toString('utf8'));
+      });
+      return;
+    }
+    if (url.pathname === '/redirect307') {
+      res.writeHead(307, { 'Location': '/post-echo', 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('not found');
+  });
+  server.on('clientError', (err, socket) => {
+    if (!socket.destroyed) {
+      if (isBenignSocketError(err)) socket.destroy();
+      else socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    }
+  });
+  server.on('upgrade', (req, socket) => handleWebSocketUpgrade(req, socket, requests));
+  return server;
+}
+
+function handleWebSocketUpgrade(req, socket, requests) {
+  requests.push({ url: req.url, method: req.method, host: req.headers.host || '', userAgent: req.headers['user-agent'] || '', origin: req.headers.origin || '', cookie: req.headers.cookie || '', protocol: req.headers['sec-websocket-protocol'] || '', upgrade: true });
+  const url = new URL(req.url, 'http://target.local');
+  if (url.pathname !== '/ws') {
+    socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const key = req.headers['sec-websocket-key'];
+  if (!key) {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  const requestedProtocol = String(req.headers['sec-websocket-protocol'] || '').split(',').map(s => s.trim()).filter(Boolean)[0] || '';
+  ignoreBenignSocketErrors(socket);
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + (requestedProtocol ? '\r\nSec-WebSocket-Protocol: ' + requestedProtocol : '') + '\r\n\r\n');
+  const silentClose = url.searchParams.get('silent-close') === '1';
+  if (silentClose) {
+    // Upgraded HTTP sockets allow half-open TCP. Receiving FIN alone cannot
+    // emit close until this peer also ends its writable half.
+    socket.once('end', () => {
+      requests.push({ url: req.url, socketEnded: true, at: Date.now() });
+      socket.end();
+    });
+    socket.once('close', () => requests.push({ url: req.url, socketClosed: true, at: Date.now() }));
+  }
+  let buffered = Buffer.alloc(0);
+  socket.on('data', chunk => {
+    buffered = Buffer.concat([buffered, chunk]);
+    while (buffered.length >= 2) {
+      const frame = readWebSocketFrame(buffered);
+      if (!frame) break;
+      buffered = buffered.subarray(frame.consumed);
+      if (frame.opcode === 0x8) {
+        if (silentClose) {
+          requests.push({ url: req.url, closeCode: frame.payload.readUInt16BE(0), closeReason: frame.payload.subarray(2).toString('utf8'), at: Date.now() });
+          return;
+        }
+        writeWebSocketFrame(socket, 0x8, frame.payload);
+        socket.end();
+        return;
+      }
+      if (frame.opcode === 0x9) {
+        writeWebSocketFrame(socket, 0xA, frame.payload);
+        continue;
+      }
+      if (frame.opcode === 0x1) writeWebSocketFrame(socket, 0x1, Buffer.from('echo:' + frame.payload.toString('utf8')));
+      if (frame.opcode === 0x2) writeWebSocketFrame(socket, 0x2, frame.payload);
+    }
+  });
+}
+
+function readWebSocketFrame(buffer) {
+  const b0 = buffer[0];
+  const b1 = buffer[1];
+  const masked = (b1 & 0x80) !== 0;
+  let length = b1 & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < offset + 2) return null;
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) return null;
+    length = Number(buffer.readBigUInt64BE(offset));
+    offset += 8;
+  }
+  const maskOffset = offset;
+  if (masked) offset += 4;
+  if (buffer.length < offset + length) return null;
+  const payload = Buffer.from(buffer.subarray(offset, offset + length));
+  if (masked) {
+    const mask = buffer.subarray(maskOffset, maskOffset + 4);
+    for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+  }
+  return { opcode: b0 & 0x0f, payload, consumed: offset + length };
+}
+
+function writeWebSocketFrame(socket, opcode, data = Buffer.alloc(0)) {
+  const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  let header;
+  if (payload.length < 126) {
+    header = Buffer.from([0x80 | opcode, payload.length]);
+  } else if (payload.length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  }
+  socket.write(Buffer.concat([header, payload]));
+}
+
+function createSocks5Server(resolveHost) {
+  return net.createServer(socket => {
+    handleSocks(socket, resolveHost).catch(() => socket.destroy());
+  });
+}
+
+async function handleSocks(socket, resolveHost) {
+  socket.on('error', err => { if (!isBenignSocketError(err)) socket.destroy(err); });
+  const reader = new SocketReader(socket);
+  const greeting = await reader.read(2);
+  assert.equal(greeting[0], 0x05);
+  const methods = await reader.read(greeting[1]);
+  const method = methods.includes(0x02) ? 0x02 : 0x00;
+  socket.write(Buffer.from([0x05, method]));
+  if (method === 0x02) {
+    const authHead = await reader.read(2);
+    assert.equal(authHead[0], 0x01);
+    await reader.read(authHead[1]);
+    const passLen = await reader.read(1);
+    await reader.read(passLen[0]);
+    socket.write(Buffer.from([0x01, 0x00]));
+  }
+  const reqHead = await reader.read(4);
+  assert.equal(reqHead[0], 0x05);
+  assert.equal(reqHead[1], 0x01);
+  let host;
+  if (reqHead[3] === 0x03) {
+    const len = await reader.read(1);
+    host = (await reader.read(len[0])).toString('utf8');
+  } else {
+    throw new Error(`unsupported SOCKS address type ${reqHead[3]}`);
+  }
+  const portBuf = await reader.read(2);
+  const port = portBuf.readUInt16BE(0);
+  const upstream = net.connect(resolveHost(host, port));
+  await new Promise((resolve, reject) => {
+    upstream.once('connect', resolve);
+    upstream.once('error', reject);
+  });
+  upstream.on('error', err => {
+    if (!isBenignSocketError(err)) socket.destroy(err);
+  });
+  socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+  if (reader.buf.length) upstream.write(reader.buf);
+  socket.pipe(upstream);
+  upstream.pipe(socket);
+}
+
+// ZP_E2E_ONLY=<regex> runs only the subtests whose names match (a development aid; unset runs everything).
+// ZP_E2E_RANGE=<from>-<to> additionally runs the subtests at those positions, to find which earlier test changes a later one.
+let subtestOrdinal = 0;
+function onlySubtests(t) {
+  const only = process.env.ZP_E2E_ONLY ? new RegExp(process.env.ZP_E2E_ONLY, 'i') : null;
+  if (!only) return;
+  const range = /^(d+)-(d+)$/.exec(process.env.ZP_E2E_RANGE || '');
+  const run = t.test.bind(t);
+  t.test = (name, ...rest) => {
+    const at = subtestOrdinal++;
+    if (process.env.ZP_E2E_LIST === '1') console.log('ordinal', at, String(name).slice(0, 80));
+    const inRange = range && at >= Number(range[1]) && at <= Number(range[2]);
+    return typeof name === 'string' && !only.test(name) && !inRange && !/E1 escape matrix/.test(name) ? Promise.resolve() : run(name, ...rest);
+  };
+}
+test('built proxy browser contracts and E1 escape matrix', { timeout: 900000, concurrency: false }, async t => {
+  onlySubtests(t);
+  const prebuilt = process.env.ZP_E2E_PREBUILT === '1' || Boolean(process.env.CI);
+  const temp = prebuilt ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'zeroproxy-e2e-'));
+  const buildOut = path.resolve(process.env.ZP_E2E_DIST || (prebuilt ? 'dist' : path.join(temp, 'dist')));
+  const artifacts = path.resolve(process.env.ZP_E2E_ARTIFACTS || 'artifacts/e2e');
+  fs.mkdirSync(artifacts, { recursive: true });
+  let browser;
+  let proxy;
+  let proxyLog = '';
+  const browserLog = [];
+  const wireRequests = [];
+  const responseHeaders = new Map();
+  const sessions = new Map();
+  const saveArtifacts = async (name, page) => {
+    if (page && !page.isClosed()) {
+      try { await page.screenshot({ path: path.join(artifacts, name + '.png') }); }
+      catch (error) { browserLog.push('screenshot: ' + error.message); }
+    }
+    fs.writeFileSync(path.join(artifacts, 'browser.log'), browserLog.join('\n'));
+    fs.writeFileSync(path.join(artifacts, 'server.log'), proxyLog);
+    fs.writeFileSync(path.join(artifacts, 'browser-network.json'), JSON.stringify(wireRequests, null, 2));
+  };
+  t.after(async () => {
+    try { await saveArtifacts('final', browser && (await browser.pages())[0]); }
+    finally {
+      try { if (browser) await browser.close(); }
+      finally {
+        if (proxy && proxy.pid && proxy.exitCode === null && proxy.signalCode === null) {
+          await new Promise(resolve => {
+            const timer = setTimeout(() => proxy.kill('SIGKILL'), 3000);
+            proxy.once('exit', () => { clearTimeout(timer); resolve(); });
+            proxy.kill('SIGTERM');
+          });
+        }
+        if (temp) fs.rmSync(temp, { recursive: true, force: true });
+      }
+    }
+  });
+  if (!prebuilt) run('node', ['scripts/build.mjs', '--out', buildOut]);
+  const serverPath = path.join(buildOut, process.platform === 'win32' ? 'zeroproxy-server.exe' : 'zeroproxy-server');
+  const webPath = path.join(buildOut, 'web');
+  for (const file of [serverPath, ...['index.html', 'sw.js', 'runtime-prelude.js', 'worker-prelude.js', 'zp-page-bundle.js', 'Asset/zp-bundle.js', 'Asset/zp-bundle.wasm', 'Asset/zp-kernel.js', 'Asset/zp-kernel.wasm', 'Asset/zp-rt.wasm'].map(name => path.join(webPath, name))]) {
+    assert.ok(fs.existsSync(file) && fs.statSync(file).size > 0, `required built artifact missing: ${file}; prebuilt mode never rebuilds`);
+  }
+
+  const requests = [];
+  const pendingResponses = new Map();
+  const target = createTargetServer(requests, pendingResponses);
+  const targetPort = await listen(target);
+  t.after(() => closeServer(target));
+  t.after(() => fs.writeFileSync(path.join(artifacts, 'upstream.json'), JSON.stringify(requests, null, 2)));
+  const targetHost = 'localhost';
+
+  const proxyPort = await new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.listen(0, '127.0.0.1', () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+    s.once('error', reject);
+  });
+  proxy = childProcess.spawn(serverPath, ['-addr', `127.0.0.1:${proxyPort}`, '-web', webPath, '-socks', 'internal'], {
+    cwd: path.resolve(__dirname, '../..'),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  proxy.stdout.on('data', chunk => { proxyLog += chunk; });
+  proxy.stderr.on('data', chunk => { proxyLog += chunk; });
+  proxy.on('error', error => { proxyLog += '\nspawn: ' + error.message; });
+  await waitForHTTP(`http://127.0.0.1:${proxyPort}/`).catch(err => {
+    throw new Error(`${err.message}\nproxy output:\n${proxyLog}`);
+  });
+
+  browser = await puppeteer.launch({
+    headless: true,
+    protocolTimeout: 30000,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--host-resolver-rules=MAP proxy.localhost 127.0.0.1'],
+  });
+  const observeTarget = target => {
+    if (sessions.has(target)) return sessions.get(target);
+    const pending = (async () => {
+      if (!['page', 'service_worker', 'shared_worker', 'worker'].includes(target.type())) return;
+      const session = await target.createCDPSession();
+      const reqUrls = new Map();
+      session.on('Network.requestWillBeSent', event => { reqUrls.set(event.requestId, event.request.url); wireRequests.push(event.request.url); });
+      session.on('Network.responseReceived', event => { if (event.response && event.response.headers) responseHeaders.set(event.response.url, event.response.headers); });
+      session.on('Network.webSocketCreated', event => wireRequests.push(event.url));
+      session.on('Network.loadingFailed', event => browserLog.push(`${target.type()} netfail ${reqUrls.get(event.requestId) || event.requestId} ${event.errorText} blocked=${event.blockedReason || ''} cors=${event.corsErrorStatus ? JSON.stringify(event.corsErrorStatus) : ''}`));
+      session.on('Runtime.consoleAPICalled', event => browserLog.push(`${target.type()} ${event.type}: ${event.args.map(arg => arg.value ?? arg.description ?? '').join(' ')}`));
+      session.on('Runtime.exceptionThrown', event => browserLog.push(JSON.stringify(event.exceptionDetails)));
+      await session.send('Network.enable');
+      await session.send('Runtime.enable');
+    })();
+    sessions.set(target, pending);
+    return pending;
+  };
+  browser.on('targetcreated', target => { observeTarget(target).catch(error => browserLog.push('CDP: ' + error.message)); });
+  await Promise.all(browser.targets().map(observeTarget));
+  const proxyOrigin = `http://proxy.localhost:${proxyPort}`;
+  await t.test('target-authored request compatibility', async t => {
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
+    try {
+      await observeTarget(page.target());
+      await page.goto(proxyOrigin + '/', { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => navigator.serviceWorker?.controller && document.querySelector('#status')?.textContent === 'Ready.', { timeout: 30000 });
+      await Promise.all(browser.targets().map(observeTarget));
+      await page.type('#url', `http://${targetHost}:${targetPort}/compat/index`);
+      await page.click('button');
+      await page.waitForSelector('#methods', { visible: true, timeout: 30000 });
+      await runRequestContract(t, page, `http://${targetHost}:${targetPort}`, requests, wireRequests, proxyOrigin, saveArtifacts);
+    } finally {
+      await saveArtifacts('request-final', page);
+      await context.close();
+    }
+  });
+  await t.test('rewritten module, receiver and transport regressions', { timeout: 150000 }, async t => {
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
+    const targetOrigin = `http://${targetHost}:${targetPort}`;
+    const assertPublicHeaders = headers => {
+      assert.equal(headers['x-zp-body-stream'], undefined);
+      assert.equal(headers['x-zp-stream'], undefined);
+      assert.equal(headers['x-fixture'], 'preserved');
+    };
+    try {
+      await observeTarget(page.target());
+      await page.goto(proxyOrigin + '/', { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(() => navigator.serviceWorker?.controller && document.querySelector('#status')?.textContent === 'Ready.', { timeout: 30000 });
+      await page.type('#url', targetOrigin + '/regressions');
+      await page.click('button');
+      await page.waitForSelector('#regressions', { timeout: 30000 });
+
+      await t.test('static imports and inserted modules share one evaluation across history changes', async () => {
+        await page.waitForFunction(() => window.__moduleIdentityFixture, { timeout: 30000 });
+        const result = await page.evaluate(() => window.__moduleIdentityFixture);
+        const initial = { evaluations: 1, evaluationCount: 1, sameSingleton: true, href: targetOrigin + '/regressions' };
+        const changed = { ...initial, href: targetOrigin + '/regressions/changed?view=2' };
+        assert.deepEqual(result, { initial, dynamic: initial, afterHistory: changed, repeated: changed, classic: [initial.href, changed.href] });
+        const scripts = wireRequests.map(value => new URL(value)).filter(url => url.pathname === '/zp/api/script');
+        const dependencyURLs = scripts.filter(url => url.searchParams.get('u') === targetOrigin + '/module-singleton.js');
+        assert.deepEqual([...new Set(dependencyURLs.map(url => url.href))], [proxyOrigin + '/zp/api/script?u=' + encodeURIComponent(targetOrigin + '/module-singleton.js') + '&kind=module']);
+        assert.equal(requests.filter(request => request.url === '/module-singleton.js').length, 1);
+        const classicURLs = scripts.filter(url => url.searchParams.get('u') === targetOrigin + '/classic-ref.js');
+        assert.deepEqual([...new Set(classicURLs.map(url => url.searchParams.get('ref')))], [initial.href, changed.href]);
+      });
+
+      await t.test('native Window receivers work without binding page functions or constructors', async () => {
+        await page.waitForFunction(() => window.__receiverFixture, { timeout: 30000 });
+        assert.deepEqual(await page.evaluate(() => window.__receiverFixture), {
+          clonedValue: 7, cycle: true, independent: true, order: ['sync', 'microtask'],
+          pageFunctionSame: true, pageReceiver: 'custom-receiver', constructorSame: true,
+          constructed: true, constructedValue: 11, nativeURL: targetOrigin + '/receiver-child', nativeInstance: true,
+        });
+      });
+
+      await t.test('silent peer close deadline closes the upstream socket exactly once', { timeout: 70000 }, async () => {
+        // Invoke target-authored, rewritten code; polling never holds a CDP call
+        // across the real 30-second SW deadline or changes the production timer.
+        await page.evaluate(() => window.__startSilentCloseFixture());
+        const deadline = Date.now() + 60000;
+        let result;
+        do {
+          result = await page.evaluate(() => window.__silentCloseFixture);
+          if (result.closes.length && requests.some(request => request.url === '/ws?silent-close=1' && request.socketClosed)) break;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } while (Date.now() < deadline);
+        assert.equal(result.opened, true);
+        assert.equal(result.closingState, 2);
+        assert.equal(result.closes.length, 1, JSON.stringify(result));
+        const { elapsed, ...closed } = result.closes[0];
+        assert.deepEqual(closed, { code: 1006, reason: '', wasClean: false, readyState: 3 });
+        assert.ok(elapsed >= 29000 && elapsed < 60000, `close deadline elapsed ${elapsed}ms`);
+        const peerCloses = requests.filter(request => request.url === '/ws?silent-close=1' && request.closeCode);
+        assert.equal(peerCloses.length, 1);
+        assert.equal(peerCloses[0].closeCode, 3001);
+        assert.equal(peerCloses[0].closeReason, 'unanswered');
+        const peerEOFs = requests.filter(request => request.url === '/ws?silent-close=1' && request.socketEnded);
+        assert.equal(peerEOFs.length, 1, 'the proxy must deliver TCP EOF before the fixture closes its half');
+        assert.ok(peerEOFs[0].at - peerCloses[0].at >= 29000, 'upstream EOF arrived before the close-handshake deadline');
+        const physicalCloses = requests.filter(request => request.url === '/ws?silent-close=1' && request.socketClosed);
+        assert.equal(physicalCloses.length, 1, 'deadline must close the upstream socket, not only the page facade');
+        assert.ok(physicalCloses[0].at - peerCloses[0].at >= 29000, 'upstream closed before allowing the peer its close-handshake deadline');
+        await new Promise(resolve => setTimeout(resolve, 250));
+        assert.equal((await page.evaluate(() => window.__silentCloseFixture.closes)).length, 1);
+      });
+
+      await t.test('hostile markers cannot escape a buffered non-HTML response', async () => {
+        await page.evaluate(() => window.__startReservedFetchFixture('buffered'));
+        await page.waitForFunction(() => window.__reservedFetchFixture.done || window.__reservedFetchFixture.error, { timeout: 30000 });
+        const result = await page.evaluate(() => window.__reservedFetchFixture);
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 200);
+        assert.equal(result.done, true);
+        assert.equal(result.body, 'buffered-complete\n');
+        assertPublicHeaders(Object.fromEntries(result.headers));
+      });
+
+      await t.test('hostile markers preserve progressive raw bytes and terminal EOF', async () => {
+        try {
+          await page.evaluate(() => window.__startReservedFetchFixture('raw'));
+          await page.waitForFunction(() => window.__reservedFetchFixture.body.endsWith('</p>\n') || window.__reservedFetchFixture.error, { timeout: 30000 });
+          const first = await page.evaluate(() => window.__reservedFetchFixture);
+          assert.equal(first.error, undefined);
+          assert.equal(first.status, 200);
+          assert.equal(first.body, '<!doctype html><p>raw-first</p>\n');
+          assert.equal(first.done, false, 'first bytes must arrive while the upstream body is still open');
+          assertPublicHeaders(Object.fromEntries(first.headers));
+          assert.ok(pendingResponses.has('raw'));
+          pendingResponses.get('raw').end('raw-last\n');
+          await page.waitForFunction(() => window.__reservedFetchFixture.done || window.__reservedFetchFixture.error, { timeout: 30000 });
+          const finished = await page.evaluate(() => window.__reservedFetchFixture);
+          assert.equal(finished.error, undefined);
+          assert.equal(finished.done, true);
+          assert.equal(finished.body, '<!doctype html><p>raw-first</p>\nraw-last\n');
+        } finally {
+          pendingResponses.get('raw')?.destroy();
+        }
+      });
+
+      await t.test('hostile markers do not turn a truncated body into successful EOF', async () => {
+        await page.evaluate(() => window.__startReservedFetchFixture('truncated'));
+        await page.waitForFunction(() => window.__reservedFetchFixture.done || window.__reservedFetchFixture.error, { timeout: 30000 });
+        const result = await page.evaluate(() => window.__reservedFetchFixture);
+        assert.equal(result.done, false);
+        assert.ok(result.error, 'truncated body must reject its reader');
+      });
+
+      await t.test('hostile markers preserve progressive HTML rendering and completion', async () => {
+        try {
+          const responsePromise = page.waitForResponse(response => response.request().isNavigationRequest() && response.frame()?.parentFrame() === page.mainFrame(), { timeout: 30000 });
+          await page.evaluate(() => window.__startReservedHTMLFixture());
+          const response = await responsePromise;
+          assert.equal(response.status(), 200);
+          assertPublicHeaders(response.headers());
+          await page.waitForFunction(() => {
+            const first = document.querySelector('#reserved-frame')?.contentDocument?.getElementById('reserved-first');
+            return first?.textContent === 'html-first' && first.getBoundingClientRect().height > 0;
+          }, { timeout: 30000 });
+          const first = await page.evaluate(() => {
+            const doc = document.querySelector('#reserved-frame').contentDocument;
+            return { last: doc.getElementById('reserved-last')?.textContent || null, readyState: doc.readyState };
+          });
+          assert.deepEqual(first, { last: null, readyState: 'loading' });
+          assert.ok(pendingResponses.has('html'));
+          pendingResponses.get('html').end('<p id="reserved-last">html-last</p></body></html>');
+          await page.waitForFunction(() => document.querySelector('#reserved-frame')?.contentDocument?.readyState === 'complete', { timeout: 30000 });
+          assert.deepEqual(await page.evaluate(() => {
+            const doc = document.querySelector('#reserved-frame').contentDocument;
+            return [doc.getElementById('reserved-first')?.textContent, doc.getElementById('reserved-last')?.textContent];
+          }), ['html-first', 'html-last']);
+        } finally {
+          pendingResponses.get('html')?.destroy();
+        }
+      });
+    } finally {
+      await saveArtifacts('compatibility-regressions', page);
+      await context.close();
+    }
+  });
+  // High timeout budget to avoid false timeouts when native-vs-proxied tests launch multiple browser instances under load.
+  await t.test('E1 escape matrix and runtime integrations', { timeout: 720000 }, async t => {
+  onlySubtests(t);
+  const page = await browser.newPage();
+  t.after(async () => { await saveArtifacts('e1', page); await page.close(); });
+  await observeTarget(page.target());
+  await page.goto(`http://proxy.localhost:${proxyPort}/`, { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => navigator.serviceWorker && navigator.serviceWorker.controller && document.querySelector('#status')?.textContent === 'Ready.', { timeout: 30000 });
+  await page.type('#url', `http://${targetHost}:${targetPort}/`);
+  await page.click('button');
+  try {
+    await page.waitForFunction(() => document.title === 'E2E Home', { timeout: 30000 });
+  } catch (err) {
+    const state = await page.evaluate(() => ({ title: document.title, url: location.href, body: document.body && document.body.innerText, status: document.querySelector('#status')?.textContent || '' }));
+    throw new Error(`${err.message}; nav state=${JSON.stringify(state)}; requests=${JSON.stringify(requests)}; proxy=${proxyLog}`);
+  }
+
+  const home = await page.evaluate(() => ({
+    href: location.href,
+    hash: location.hash,
+    title: document.title,
+    shellVisible: Boolean(document.querySelector('#open')),
+    userAgent: navigator.userAgent,
+    appVersion: navigator.appVersion,
+    platform: navigator.platform,
+    templateLink: window.__templateLinkFixture,
+    urlAttributes: window.__urlAttributeFixture,
+    phase2Location: window.__phase2Location,
+    phase2DynamicFunction: window.__phase2DynamicFunction,
+    phase2EvalLocation: window.__phase2EvalLocation,
+    styleProbe: (() => {
+      const el = document.getElementById('style-probe');
+      const cs = el && getComputedStyle(el);
+      return cs && { borderTopWidth: cs.borderTopWidth, borderTopColor: cs.borderTopColor, paddingLeft: cs.paddingLeft };
+    })(),
+    imageProbe: (() => {
+      const el = document.getElementById('image-probe');
+      return el && { complete: el.complete, naturalWidth: el.naturalWidth, src: el.getAttribute('src') };
+    })(),
+    faviconProbe: (() => {
+      const el = document.getElementById('icon-link');
+      const hrefAttr = el && el.attributes.getNamedItem('href');
+      return el && {
+        rel: el.getAttribute('rel'),
+        href: el.getAttribute('href'),
+        hrefProp: el.href,
+        hrefAttrValue: hrefAttr && hrefAttr.value,
+        outerHTML: el.outerHTML,
+      };
+    })(),
+  }));
+  fs.writeFileSync(path.join(artifacts, 'e1-home.json'), JSON.stringify(home, null, 2));
+  const TARGET_UA = home.userAgent;
+  const homeProxyURL = page.url();
+  await t.test('home navigation and fingerprint identity', () => {
+  assert.equal(home.title, 'E2E Home');
+  assert.match(home.hash, /^#k=/);
+  assert.equal(home.shellVisible, false);
+  assert.match(TARGET_UA, /^Mozilla\/5\.0 .*Chrome\/\d+\.0\.0\.0 Safari\//);
+  assert.doesNotMatch(TARGET_UA, /HeadlessChrome|proxy\.localhost/);
+  assert.equal(home.appVersion, TARGET_UA.replace(/^Mozilla\//, ''));
+  assert.equal(home.platform, 'Win32');
+  assert.match(home.href, new RegExp(`^http://proxy\\.localhost:${proxyPort}/zp/p/`));
+  });
+  await t.test('template link suppression preserves DOM absence', () => {
+  assert.deepEqual(home.templateLink, {
+    childCount: 1,
+    firstNode: 'link',
+    rel: null,
+    href: null,
+    blockedRel: null,
+    blockedURL: null,
+    cloneRel: null,
+    cloneHref: null,
+    tableRowNode: 'TR',
+    tableRowText: 'cell',
+  });
+  });
+  for (const [index, name] of ['link href', 'image srcset', 'script src'].entries()) {
+    await t.test(name + ' distinguishes absent, empty and removed attributes', () => {
+      assert.deepEqual(home.urlAttributes[index], {
+        absent: [null, null, false],
+        empty: ['', '', true],
+        removed: [null, null, false],
+        removedAfterURL: [null, null, false],
+        emptyAfterURL: ['', '', true],
+      });
+    });
+  }
+  await t.test('favicon masking without upstream fetch', () => {
+  // getAttribute and Attr.value return the author-written literal; only the IDL property resolves to the absolute target URL.
+  assert.deepEqual(home.faviconProbe && {
+    rel: home.faviconProbe.rel,
+    href: home.faviconProbe.href,
+    hrefProp: home.faviconProbe.hrefProp,
+    hrefAttrValue: home.faviconProbe.hrefAttrValue,
+  }, {
+    rel: 'icon',
+    href: '/site-icon.png',
+    hrefProp: `http://${targetHost}:${targetPort}/site-icon.png`,
+    hrefAttrValue: '/site-icon.png',
+  });
+  assert.doesNotMatch(home.faviconProbe.outerHTML, /x-zeroproxy-icon|data-zp-target-url/);
+  assert.equal(requests.some(r => r.url === '/site-icon.png'), false, `favicon must not be fetched: ${JSON.stringify(requests)}`);
+  });
+  await t.test('target-authored virtual location and dynamic compilation', () => {
+  assert.deepEqual(home.phase2Location, { href: `http://${targetHost}:${targetPort}/`, windowHref: `http://${targetHost}:${targetPort}/` });
+  assert.equal(home.phase2DynamicFunction, `http://${targetHost}:${targetPort}/`);
+  assert.equal(home.phase2EvalLocation, `http://${targetHost}:${targetPort}/`);
+  });
+  await t.test('stylesheet rendering and upstream identity', () => {
+  assert.deepEqual(home.styleProbe, { borderTopWidth: '7px', borderTopColor: 'rgb(12, 34, 56)', paddingLeft: '13px' });
+  assert.ok(requests.some(r => r.url === '/site.css' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('image rendering and upstream identity', () => {
+  assert.equal(home.imageProbe.complete, true);
+  assert.equal(home.imageProbe.naturalWidth, 1);
+  assert.equal(home.imageProbe.src, '/image-probe.png');
+  assert.ok(requests.some(r => r.url === '/image-probe.png' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url === '/' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+  const addressBarShare = page.url();
+  const relayServerParam = new RegExp(`server=ws%3A%2F%2Fproxy\\.localhost%3A${proxyPort}%2Fzp%2Fws-pipe`);
+  await t.test('share URL round-trip in a fresh browser context', async () => {
+  assert.match(addressBarShare, /#k=/);
+  assert.match(addressBarShare, relayServerParam);
+  const staticNextHref = await page.$eval('#next', el => el.href);
+  assert.equal(staticNextHref, `http://${targetHost}:${targetPort}/next`);
+  const externalContext = await browser.createBrowserContext();
+  try {
+    const externalPage = await externalContext.newPage();
+    await externalPage.goto(addressBarShare, { waitUntil: 'domcontentloaded' });
+    await externalPage.waitForFunction(() => document.title === 'E2E Home', { timeout: 30000 });
+    assert.match(externalPage.url(), /#k=/);
+    assert.match(externalPage.url(), relayServerParam);
+  } finally {
+    await externalContext.close();
+  }
+  });
+  await t.test('rewritten assignment and WebSocket integration', async () => {
+  await page.waitForFunction(() => window.__rewriteAdvanced && window.__rewriteAdvanced.wsMessage === 'echo:rewrite-script', { timeout: 30000 });
+  const rewriteAdvanced = await page.evaluate(() => window.__rewriteAdvanced);
+  assert.equal(rewriteAdvanced.initialHref, `http://${targetHost}:${targetPort}/`);
+  assert.equal(rewriteAdvanced.wsURL, `ws://${targetHost}:${targetPort}/ws`);
+  assert.equal(rewriteAdvanced.wsProtocol, 'zp-rewrite');
+  assert.equal(rewriteAdvanced.wsMessage, 'echo:rewrite-script');
+  assert.equal(rewriteAdvanced.wsError, undefined);
+  assert.equal(rewriteAdvanced.jqueryConstructorLength, 0);
+  assert.equal(rewriteAdvanced.constructorEscapeHref, `http://${targetHost}:${targetPort}/#compound-tail`);
+  assert.equal(rewriteAdvanced.compoundHash, '#compound-tail');
+  assert.equal(rewriteAdvanced.compoundHref, `http://${targetHost}:${targetPort}/#compound-tail`);
+  assert.ok(requests.some(r => r.upgrade && r.url === '/ws' && r.protocol === 'zp-rewrite' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('dynamic scripts and module worker integration', async () => {
+  try {
+    await page.waitForFunction(() => window.__gtmFixture && window.__gtmFixture.loaded && window.__dynamicScriptLoaded && window.__dynamicScriptLoaded.loaded && window.__moduleWorkerFixture && window.__moduleWorkerFixture.loaded, { timeout: 30000 });
+  } catch (err) {
+    const state = await page.evaluate(() => ({
+      gtm: window.__gtmFixture || null,
+      dynamic: window.__dynamicScriptLoaded || null,
+      moduleWorker: window.__moduleWorkerFixture || null,
+      scripts: Array.from(document.scripts).map(s => ({ id: s.id, src: s.attributes.getNamedItem('src')?.value || '', type: s.type || '', blocked: s.hasAttribute('data-zp-blocked-script') })),
+      messages: window.__messageEvents || [],
+    }));
+    throw new Error(`${err.message}; dynamic state=${JSON.stringify(state)}; requests=${JSON.stringify(requests)}`);
+  }
+  const dynamicScripts = await page.evaluate(() => ({
+    gtm: window.__gtmFixture,
+    dynamic: window.__dynamicScriptLoaded,
+    moduleWorker: window.__moduleWorkerFixture,
+    gtmAttr: document.getElementById('gtm-fixture')?.attributes.getNamedItem('src')?.value || '',
+    dynamicAttr: document.getElementById('dynamic-script-probe')?.attributes.getNamedItem('src')?.value || '',
+    messages: window.__messageEvents || [],
+  }));
+  assert.ok(dynamicScripts.gtm.href.startsWith(`http://${targetHost}:${targetPort}/`), dynamicScripts.gtm.href);
+  assert.ok(dynamicScripts.dynamic.href.startsWith(`http://${targetHost}:${targetPort}/`), dynamicScripts.dynamic.href);
+  assert.equal(dynamicScripts.moduleWorker.href, `http://${targetHost}:${targetPort}/worker-fixture.js`);
+  assert.equal(dynamicScripts.moduleWorker.userAgent, TARGET_UA);
+  assert.equal(dynamicScripts.moduleWorker.platform, 'Win32');
+  assert.ok(dynamicScripts.messages.some(m => m.type === 'gtm-loaded'), `messages: ${JSON.stringify(dynamicScripts.messages)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/gtm.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/dynamic-script.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/module-worker.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/worker-fixture.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('jQuery integration', async () => {
+
+  try {
+    await page.waitForFunction(() => window.__jqueryFixture && window.__jqueryFixture.ready, { timeout: 30000 });
+  } catch (err) {
+    const state = await page.evaluate(() => ({
+      jquery: window.__jqueryFixture || null,
+      plugin: window.__jqueryPlugin || null,
+      hasJQuery: Boolean(window.jQuery),
+      scripts: Array.from(document.scripts).map(s => ({ id: s.id, src: s.attributes.getNamedItem('src')?.value || '', type: s.type || '', blocked: s.hasAttribute('data-zp-blocked-script') })),
+    }));
+    throw new Error(`${err.message}; jquery state=${JSON.stringify(state)}; requests=${JSON.stringify(requests)}`);
+  }
+  const jquery = await page.evaluate(() => window.__jqueryFixture);
+  assert.match(jquery.version, /^3\./);
+  assert.equal(jquery.selectorText, 'one,two');
+  assert.equal(jquery.endMatchesRoot, true);
+  assert.equal(jquery.delegated, 1);
+  assert.equal(jquery.dataClicked, true);
+  assert.equal(jquery.attrClicked, 'yes');
+  assert.equal(jquery.parsedText, 'parsed');
+  assert.equal(jquery.htmlProbeText, 'filled');
+  assert.equal(jquery.htmlProbeChildren, 1);
+  assert.equal(jquery.param, 'a=1&b%5B%5D=x&b%5B%5D=y');
+  assert.deepEqual(jquery.ajaxData, { ok: true, path: '/jquery-ajax.json' });
+  assert.equal(jquery.plugin && jquery.plugin.loaded, true);
+  assert.equal(jquery.plugin && jquery.plugin.jquery, true);
+  assert.ok(jquery.plugin.href.startsWith(`http://${targetHost}:${targetPort}/`), jquery.plugin.href);
+  assert.ok(jquery.globalEvalHref.startsWith(`http://${targetHost}:${targetPort}/`), jquery.globalEvalHref);
+  assert.ok(jquery.locationHref.startsWith(`http://${targetHost}:${targetPort}/`), jquery.locationHref);
+  assert.ok(requests.some(r => r.url.startsWith('/jquery.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/jquery-fixture.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/jquery-ajax.json') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  assert.ok(requests.some(r => r.url.startsWith('/jquery-plugin.js') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+
+  await t.test('synchronous and navigated iframe isolation', async () => {
+  const iframeIsolation = await page.evaluate(async target => {
+    // A page's RTCPeerConnection works locally but is contained: whatever ICE servers and policy it asks for, it gathers no candidate, so
+    // nothing leaves the browser and nothing can connect.
+    const blockedChannel = async win => {
+      let pc;
+      try {
+        pc = new win.RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], iceTransportPolicy: 'all' });
+        let candidates = 0;
+        pc.addEventListener('icecandidate', e => { if (e.candidate) candidates++; });
+        pc.createDataChannel('escape-probe');
+        await pc.setLocalDescription(await pc.createOffer());
+        await new Promise(r => setTimeout(r, 1500));
+        return candidates === 0 ? 'contained' : 'leak:' + candidates;
+      } catch (err) { return err.name; }
+      finally { if (pc) pc.close(); }
+    };
+
+    const sync = document.createElement('iframe');
+    document.body.appendChild(sync);
+    const syncRTC = await blockedChannel(sync.contentWindow);
+    const docRTC = await blockedChannel(sync.contentDocument.defaultView);
+
+    const modern = document.createElement('iframe');
+    document.body.append(modern);
+    const modernRTC = await blockedChannel(modern.contentWindow);
+    const ws = new modern.contentWindow.WebSocket('ws://evil.example/socket');
+    const websocketURL = ws.url;
+    const childCanvasMask = modern.contentWindow.HTMLCanvasElement.prototype.toDataURL.toString();
+    const childFunctionHref = modern.contentWindow.Function('return location.href')();
+    try { ws.close(); } catch {}
+
+    const observed = document.createElement('iframe');
+    document.body.appendChild(observed);
+    const loaded = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('attribute iframe navigation timed out')), 30000);
+      observed.addEventListener('load', () => {
+        if (observed.contentDocument?.title !== 'E2E Next') return;
+        clearTimeout(timer);
+        resolve(observed.contentDocument.querySelector('h1')?.textContent);
+      });
+    });
+    const attr = document.createAttribute('src');
+    attr.value = target;
+    observed.attributes.setNamedItem(attr);
+    const frameTitle = await loaded;
+    const visibleSrc = observed.src;
+    const visibleAttribute = observed.getAttribute('src');
+    const visibleNodeValue = attr.value;
+    const attachedNode = observed.getAttributeNode('src') === attr && attr.ownerElement === observed;
+    const marker = document.createAttribute('data-marker');
+    marker.value = 'before';
+    observed.setAttributeNode(marker);
+    const replacement = document.createAttribute('data-marker');
+    replacement.value = 'after';
+    const replaced = NamedNodeMap.prototype.setNamedItemNS.call(observed.attributes, replacement);
+    const replacedNode = replaced === marker && marker.ownerElement === null && marker.value === 'before' && replacement.ownerElement === observed && observed.getAttribute('data-marker') === 'after';
+    observed.removeAttribute('src');
+    const removedSrc = observed.src;
+    sync.remove();
+    modern.remove();
+    observed.remove();
+    return { syncRTC, docRTC, modernRTC, websocketURL, childCanvasMask, childFunctionHref, frameTitle, visibleSrc, visibleAttribute, visibleNodeValue, removedSrc, attachedNode, replacedNode };
+  }, `http://${targetHost}:${targetPort}/next`);
+  assert.equal(iframeIsolation.syncRTC, 'contained');
+  assert.equal(iframeIsolation.docRTC, 'contained');
+  assert.equal(iframeIsolation.modernRTC, 'contained');
+  assert.equal(iframeIsolation.websocketURL, 'ws://evil.example/socket');
+  assert.equal(iframeIsolation.frameTitle, 'E2E Next');
+  assert.equal(iframeIsolation.visibleSrc, `http://${targetHost}:${targetPort}/next`);
+  assert.equal(iframeIsolation.visibleAttribute, `http://${targetHost}:${targetPort}/next`);
+  assert.equal(iframeIsolation.visibleNodeValue, `http://${targetHost}:${targetPort}/next`);
+  assert.equal(iframeIsolation.removedSrc, '');
+  assert.equal(iframeIsolation.attachedNode, true);
+  assert.equal(iframeIsolation.replacedNode, true);
+  assert.equal(iframeIsolation.childCanvasMask, 'function toDataURL() { [native code] }');
+  // A blank frame is at `about:blank`, as natively; it is the page that is at the virtual address.
+  assert.equal(iframeIsolation.childFunctionHref, 'about:blank');
+  });
+
+  await t.test('child frame messaging preserves parent navigation', async () => {
+  const frameMessage = await page.evaluate(async target => {
+    const before = location.href;
+    const got = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('frame postMessage timed out')), 10000);
+      window.addEventListener('message', function onMessage(ev) {
+        if (!ev.data || ev.data.type !== 'frame-child-ready') return;
+        window.removeEventListener('message', onMessage);
+        clearTimeout(timer);
+        resolve({ origin: ev.origin, href: ev.data.href, topOrigin: ev.data.topOrigin });
+      });
+    });
+    const frame = document.createElement('iframe');
+    frame.src = target;
+    document.body.appendChild(frame);
+    const message = await got;
+    frame.remove();
+    return { before, after: location.href, message };
+  }, `http://${targetHost}:${targetPort}/frame-child`);
+  assert.equal(frameMessage.before, frameMessage.after);
+  assert.equal(frameMessage.message.origin, `http://${targetHost}:${targetPort}`);
+  assert.equal(frameMessage.message.href, `http://${targetHost}:${targetPort}/frame-child`);
+  assert.equal(frameMessage.message.topOrigin, `http://${targetHost}:${targetPort}`);
+  });
+
+  await t.test('canvas and audio reads come back unmodified; speech voices are the fixed list', async () => {
+  const fingerprintMasking = await page.evaluate(() => {
+    const canvasMask = HTMLCanvasElement.prototype.toDataURL.toString();
+    const voicesMask = speechSynthesis.getVoices.toString();
+
+    // #123456 read back must be exactly what was drawn: the membrane adds no noise to canvas pixels.
+    const solid = () => {
+      const c = document.createElement('canvas');
+      c.width = 64;
+      c.height = 64;
+      const x = c.getContext('2d');
+      x.fillStyle = '#123456';
+      x.fillRect(0, 0, 64, 64);
+      return c;
+    };
+    const canvasA = solid();
+    const canvasB = solid();
+    const urlA = canvasA.toDataURL();
+    const urlA2 = canvasA.toDataURL();
+    const urlB = canvasB.toDataURL();
+    const ctxA = canvasA.getContext('2d');
+    const read = Array.from(ctxA.getImageData(0, 0, 64, 64).data);
+    const raw = [0x12, 0x34, 0x56, 255];
+    const changedChannels = read.filter((v, i) => v !== raw[i % 4]).length;
+    // a sub-rectangle reads the same pixels as the whole canvas does
+    const sub = Array.from(ctxA.getImageData(10, 20, 5, 1).data);
+    const subMatches = sub.every((v, i) => v === read[(20 * 64 + 10) * 4 + i]);
+    // the page's canvas is never painted on: after every read, putting back what it gave reads back the same
+    const clean = solid();
+    const cleanCtx = clean.getContext('2d');
+    cleanCtx.putImageData(ctxA.getImageData(0, 0, 64, 64), 0, 0);
+    const roundTrip = clean.toDataURL() === urlA;
+    const blank = document.createElement('canvas');
+    blank.width = 8;
+    blank.height = 8;
+    blank.getContext('2d');
+    const blankStaysBlank = Array.from(blank.getContext('2d').getImageData(0, 0, 8, 8).data).every(v => v === 0);
+    const shape = (proto, key) => {
+      const d = Object.getOwnPropertyDescriptor(proto, key);
+      let constructs = true;
+      try { new d.value(); } catch { constructs = false; }
+      return [d.value.name, d.value.length, d.writable, d.enumerable, d.configurable, 'prototype' in d.value, constructs];
+    };
+
+    let audio = null;
+    if (window.AudioBuffer) {
+      const buffer = new AudioBuffer({ length: 6000, numberOfChannels: 1, sampleRate: 44100 });
+      const written = new Float32Array(6000).map((_, i) => Math.sin(i / 7) * 0.5);
+      buffer.copyToChannel(written, 0);
+      const first = buffer.getChannelData(0);
+      const firstCopy = Array.from(first);
+      const again = buffer.getChannelData(0);
+      const deltas = firstCopy.map((v, i) => v - written[i]);
+      audio = {
+        sameArray: first === again,
+        stable: firstCopy.every((v, i) => v === again[i]),
+        changed: deltas.filter(d => d !== 0).length,
+        changedDeep: deltas.slice(4500, 5000).filter(d => d !== 0).length,
+        maxDelta: Math.max(...deltas.map(Math.abs)),
+      };
+    }
+
+    const voices = speechSynthesis.getVoices();
+    return {
+      canvasMask,
+      voicesMask,
+      sameDrawingSameBytes: urlA === urlB && urlA === urlA2,
+      changedChannels,
+      subMatches,
+      roundTrip,
+      blankStaysBlank,
+      shapes: [
+        shape(CanvasRenderingContext2D.prototype, 'getImageData'),
+        shape(HTMLCanvasElement.prototype, 'toDataURL'),
+        shape(HTMLCanvasElement.prototype, 'toBlob'),
+        shape(HTMLCanvasElement.prototype, 'getContext'),
+        shape(AudioBuffer.prototype, 'getChannelData'),
+      ],
+      audio,
+      voiceCount: voices.length,
+      voiceNames: voices.map(v => v.name),
+    };
+  });
+  assert.equal(fingerprintMasking.canvasMask, 'function toDataURL() { [native code] }');
+  assert.equal(fingerprintMasking.voicesMask, 'function getVoices() { [native code] }');
+  assert.equal(fingerprintMasking.sameDrawingSameBytes, true);
+  assert.equal(fingerprintMasking.changedChannels, 0, 'canvas pixels read back unchanged');
+  assert.equal(fingerprintMasking.subMatches, true);
+  assert.equal(fingerprintMasking.roundTrip, true);
+  assert.equal(fingerprintMasking.blankStaysBlank, true);
+  assert.deepEqual(fingerprintMasking.shapes, [
+    ['getImageData', 4, true, true, true, false, false],
+    ['toDataURL', 0, true, true, true, false, false],
+    ['toBlob', 1, true, true, true, false, false],
+    ['getContext', 1, true, true, true, false, false],
+    ['getChannelData', 1, true, true, true, false, false],
+  ]);
+  if (fingerprintMasking.audio) {
+    assert.equal(fingerprintMasking.audio.sameArray, true);
+    assert.equal(fingerprintMasking.audio.stable, true);
+    assert.equal(fingerprintMasking.audio.changed, 0, JSON.stringify(fingerprintMasking.audio));
+    assert.equal(fingerprintMasking.audio.maxDelta, 0, JSON.stringify(fingerprintMasking.audio));
+  }
+  assert.equal(fingerprintMasking.voiceCount, 2);
+  assert.deepEqual(fingerprintMasking.voiceNames, ['Google US English', 'Microsoft David - English (United States)']);
+  });
+
+  await t.test('runtime transport integration', async t => {
+  const runtimeIntegration = await page.evaluate(async targetPort => {
+    async function readText(path) {
+      const resp = await fetch(path, { cache: 'no-store' });
+      return resp.text();
+    }
+    async function waitForCookieHeader(needle) {
+      let last = '';
+      for (let i = 0; i < 30; i++) {
+        last = await readText('/cookie-echo?needle=' + encodeURIComponent(needle) + '&i=' + i);
+        if (last.includes(needle)) return last;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      throw new Error('cookie header never contained ' + needle + ': ' + last);
+    }
+    async function readStream() {
+      const started = performance.now();
+      const resp = await fetch('/stream?ts=' + Date.now(), { cache: 'no-store' });
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      const first = await reader.read();
+      const firstMs = performance.now() - started;
+      let body = first.value ? decoder.decode(first.value, { stream: true }) : '';
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        body += decoder.decode(next.value, { stream: true });
+      }
+      body += decoder.decode();
+      return { status: resp.status, contentType: resp.headers.get('content-type') || '', firstText: first.value ? decoder.decode(first.value) : '', firstMs, body };
+    }
+    async function postText(path, body) {
+      const resp = await fetch(path, { method: 'POST', body, cache: 'no-store' });
+      return { status: resp.status, text: await resp.text() };
+    }
+    function websocketEcho() {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket('ws://localhost:' + targetPort + '/ws', ['zp-test']);
+        let settled = false;
+        const finish = fn => value => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          fn(value);
+        };
+        const timer = setTimeout(() => finish(reject)(new Error('websocket echo timed out')), 10000);
+        ws.onerror = () => finish(reject)(new Error('websocket error'));
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => ws.send(new Uint8Array([1, 2, 3]).buffer);
+        ws.onmessage = ev => {
+          const data = ev.data instanceof ArrayBuffer ? Array.from(new Uint8Array(ev.data)).join(',') : String(ev.data);
+          const result = { url: ws.url, data, protocol: ws.protocol, readyState: ws.readyState };
+          try { ws.close(1000, 'done'); } catch {}
+          finish(resolve)(result);
+        };
+      });
+    }
+    async function websocketStreamEcho() {
+      const stream = new WebSocketStream('ws://localhost:' + targetPort + '/ws', { protocols: ['zp-stream'] });
+      const opened = await stream.opened;
+      const writer = opened.writable.getWriter();
+      await writer.write('stream');
+      const reader = opened.readable.getReader();
+      const first = await reader.read();
+      await writer.close();
+      const closed = await stream.closed;
+      const end = await reader.read();
+      const explicit = new WebSocketStream('ws://localhost:' + targetPort + '/ws', { protocols: ['zp-stream-close'] });
+      await explicit.opened;
+      explicit.close({ closeCode: 3001, reason: 'finished' });
+      const explicitClosed = await explicit.closed;
+      return { protocol: opened.protocol, data: String(first.value), closeCode: closed.closeCode, done: end.done, explicitClosed };
+    }
+
+
+    // Keep a failed transport visible in its own assertion without preventing
+    // the remaining independent transports from being exercised.
+    async function observe(run) {
+      try { return await run(); }
+      catch (error) { return { error: error && error.stack || String(error) }; }
+    }
+    const setCookieBody = await observe(() => readText('/set-cookie?ts=' + Date.now()));
+    const serverCookie = await observe(() => waitForCookieHeader('target_server=from-target'));
+    const visibleCookie = await observe(() => {
+      document.cookie = 'client_runtime=from-runtime; Path=/';
+      return document.cookie;
+    });
+    const clientCookie = await observe(() => waitForCookieHeader('client_runtime=from-runtime'));
+    const stream = await observe(readStream);
+    const post = await observe(() => postText('/post-echo', 'small-upload'));
+    const redirectPost = await observe(() => postText('/redirect307', 'redirect-body'));
+    const oversized = await observe(() => postText('/post-echo', 'x'.repeat(8 * 1024 * 1024 + 1)));
+    const ws = await observe(websocketEcho);
+    const wsStream = await observe(websocketStreamEcho);
+    return { setCookieBody, serverCookie, visibleCookie, clientCookie, stream, ws, wsStream, post, redirectPost, oversized };
+  }, targetPort);
+  fs.writeFileSync(path.join(artifacts, 'e1-runtime.json'), JSON.stringify(runtimeIntegration, null, 2));
+  await t.test('setCookieBody', () => { assert.equal(runtimeIntegration.setCookieBody, 'set-cookie-ok'); });
+  await t.test('serverCookie', () => { assert.match(runtimeIntegration.serverCookie, /target_server=from-target/); });
+  await t.test('visibleCookie', () => { assert.match(runtimeIntegration.visibleCookie, /client_runtime=from-runtime/); });
+  await t.test('clientCookie', () => { assert.match(runtimeIntegration.clientCookie, /target_server=from-target/); });
+  await t.test('clientCookie', () => { assert.match(runtimeIntegration.clientCookie, /client_runtime=from-runtime/); });
+  await t.test('stream.status', () => { assert.equal(runtimeIntegration.stream.status, 200); });
+  await t.test('stream.contentType', () => { assert.match(runtimeIntegration.stream.contentType, /^text\/plain/); });
+  await t.test('stream.firstText', () => { assert.equal(runtimeIntegration.stream.firstText, 'chunk-one\n'); });
+  await t.test('stream.body', () => { assert.equal(runtimeIntegration.stream.body, 'chunk-one\nchunk-two\n'); });
+  await t.test('stream.firstMs', () => { assert.ok(runtimeIntegration.stream.firstMs < 500, `stream first chunk was buffered for ${runtimeIntegration.stream.firstMs}ms`); });
+  await t.test('ws.url', () => { assert.equal(runtimeIntegration.ws.url, `ws://${targetHost}:${targetPort}/ws`); });
+  await t.test('ws.data', () => { assert.equal(runtimeIntegration.ws.data, '1,2,3'); });
+  await t.test('ws.protocol', () => { assert.equal(runtimeIntegration.ws.protocol, 'zp-test'); });
+  await t.test('wsStream', () => { assert.deepEqual(runtimeIntegration.wsStream, { protocol: 'zp-stream', data: 'echo:stream', closeCode: 1000, done: true, explicitClosed: { closeCode: 3001, reason: 'finished' } }); });
+  await t.test('opening WebSocket cancellation is unclean and streams settle', async () => {
+    const canceled = await page.evaluate(async targetPort => {
+      const url = 'ws://localhost:' + targetPort + '/ws';
+      const ws = new WebSocket(url);
+      const early = new Promise(resolve => {
+        ws.onclose = event => resolve({ code: event.code, reason: event.reason, wasClean: event.wasClean });
+      });
+      ws.close(3001, 'not a peer close');
+      const stream = new WebSocketStream(url);
+      stream.close({ closeCode: 3001, reason: 'not a peer close' });
+      const controller = new AbortController();
+      const aborted = new WebSocketStream(url, { signal: controller.signal });
+      controller.abort();
+      const settlements = await Promise.allSettled([stream.opened, stream.closed, aborted.opened, aborted.closed]);
+      return { early: await early, settlements: settlements.map(result => ({ status: result.status, error: result.reason?.name })) };
+    }, targetPort);
+    assert.deepEqual(canceled, {
+      early: { code: 1006, reason: '', wasClean: false },
+      settlements: [
+        { status: 'rejected', error: 'NetworkError' }, { status: 'rejected', error: 'NetworkError' },
+        { status: 'rejected', error: 'AbortError' }, { status: 'rejected', error: 'AbortError' }
+      ]
+    });
+  });
+  await t.test('post', () => { assert.deepEqual(runtimeIntegration.post, { status: 200, text: 'small-upload' }); });
+  await t.test('redirectPost', () => { assert.deepEqual(runtimeIntegration.redirectPost, { status: 200, text: 'redirect-body' }); });
+  await t.test('oversized.status', () => { assert.equal(runtimeIntegration.oversized.status, 413); });
+  await t.test('oversized.text', () => { assert.match(runtimeIntegration.oversized.text, /REQUEST_BODY_TOO_LARGE/); });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.url.startsWith('/set-cookie') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.url.startsWith('/stream') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.upgrade && r.url === '/ws' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.upgrade && r.url === '/ws' && r.protocol === 'zp-stream' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('websocket initiating origin and cookie identity', () => {
+    for (const protocol of ['zp-test', 'zp-stream', 'zp-stream-close']) {
+      const request = requests.find(r => r.upgrade && r.protocol === protocol);
+      assert.ok(request, protocol);
+      assert.equal(request.origin, `http://${targetHost}:${targetPort}`);
+      assert.match(request.cookie, /target_server=from-target/);
+      assert.match(request.cookie, /client_runtime=from-runtime/);
+      assert.equal(request.userAgent, TARGET_UA);
+    }
+  });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.url.startsWith('/cookie-echo') && r.cookie.includes('target_server=from-target') && r.cookie.includes('client_runtime=from-runtime')), `target requests: ${JSON.stringify(requests)}`); });
+  });
+
+  await t.test('response framing and cancellation', async t => {
+    await t.test('chunk trailers are not response body bytes', async () => {
+      assert.equal(await page.evaluate(async () => (await fetch('/stream-trailers')).text()), 'payload');
+    });
+    for (const [method, status] of [['HEAD', 200], ['GET', 204], ['GET', 304]]) {
+      await t.test(`${method} ${status} has no body`, async () => {
+        const result = await page.evaluate(async ({ method, status }) => {
+          const response = await fetch('/stream-bodyless?status=' + status, { method });
+          return { status: response.status, body: await response.text() };
+        }, { method, status });
+        assert.deepEqual(result, { status, body: '' });
+      });
+    }
+    for (const endpoint of ['/stream-truncated', '/stream-gzip-truncated']) {
+      await t.test(`${endpoint} rejects incomplete body`, async () => {
+        const result = await page.evaluate(async endpoint => {
+          try { const response = await fetch(endpoint); await response.text(); return 'accepted'; }
+          catch { return 'rejected'; }
+        }, endpoint);
+        assert.equal(result, 'rejected');
+      });
+    }
+    await t.test('cancel closes an idle upstream stream', async () => {
+      const first = await page.evaluate(async () => {
+        const response = await fetch('/stream-cancel');
+        const reader = response.body.getReader();
+        const first = await reader.read();
+        await reader.cancel();
+        return new TextDecoder().decode(first.value);
+      });
+      assert.equal(first, 'first');
+      for (let i = 0; i < 100 && !requests.some(r => r.url === '/stream-cancel' && r.canceled); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(requests.some(r => r.url === '/stream-cancel' && r.canceled), 'cancellation did not close the upstream socket');
+    });
+  });
+
+  await t.test('escape matrix', async t => {
+  const escapeMatrix = await page.evaluate(async targetPort => {
+    const directBase = 'http://localhost:' + targetPort;
+    const out = {};
+    out.fetch = await fetch(directBase + '/direct-fetch', { cache: 'no-store' }).then(r => 'ok:' + r.status).catch(err => 'blocked:' + (err && err.name || 'Error'));
+    out.xhr = await new Promise(resolve => {
+      const xhr = new XMLHttpRequest();
+      xhr.onload = () => resolve('ok:' + xhr.status);
+      xhr.onerror = () => resolve('blocked:error');
+      try { xhr.open('GET', directBase + '/direct-xhr'); xhr.send(); } catch (err) { resolve('blocked:' + (err && err.name || 'Error')); }
+    });
+    out.eventSource = await new Promise(resolve => {
+      let settled = false;
+      const finish = value => { if (!settled) { settled = true; try { es.close(); } catch {} resolve(value); } };
+      let es;
+      try {
+        es = new EventSource(directBase + '/sse');
+        es.onmessage = ev => finish('ok:' + ev.data);
+        es.onerror = () => finish('blocked:error');
+        setTimeout(() => finish('blocked:timeout'), 1000);
+      } catch (err) { resolve('blocked:' + (err && err.name || 'Error')); }
+    });
+    out.websocket = await new Promise((resolve, reject) => {
+      const ws = new WebSocket('ws://localhost:' + targetPort + '/ws');
+      const timer = setTimeout(() => reject(new Error('internal-mode websocket timed out')), 10000);
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('internal-mode websocket failed')); };
+      ws.onopen = () => ws.send('direct');
+      ws.onmessage = ev => { clearTimeout(timer); const value = String(ev.data); try { ws.close(); } catch {} resolve(value); };
+    }).catch(err => 'blocked:' + (err && err.message || String(err)));
+    out.stringTimer = await new Promise(resolve => {
+      try {
+        window.__timerRan = 0;
+        setTimeout('window.__timerRan=1', 0);
+        setTimeout(() => resolve(window.__timerRan === 1 ? 'ran' : 'not-ran'), 25);
+      } catch (err) {
+        resolve(err && err.message || String(err));
+      }
+    });
+    // A string given to a child iframe window's timers: the engine would compile it in the child, unrewritten, with the raw top and parent in reach (the membrane's
+    // __zp_get is a function on them); it must run rewritten like the child's eval, where the parent's internals are hidden. And a timer taken from the child and called
+    // on this window (rrweb, Sentry Replay) is this window's timer.
+    out.childStringTimer = await new Promise(resolve => {
+      try {
+        const f = document.createElement('iframe');
+        document.body.appendChild(f);
+        const cw = f.contentWindow;
+        cw.setTimeout('window.__seenTop = typeof top.__zp_get + "/" + typeof parent.__zp_get', 0);
+        cw.setInterval('window.__seenTopInterval = typeof top.__zp_get; clearInterval(window.__childIv)', 5);
+        let foreign = 'not-ran';
+        cw.setTimeout.call(window, () => { foreign = 'ran'; }, 0);
+        setTimeout(() => { resolve([cw.__seenTop, cw.__seenTopInterval, foreign].join('|')); f.remove(); }, 80);
+      } catch (err) {
+        resolve(err && err.message || String(err));
+      }
+    });
+    out.blobWorker = await new Promise(resolve => {
+      let worker;
+      try {
+        const url = URL.createObjectURL(new Blob([`postMessage('ran:' + self.location.protocol)`], { type: '' }));
+        worker = new Worker(url);
+        const timer = setTimeout(() => { try { worker.terminate(); } catch {} resolve('no-message'); }, 1500);
+        worker.onmessage = ev => { clearTimeout(timer); resolve(String(ev.data)); };
+        worker.onerror = () => { clearTimeout(timer); resolve('error'); };
+      } catch (err) { resolve('throw:' + (err && err.message || String(err))); }
+    });
+    out.dataWorker = await new Promise(resolve => {
+      let worker;
+      try {
+        worker = new Worker('data:text/javascript,postMessage(%22ran:%22%2Bself.location.protocol)');
+        const timer = setTimeout(() => { try { worker.terminate(); } catch {} resolve('no-message'); }, 1500);
+        worker.onmessage = ev => { clearTimeout(timer); resolve(String(ev.data)); };
+        worker.onerror = () => { clearTimeout(timer); resolve('error'); };
+      } catch (err) { resolve('throw:' + (err && err.message || String(err))); }
+    });
+    const button = document.createElement('button');
+    button.setAttribute('onclick', 'window.__eventHandlerLocation = location.href');
+    document.body.appendChild(button);
+    button.click();
+    out.eventHandlerLocation = window.__eventHandlerLocation || '';
+    button.remove();
+    const loc = __zp_get(globalThis, 'window').location;
+    out.locationReplaceSource = loc.replace.toString();
+    loc.hash = '#zp-fragment';
+    out.virtualHash = loc.hash;
+    out.virtualHref = loc.href;
+    out.topOrigin = __zp_get(globalThis, 'top').location.origin;
+    out.functionEscape = (() => {
+      try { const v = (new Function('return location.href'))(); return 'ran:' + String(v); }
+      catch (err) { return 'blocked:' + (err && err.name || 'Error'); }
+    })();
+    out.constructorEscape = (() => {
+      try { const v = ({}).constructor.constructor('return location.href')(); return 'ran:' + String(v); }
+      catch (err) { return 'blocked:' + (err && err.name || 'Error'); }
+    })();
+    out.asyncFunctionEscape = await (async () => {
+      try { const Async = (async function(){}).constructor; const v = await new Async('return location.href')(); return 'ran:' + String(v); }
+      catch (err) { return 'blocked:' + (err && err.name || 'Error'); }
+    })();
+    out.scriptBlobSrc = await new Promise(resolve => {
+      try {
+        window.__scriptBlobRan = false;
+        const blobURL = URL.createObjectURL(new Blob(['window.__scriptBlobRan = location.href;'], { type: 'text/javascript' }));
+        const s = document.createElement('script');
+        s.src = blobURL;
+        document.head.appendChild(s);
+        setTimeout(() => {
+          // The blob reads the page's address: the target's when it ran rewritten, the proxy's (it contains /zp/) when it ran as written.
+          const seen = window.__scriptBlobRan;
+          try { document.head.removeChild(s); } catch {}
+          try { URL.revokeObjectURL(blobURL); } catch {}
+          resolve(typeof seen !== 'string' ? 'blocked' : seen.indexOf('/zp/') >= 0 ? 'ran-as-written' : 'ran-rewritten');
+        }, 200);
+      } catch (err) { resolve('throw:' + (err && err.message || err)); }
+    });
+
+    // A module that statically imports a blob: the browser loads the inner one itself, so it is only rewritten if the rewriter swapped the specifier.
+    out.staticBlobImport = await (async () => {
+      try {
+        window.__staticBlobSeen = null;
+        const inner = URL.createObjectURL(new Blob(['window.__staticBlobSeen = location.href;'], { type: 'text/javascript' }));
+        const outer = URL.createObjectURL(new Blob(["import '" + inner + "';"], { type: 'text/javascript' }));
+        // the probe is not rewritten page code, so the import goes through a Function body, which is
+        await new Function('u', 'return import(u)')(outer);
+        const seen = window.__staticBlobSeen;
+        return typeof seen !== 'string' ? 'blocked' : seen.indexOf('/zp/') >= 0 ? 'ran-as-written' : 'ran-rewritten';
+      } catch (err) { return 'blocked:' + (err && err.name || 'Error'); }
+    })();
+
+    // The membrane's own attribute for a link's javascript: URL is not a way to run code: written by the page, it must not run on a click.
+    out.forgedJavascriptURL = await new Promise(resolve => {
+      try {
+        window.__forgedRan = undefined;
+        const a = document.createElement('a');
+        a.setAttributeNode(Object.assign(document.createAttribute('data-zp-jsurl'), { value: 'window.__forgedRan = location.href' }));
+        a.dataset.zpJsurlKind = 'anchor';
+        a.href = 'javascript:void(0)';
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          const seen = window.__forgedRan;
+          try { a.remove(); } catch {}
+          resolve(seen === undefined ? 'nothing ran' : 'ran:' + seen);
+        }, 300);
+      } catch (err) { resolve('threw:' + (err && err.name || err)); }
+    });
+
+    out.reflectGetLocation = (() => {
+      try {
+        const loc = Reflect.get(__zp_get(globalThis, 'window'), 'location');
+        return typeof loc?.href === 'string' && String(loc.href).startsWith(directBase) ? 'virtual' : 'native:' + (loc && loc.href);
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    out.topLocation = (() => {
+      try {
+        const href = __zp_get(globalThis, 'top').location.href;
+        return String(href).startsWith(directBase) ? 'virtual' : 'native:' + href;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+    out.parentLocation = (() => {
+      try {
+        const href = __zp_get(globalThis, 'parent').location.href;
+        return String(href).startsWith(directBase) ? 'virtual' : 'native:' + href;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+    out.opener = (() => {
+      try {
+        const op = __zp_get(globalThis, 'opener');
+        return op === null || op === undefined ? 'empty' : 'leaked:' + typeof op;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    // Storage facade exposes unprefixed keys while storing values under a per-target prefix on the proxy origin.
+    out.storagePrefix = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const ls = w.localStorage;
+        ls.setItem('zp-probe', 'v1');
+        const got = ls.getItem('zp-probe');
+        const keys = [];
+        for (let i = 0; i < ls.length; i++) keys.push(ls.key(i));
+        ls.removeItem('zp-probe');
+        const removed = ls.getItem('zp-probe');
+        const leaked = keys.some(k => /^__zp:/.test(k));
+        return got === 'v1' && removed === null && !leaked ? 'isolated' : 'leak:' + JSON.stringify({got, removed, leaked, keys});
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    out.documentDomainSetter = (() => {
+      try {
+        const d = __zp_get(globalThis, 'document');
+        const initial = d.domain;
+        try { d.domain = 'evil.example'; } catch {}
+        const after = d.domain;
+        try { d.domain = initial; } catch {}
+        const afterValid = d.domain;
+        return (after === initial && afterValid === initial) ? 'unchanged:' + initial : 'changed:' + after + '|' + afterValid;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    // Chromium removed non-standard document.origin; if present in another engine, it must report the virtual target origin.
+    out.documentOrigin = (() => {
+      try {
+        const d = __zp_get(globalThis, 'document');
+        if (d.origin === undefined) return 'absent-natively:ok';
+        return String(d.origin || '').startsWith(directBase) ? 'virtual:' + d.origin : 'native:' + d.origin;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    out.broadcastChannelName = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const bc = new w.BroadcastChannel('zp-test');
+        const nm = bc.name;
+        try { bc.close(); } catch {}
+        return nm === 'zp-test' ? 'unprefixed-facade' : 'leaked-prefix:' + nm;
+      } catch (err) { return 'throw:' + (err && err.message || err); }
+    })();
+
+    out.indirectEval = (() => {
+      try {
+        const v = (0, eval)('location.href');
+        return String(String(v)).startsWith(directBase) ? 'virtual:' + v : 'native:' + v;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.globalThisEval = (() => {
+      try {
+        const v = globalThis.eval('location.href');
+        return String(String(v)).startsWith(directBase) ? 'virtual:' + v : 'native:' + v;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.computedAccess = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const loc = w['loca' + 'tion'];
+        const href = loc && loc.href;
+        return String(href || '').startsWith(directBase) ? 'virtual' : 'native:' + href;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.destructuringAccess = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const { location } = w;
+        return String(location.href).startsWith(directBase) ? 'virtual' : 'native:' + location.href;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.optionalChainAccess = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const href = w?.location?.href;
+        return String(href || '').startsWith(directBase) ? 'virtual' : 'native:' + href;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.locationDescriptor = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const desc = Object.getOwnPropertyDescriptor(w, 'location');
+        if (!desc) return 'no-desc';
+        const v = desc.get ? desc.get.call(w) : desc.value;
+        out.locationDescriptorFlags = {
+          configurable: desc.configurable, enumerable: desc.enumerable,
+          getter: typeof desc.get, setter: typeof desc.set,
+          stable: desc.get === Reflect.getOwnPropertyDescriptor(w, 'location').get,
+          sameLocation: v === w.location,
+          redefinable: Reflect.defineProperty(w, 'location', { configurable: true }),
+          deletable: Reflect.deleteProperty(w, 'location')
+        };
+        const href = v && v.href;
+        return String(String(href || '')).startsWith(directBase) ? 'virtual' : 'native:' + href;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    // Per HTML5 spec, inline scripts inside DOMParser.parseFromString documents must not execute.
+    out.domParserScript = (() => {
+      try {
+        window.__domParserRan = false;
+        const doc = new DOMParser().parseFromString(
+          '<html><body><script>window.__domParserRan = true<\/script></body></html>',
+          'text/html'
+        );
+        // Adopting a parser-inserted script node into the live document must not execute it.
+        document.body.appendChild(document.importNode(doc.body, true));
+        return window.__domParserRan ? 'ran' : 'blocked';
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    // HTML createContextualFragment uses Fragment scripting mode, unlike
+    // innerHTML/DOMParser: insertion executes scripts. The authored consumer
+    // must run with virtual URLs and route its fetch through the proxy.
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
+    try { out.rangeFragmentScript = await window.__runFragmentProbe(); }
+    catch (err) { out.rangeFragmentScript = { error: err && err.name || String(err) }; }
+
+    out.innerHTMLScript = (() => {
+      try {
+        window.__innerHTMLRan = false;
+        const d = document.createElement('div');
+        d.innerHTML = '<script>window.__innerHTMLRan = true<\/script>';
+        document.body.appendChild(d);
+        return window.__innerHTMLRan ? 'ran' : 'blocked';
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.sessionStoragePrefix = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const ss = w.sessionStorage;
+        ss.setItem('zp-sess-probe', 'v2');
+        const got = ss.getItem('zp-sess-probe');
+        const keys = [];
+        for (let i = 0; i < ss.length; i++) keys.push(ss.key(i));
+        ss.removeItem('zp-sess-probe');
+        const removed = ss.getItem('zp-sess-probe');
+        const leaked = keys.some(k => /^zp:/.test(k));
+        return got === 'v2' && removed === null && !leaked
+          ? 'isolated'
+          : 'leak:' + JSON.stringify({ got, removed, leaked, keys });
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.cachesAPI = await (async () => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        if (!w.caches) return 'missing';
+        await w.caches.open('zp-probe-cache');
+        const keys = await w.caches.keys();
+        const leaked = keys.some(k => /^zp:/.test(k));
+        try { await w.caches.delete('zp-probe-cache'); } catch {}
+        return !leaked ? 'isolated' : 'leak:' + JSON.stringify(keys);
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.performanceTimeOrigin = (() => {
+      try {
+        const w = __zp_get(globalThis, 'window');
+        const to = w.performance && w.performance.timeOrigin;
+        return typeof to === 'number' && to > 0 ? 'numeric' : 'missing:' + typeof to;
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    out.webTransport = await (async () => {
+      try {
+        const WT = __zp_get(globalThis, 'WebTransport');
+        if (typeof WT !== 'function') return 'absent';
+        const wt = new WT('https://evil.example/');
+        try { await wt.ready; return 'allowed:resolved'; }
+        catch (err) { return 'gateway-stub:' + (err && err.name || String(err)); }
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+    out.rtcPeerConnection = await (async () => {
+      try {
+        const RTC = __zp_get(globalThis, 'RTCPeerConnection');
+        if (typeof RTC !== 'function') return 'absent';
+        // The page asks for a STUN server and every candidate type, and tries to widen the policy again once the connection exists.
+        const pc = new RTC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], iceTransportPolicy: 'all' });
+        let candidates = 0;
+        pc.addEventListener('icecandidate', e => { if (e.candidate) candidates++; });
+        try {
+          pc.setConfiguration({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], iceTransportPolicy: 'all' });
+          pc.createDataChannel('chan');
+          await pc.setLocalDescription(await pc.createOffer());
+          await new Promise(r => setTimeout(r, 1500));
+          return candidates === 0 ? 'contained:0' : 'allowed:' + candidates;
+        } catch (err) { return 'gateway-stub:' + (err && err.name || String(err)); }
+        finally { pc.close(); }
+      } catch (err) { return 'throw:' + (err && err.name || String(err)); }
+    })();
+
+    return out;
+  }, targetPort);
+  fs.writeFileSync(path.join(artifacts, 'e1-escape.json'), JSON.stringify(escapeMatrix, null, 2));
+  await t.test('fetch', () => { assert.equal(escapeMatrix.fetch, 'ok:404'); });
+  await t.test('xhr', () => { assert.equal(escapeMatrix.xhr, 'ok:404'); });
+  await t.test('eventSource', () => { assert.equal(escapeMatrix.eventSource, 'ok:sse-ok'); });
+  await t.test('websocket', () => { assert.equal(escapeMatrix.websocket, 'echo:direct'); });
+  await t.test('locationReplaceSource', () => { assert.equal(escapeMatrix.locationReplaceSource, 'function replace() { [native code] }'); });
+  await t.test('virtualHash', () => { assert.equal(escapeMatrix.virtualHash, '#zp-fragment'); });
+  await t.test('virtualHref', () => { assert.match(escapeMatrix.virtualHref, /#zp-fragment$/); });
+  await t.test('topOrigin', () => { assert.equal(escapeMatrix.topOrigin, `http://${targetHost}:${targetPort}`); });
+  await t.test('proxy-origin navigation', () => { assert.equal(page.url().startsWith(`http://proxy.localhost:${proxyPort}/`), true); });
+  await t.test('stringTimer', () => { assert.equal(escapeMatrix.stringTimer, 'ran'); });
+  await t.test('childStringTimer', () => { assert.equal(escapeMatrix.childStringTimer, 'undefined/undefined|undefined|ran'); });
+  await t.test('blobWorker', () => { assert.equal(escapeMatrix.blobWorker, 'ran:blob:'); });
+  await t.test('dataWorker', () => { assert.equal(escapeMatrix.dataWorker, 'ran:data:'); });
+  await t.test('eventHandlerLocation', () => { assert.ok(escapeMatrix.eventHandlerLocation === '' || escapeMatrix.eventHandlerLocation === `http://${targetHost}:${targetPort}/#compound-tail`, `event handler location: ${escapeMatrix.eventHandlerLocation}`); });
+  await t.test('upstream request identity', () => { assert.equal(requests.filter(r => r.userAgent && r.userAgent !== TARGET_UA).length, 0, `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('upstream request identity', () => { assert.ok(requests.some(r => r.url.startsWith('/direct-fetch') && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`); });
+  await t.test('functionEscape', () => { assert.equal(escapeMatrix.functionEscape, 'ran:' + escapeMatrix.virtualHref); });
+  await t.test('constructorEscape', () => { assert.equal(escapeMatrix.constructorEscape, 'ran:' + escapeMatrix.virtualHref); });
+  await t.test('asyncFunctionEscape', () => { assert.equal(escapeMatrix.asyncFunctionEscape, 'ran:' + escapeMatrix.virtualHref); });
+  await t.test('forgedJavascriptURL', () => { assert.equal(escapeMatrix.forgedJavascriptURL, 'nothing ran', `a data-zp-jsurl the page wrote must not run, got: ${escapeMatrix.forgedJavascriptURL}`); });
+  await t.test('staticBlobImport', () => { assert.equal(escapeMatrix.staticBlobImport, 'ran-rewritten', `a blob imported by a module must not load as written, got: ${escapeMatrix.staticBlobImport}`); });
+  await t.test('scriptBlobSrc', () => { assert.equal(escapeMatrix.scriptBlobSrc, 'ran-rewritten', `<script src=blob:...> runs only as a rewritten copy, got: ${escapeMatrix.scriptBlobSrc}`); });
+  await t.test('reflectGetLocation', () => { assert.equal(escapeMatrix.reflectGetLocation, 'virtual', `Reflect.get must hit membrane, got: ${escapeMatrix.reflectGetLocation}`); });
+  await t.test('topLocation', () => { assert.equal(escapeMatrix.topLocation, 'virtual', `top.location escape: ${escapeMatrix.topLocation}`); });
+  await t.test('parentLocation', () => { assert.equal(escapeMatrix.parentLocation, 'virtual', `parent.location escape: ${escapeMatrix.parentLocation}`); });
+  await t.test('opener', () => { assert.equal(escapeMatrix.opener, 'empty', `opener leak: ${escapeMatrix.opener}`); });
+  await t.test('storagePrefix', () => { assert.equal(escapeMatrix.storagePrefix, 'isolated', `storage prefix leak: ${escapeMatrix.storagePrefix}`); });
+  await t.test('documentDomainSetter', () => { assert.match(escapeMatrix.documentDomainSetter, /^unchanged:/, `document.domain leak: ${escapeMatrix.documentDomainSetter}`); });
+  await t.test('documentOrigin', () => { assert.match(escapeMatrix.documentOrigin, /^(virtual:|absent-natively:ok)/, `document.origin leak: ${escapeMatrix.documentOrigin}`); });
+  await t.test('broadcastChannelName', () => { assert.equal(escapeMatrix.broadcastChannelName, 'unprefixed-facade', `BroadcastChannel: ${escapeMatrix.broadcastChannelName}`); });
+  await t.test('indirectEval', () => { assert.match(escapeMatrix.indirectEval, /^virtual:/, `indirect eval: ${escapeMatrix.indirectEval}`); });
+  await t.test('globalThisEval', () => { assert.match(escapeMatrix.globalThisEval, /^virtual:/, `globalThis.eval: ${escapeMatrix.globalThisEval}`); });
+  await t.test('computedAccess', () => { assert.equal(escapeMatrix.computedAccess, 'virtual', `computed access: ${escapeMatrix.computedAccess}`); });
+  await t.test('destructuringAccess', () => { assert.equal(escapeMatrix.destructuringAccess, 'virtual', `destructuring: ${escapeMatrix.destructuringAccess}`); });
+  await t.test('optionalChainAccess', () => { assert.equal(escapeMatrix.optionalChainAccess, 'virtual', `optional chain: ${escapeMatrix.optionalChainAccess}`); });
+  await t.test('locationDescriptor', () => { assert.equal(escapeMatrix.locationDescriptor, 'virtual', `descriptor leak: ${escapeMatrix.locationDescriptor}`); });
+  await t.test('locationDescriptorFlags', () => { assert.deepEqual(escapeMatrix.locationDescriptorFlags, { configurable: false, enumerable: true, getter: 'function', setter: 'function', stable: true, sameLocation: true, redefinable: false, deletable: false }); });
+  await t.test('domParserScript', () => { assert.equal(escapeMatrix.domParserScript, 'blocked', `DOMParser script: ${escapeMatrix.domParserScript}`); });
+  await t.test('rangeFragmentScript', () => {
+    assert.deepEqual(escapeMatrix.rangeFragmentScript, { beforeInsertion: true, result: { href: escapeMatrix.virtualHref, origin: `http://${targetHost}:${targetPort}`, echo: { href: escapeMatrix.virtualHref, userAgent: TARGET_UA } } });
+  });
+  await t.test('innerHTMLScript', () => { assert.equal(escapeMatrix.innerHTMLScript, 'blocked', `innerHTML script: ${escapeMatrix.innerHTMLScript}`); });
+  await t.test('sessionStoragePrefix', () => { assert.equal(escapeMatrix.sessionStoragePrefix, 'isolated', `sessionStorage leak: ${escapeMatrix.sessionStoragePrefix}`); });
+  await t.test('cachesAPI', () => { assert.equal(escapeMatrix.cachesAPI, 'isolated', `caches leak: ${escapeMatrix.cachesAPI}`); });
+  await t.test('performanceTimeOrigin', () => { assert.equal(escapeMatrix.performanceTimeOrigin, 'numeric', `timeOrigin: ${escapeMatrix.performanceTimeOrigin}`); });
+  await t.test('webTransport', () => { assert.match(escapeMatrix.webTransport, /^(?:gateway-stub|absent)/, `WebTransport leak: ${escapeMatrix.webTransport}`); });
+  await t.test('rtcPeerConnection', () => { assert.match(escapeMatrix.rtcPeerConnection, /^(?:gateway-stub|absent|contained:0)/, `RTCPeerConnection leak: ${escapeMatrix.rtcPeerConnection}`); });
+  });
+
+  await t.test('A-section escapes stay virtual or fail closed', async t => {
+    await page.evaluate(target => { __zp_get(globalThis, 'location').href = target; }, `http://${targetHost}:${targetPort}/escape-probes`);
+    await page.waitForFunction(() => window.__escapeProbes, { timeout: 30000 });
+    const probes = await page.evaluate(() => window.__escapeProbes);
+    fs.writeFileSync(path.join(artifacts, 'e1-escape-probes.json'), JSON.stringify(probes, null, 2));
+    const virtual = probes.virtual;
+    const virtualURLRe = /^https?:\/\//;
+    const noProxy = v => typeof v === 'string' && !v.includes('proxy.localhost') && !v.includes('/zp/');
+    await t.test('var/function shadowing keeps local binding', () => {
+      assert.equal(probes.varShadow, 'v-shadow');
+      assert.equal(probes.letShadow, 'l-shadow');
+      assert.equal(probes.fnDeclShadow, 'f-shadow');
+    });
+    await t.test('computed members on this/globalThis virtualize', () => {
+      assert.equal(probes.thisComputed, virtual, `this['location']: ${probes.thisComputed}`);
+      assert.equal(probes.globalComputed, virtual, `globalThis['loc'+'ation']: ${probes.globalComputed}`);
+    });
+    await t.test('dynamic Function this maps to virtual global', () => {
+      assert.equal(probes.fnThis, virtual, `Function this: ${probes.fnThis}`);
+      assert.equal(probes.fnThisNull, virtual, `Function.call(null) this: ${probes.fnThisNull}`);
+    });
+    await t.test('eval expression resolves virtual location', () => {
+      assert.equal(probes.evalHref, virtual, `eval location.href: ${probes.evalHref}`);
+      assert.equal(probes.evalArith, 42);
+    });
+    await t.test('GOPD and __lookupGetter__ return membrane getters', () => {
+      assert.equal(probes.gopdHref, virtual, `GOPD get(): ${probes.gopdHref}`);
+      assert.equal(probes.lookupGetter, virtual, `__lookupGetter__: ${probes.lookupGetter}`);
+    });
+    await t.test('iframe contentDocument.location exposes no proxy URL', () => {
+      assert.equal(probes.contentDocLocation, 'about:blank', `contentDocument.location: ${probes.contentDocLocation}`);
+      assert.ok(noProxy(probes.contentDocLocation), `contentDocument.location leaked proxy: ${probes.contentDocLocation}`);
+    });
+    await t.test('navigation.navigate refuses javascript:', () => {
+      assert.match(probes.navigationJs, /^blocked:/, `navigation.navigate: ${probes.navigationJs}`);
+      assert.equal(probes.navEscaped, 'clean');
+      assert.equal(probes.navCurrentEntry, virtual, `navigation.currentEntry.url: ${probes.navCurrentEntry}`);
+    });
+    await t.test('open() does not execute javascript: URLs', () => {
+      assert.equal(probes.openEscaped, 'clean');
+      assert.ok(noProxy(probes.openJs) || probes.openJs === 'null-return' || probes.openJs === 'throw:NotSupportedError', `open() child leak: ${probes.openJs}`);
+    });
+    await t.test('frames[i] surfaces a contained window', () => {
+      assert.ok(noProxy(probes.framesIndex) || probes.framesIndex === 'throw:SecurityError', `frames[0].location leak: ${probes.framesIndex}`);
+    });
+    await t.test('dynamic meta refresh with javascript: is neutralized', () => {
+      assert.equal(probes.metaRefresh, 'neutralized', `meta refresh: ${probes.metaRefresh}`);
+    });
+    await t.test('diagnostics surface exists but stays hidden from page scope', async () => {
+      // __zp_diagnostics is filtered on the scope proxy and only reachable on the real window via CDP.
+      assert.equal(probes.diagnostics, -1);
+      assert.ok(await page.evaluate(() => Array.isArray(window.__zp_diagnostics)), '__zp_diagnostics missing on real window');
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  await t.test('direct-vs-proxy compatibility differential', async t => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    // Use a separate browser instance so direct-target navigations do not trigger the suite-wide targetcreated network guard.
+    const directBrowser = await puppeteer.launch({
+      headless: true,
+      protocolTimeout: 30000,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/compat-probes`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__compatProbes, { timeout: 15000 });
+      direct = await directPage.evaluate(() => window.__compatProbes);
+    } finally {
+      await directBrowser.close();
+    }
+    const expectedDivergences = {
+    };
+    const wireBefore = wireRequests.length;
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/compat-probes`);
+    await page.waitForFunction(() => window.__compatProbes, { timeout: 30000 });
+    const proxied = await page.evaluate(() => window.__compatProbes);
+    fs.writeFileSync(path.join(artifacts, 'compat-differential.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(Object.keys(proxied).sort(), Object.keys(direct).sort(), 'probe key sets differ between direct and proxied runs');
+    const divergent = Object.fromEntries(Object.entries(direct).filter(([k]) => proxied[k] !== direct[k]));
+    fs.writeFileSync(path.join(artifacts, 'compat-divergences.json'), JSON.stringify(divergent, null, 2));
+    await t.test('B/C/I positive cases match native exactly', () => {
+      const unexpected = Object.keys(divergent).filter(k => !(k in expectedDivergences));
+      assert.deepEqual(unexpected, [], `unexpected divergences: ${JSON.stringify(divergent)}`);
+    });
+    await t.test('documented divergences match ERRATA exactly', () => {
+      for (const [k, proxyValue] of Object.entries(expectedDivergences)) {
+        if (!(k in divergent)) {
+          assert.fail(`${k}: expected divergence but results matched — behavior changed, re-audit ERRATA (both=${direct[k]})`);
+        }
+        assert.equal(proxied[k], proxyValue, `${k}: proxy=${proxied[k]} direct=${direct[k]}`);
+      }
+    });
+    await t.test('proxied page used proxy transport for all target traffic', () => {
+      const newWire = wireRequests.slice(wireBefore);
+      assert.ok(newWire.some(u => u.startsWith(proxyOrigin + '/')), 'no proxy-origin wire request observed');
+      assert.ok(!newWire.some(u => u.startsWith(`${targetBase}/`)), `page issued direct-target requests: ${JSON.stringify(newWire.filter(u => u.startsWith(targetBase)))}`);
+      assert.ok(requests.some(r => r.url.startsWith('/compat-echo')), 'upstream never saw /compat-echo');
+    });
+    await t.test('J: every URL form loads through the proxy exactly when it loads natively', () => {
+      const keys = ['poster', 'inputsrc', 'tdbg', 'imagesrcset', 'svgimage', 'imageset', 'mask', 'before', 'shape', 'import', 'bodybg', 'svgbaseval'];
+      const seen = (k, proxied) => requests.some(r => r.url.includes('j=' + k) && ((r.userAgent === TARGET_UA) === proxied));
+      const table = keys.map(k => [k, seen(k, false), seen(k, true)]);
+      fs.writeFileSync(path.join(artifacts, 'compat-j-loads.json'), JSON.stringify(table, null, 2));
+      const diverged = table.filter(([, nat, prox]) => nat !== prox).map(([k, nat, prox]) => `${k}: native=${nat} proxy=${prox}`);
+      assert.deepEqual(diverged, [], diverged.join('; '));
+      assert.ok(table.filter(([, nat]) => nat).length >= 8, `native run loaded too few probes to mean anything: ${JSON.stringify(table)}`);
+    });
+  });
+
+  await t.test('iframe suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/iframe-probes`);
+    try {
+      await page.waitForFunction(() => window.__iframeProbes, { timeout: 45000 });
+    } catch (e) {
+      const stage = await page.evaluate(() => ({ stage: window.__probeStage, partial: window.__iframeProbes || null })).catch(() => null);
+      console.log('iframe probes wait failed; stage =', JSON.stringify(stage));
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__iframeProbes);
+    probes.__diag = await page.evaluate(() => window.__zp_diagnostics || null);
+    fs.writeFileSync(path.join(artifacts, 'iframe-probes.json'), JSON.stringify(probes, null, 2));
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    await t.test('creation/insertion/ownerDocument', () => {
+      assert.equal(probes.createBlank, 'v:true,true,true', `createBlank: ${probes.createBlank}`);
+    });
+    await t.test('identity surfaces', () => {
+      assert.equal(probes.identityStable, 'v:true,true,true', `identityStable: ${probes.identityStable}`);
+    });
+    await t.test('navigation via src + virtual child location', () => {
+      assert.equal(probes.srcLoad, 'v:true', `srcLoad: ${probes.srcLoad}`);
+      assert.equal(probes.srcVirtual, `v:${targetBase}/frame-child`, `srcVirtual: ${probes.srcVirtual}`);
+    });
+    await t.test('postMessage carries virtual origin and stable source', () => {
+      assert.equal(probes.postMessage, `v:${targetBase}/frame-child|${targetBase}|${targetBase}|true`, `postMessage: ${probes.postMessage}`);
+    });
+    await t.test('srcdoc loads with injected prelude', () => {
+      assert.equal(probes.srcdocLoad, 'v:inner sd', `srcdocLoad: ${probes.srcdocLoad}`);
+      assert.equal(probes.srcdocScript, 'v:sd-ran', `srcdocScript: ${probes.srcdocScript}`);
+      assert.equal(probes.srcdocLocation, 'v:about:srcdoc', `srcdocLocation: ${probes.srcdocLocation}`);
+    });
+    await t.test('blob: iframe src is fail-closed', () => {
+      assert.match(probes.blobBlocked, /^v:contained:/, `blobBlocked: ${probes.blobBlocked}`);
+    });
+    await t.test('sandbox allow-scripts runs opaque-origin child', () => {
+      assert.match(probes.sandboxOpaque, /^v:ran\|(null-doc|e:)/, `sandboxOpaque: ${probes.sandboxOpaque}`);
+    });
+    await t.test('nested srcdoc grandchild gets prelude', () => {
+      assert.match(probes.nested, /^v:grandchild-ran\|/, `nested: ${probes.nested}`);
+    });
+    await t.test('insert/remove race stays clean', () => {
+      assert.equal(probes.removeRace, 'v:true', `removeRace: ${probes.removeRace}`);
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  await t.test('worker suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/worker-probes`);
+    try {
+      await page.waitForFunction(() => window.__workerProbes, { timeout: 45000 });
+    } catch (e) {
+      console.log('worker probes wait failed');
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__workerProbes);
+    fs.writeFileSync(path.join(artifacts, 'worker-probes.json'), JSON.stringify(probes, null, 2));
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const d = probes.dedicated || {};
+    await t.test('dedicated worker location is virtual', () => {
+      assert.equal(d.href, `v:${targetBase}/probe-worker.js`, `href: ${d.href}`);
+      assert.equal(d.locProps, `v:http:|${targetHost}:${targetPort}|/probe-worker.js`, `locProps: ${d.locProps}`);
+      assert.match(d.locMethods, /^v:(undefined|function),(undefined|function),function$/, `locMethods: ${d.locMethods}`);
+    });
+    await t.test('dedicated worker network surface', () => {
+      assert.equal(d.fetchEcho, 'v:200', `fetchEcho: ${d.fetchEcho}`);
+      assert.equal(d.xhrShim, 'v:200', `xhrShim: ${d.xhrShim}`);
+      assert.equal(d.xhrSync, 'v:status:200|worker-echo', `xhrSync: ${d.xhrSync}`);
+      assert.equal(d.wsCtor, 'v:constructed', `wsCtor: ${d.wsCtor}`);
+      assert.equal(d.wsRoundtrip, 'v:msg:echo:ping', `wsRoundtrip: ${d.wsRoundtrip}`);
+      assert.ok(requests.some(r => r.upgrade && String(r.url).startsWith('/ws?w=worker')), `upstream never saw worker /ws upgrade: ${JSON.stringify(requests.filter(r => r.upgrade).map(r => r.url))}`);
+      assert.equal(d.rtcCtor, 'v:e:ReferenceError', `rtcCtor: ${d.rtcCtor}`);
+      assert.equal(d.wtCtor, 'v:constructed:closed', `wtCtor: ${d.wtCtor}`);
+      assert.equal(d.esRoundtrip, 'v:msg:sse-ok', `esRoundtrip: ${d.esRoundtrip}`);
+      assert.ok(requests.some(r => r.url.startsWith('/worker-echo')), `upstream never saw /worker-echo: ${JSON.stringify(requests.map(r => r.url))}`);
+    });
+    await t.test('dedicated worker dynamic code is rewrite-then-execute', () => {
+      assert.equal(d.evalCode, 'v:2', `evalCode: ${d.evalCode}`);
+      assert.equal(d.funcCtor, 'v:7', `funcCtor: ${d.funcCtor}`);
+    });
+    await t.test('dedicated worker timers', () => {
+      assert.equal(d.timerFn, 'v:fired', `timerFn: ${d.timerFn}`);
+      assert.equal(d.timerStr, 'v:ran', `timerStr: ${d.timerStr}`);
+    });
+    await t.test('dedicated worker importScripts', () => {
+      assert.equal(d.importScriptsOK, 'v:imp-ok', `importScriptsOK: ${d.importScriptsOK}`);
+      assert.equal(d.importScriptsData, 'v:imported', `importScriptsData: ${d.importScriptsData}`);
+      assert.equal(d.importScriptsBlob, 'v:imported', `importScriptsBlob: ${d.importScriptsBlob}`);
+      assert.ok(requests.some(r => r.url.startsWith('/worker-imported.js')), 'upstream never saw /worker-imported.js');
+    });
+    await t.test('dedicated worker storage isolation + fingerprint', () => {
+      assert.equal(d.ua, `v:${TARGET_UA}`, `ua: ${d.ua}`);
+      assert.equal(d.platform, 'v:Win32', `platform: ${d.platform}`);
+      assert.equal(d.idb, 'v:object', `idb: ${d.idb}`);
+      assert.equal(d.idbRoundtrip, 'v:listed-virtual', `idbRoundtrip: ${d.idbRoundtrip}`);
+      assert.equal(d.cachesRoundtrip, 'v:open+keys=1', `cachesRoundtrip: ${d.cachesRoundtrip}`);
+      assert.equal(d.errorStack, 'v:clean', `errorStack: ${d.errorStack}`);
+    });
+    await t.test('worker virtual surfaces (W8-W12)', () => {
+      assert.equal(d.origin, `v:${targetBase}`, `origin: ${d.origin}`);
+      assert.equal(d.secureCtx, 'v:true', `secureCtx: ${d.secureCtx}`);
+      assert.equal(d.urlResolve, `v:${targetBase}/w-abs`, `urlResolve: ${d.urlResolve}`);
+      assert.equal(d.webkitURLAlias, 'v:absent:undefined', `webkitURLAlias: ${d.webkitURLAlias}`);
+      assert.match(d.webkitIDB, /^v:(alias|not-alias:undefined)$/, `webkitIDB: ${d.webkitIDB}`);
+      assert.equal(d.bcName, 'v:wp1', `bcName: ${d.bcName}`);
+      assert.equal(d.opfsName, 'v:name:', `opfsName: ${d.opfsName}`);
+      assert.match(d.webkitFS, /^v:(undefined|fn:e:NotSupportedError)$/, `webkitFS: ${d.webkitFS}`);
+      assert.equal(d.sharedStorageW, 'v:undefined', `sharedStorageW: ${d.sharedStorageW}`);
+    });
+    const m = probes.module || {};
+    await t.test('module worker imports + meta', () => {
+      assert.equal(m.staticImport, 'v:dep-ok', `staticImport: ${m.staticImport}`);
+      assert.equal(m.href, `v:${targetBase}/probe-module-worker.js`, `href: ${m.href}`);
+      assert.equal(m.fetchEcho, 'v:200', `fetchEcho: ${m.fetchEcho}`);
+      assert.equal(m.evalCode, 'v:1', `evalCode: ${m.evalCode}`);
+      assert.equal(m.funcCtor, 'v:1', `funcCtor: ${m.funcCtor}`);
+      assert.equal(m.importScriptsStub, 'v:e:TypeError', `importScriptsStub: ${m.importScriptsStub}`);
+      assert.ok(requests.some(r => r.url.startsWith('/probe-module-dep.js')), 'upstream never saw module dep');
+    });
+    const s = probes.shared || {};
+    await t.test('shared worker isolation + messaging', () => {
+      assert.equal(s.href, `${targetBase}/probe-shared-worker.js`, `href: ${s.href}`);
+      assert.equal(s.ua, TARGET_UA, `ua: ${s.ua}`);
+      assert.equal(s.name, 'swprobe', `name: ${s.name}`);
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  await t.test('csp suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/csp-probes`);
+    try {
+      await page.waitForFunction(() => window.__cspProbes && window.__cspProbes.done, { timeout: 30000 });
+    } catch (e) {
+      console.log('csp probes wait failed');
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__cspProbes);
+    fs.writeFileSync(path.join(artifacts, 'csp-probes.json'), JSON.stringify(probes, null, 2));
+    const v = probes.violations || [];
+    await t.test('inline module executes via blob: script-src', () => {
+      assert.equal(probes.inlineModule, 'ran', `inlineModule: ${probes.inlineModule}`);
+    });
+    await t.test('connect-src allows data: and blob: fetch', () => {
+      assert.equal(probes.fetchData, '200:hi', `fetchData: ${probes.fetchData}`);
+      assert.equal(probes.fetchBlob, '200:bl', `fetchBlob: ${probes.fetchBlob}`);
+    });
+    await t.test('img/style/font/media allow data: sources', () => {
+      assert.equal(probes.imgData, 'loaded', `imgData: ${probes.imgData}`);
+      assert.equal(probes.styleData, 'loaded', `styleData: ${probes.styleData}`);
+      assert.ok(!v.some(x => /^font-src/.test(x)), `font-src violation: ${v}`);
+      assert.ok(!v.some(x => /^media-src/.test(x)), `media-src violation: ${v}`);
+    });
+    await t.test('blocked resources fire securitypolicyviolation', () => {
+      assert.equal(probes.objectBlocked, 'spv:object-src', `objectBlocked: ${probes.objectBlocked}`);
+      assert.equal(probes.baseBlocked, 'spv:base-uri', `baseBlocked: ${probes.baseBlocked}`);
+      assert.equal(probes.manifestBlocked, 'no-spv', `manifestBlocked: ${probes.manifestBlocked}`);
+      assert.equal(probes.prefetchBlocked, 'no-spv', `prefetchBlocked: ${probes.prefetchBlocked}`);
+    });
+    await t.test('sealed paths fail before CSP (divergence pins)', () => {
+      assert.match(probes.frameDataSrc, /^(blocked:|set:(about:|http:\/\/proxy))/,
+        `frameDataSrc: ${probes.frameDataSrc}`);
+      assert.ok(!v.some(x => /^frame-src|^child-src/.test(x)), `frame violation leaked: ${v}`);
+      assert.match(probes.workerBlob, /^(blocked:|created)/, `workerBlob: ${probes.workerBlob}`);
+    });
+    await t.test('unsafe-inline/unsafe-eval paths work', () => {
+      assert.equal(probes.inlineHandler, 'ran', `inlineHandler: ${probes.inlineHandler}`);
+      assert.equal(probes.evalPath, 'v:42', `evalPath: ${probes.evalPath}`);
+    });
+    await t.test('CSP meta injection is intersected, not dropped', () => {
+      assert.equal(probes.metaNeutralized, 'img-loaded-after-meta', `metaNeutralized: ${probes.metaNeutralized}`);
+      assert.equal(probes.metaStricter, 'img-blocked', `metaStricter: ${probes.metaStricter}`);
+    });
+    await t.test('response CSP matches proxied policy contract', () => {
+      // Filter to the share document response (identified by report-uri) rather than control-surface /zp/api/* responses.
+      const docHeaders = [...responseHeaders.entries()]
+        .filter(([u]) => { try { const p = new URL(u); return p.origin === proxyOrigin && (p.pathname === '/zp/' || p.pathname.startsWith('/zp/p/')); } catch { return false; } })
+        .map(([, h]) => h['content-security-policy'] || h['Content-Security-Policy'])
+        .find(csp => csp && /report-uri/.test(String(csp)));
+      assert.ok(docHeaders, 'proxied document CSP header not captured');
+      const csp = String(docHeaders);
+      assert.match(csp, /default-src 'none'/, 'default-src');
+      assert.match(csp, /script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:/, 'script-src must carry blob: for inline modules');
+      assert.match(csp, /connect-src [^;]*blob: data:/, 'connect-src must carry blob:/data:');
+      assert.match(csp, /media-src 'self' blob: data:/, 'media-src');
+      assert.match(csp, /worker-src 'self' blob:/, 'worker-src');
+      assert.match(csp, /object-src 'none'/, 'object-src');
+      assert.match(csp, /base-uri 'none'/, 'base-uri');
+      assert.match(csp, /form-action 'self'/, 'form-action');
+      assert.match(csp, /manifest-src 'self'/, 'manifest-src');
+      assert.match(csp, /report-uri \/zp\/api\/csp-report/, 'report-uri');
+      assert.ok(!/frame-ancestors/.test(csp), 'frame-ancestors must be absent on proxied docs');
+      for (const absent of ['trusted-types', 'require-trusted-types-for', 'sandbox', 'upgrade-insecure-requests', 'block-all-mixed-content']) {
+        assert.ok(!csp.includes(absent), `${absent} must be absent`);
+      }
+    });
+    await t.test('violation reports reach the server log', async () => {
+      await new Promise(r => setTimeout(r, 1500));
+      assert.match(proxyLog, /\[CSP\] blocked=.*directive=object-src/, `no object-src report in server log`);
+      assert.match(proxyLog, /\[CSP\] blocked=.*directive=base-uri/, `no base-uri report in server log`);
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  // `page.waitForFunction` compiles its predicate from a string, which a document whose policy refuses string evaluation refuses, as the
+  // engine would (an earlier suite leaves such a `<meta>` policy in this page until it navigates): poll with `evaluate`, which does not.
+  const pollPage = async (p, predicate, { timeout = 30000, polling = 100, arg, what = 'pollPage timed out' } = {}) => {
+    const end = Date.now() + timeout;
+    for (;;) {
+      try { const v = await p.evaluate(predicate, arg); if (v) return v; } catch { /* the page is navigating */ }
+      if (Date.now() > end) throw new Error(what);
+      await new Promise(r => setTimeout(r, polling));
+    }
+  };
+  // A run's two captures (native, proxied) differ only in the run name the fixtures put in their addresses.
+  const scrub = r => JSON.parse(JSON.stringify(r).split('run=native').join('run=X').split('run=proxied').join('run=X'));
+
+  // `navigator.sendBeacon()` without arguments is an error in a browser; the replacement used to POST to `.../undefined` (a request the
+  // origin answered 405), and an XMLHttpRequest keeps its state where the page cannot enumerate it.
+  await t.test('sendBeacon() without arguments throws, and a request owns no properties of its own', async () => {
+    const r = await page.evaluate(() => {
+      const t = f => { try { f(); return 'no error'; } catch (e) { return e.name + ': ' + e.message; } };
+      return {
+        beacon: t(() => navigator.sendBeacon()),
+        xhrOwnNames: Object.getOwnPropertyNames(new XMLHttpRequest()),
+        valid: t(() => { const x = new XMLHttpRequest(); x.open('GET', '/zp/probe-nothing'); }),
+      };
+    });
+    assert.equal(r.beacon, "TypeError: Failed to execute 'sendBeacon' on 'Navigator': 1 argument required, but only 0 present.");
+    assert.deepEqual(r.xhrOwnNames, [], 'a request owns no properties of its own');
+    assert.equal(r.valid, 'no error', 'a valid call still works');
+  });
+
+  await t.test('dynamic code suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/dyn-probes`);
+    try {
+      await pollPage(page, () => window.__dynProbes && window.__dynProbes.done, { timeout: 30000 });
+    } catch (e) {
+      console.log('dyn probes wait failed');
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__dynProbes);
+    fs.writeFileSync(path.join(artifacts, 'dyn-probes.json'), JSON.stringify(probes, null, 2));
+    const targetBase = `http://${targetHost}:${targetPort}`;
+
+    await t.test('dyn probes match native Chrome (direct-vs-proxy)', async () => {
+      const directBrowser = await puppeteer.launch({
+        headless: true,
+        protocolTimeout: 30000,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      });
+      let direct;
+      try {
+        const directPage = await directBrowser.newPage();
+        await directPage.goto(`${targetBase}/dyn-probes`, { waitUntil: 'domcontentloaded' });
+        await directPage.waitForFunction(() => window.__dynProbes && window.__dynProbes.done, { timeout: 30000 });
+        direct = await directPage.evaluate(() => window.__dynProbes);
+      } finally {
+        await directBrowser.close();
+      }
+      fs.writeFileSync(path.join(artifacts, 'dyn-differential.json'), JSON.stringify({ direct, proxied: probes }, null, 2));
+      assert.deepEqual(Object.keys(probes).sort(), Object.keys(direct).sort(), 'dyn probe key sets differ');
+      const divergent = Object.fromEntries(Object.keys(direct)
+        .filter(k => probes[k] !== direct[k])
+        .map(k => [k, { direct: direct[k], proxied: probes[k] }]));
+      assert.deepEqual(divergent, {}, `dyn probes diverge from native: ${JSON.stringify(divergent)}`);
+    });
+
+    await t.test('eval success and virtual scope', () => {
+      assert.equal(probes.evalBasic, 'v:2', `evalBasic: ${probes.evalBasic}`);
+      assert.equal(probes.evalLocation, `v:${targetBase}/dyn-probes`, `evalLocation: ${probes.evalLocation}`);
+      assert.equal(probes.evalStrict, `v:${targetBase}`, `evalStrict: ${probes.evalStrict}`);
+      assert.equal(probes.evalNonString, 'v:[123,null,null]', `evalNonString: ${probes.evalNonString}`);
+    });
+    await t.test('eval exceptions and edge forms', () => {
+      assert.equal(probes.evalSyntaxError, 'threw:SyntaxError', `evalSyntaxError: ${probes.evalSyntaxError}`);
+      assert.equal(probes.evalIndirect, `v:${targetBase}`, `evalIndirect: ${probes.evalIndirect}`);
+      assert.equal(probes.evalCall, 'v:5', `evalCall: ${probes.evalCall}`);
+      assert.equal(probes.evalAsCtor, 'threw:TypeError', `evalAsCtor: ${probes.evalAsCtor}`);
+      assert.equal(probes.evalTagged, 'v:object', `evalTagged: ${probes.evalTagged}`);
+      assert.equal(probes.evalVarVisible, 'v:42', `evalVarVisible: ${probes.evalVarVisible}`);
+    });
+    await t.test('Function paths', () => {
+      assert.equal(probes.fnBasic, 'v:42', `fnBasic: ${probes.fnBasic}`);
+      assert.equal(probes.fnParams, 'v:42', `fnParams: ${probes.fnParams}`);
+      assert.equal(probes.fnDefaultParam, 'v:5', `fnDefaultParam: ${probes.fnDefaultParam}`);
+      assert.equal(probes.fnCommentParam, 'v:9', `fnCommentParam: ${probes.fnCommentParam}`);
+      assert.equal(probes.fnLocation, `v:${targetBase}`, `fnLocation: ${probes.fnLocation}`);
+      assert.equal(probes.asyncFn, 'v:8', `asyncFn: ${probes.asyncFn}`);
+      assert.equal(probes.fnThisIsWindow, 'v:true', `fnThisIsWindow: ${probes.fnThisIsWindow}`);
+      assert.ok(String(probes.fnThis).startsWith(`v:${targetBase}`), `fnThis: ${probes.fnThis}`);
+      assert.equal(probes.fnWith, 'v:1', `fnWith: ${probes.fnWith}`);
+      assert.equal(probes.fnNestedEval, 'v:9', `fnNestedEval: ${probes.fnNestedEval}`);
+      assert.equal(probes.asyncFnCtor, 'v:ctor-same', `asyncFnCtor: ${probes.asyncFnCtor}`);
+    });
+    await t.test('string timers', () => {
+      assert.equal(probes.timerString, 'v:7', `timerString: ${probes.timerString}`);
+      assert.equal(probes.timerVirtual, `v:${targetBase}`, `timerVirtual: ${probes.timerVirtual}`);
+      assert.ok(probes.intervalString && probes.intervalString.startsWith('v:') && +probes.intervalString.slice(2) >= 1, `intervalString: ${probes.intervalString}`);
+      assert.ok(String(probes.timerThis).startsWith(`v:${targetBase}`), `timerThis: ${probes.timerThis}`);
+      assert.equal(probes.timerBad, 'v:error-surfaced', `timerBad: ${probes.timerBad}`);
+    });
+    await t.test('event handlers', () => {
+      assert.equal(probes.handlerStatic, 'v:1', `handlerStatic: ${probes.handlerStatic}`);
+      assert.equal(probes.handlerPropFn, `v:${targetBase}`, `handlerPropFn: ${probes.handlerPropFn}`);
+      assert.equal(probes.handlerPropString, 'v:silent', `handlerPropString: ${probes.handlerPropString}`);
+    });
+    await t.test('module kind survives import/export-free modules', () => {
+      assert.equal(probes.staticModuleLex, 'v:a|b', `staticModuleLex: ${probes.staticModuleLex}`);
+      assert.equal(probes.dynModuleTypeAfterSrc, 'v:c|k', `dynModuleTypeAfterSrc: ${probes.dynModuleTypeAfterSrc}`);
+    });
+    await t.test('blob worker source is fixed at construction', () => {
+      assert.equal(probes.blobWorkerRevoked, 'v:blob:a', `blobWorkerRevoked: ${probes.blobWorkerRevoked}`);
+      assert.equal(probes.workerSelfMethods, 'v:a,number,true,true', `workerSelfMethods: ${probes.workerSelfMethods}`);
+    });
+    await t.test('DOM insertion', () => {
+      assert.equal(probes.docWrite, 'v:wrote', `docWrite: ${probes.docWrite}`);
+      assert.equal(probes.innerHTMLScript, 'v:silent', `innerHTMLScript: ${probes.innerHTMLScript}`);
+      assert.equal(probes.adjacentScript, 'v:silent', `adjacentScript: ${probes.adjacentScript}`);
+      assert.equal(probes.domParserScript, 'v:silent', `domParserScript: ${probes.domParserScript}`);
+    });
+    await t.test('dynamic import()', () => {
+      assert.equal(probes.importHttp, `v:1|${targetBase}/dyn-mod.js`, `importHttp: ${probes.importHttp}`);
+      assert.equal(probes.importData, 'v:1', `importData: ${probes.importData}`);
+      assert.equal(probes.importBlob, 'v:3', `importBlob: ${probes.importBlob}`);
+    });
+    await t.test('no source or path leaks', () => {
+      for (const k of ['leakFnToString', 'leakCallee', 'leakDynStack', 'leakFnStack']) {
+        assert.equal(probes[k], 'v:clean', `${k}: ${probes[k]}`);
+      }
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  await t.test('perf suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/perf-probes`);
+    try {
+      await pollPage(page, () => window.__perfProbes && window.__perfProbes.done, { timeout: 60000 });
+    } catch (e) {
+      console.log('perf probes wait failed');
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__perfProbes);
+    fs.writeFileSync(path.join(artifacts, 'perf-probes.json'), JSON.stringify(probes, null, 2));
+    assert.ok(!probes.__fatal, `perf fixture died: ${probes.__fatal}`);
+
+    await t.test('10M loop-cap boundary', () => {
+      assert.equal(probes.underCap, 'v:5000000', `underCap: ${probes.underCap}`);
+      assert.equal(probes.cappedWhile, 'v:10000000', `cappedWhile: ${probes.cappedWhile}`);
+      assert.equal(probes.cappedFor, 'v:10000000', `cappedFor (expected 10000000 when capped, 12000001 if uncapped): ${probes.cappedFor}`);
+      assert.equal(probes.cappedDo, 'v:10000001', `cappedDo: ${probes.cappedDo}`);
+      assert.equal(probes.normalLoop, 'v:3', `normalLoop: ${probes.normalLoop}`);
+      assert.equal(probes.nestedLoops, 'v:100|9900', `nestedLoops: ${probes.nestedLoops}`);
+    });
+
+    await t.test('async-poll lifetime', () => {
+      assert.equal(probes.asyncPollBreak, 'v:20', `asyncPollBreak: ${probes.asyncPollBreak}`);
+      assert.equal(probes.asyncPollFlag, 'v:true|true|true', `asyncPollFlag: ${probes.asyncPollFlag}`);
+    });
+
+    await t.test('bulk DOM insertion', () => {
+      const m = /^v:(\d+)\|(\d+)$/.exec(probes.bulkDom || '');
+      assert.ok(m, `bulkDom: ${probes.bulkDom}`);
+      assert.ok(+m[1] >= 5000, `bulkDom count: ${probes.bulkDom}`);
+      assert.ok(+m[2] < 15000, `bulkDom ms: ${probes.bulkDom}`);
+    });
+
+    await t.test('iframe count x load time', () => {
+      const m = /^v:([^|]+)\|(\d+)$/.exec(probes.iframes || '');
+      assert.ok(m, `iframes: ${probes.iframes}`);
+      assert.equal(m[1], 'loaded,loaded,loaded,loaded,loaded', `iframe results: ${probes.iframes}`);
+      assert.ok(+m[2] < 30000, `iframe ms: ${probes.iframes}`);
+    });
+
+    await t.test('membrane hot-loop cost (T5-3)', () => {
+      const mm = /^v:(\d+)ms\|(\d+)$/.exec(probes.membraneRead || '');
+      assert.ok(mm, `membraneRead: ${probes.membraneRead}`);
+      assert.ok(+mm[1] < 20000, `membrane read 200k too slow: ${probes.membraneRead}`);
+      const mo = /^v:(\d+)ms$/.exec(probes.moOverhead || '');
+      assert.ok(mo, `moOverhead: ${probes.moOverhead}`);
+      assert.ok(+mo[1] < 15000, `MutationObserver overhead too high: ${probes.moOverhead}`);
+      console.log(`[perf] membraneRead=${mm[1]}ms moOverhead=${mo[1]}ms`);
+    });
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  // Proxied frames share one physical origin, so the membrane enforces cross-origin Window SecurityError boundaries.
+  await t.test('cross-site frame and popup access matches native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xsite`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xsite, { timeout: 45000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xsite);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/xsite`);
+    await page.waitForFunction(() => window.__xsite, { timeout: 60000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__xsite);
+    fs.writeFileSync(path.join(artifacts, 'xsite-differential.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['p2c.cross.document'], 'threw:SecurityError');
+    assert.equal(direct['p2c.cross.localStorage'], 'threw:SecurityError');
+    assert.equal(direct['p2c.cross.contentDocument'], 'null');
+    assert.equal(direct['p2c.cross.postMessage'], 'function');
+    assert.equal(direct['p2c.same.document'], 'object');
+    assert.equal(direct['c2p.cross.frameElement'], 'null');
+    assert.equal(direct['c2p.cross.parentDocument'], 'threw:SecurityError');
+    assert.equal(direct['c2p.same.parentDocument'], 'object');
+    assert.equal(direct['pop.handle.document'], 'threw:SecurityError');
+    assert.equal(direct['pop.opener.openerDocument'], 'threw:SecurityError');
+    assert.equal(direct['pm.cross.wrong'], 'dropped');
+    assert.equal(direct['pm.cross.ownOrigin'], 'dropped');
+    assert.equal(direct['pm.cross.optionsStar'], 'delivered');
+    assert.equal(direct['named.cross.bracket'], 'threw:SecurityError');
+    assert.equal(direct['reply.sources'], 'cross,same');
+    assert.match(direct['reply.cross'], /"srcIsParent":true,"srcIsTop":true,"origin":"http:\/\/[^"]+","trusted":true/);
+    assert.ok(Object.keys(direct).length >= 130, `too few probes ran natively: ${Object.keys(direct).length}`);
+    assert.deepEqual(Object.keys(proxied).sort(), Object.keys(direct).sort(), 'probe key sets differ');
+    const expected = new Set();
+    const unexpected = Object.keys(direct).filter(k => proxied[k] !== direct[k] && !expected.has(k))
+      .map(k => `${k}: native=${direct[k]} proxy=${proxied[k]}`);
+    assert.deepEqual(unexpected, [], unexpected.join('\n'));
+    const healed = [...expected].filter(k => proxied[k] === direct[k]);
+    assert.deepEqual(healed, [], `now match native — update ERRATA and this list: ${healed.join(', ')}`);
+  });
+
+  await t.test('cookies reach every document that can see them, and no other (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xcookie2`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xcookie2, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xcookie2);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/xcookie2`);
+    await page.waitForFunction(() => window.__xcookie2, { timeout: 90000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__xcookie2);
+    fs.writeFileSync(path.join(artifacts, 'cookies-from-elsewhere.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['frame.navigation'], 'ck2_frame');
+    assert.equal(direct['image'], 'ck2_frame,ck2_img');
+    assert.equal(direct['script'], 'ck2_frame,ck2_img,ck2_script');
+    assert.equal(direct['sync.xhr.immediately'], 'ck2_frame,ck2_img,ck2_script,ck2_sync', 'a synchronous XHR returns with its cookies already readable');
+    assert.equal(direct['sibling.write.parent'], 'ck2_child,ck2_frame,ck2_img,ck2_script,ck2_sync');
+    assert.equal(direct['child.same.reads'], 'ck2_child,ck2_frame,ck2_img,ck2_parent,ck2_script,ck2_sync');
+    assert.equal(direct['child.cross.reads'], '', 'another site reads none of them');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a cookie reaches the other tab of the same site (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const names = p => p.evaluate(() => document.cookie.split('; ').filter(Boolean).map(c => c.split('=')[0]).filter(n => n.indexOf('ck3_') === 0).sort().join(','));
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    const scenario = async (a, b) => {
+      const out = {};
+      await a.evaluate(() => { document.cookie = 'ck3_written=1; Path=/'; });
+      await wait(900);
+      out['written in A: A'] = await names(a);
+      out['written in A: B'] = await names(b);
+      await b.evaluate(() => fetch('/xsetcookie?n=ck3_response').then(r => r.text()));
+      await wait(900);
+      out['set by a response in B: A'] = await names(a);
+      out['set by a response in B: B'] = await names(b);
+      return out;
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const a = await directBrowser.newPage();
+      const b = await directBrowser.newPage();
+      await a.goto(`${targetBase}/xtab`, { waitUntil: 'domcontentloaded' });
+      await b.goto(`${targetBase}/xtab`, { waitUntil: 'domcontentloaded' });
+      direct = await scenario(a, b);
+    } finally {
+      await directBrowser.close();
+    }
+    const a = await browser.newPage();
+    const b = await browser.newPage();
+    let proxied;
+    try {
+      assert.ok(await openThroughLauncher(a, proxyOrigin, `${targetBase}/xtab`), 'tab A reached the target');
+      assert.ok(await openThroughLauncher(b, proxyOrigin, `${targetBase}/xtab`), 'tab B reached the target');
+      proxied = await scenario(a, b);
+    } finally {
+      await a.close().catch(() => {});
+      await b.close().catch(() => {});
+    }
+    fs.writeFileSync(path.join(artifacts, 'cookies-across-tabs.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['written in A: B'], 'ck3_written', 'natively the other tab reads it');
+    assert.equal(direct['set by a response in B: A'], 'ck3_response,ck3_written');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('window.name stays with its own frame and lock queries stay inside the site', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xnames`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xnames, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xnames);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/xnames`);
+    await page.waitForFunction(() => window.__xnames, { timeout: 90000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__xnames);
+    fs.writeFileSync(path.join(artifacts, 'names-and-locks.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['child.plain'], 'name= held=zp_names_lock pending=0', 'a frame starts unnamed and sees its own site\'s lock');
+    assert.equal(direct['child.cross'], 'name= held= pending=0', 'another site sees neither');
+    assert.equal(direct['child.named'], 'name=child_named held=zp_names_lock pending=0');
+    assert.equal(direct['parent.name'], 'parent_window_name');
+    assert.equal(direct['parent.readsChildName'], 'child_named');
+    assert.equal(direct['afterChildRename.parent'], 'parent_window_name', 'a frame naming itself does not rename its parent');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('cookies set by fetch and XHR responses are visible to the page and match native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xcookie`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xcookie, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xcookie);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/xcookie`);
+    await page.waitForFunction(() => window.__xcookie, { timeout: 90000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__xcookie);
+    fs.writeFileSync(path.join(artifacts, 'server-set-cookies.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['fetch.visible'], 'tok');
+    assert.equal(direct['fetch.httpOnly.visible'], 'absent', 'a script never reads an HttpOnly cookie');
+    assert.equal(direct['xhr.visible'], 'tok');
+    assert.equal(direct['redirect.visible'], 'tok', 'a cookie set on a redirect hop is stored');
+    assert.equal(direct['omit.visible'], 'absent', 'credentials: omit stores nothing');
+    assert.equal(direct['update.value'], 'two');
+    assert.equal(direct['gone.before'], 'tok');
+    assert.equal(direct['gone.after'], 'absent', 'Max-Age=0 deletes');
+    assert.equal(direct['store.get'], 'present');
+    assert.equal(direct['sent.back'], 'as expected');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('storage events stay inside the writing site and match native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xstore`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xstore, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xstore);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/xstore`);
+    await page.waitForFunction(() => window.__xstore, { timeout: 90000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__xstore);
+    fs.writeFileSync(path.join(artifacts, 'storage-events.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['cross.write'], '', 'another site writing is not heard natively');
+    assert.equal(direct['same.write'], 'k_child|null|v1|local|true,s_child|null|v1|session|true');
+    assert.equal(direct['same.rewrite'], '', 'an unchanged value fires nothing');
+    assert.equal(direct['same.update'], 'k_child|v1|v2|local|true');
+    assert.equal(direct['same.remove'], 'k_child|v2|null|local|true');
+    assert.equal(direct['onstorage.keys'], 'k_child,k_child,k_child,s_child', 'the onstorage handler hears the same-site events');
+    assert.equal(direct['child.cross.heard'], '', 'the other site hears nothing of this one');
+    assert.match(direct['child.same.heard'], /k_parent\|null\|p1\|local\|true\|true/);
+    assert.equal(direct['synthetic'], 'synthetic|x|null');
+    assert.deepEqual(proxied, direct);
+  });
+
+  // Use a dedicated page because creating many frames caps joint session history at 50 entries and affects history-delta tests.
+  const openProxiedPage = async url => {
+    const fresh = await browser.newPage();
+    await observeTarget(fresh.target());
+    assert.ok(await openThroughLauncher(fresh, proxyOrigin, url), `the launcher did not reach ${url}`);
+    return fresh;
+  };
+  await t.test('a frame of another site made inside a blank child frame is routed once and is not wrapped again', async () => {
+    // The observer of a blank child frame's document saw the address the membrane had just written (a share path on a site host), took it for
+    // the page's own URL and routed it again: a new token, a host prefixed once more (s-s-...), every round a third longer, until the page died.
+    // The frame's visible address may be replaced once by its own document (a new token of the same length, a fragment added); that is not the loop.
+    // The loop is the routing of frames to site hosts, so site frames are asked for here whatever mode the suite runs in.
+    const page = await browser.newPage();
+    await observeTarget(page.target());
+    assert.ok(await openThroughLauncher(page, proxyOrigin, `http://${targetHost}:${targetPort}/xnested`, { siteFrames: true }), 'the launcher did not reach /xnested');
+    try {
+      const routed = () => page.frames().map(f => f.url()).filter(u => /^http:\/\/s-[a-z0-9-]+\.localhost:\d+\/zp\/p\//.test(u));
+      let first = [];
+      for (let i = 0; i < 100 && !first.length; i++) { first = routed(); if (!first.length) await new Promise(r => setTimeout(r, 100)); }
+      const shown = () => JSON.stringify(page.frames().map(f => f.url().slice(0, 100)));
+      assert.equal(first.length, 1, `the nested frame is routed to a site frame address; frames: ${shown()}`);
+      await new Promise(r => setTimeout(r, 2500));
+      const later = routed();
+      assert.equal(later.length, 1, `still one routed frame; frames: ${shown()}`);
+      assert.ok(!/^http:\/\/s-s-/.test(later[0]), `the host is not wrapped again: ${later[0].slice(0, 100)}`);
+      const pathLength = u => new URL(u).pathname.length; // the token; the fragment is added when the frame's document boots
+      assert.ok(pathLength(later[0]) <= pathLength(first[0]) + 8, `the route token does not grow: ${pathLength(first[0])} then ${pathLength(later[0])}`);
+    } finally { await page.close().catch(() => {}); }
+  });
+  await t.test("a strict inline script's var and function declarations are global, as natively", async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        await p.click('#b');
+        await p.waitForFunction(() => window.__handler, { timeout: 10000, polling: 100 });
+        return await p.evaluate(() => ({ inline: window.__inline, ext: window.__ext, handler: window.__handler, live: window.__live, live2: window.__live2, redecl: window.__redecl }));
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xstrict`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xstrict`));
+    fs.writeFileSync(path.join(artifacts, 'strict-globals.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // the native reference: both strict scripts' names are there, the later function replaced the earlier, the variable is one shared binding
+    assert.equal(direct.inline.sVar, '"v"');
+    assert.equal(direct.inline.sFn, 'f2');
+    assert.deepEqual(direct.live, ['changed-by-inline', 'changed-by-inline', 'changed-by-inline']);
+    assert.deepEqual(direct.live2, ['changed-by-function', 'changed-by-function']);
+    assert.deepEqual(direct.redecl, ['v', 1, true, 'undefined']);
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('a preload link a page makes at runtime loads through the proxy and fires its events, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__out && window.__out.events.length >= 2 && getComputedStyle(document.getElementById('probe')).width === '7px', { timeout: 30000, polling: 100 });
+        return await p.evaluate(() => ({
+          events: window.__out.events.slice().sort(),
+          width: getComputedStyle(document.getElementById('probe')).width,
+          rels: [...document.head.querySelectorAll('link')].map(l => l.getAttribute('rel') + '|' + l.getAttribute('as') + '|' + l.hasAttribute('href')).sort()
+        }));
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xpreload`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const before = requests.length;
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xpreload`));
+    const reached = requests.slice(before).filter(r => r.url.startsWith('/xpreload-'));
+    fs.writeFileSync(path.join(artifacts, 'preload-link.json'), JSON.stringify({ direct, proxied, reached: reached.map(r => [r.url, r.userAgent === TARGET_UA]) }, null, 2));
+    // the native reference: the preload of a stylesheet and the one set with rel last both settle with load, and the idiom's second link applies its rules
+    assert.deepEqual(direct.events, ['a:load', 'c:load']);
+    assert.equal(direct.width, '7px');
+    assert.deepEqual(proxied, direct);
+    for (const j of ['a', 'b', 'c']) assert.ok(reached.some(r => r.url.includes('j=' + j)), `proxied page never fetched ${j}: ${JSON.stringify(reached)}`);
+    assert.ok(reached.every(r => r.userAgent === TARGET_UA), `a request reached the target outside the proxy: ${JSON.stringify(reached)}`);
+  });
+  await t.test('a protocol-relative URL in CSS the page makes at runtime loads through the proxy, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const forms = ['textContent-before', 'textContent-after', 'appendText-before', 'appendText-after', 'insertBefore-text', 'append-text', 'innerHTML', 'insertRule', 'replaceSync', 'elstyle-prop', 'style-attr'];
+    const open = async p => { await p.waitForFunction(() => window.__done === true, { timeout: 30000, polling: 100 }); await new Promise(r => setTimeout(r, 2500)); await p.close(); };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const beforeDirect = requests.length;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xcssurls`, { waitUntil: 'domcontentloaded' });
+      await open(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const beforeProxied = requests.length;
+    const wireBefore = wireRequests.length;
+    await open(await openProxiedPage(`${targetBase}/xcssurls`));
+    // No form may make the browser ask the target directly, even where only the CSP would have stopped it.
+    const direct = wireRequests.slice(wireBefore).filter(u => u.startsWith(`${targetBase}/`));
+    assert.deepEqual(direct, [], `the page asked the target directly: ${direct.join(', ')}`);
+    const keys = [...forms, 'import'].map(k => 'prcss-' + k);
+    const native = requests.slice(beforeDirect, beforeProxied), via = requests.slice(beforeProxied);
+    const table = keys.map(k => [k, native.some(r => r.url.includes('j=' + k)), via.some(r => r.url.includes('j=' + k) && r.userAgent === TARGET_UA)]);
+    fs.writeFileSync(path.join(artifacts, 'css-protocol-relative.json'), JSON.stringify(table, null, 2));
+    assert.ok(table.every(([, nat]) => nat), `native run did not load every form: ${JSON.stringify(table)}`);
+    const diverged = table.filter(([, nat, prox]) => nat !== prox).map(([k]) => k);
+    assert.deepEqual(diverged, [], `not loaded through the proxy: ${diverged.join(', ')}`);
+    assert.ok(!via.some(r => r.url.includes('prcss-') && r.userAgent !== TARGET_UA), 'a protocol-relative CSS URL reached the target outside the proxy');
+  });
+  await t.test('Navigation API listeners a page adds run and see its navigations (the wrapper no longer recurses)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 30000, polling: 100 });
+        await new Promise(r => setTimeout(r, 300));
+        return await p.evaluate(() => window.__nav);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xnavigate`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xnavigate`));
+    fs.writeFileSync(path.join(artifacts, 'navigation-listeners.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: three navigations (hash change, pushState, replaceState), each seen once by the function, the object and the property handler; the removed one never.
+    assert.equal(direct.error, null);
+    assert.equal(direct.fn.length, 3);
+    assert.equal(direct.obj.length, 3);
+    assert.equal(direct.on.length, 3);
+    assert.deepEqual(direct.removed, []);
+    // Through the proxy every listener form runs (the wrapper used to call itself until the stack overflowed) and sees the same navigations in order. Two differences are known and not pinned
+    // here (ERRATA): the membrane's own address refresh adds one more navigate event (a replace to the current URL), and the first navigation reads push where a load-time hash change reads replace.
+    assert.equal(proxied.error, null);
+    assert.deepEqual(proxied.removed, []);
+    const hashes = list => list.filter((h, i) => i === 0 || h !== list[i - 1]);
+    const seen = {
+      fn: hashes(proxied.fn.map(e => e[2])),
+      obj: hashes(proxied.obj.map(e => e.split(':')[1])),
+      on: hashes(proxied.on.map(e => e.split(':')[1]))
+    };
+    for (const form of ['fn', 'obj', 'on']) assert.deepEqual(seen[form], ['h1', 'h2', 'h3'], `${form}: ${JSON.stringify(proxied[form])}`);
+    assert.ok(proxied.fn.every(e => e[0] === 'navigate' && e[3] === true && e[4] === 'function'), `event shape: ${JSON.stringify(proxied.fn)}`);
+  });
+  await t.test('code a page builds in blobs runs rewritten, including what a blob module imports, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__blobs);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xblobmodule`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xblobmodule`));
+    fs.writeFileSync(path.join(artifacts, 'blob-modules.json'), JSON.stringify({ direct, proxied }, null, 2));
+    const here = `${targetBase}/xblobmodule`;
+    // The native reference: each blob (and the data: module a blob imports) sees the page's address; es-module-shims' feature check loads and `src` reads back as the blob.
+    assert.deepEqual(direct.errors, []);
+    assert.deepEqual(direct.dynamic, [here, 7]);
+    assert.equal(direct.dataImport, here);
+    assert.deepEqual(direct.moduleScript, ['load', true, 8, here]);
+    assert.deepEqual(direct.classicScript, ['load', true, here]);
+    assert.equal(direct.computedImport, 'dep-loaded');
+    // Through the proxy: the same, which also means no blob ran as it was written (it would read the proxy's address, or be refused).
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('javascript: links and forms run as the default action of a click, in the markup and made at runtime, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        for (const id of ['sa', 'sfb', 'so', 'sp', 'ev', 'ra', 'rb', 'rc', 'ev2', 'ev3']) {
+          await p.click(`#${id}`);
+          await new Promise(r => setTimeout(r, 250));
+        }
+        return await p.evaluate(() => ({
+          log: window.__js,
+          forged: window.__forged === undefined ? 'nothing ran' : window.__forged,
+          hrefs: ['sa', 'so', 'sp', 'ra', 'rb', 'rc'].map(id => document.getElementById(id).getAttribute('href')),
+          action: document.getElementById('sf').getAttribute('action')
+        }));
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xjsurl`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xjsurl`));
+    fs.writeFileSync(path.join(artifacts, 'javascript-urls.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: each URL runs once after its click; the page's own onclick runs on the link that has one; a cancelled click runs nothing of the URL.
+    assert.deepEqual(direct.log, ['doc:sa', 'static-a', 'doc:sfb', 'static-form', 'onclick', 'doc:so', 'prevented', 'doc:sp', 'doc:ev', 'doc:ra', 'runtime-inner', 'doc:rb', 'runtime-attr', 'doc:rc', 'runtime-prop', 'doc:ev2', 'doc:ev3']);
+    // Internal attributes an author or the page writes are not a way to run code: natively they mean nothing, and through the proxy the runner ignores the code in them.
+    assert.equal(direct.forged, 'nothing ran');
+    assert.ok(direct.hrefs.every(h => /^javascript:/.test(h)));
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('members the page wraps with Object.defineProperty read, redefine and call as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__hooks);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xhookdefine`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xhookdefine`));
+    fs.writeFileSync(path.join(artifacts, 'hook-define.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: every member is configurable, the wrappers install, and each sits in the path of the call the page makes next.
+    assert.deepEqual(direct.errors, []);
+    assert.equal(direct.flags.window.setInterval, 'data,true,true,true');
+    assert.equal(direct.flags.Element.innerHTML, 'accessor,true,true,');
+    assert.equal(direct.flags.Element.setAttribute, 'data,true,true,true');
+    assert.equal(direct.timeout, 'ran');
+    assert.equal(direct.interval, 'ran');
+    assert.equal(direct.fetch, 'pong');
+    assert.deepEqual(Object.values(direct.deleted).filter(v => v[0] !== true || v[1] !== false), [], 'natively each is deletable and gone from the object');
+    assert.equal(direct.html, '<b id="x">x</b>');
+    assert.equal(direct.innerText, 'hello');
+    assert.ok(direct.calls.includes('innerText'));
+    // Through the proxy: the same flags and the same calls (the page's wrappers are called, and call the membrane's hooks underneath).
+    // Accessor hooks stay non-configurable on purpose (the membrane reads some of them through the page-facing property); everything else reads as natively.
+    assert.equal(proxied.flags.Element.innerHTML, 'accessor,false,true,');
+    assert.equal(proxied.flags.Node.textContent, 'accessor,false,true,');
+    assert.equal(proxied.flags.Document.cookie, 'accessor,false,true,');
+    for (const side of [direct, proxied]) for (const key of ['innerHTML']) delete side.flags.Element[key];
+    for (const side of [direct, proxied]) { delete side.flags.Node.textContent; delete side.flags.Document.cookie; }
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('EventTarget methods the page keeps and calls on window register, fire and remove as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__ael);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xael`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xael`));
+    fs.writeFileSync(path.join(artifacts, 'event-target-receiver.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: every shape works; a listener that was removed again does not hear its event.
+    assert.ok(Object.values(direct.shapes).every(v => v === 'ok'), JSON.stringify(direct.shapes));
+    assert.ok(!direct.heard.includes('removeCall') && !direct.heard.includes('removeCopy'));
+    assert.ok(direct.heard.includes('callWindow') && direct.heard.includes('protoCopyOnProto') && direct.heard.includes('dispatchCall'));
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('an inline module that imports its own site by absolute address runs, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__inline);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xinlinemod`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xinlinemod`));
+    fs.writeFileSync(path.join(artifacts, 'inline-module.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { v: 'static-ok', w: 'dynamic-ok' });
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('attribute selectors on URL-bearing attributes find the elements they name, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__sel);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xurlselect`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xurlselect`));
+    fs.writeFileSync(path.join(artifacts, 'url-attribute-selectors.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: a selector reads the value the page wrote, so each of these finds its element.
+    const site = targetBase;
+    assert.deepEqual(direct.later.all['script[src="/xsel.js"]'], ['s1']);
+    assert.deepEqual(direct.later.all[`script[src="${site}/xsel.js"]`], ['r1']);
+    assert.deepEqual(direct.later.all['link[href="/xsel.css"]'], ['l1']);
+    assert.deepEqual(direct.later.all['a[href="#changed"]'], ['a6']);
+    assert.deepEqual(direct.later.all['a[href="/xsel-old"]'], [], 'an attribute set to something else no longer matches its old value');
+    assert.ok(direct.later.all['a[href^="http"]'].includes('r12'));
+    // Through the proxy: the same elements for every selector, at the moment the element is made and after the membrane has settled it, the same errors for malformed selectors,
+    // the same values from getAttribute, and no script requested twice.
+    assert.deepEqual(proxied.sync.all, direct.sync.all);
+    assert.deepEqual(proxied.later.all, direct.later.all);
+    assert.deepEqual(proxied.later, direct.later);
+    assert.deepEqual(proxied.sync, direct.sync);
+    assert.equal(proxied.selLoads, direct.selLoads);
+  });
+  await t.test('cookieStore event methods taken from the prototype chain work on the facade, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__cs);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xcookiestore`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xcookiestore`));
+    fs.writeFileSync(path.join(artifacts, 'cookie-store-events.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: the wrapper ran, the listener heard the event dispatched through the prototype, and the removed one heard nothing.
+    assert.ok(Object.entries(direct).every(([, v]) => !String(v).startsWith('threw')), JSON.stringify(direct));
+    assert.equal(direct.delivered, true, JSON.stringify(direct));
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('the stack hook read through an alias of Error is the page\'s own, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__stk);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xstackalias`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xstackalias`));
+    fs.writeFileSync(path.join(artifacts, 'stack-hook-alias.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: nothing is saved at first, so a library falls back to its own default.
+    assert.equal(direct['saved hook type'], 'undefined', JSON.stringify(direct));
+    assert.ok(Object.entries(direct).every(([, v]) => !String(v).startsWith('threw')), JSON.stringify(direct));
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('scripts whose code is in their address run rewritten and in order, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__dat);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xdatascript`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xdatascript`));
+    fs.writeFileSync(path.join(artifacts, 'data-scripts.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: every kind of data: script ran (the two static classic ones, a module with an import, an inline module with an import, and two dynamic ones).
+    assert.deepEqual(direct.order, ['attribute', 'b64', 'dynamic', 'inline-import', 'inline-module', 'inner', 'module', 'plain'], JSON.stringify(direct));
+    assert.equal(direct.plainHref, `${targetBase}/xdatascript`);
+    // Rewritten, not run as written: the script sees the target's location rather than the proxy's.
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('native window accessors and methods that the page wraps or binds with its window as the receiver work, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__acc);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xwinaccessor`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xwinaccessor`));
+    fs.writeFileSync(path.join(artifacts, 'window-accessors.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: the wrapped getter ran and every call with the window as receiver works; only the foreign receiver is refused.
+    assert.equal(direct['screen.width via window'], 'number', JSON.stringify(direct));
+    assert.ok(Object.entries(direct).filter(([k]) => k !== 'getter on a foreign object').every(([, v]) => !String(v).startsWith('threw')), JSON.stringify(direct));
+    assert.match(String(direct['getter on a foreign object']), /Illegal invocation/);
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('window operations taken from a fresh iframe and called on the page window work, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__ifr);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xifrnative`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xifrnative`));
+    fs.writeFileSync(path.join(artifacts, 'iframe-native-operations.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: each operation works on the page's window, and the rrweb setter hook ran its timer (hits counts every callback that ran).
+    assert.ok(Object.entries(direct).filter(([k]) => k !== 'hits' && !k.startsWith('window.setTimeout')).every(([, v]) => !String(v).startsWith('threw')), JSON.stringify(direct));
+    assert.ok(direct.hits >= 1000, `the setter hook's timer did not run: ${direct.hits}`);
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('images the page puts in a document with no window are not requested, and load once adopted, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__inert);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xinertdoc`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xinertdoc`));
+    fs.writeFileSync(path.join(artifacts, 'inert-document-images.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: nothing is requested for what sits in a window-less document; an image requests once a document adopts or receives its node.
+    assert.equal(direct.beforeAdopt, 0);
+    assert.deepEqual(direct.afterAdopt, { adopted: 1, inserted: 1, other: 0 });
+    assert.equal(direct.readback[2], 'fast-x{fast-x-1}fast-x/xinert-placeholder.gif');
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('a document with no bytes loads as a blank document, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__empty);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xemptyframe`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xemptyframe`));
+    fs.writeFileSync(path.join(artifacts, 'empty-document.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { readyState: 'complete', bodyText: '', bodyChildren: 0, title: '', hasError: false, fetched: '200:0' });
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('media session metadata with artwork is accepted and shows the same fields, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__ms);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xmediasession`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xmediasession`));
+    fs.writeFileSync(path.join(artifacts, 'media-session-metadata.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The native reference: the assignment works, the fields read back, a plain object is refused, and the metadata stays live.
+    assert.equal(direct.set, 'ok');
+    assert.deepEqual([direct.title, direct.artist, direct.album, direct.count, direct.sizes, direct.type0], ['T', 'A', 'B', 2, '96x96,128x128', 'image/png']);
+    assert.equal(direct.live, 'live');
+    assert.equal(direct.plainObject, 'TypeError');
+    // Through the proxy: the same, except the artwork addresses, which the browser's media UI would fetch itself: the target's own address is the proxy's route to it.
+    const { abs: directAbs, rel: directRel, ...directRest } = direct;
+    const { abs: proxiedAbs, rel: proxiedRel, ...proxiedRest } = proxied;
+    assert.deepEqual(proxiedRest, directRest);
+    assert.equal(directAbs, `${targetBase}/art.png`);
+    assert.ok(!proxiedAbs.startsWith(targetBase) && decodeURIComponent(proxiedAbs).includes(`${targetBase}/art.png`), `artwork address: ${proxiedAbs}`);
+    assert.ok(proxiedRel.endsWith('/rel.png'), `relative artwork address: ${proxiedRel}`);
+  });
+  await t.test('localStorage and sessionStorage inherit from Object.prototype and Storage.prototype, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__done === true, { timeout: 30000, polling: 100 });
+        return await p.evaluate(() => window.__st);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xstorage`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xstorage`));
+    fs.writeFileSync(path.join(artifacts, 'storage-inheritance.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // the native reference: Object.prototype's methods answer, a stored key never shadows a prototype name, the Storage members are enumerable after the stored keys
+    assert.equal(direct['local typeof hasOwnProperty'], 'function');
+    assert.equal(direct['local hasOwnProperty a/zz/getItem'], 'true,false,false');
+    assert.equal(direct['local toString'], '[object Storage]');
+    assert.equal(direct['local constructor is Storage'], true);
+    assert.deepEqual(proxied, direct);
+  });
+  await t.test('frames made from markup load and read back as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xmarkup`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xmarkup, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xmarkup);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xmarkup`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xmarkup, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xmarkup);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'markup-frames.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    for (const k of ['innerHTML.title', 'insertAdjacentHTML.beforeend', 'insertAdjacentHTML.afterend', 'insertAdjacentHTML.beforebegin', 'setHTMLUnsafe', 'outerHTML', 'template.import', 'template.clone', 'createContextualFragment', 'DOMParser.adopt', 'document.write', 'innerHTML.late']) {
+      assert.equal(direct[k], 'frame ready', `${k}: the native reference changed`);
+    }
+    assert.equal(direct['innerHTML.src'], '/xframe-title', 'the author\'s text, not the resolved URL');
+    assert.equal(direct['innerHTML.read'], '<iframe src="/xframe-title" name="m"></iframe>');
+    assert.equal(direct['template.src'], '/xframe-title');
+    assert.equal(direct['innerHTML.srcdoc.prop'], '<p id=x>from srcdoc</p>', 'the page\'s text, not the document the proxy made of it');
+    assert.equal(direct['innerHTML.srcdoc.attr'], '<p id=x>from srcdoc</p>');
+    assert.equal(direct['innerHTML.srcdoc.body'], '<p id="x">from srcdoc</p>', 'and the document it shows');
+    assert.equal(direct['setAttribute.srcdoc.prop'], '<p id=y>from setAttribute</p>');
+    assert.equal(direct['setAttribute.srcdoc.attr'], '<p id=y>from setAttribute</p>');
+    assert.equal(direct['setAttribute.srcdoc.body'], '<p id="y">from setAttribute</p>', 'setAttribute gives the markup a document, not a URL string');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('scripts put in by every insertion door run through the membrane (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xinsert`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xinsert, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xinsert);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xinsert`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xinsert, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xinsert);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'insertion-doors.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.ok(Object.keys(direct).length >= 19, `the fixture lost doors: ${Object.keys(direct)}`);
+    for (const [door, where] of Object.entries(direct)) assert.equal(where, 'virtual', `${door}: the native reference changed`);
+    assert.deepEqual(proxied, direct);
+  });
+
+  // Synchronous XHR forwards unacknowledged cookie writes so the Service Worker applies them before sending upstream.
+  await t.test('a cookie written just before a synchronous XHR goes out with it (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xsyncck`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xsyncck, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xsyncck);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xsyncck`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xsyncck, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xsyncck);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'sync-xhr-cookies.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { rounds: 30, uniqueMissed: [], sharedWrong: [], heldSent: true, heldAfter: 'sheld=1/sheld=1' });
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a sandboxed frame sends and keeps only the cookies a cross-site context may (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xopck`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xopck, { timeout: 90000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xopck);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xopck`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xopck, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xopck);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'opaque-cookies.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct.jarHere.split(',').includes('ss_lax'), true, 'the embedding page sends its Lax cookie');
+    for (const k of ['img', 'css', 'script', 'last', 'fetch-default']) {
+      assert.equal(direct[k].split(',').includes('ss_lax'), false, `${k}: a cross-site request carries no Lax cookie`);
+      assert.equal(direct[k].split(',').includes('ss_strict'), false, `${k}: ... nor a Strict one`);
+      assert.equal(direct[k].split(',').includes('ss_def'), false, `${k}: ... nor one with no SameSite`);
+    }
+    assert.equal(direct.jarAfter.split(',').includes('op_lax'), false, 'a cross-site response may not set a Lax cookie');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a popup of a sandboxed frame is as opaque as the frame (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xpopop`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xpopop, { timeout: 120000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xpopop);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xpopop`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xpopop, { timeout: 180000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xpopop);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'opaque-popups.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    const opaque = direct['opaque popup'].report;
+    assert.equal(opaque['self.origin'], 'null', 'the popup is as opaque as the frame that opened it');
+    assert.equal(opaque.localStorage, 'threw:SecurityError');
+    assert.equal(opaque['document.cookie'], 'threw:SecurityError');
+    assert.equal(opaque['opener.document'], 'threw:SecurityError');
+    assert.notEqual(direct['escaping popup'].report['self.origin'], 'null', 'an escaping popup has the site\'s origin');
+    assert.equal(direct['escaping popup'].report.localStorage, '1');
+    assert.equal(direct['no popups'].handle.opened, 'no', 'no allow-popups: no popup');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('cross-origin fetch and XHR obey CORS: who may read, when the browser asks first, redirects (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xcors`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xcors, { timeout: 120000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xcors);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xcors`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xcors, { timeout: 180000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xcors);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'cors.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['acao-origin'].type, 'cors');
+    assert.match(String(direct['acao-missing']), /^threw:TypeError/);
+    assert.match(String(direct['star-creds-acac']), /^threw:TypeError/);
+    assert.deepEqual(direct['expose-listed'].hdr, ['cache-control', 'content-type', 'x-other', 'x-secret']);
+    assert.match(String(direct['pf-put-no-acam']), /^threw:TypeError/);
+    assert.deepEqual(direct.__log['pf-put-no-acam'].map(e => e.m), ['OPTIONS'], 'a failed preflight means the request is never sent');
+    assert.deepEqual(direct.__log['pf-put-ok'].map(e => e.m), ['OPTIONS', 'PUT']);
+    assert.deepEqual(direct.__log['pf-maxage'].map(e => e.m), ['OPTIONS', 'PUT', 'PUT'], 'a preflight answer is reused for its Max-Age');
+    assert.equal(direct['same-put'].type, 'basic');
+    assert.deepEqual(direct.__log['same-put'].map(e => e.m), ['PUT'], 'no preflight inside the document\'s own origin');
+    assert.equal(direct['no-cors-get'].type, 'opaque');
+    assert.equal(direct.__log['redir-self-star:b'][0].origin, 'null', 'after a trip through another origin the request\'s origin is null');
+    assert.match(String(direct['redir-self-origin']), /^threw:TypeError/);
+    assert.match(String(direct['redir-userinfo']), /^threw:TypeError/);
+    assert.equal(direct['sx-fail'].threw, 'NetworkError');
+    assert.equal(direct.__log['cookie-include'][0].cookies, 'xc');
+    assert.equal(direct.__log['cookie-default'][0].cookies, '');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('images in frames and in markup end up as the real image, not the placeholder (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xph`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xph, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xph);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xph`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xph, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xph);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'placeholders.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.deepEqual(direct, { written: '8x8', srcdoc: '8x8', top: '8x8', nested: '8x8' });
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('member operations on null and undefined throw as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xnullish`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xnullish, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xnullish);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xnullish`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xnullish, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xnullish);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'nullish.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.out['null / get location'], "TypeError: Cannot read properties of null (reading 'location') | true");
+    assert.equal(direct.out['undefined / set href'], "TypeError: Cannot set properties of undefined (setting 'href') | true");
+    assert.equal(direct.out['null / optional get'], 'ok:undefined');
+    assert.equal(direct.out['object / get location'], 'ok:undefined');
+    assert.equal(direct.uncaught.length, 2);
+    assert.deepEqual(direct.uncaught.map(u => u[1]), ['page', 'page']);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('dynamic code declares globals as natively, and the file-system entry points exist', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xdyneval`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xdyneval, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xdyneval);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xdyneval`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xdyneval, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xdyneval);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'dynamic-globals.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.globals.g4, 'function');
+    assert.equal(direct.globals.g7, 'function');
+    assert.equal(direct.globals.g5, 'undefined');
+    assert.equal(direct.globals.g11, 'undefined');
+    assert.ok(Object.values(direct.identity).every(v => v === true), JSON.stringify(direct.identity));
+    assert.deepEqual(direct.fs.webkitRequestFileSystem.slice(0, 2), ['function', 3]);
+    assert.deepEqual(proxied, direct);
+  });
+
+  // Site frames (see .ai/design/site-frames.md): a frame of another site is served from a real origin of its own, so the browser isolates it.
+  await t.test('with site frames on, a frame of another site runs at a real origin of its own and one of the same site does not', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const isSiteHost = f => { const h = new URL(f.url()).host; return h.startsWith('s-') && h.endsWith(`.localhost:${proxyPort}`); };
+    const open = async (path, siteFrames) => {
+      const page = await browser.newPage();
+      await observeTarget(page.target());
+      assert.ok(await openThroughLauncher(page, proxyOrigin, `${targetBase}${path}`, { siteFrames }), `the launcher did not reach ${path}`);
+      return page;
+    };
+    // another site: its own host, out of the embedder's reach for the browser itself, a cross-origin frame to the page
+    const cross = await open('/xframe-env', true);
+    try {
+      await cross.waitForFunction(() => window.__xframeenv, { timeout: 120000, polling: 100 });
+      const frames = cross.frames().slice(1);
+      const site = frames.find(isSiteHost);
+      assert.ok(site, `no frame at a site host: ${frames.map(f => f.url()).join(' ')}`);
+      // evaluated natively inside the frame: the browser, not the membrane, refuses
+      assert.equal(await site.evaluate(() => { try { return typeof top.document; } catch (e) { return e.name; } }), 'SecurityError');
+      assert.equal(await cross.evaluate(() => { try { return String(document.querySelector('iframe').contentDocument); } catch (e) { return e.name; } }), 'null');
+      assert.equal(await cross.evaluate(() => { try { return typeof document.querySelector('iframe').contentWindow.document; } catch (e) { return e.name; } }), 'SecurityError');
+    } finally {
+      await cross.close();
+    }
+    // the same site as the top document stays where the top document is
+    const same = await open('/xsf-same', true);
+    try {
+      await same.waitForFunction(() => document.querySelector('iframe'), { timeout: 60000, polling: 100 });
+      await new Promise(r => setTimeout(r, 3000));
+      const frames = same.frames().slice(1);
+      assert.ok(frames.length > 0 && frames.every(f => !isSiteHost(f)), `a same-site frame left the main origin: ${frames.map(f => f.url()).join(' ')}`);
+    } finally {
+      await same.close();
+    }
+    // and without site frames nothing moves
+    const off = await open('/xframe-env', false);
+    try {
+      await off.waitForFunction(() => window.__xframeenv, { timeout: 120000, polling: 100 });
+      assert.equal(off.frames().slice(1).some(isSiteHost), false);
+    } finally {
+      await off.close();
+    }
+  });
+
+  await t.test('a cross-origin frame sees its embedder and a native-shaped stack', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xframe-env`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xframeenv, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xframeenv);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xframe-env`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xframeenv, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xframeenv);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'frame-env.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct.ancestorOrigins, [targetBase]);
+    assert.equal(direct.referrer, `${targetBase}/`);
+    assert.equal(direct.stackHasPositions, true);
+    assert.equal(direct.stackLeaks, false);
+    // External script callbacks match native stack frames; inline scripts run via eval and differ in top-level frame names.
+    assert.equal(direct.stackFrames.length, 5, JSON.stringify(direct.stackFrames));
+    assert.equal(proxied.stackLeaks, false, `the stack names the membrane: ${JSON.stringify(proxied.stackFrames)}`);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('Fetch Metadata of fetches and frames matches native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xfm`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xfm, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xfm);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xfm`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xfm, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xfm);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'fetch-metadata.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.sameOrigin.site, 'same-origin');
+    assert.equal(direct.crossSite.site, 'cross-site');
+    assert.deepEqual([direct.frame.site, direct.frame.mode, direct.frame.dest, direct.frame.user], ['cross-site', 'navigate', 'iframe', 'absent']);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('Fetch Metadata of element loads matches native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xfm2?run=native`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xfm2, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xfm2);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xfm2?run=proxied`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xfm2, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xfm2);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'fetch-metadata-elements.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['img-same'].dest, 'image');
+    assert.equal(direct['script-cross'].mode, 'no-cors');
+    assert.deepEqual(direct['worker-same'], { site: 'same-origin', mode: 'same-origin', dest: 'worker', user: 'absent', storage: 'absent' });
+    assert.deepEqual(['img-cross', 'css-cross', 'script-cross', 'script-cors', 'fetch-cors'].map(k => direct[k].storage),
+      ['active', 'active', 'active', 'absent', 'absent']);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('workers start under a cross-origin-isolated document (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xcoep`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xcoep, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xcoep);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xcoep`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xcoep, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xcoep);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'coep-workers.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.match(String(direct.blob), /^blob-ok:/);
+    assert.match(String(direct.file), /^file-ok:/);
+    assert.deepEqual({ blob: proxied.blob, file: proxied.file }, { blob: direct.blob, file: direct.file });
+  });
+
+  await t.test('an inline script\'s Error.stack is a browser\'s (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xstack`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xstack, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xstack);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xstack`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xstack, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xstack);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'inline-stack.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct.top, [`at ${targetBase}/xstack:L:C`]);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a plain call\'s this, Object.keys(window), location\'s accessors and Error.prepareStackTrace are a browser\'s (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xthis`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xthis && window.__xthis.external && window.__xthis.worker, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xthis);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xthis`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xthis && window.__xthis.external && window.__xthis.worker, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xthis);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'plain-call-this.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.inline.plain, true);
+    assert.equal(direct.inline.href[4], 'function get href() { [native code] }');
+    assert.deepEqual(direct.inline.stackHook.before, ['undefined', false, false, 'stackTraceLimit', 'none']);
+    assert.equal(direct.worker.customStack, 'custom true function');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a worker sees the environment a browser gives it (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xwenv`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xwenv, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xwenv);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xwenv`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xwenv, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xwenv);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'worker-env.json'), JSON.stringify({ direct, proxied }, null, 2));
+    const identity = ['ua', 'appVersion', 'platform', 'uaData'];
+    for (const run of [direct, proxied]) {
+      for (const k of identity) assert.deepEqual([run.blob[k], run.file[k]], [run.page[k], run.page[k]], k);
+    }
+    // A worker's hooks print their own source and its navigator getters are not native-shaped: that is not pinned (a worker is not asked to look
+    // like a browser's). What is pinned for workers is the placement (`protoMembers`: the hook sits where the native member lives, so no native
+    // is left reachable behind it) and what a library reads to tell a worker from a page.
+    const workerShapeOnly = ['srcFetch', 'srcSetTimeout', 'srcPostMessage', 'srcImportScripts', 'srcXHROpen', 'srcFunction', 'srcEval', 'uaShape', 'platformShape', 'uaDataShape',
+      'globalOwnCount', 'globalOwn', 'zpNames'];
+    const diff = {};
+    for (const realm of ['page', 'blob', 'file']) {
+      for (const k of Object.keys(direct[realm] || {})) {
+        if (identity.includes(k)) continue;
+        if (realm !== 'page' && workerShapeOnly.includes(k)) continue;
+        if (JSON.stringify(direct[realm][k]) !== JSON.stringify((proxied[realm] || {})[k])) diff[realm + '.' + k] = [direct[realm][k], (proxied[realm] || {})[k]];
+      }
+    }
+    assert.deepEqual(diff, {});
+  });
+
+  await t.test('a TrustedScript is code for eval and timers, and no timer handler skips the rewriter (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xtt`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xtt, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xtt);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xtt`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xtt, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xtt);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'trusted-script-code.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { indirect: 2, direct: 42, declared: 7, plainObject: true, fn: 3, timers: Array(3).fill(`${targetBase}/xtt`) });
+    assert.deepEqual(proxied, direct);
+  });
+
+  // The same Trusted Types fixture read in a native browser and through the proxy.
+  const compareTrustedTypes = async (route, key) => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    // puppeteer's waitForFunction compiles its predicate from a string, which a document that enforces Trusted Types refuses: poll with evaluate.
+    const read = (page, timeout) => pollPage(page, k => window[k], { timeout, arg: key, what: `${key} never appeared` });
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}${route}`, { waitUntil: 'domcontentloaded' });
+      direct = await read(directPage, 60000);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}${route}`);
+    let proxied;
+    try {
+      proxied = await read(fresh, 120000);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, `trusted-types-${key}.json`), JSON.stringify({ direct, proxied }, null, 2));
+    return { direct, proxied };
+  };
+
+  await t.test('a document that enforces Trusted Types hands every sink string to its default policy, as natively', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xtte', '__xtte');
+    assert.equal(direct.innerHTML, 'built', 'the native reference changed');
+    assert.equal(direct.eval, '3');
+    assert.equal(direct.timer, 1, 'a string timer still runs once the default policy has seen it');
+    for (const sink of ['Element innerHTML', 'Element insertAdjacentHTML', 'Element outerHTML', 'HTMLIFrameElement srcdoc', 'eval', 'HTMLScriptElement text', 'HTMLScriptElement src', 'Element onclick', 'Window setTimeout']) {
+      assert.ok(direct.calls.some(c => c.includes(`|${sink}|`)), `the native reference never reported ${sink}: ${direct.calls.join(' ; ')}`);
+    }
+    assert.deepEqual(proxied.calls, direct.calls, 'the default policy hears the same inputs, types and sinks in the same order');
+    assert.deepEqual(proxied, direct);
+  });
+
+  for (const via of ['header', 'meta']) {
+    await t.test(`a document that enforces Trusted Types by ${via} refuses strings and accepts Trusted values, as natively`, async () => {
+      const { direct, proxied } = await compareTrustedTypes(`/xttn?via=${via}`, '__xttn');
+      for (const k of ['stringHTML', 'stringAdjacent', 'stringScriptSrc', 'stringScriptText', 'stringTimeout', 'stringSrcdoc', 'stringHandler', 'stringWorker', 'stringParse', 'stringFragment']) {
+        assert.match(direct[k], /^threw:TypeError:Failed to (set|execute|construct) [^:]+: This document requires 'Trusted(HTML|Script|ScriptURL)' assignment\.$/, `${k}: the native reference changed`);
+      }
+      assert.match(direct.stringEval, /^threw:EvalError:/);
+      assert.equal(direct.trustedHTML, 'true');
+      assert.equal(direct.trustedEval, '2');
+      assert.equal(direct.trustedScriptText, '1');
+      assert.equal(direct.trustedHandler, '2');
+      assert.equal(direct.plainText, 'plain', 'text that is no code or markup needs no policy');
+      assert.equal(direct.policies, 'q:ok', 'no name list: any policy name is allowed');
+      assert.deepEqual(proxied, direct);
+    });
+  }
+
+  await t.test('a worker of a document that enforces Trusted Types is bound by it when started from a blob, not when started from a URL, as natively', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xttw', '__xttw');
+    assert.match(direct.blob.eval + direct.blob.importScripts, /EvalError.*TypeError/, 'the native blob worker inherits the policy');
+    assert.equal(direct.url.eval, '2', 'a worker started from a URL has the policy of its own response');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a srcdoc frame of a document that enforces Trusted Types is bound by it, as natively', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xttf', '__xttf');
+    assert.match(direct.innerHTML, /^threw:TypeError:/, 'the native frame inherits the policy');
+    assert.match(direct.eval, /^threw:EvalError/);
+    assert.equal(direct.has, 'null', 'a frame has a default policy of its own');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a default policy that changes a string is obeyed by timers and markup and refused by eval and Function, as natively', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xttm', '__xttm');
+    assert.match(direct['eval changed'], /^threw:EvalError/, 'the engine refuses an eval whose text the policy changed');
+    assert.match(direct['indirect eval changed'], /^threw:EvalError/);
+    assert.match(direct['new Function changed'], /^threw:EvalError/, 'and a Function whose source it changed');
+    assert.equal(direct.timer, 2, 'a timer runs what the policy returned');
+    assert.match(direct['innerHTML changed'], /<i>x<\/i><!--p-->/, 'markup is what the policy returned');
+    assert.deepEqual(proxied, direct);
+  });
+
+  // The same fixture read natively and through the proxy, for a test that does not enforce Trusted Types (the helper above polls with evaluate).
+  await t.test('window identity holds across events: view, currentTarget, composedPath and the UI event constructors (matches native)', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xevid', '__xevid');
+    assert.equal(direct['MouseEvent view:window -> view===window,===self,===defaultView,===top'], '1111', 'the native reference changed');
+    assert.equal(direct['window listener: target,currentTarget,srcElement,this,windowEvent,path'], '010111');
+    assert.equal(direct['real click: view===window,view===defaultView,target===body'], '111');
+    assert.deepEqual(proxied, direct);
+  });
+
+
+
+  // The proxy's own policy has to allow eval for the membrane, so the target's refusal of it is made by the membrane.
+  await t.test('a policy that refuses string evaluation refuses it here too: header, meta, and a srcdoc frame (matches native)', async () => {
+    for (const variant of ['header', 'meta', 'allowed']) {
+      const { direct, proxied } = await compareTrustedTypes(`/xcspeval?v=${variant}`, '__xcsp');
+      assert.deepEqual(proxied, direct, variant);
+      if (variant !== 'allowed') {
+        assert.match(direct.eval, /EvalError: Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval'/, `native ${variant}: ${direct.eval}`);
+        assert.equal(direct.timerRan, 'undefined', 'a refused string timer must not run');
+        assert.ok(direct.events.length >= 6, `native ${variant} events: ${JSON.stringify(direct.events)}`);
+      } else {
+        assert.equal(direct.eval, '2');
+      }
+    }
+    const frame = await compareTrustedTypes('/xcspsrcdoc', '__xcsp');
+    assert.deepEqual(frame.proxied, frame.direct, 'srcdoc frame');
+    assert.match(frame.direct.eval, /EvalError/, JSON.stringify(frame.direct));
+  });
+
+  await t.test('a blank or srcdoc frame reports its own URL (matches native)', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xframes', '__xframes');
+    const diffs = Object.keys(direct).filter(k => direct[k] !== proxied[k]).map(k => `${k}\n   native : ${direct[k]}\n   proxied: ${proxied[k]}`);
+    assert.equal(diffs.length, 0, `\n${diffs.join('\n')}`);
+    assert.equal(direct['blank.href'], 'about:blank');
+    assert.equal(direct['srcdoc.href'], 'about:srcdoc');
+    assert.equal(direct['createHTMLDocument'].split(' ; ')[0], 'about:blank');
+  });
+
+  await t.test('a report-only Trusted Types policy enforces nothing, as natively', async () => {
+    const { direct, proxied } = await compareTrustedTypes('/xttn?via=report-only', '__xttn');
+    for (const k of ['stringHTML', 'stringAdjacent', 'stringScriptSrc', 'stringScriptText', 'stringTimeout', 'stringSrcdoc', 'stringHandler']) {
+      assert.equal(direct[k], 'ok', `${k}: the native reference changed`);
+    }
+    assert.equal(direct.stringEval, '2');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('document.referrer and Referer follow the referrer policy, for frames and navigations (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async (open, run) => {
+      const out = {};
+      for (const [pathname, done] of [['/xref', () => window.__xrefDone], ['/xref-meta', () => window.__xrefDone], ['/xref-nav', () => typeof window.__xreflanding === 'string']]) {
+        const p = await open(`${targetBase}${pathname}?run=${run}`);
+        try {
+          await p.waitForFunction(done, { timeout: 120000, polling: 100 });
+          Object.assign(out, await p.evaluate(() => window.__xref || { landing: window.__xreflanding }));
+        } finally {
+          await p.close();
+        }
+      }
+      const log = await (await fetch(`${targetBase}/xref-log?run=${run}`)).json();
+      return { referrer: out, header: log };
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      direct = await collect(async u => { const p = await directBrowser.newPage(); await p.goto(u, { waitUntil: 'domcontentloaded' }); return p; }, 'native');
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(u => openProxiedPage(u), 'proxied');
+    fs.writeFileSync(path.join(artifacts, 'referrer-policy.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.referrer.cross, '');
+    assert.equal(direct.referrer.same, `${targetBase}/xref?run=native`);
+    assert.equal(direct.referrer.landing, `${targetBase}/xref-nav?run=native`);
+    assert.deepEqual(scrub(proxied), scrub(direct));
+  });
+
+  await t.test('a form submission carries the submitting document\'s current address as its Referer, redirect hops included (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async (open, run) => {
+      for (const k of ['same', 'cross']) {
+        const p = await open(`${targetBase}/xsub?run=${run}&k=${k}`);
+        try {
+          await p.waitForFunction(() => window.__xsubDone === true, { timeout: 120000, polling: 100 });
+        } finally {
+          await p.close();
+        }
+      }
+      return await (await fetch(`${targetBase}/xsub-log?run=${run}`)).json();
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      direct = await collect(async u => { const p = await directBrowser.newPage(); await p.goto(u, { waitUntil: 'domcontentloaded' }); return p; }, 'native');
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(u => openProxiedPage(u), 'proxied');
+    fs.writeFileSync(path.join(artifacts, 'form-submit-referer.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The address the page moved to with replaceState, without its fragment; across origins the default policy cuts it to the origin.
+    assert.equal(direct['same|first'].referer, `${targetBase}/xsub?run=native&k=same&tok=1`);
+    assert.equal(direct['same|second'].referer, direct['same|first'].referer, 'the redirect hop keeps the Referer');
+    assert.equal(direct['cross|first'].referer, `${targetBase}/`);
+    assert.deepEqual(scrub(proxied), scrub(direct));
+  });
+
+  await t.test('client hints are negotiated as Chrome does, and a fetch that cannot connect fails (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async (open, run) => {
+      const p = await open(`${targetBase}/xch?run=${run}`);
+      try {
+        await p.waitForFunction(() => window.__xch, { timeout: 120000, polling: 100 });
+        const page = await p.evaluate(() => window.__xch);
+        const log = await (await fetch(`${targetBase}/xch-log?run=${run}`)).json();
+        return { page, log };
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      direct = await collect(async u => { const p = await directBrowser.newPage(); await p.goto(u, { waitUntil: 'domcontentloaded' }); return p; }, 'native');
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(u => openProxiedPage(u), 'proxied');
+    fs.writeFileSync(path.join(artifacts, 'client-hints.json'), JSON.stringify({ direct, proxied }, null, 2));
+    const shape = (r, who) => r.log.filter(e => e.who === who).map(e => `${e.method} ${e.path} | ${e.names}`).sort();
+    assert.equal(direct.log.filter(e => e.path === '/xch').length, 2, 'natively the document is asked for twice (Critical-CH)');
+    assert.deepEqual(shape(proxied, 'self'), shape(direct, 'self'));
+    // Puppeteer-launched Chrome injects accept-language in the renderer, changing small header-table hash order relative to a user profile.
+    assert.deepEqual(shape(proxied, 'other'), [
+      'GET /xch-api | sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site sec-fetch-mode sec-fetch-dest referer accept-encoding',
+      'GET /xch-img | sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site sec-fetch-mode sec-fetch-dest sec-fetch-storage-access referer accept-encoding',
+    ]);
+    assert.deepEqual(proxied.page.neterr, direct.page.neterr);
+    assert.deepEqual(proxied.page.neterr, ['rejected TypeError', 'error 0']);
+    assert.equal(proxied.page.heKeys, direct.page.heKeys);
+    const restarted = proxied.log.filter(e => e.path === '/xch')[1].hints;
+    const full = proxied.page.he.uaFullVersion;
+    assert.match(full, /^\d+\.0\.\d+\.\d+$/);
+    assert.ok(!/\.0\.0\.0$/.test(full), `full version ${full}`);
+    assert.equal(restarted['sec-ch-ua-full-version'], `"${full}"`);
+    assert.equal(restarted['sec-ch-ua-full-version-list'], proxied.page.he.fullVersionList.map(b => `"${b.brand}";v="${b.version}"`).join(', '));
+    assert.deepEqual([restarted['sec-ch-ua-arch'], restarted['sec-ch-ua-bitness'], restarted['sec-ch-ua-model'], restarted['sec-ch-ua-platform-version']],
+      [`"${proxied.page.he.architecture}"`, `"${proxied.page.he.bitness}"`, `"${proxied.page.he.model}"`, `"${proxied.page.he.platformVersion}"`]);
+    for (const e of proxied.log.filter(x => x.who === 'other')) assert.deepEqual(Object.keys(e.hints).sort(), ['sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform']);
+  });
+
+  await t.test('a frame reads its feature policy and permissions as natively, cross-origin ones included (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xfp, { timeout: 120000, polling: 100 });
+        return await p.evaluate(() => window.__xfp);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xfp`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xfp`));
+    fs.writeFileSync(path.join(artifacts, 'feature-policy.json'), JSON.stringify({ direct, proxied }, null, 2));
+    const cross = direct.find(o => o.where === '/xfp-cross');
+    assert.equal(cross.notif, 'denied');
+    assert.notEqual(cross.allowed, direct.find(o => o.where === '/xfp').allowed, 'natively a cross-origin frame is allowed fewer features');
+    assert.deepEqual(proxied, direct);
+  });
+
+  // An XML document from DOMParser read back through outerHTML/innerHTML must use the XML serializer. Copying the element into
+  // an HTML document would write `<br></br>` and drop CDATA sections and xmlns attributes.
+  await t.test('an XML document from DOMParser serializes as XML, CDATA and namespaces kept (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xxml, { timeout: 120000, polling: 100 });
+        return await p.evaluate(() => window.__xxml);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xxml`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xxml`));
+    fs.writeFileSync(path.join(artifacts, 'xml-serialization.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(direct['0 outer'].includes('<br/>') && direct['1 serial'].includes('CDATA'), 'natively the XML serializer is used');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('the page cannot answer for the helpers rewritten code calls with the real window (escape)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xhDone, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xhDone);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xhelper`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xhelper`));
+    fs.writeFileSync(path.join(artifacts, 'helper-escape.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct.ran, ['localShadow', 'paramShadow', 'globalWrite', 'executorWrite', 'facade'], 'every attack is valid code natively');
+    assert.deepEqual(proxied.leaks, [], 'a page function was handed the real window');
+    assert.deepEqual(proxied.ran, ['facade'], 'a script binding or writing a runtime name ran');
+    assert.deepEqual([direct.functionParam, direct.evalBinding], ['compiled', 'ran']);
+    assert.deepEqual([proxied.functionParam, proxied.evalBinding], ['SyntaxError', 'SyntaxError'], 'dynamic code bound a runtime name');
+    for (const k of ['withRead', 'click', 'message', 'after']) assert.deepEqual(proxied[k], direct[k], k);
+  });
+
+  await t.test('direct eval sees its caller\'s bindings, sloppy and strict, in the page and in a written frame (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xdeval && window.__xdeval.child, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xdeval);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xdeval`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xdeval`));
+    fs.writeFileSync(path.join(artifacts, 'direct-eval.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.page.read, 31, 'the reference: a direct eval reads the function\'s own bindings');
+    assert.equal(direct.page.strictCaller, 6);
+    assert.deepEqual(proxied.page, direct.page, 'the page realm');
+    assert.deepEqual(proxied.child, direct.child, 'the written frame\'s realm');
+  });
+
+  await t.test('history.pushState refuses a foreign URL with the browser\'s own SecurityError (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xhist, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xhist);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xhist`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xhist`));
+    fs.writeFileSync(path.join(artifacts, 'history-urls.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.match(direct['push other origin'], /^SecurityError: Failed to execute 'pushState' on 'History': A history state object with URL 'URL' cannot be created in a document with origin 'ORIGIN' and URL 'URL'/);
+    assert.match(direct['push user info'], /^SecurityError/, 'natively user info is a different URL');
+    assert.match(direct['push relative'], /^ok:/);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('the membrane\'s own DOM scans do not run through the page\'s DOM methods (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xdomscan, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xdomscan.calls);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xdomscan`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xdomscan`));
+    fs.writeFileSync(path.join(artifacts, 'dom-scan-canary.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(proxied, direct, 'a call the page did not make reached its wrapper');
+  });
+
+  await t.test('a frame the page makes has a realm of its own (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xrealm, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xrealm);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xrealm`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xrealm`));
+    fs.writeFileSync(path.join(artifacts, 'child-realm.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['eval(Object) === frame.Object'], 'true');
+    assert.equal(direct['eval(Object) === own Object'], 'false');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('replaced built-ins carry the constants, statics, names and lengths of the natives (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xshape, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xshape);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xshape`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xshape`));
+    fs.writeFileSync(path.join(artifacts, 'builtin-shape.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['EventSource.CONNECTING/OPEN/CLOSED'], '0,1,2');
+    assert.equal(direct['globalThis.Proxy.revocable'], '1');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a page function\'s text is what the page wrote, on every read (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xtext, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xtext);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xtext`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xtext`));
+    fs.writeFileSync(path.join(artifacts, 'function-text.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(direct.computed[0].includes('o[k] + 1'), 'the probe did not read its own text');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a page may redefine and assign its own window attributes (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xredef, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xredef);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xredef`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xredef`));
+    fs.writeFileSync(path.join(artifacts, 'window-redefine.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['frameElement.read'], 'mine:frameElement', 'natively the page getter answers');
+    assert.deepEqual(direct['frameElement.desc'], '{"sameGet":true,"c":false,"e":true}');
+    assert.equal(direct['assign self'], '5');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a cross-origin window and Location refuse with a SecurityError wherever the browser does (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xdeny, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xdeny);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xdeny`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xdeny`));
+    fs.writeFileSync(path.join(artifacts, 'cross-origin-denials.json'), JSON.stringify({ direct, proxied }, null, 2));
+    // The refusal is what matters (containment); the sentence a browser words it with is not compared.
+    const kind = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, String(v).split('|').slice(0, 2).join('|')]));
+    assert.match(direct['read document'], /^SecurityError\|DOMException\|/);
+    assert.deepEqual(kind(proxied), kind(direct));
+  });
+
+  await t.test('a cross-origin window answers for the names of its child frames (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xnf, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xnf);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xnf`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xnf`));
+    fs.writeFileSync(path.join(artifacts, 'named-child-frames.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['c.byName'], 'object', 'a frame reads its sibling by name through a cross-origin parent');
+    assert.equal(direct['c.has'], 'threw:SecurityError', 'measured: `in` throws for a child name, `get` does not');
+    assert.equal(direct['c.flags'], 'object,false,false,true');
+    assert.equal(direct['c.getMissing'], 'threw:SecurityError');
+    assert.equal(direct['p.byName'], 'object', 'the page reads a frame inside a cross-origin frame by name');
+    assert.equal(direct['p.childDocument'], 'threw:SecurityError');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a page that wraps Map, Set, WeakMap and WeakSet methods neither sees the membrane\'s tables nor breaks it', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xtables, { timeout: 60000, polling: 100 });
+        return await p.evaluate(() => window.__xtables);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xtables`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xtables`));
+    fs.writeFileSync(path.join(artifacts, 'tables.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.survived, true, 'the native reference ran');
+    assert.equal(proxied.survived, true, 'the page died: ' + proxied.error);
+    assert.deepEqual(proxied.seenProxy, [], 'a wrapped table method was handed something of the proxy');
+    for (const k of Object.keys(direct)) {
+      if (k === 'seenProxy' || k === 'calls') continue;
+      assert.equal(proxied[k], direct[k], k);
+    }
+  });
+
+  await t.test('a getter the page puts on its own window never hands it the real window (escape)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xwinown, { timeout: 30000, polling: 100 });
+        return await p.evaluate(() => window.__xwinown);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xwinown`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xwinown`));
+    const ok = { frameElement: 'ok', bareFrameElement: 'ok', parent: 'ok', opener: 'ok' };
+    assert.deepEqual(direct, ok);
+    assert.deepEqual(proxied, ok, 'the page was handed a window that is not its own');
+  });
+
+  await t.test('an empty external script runs as nothing (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const collect = async p => {
+      try {
+        await p.waitForFunction(() => window.__xempty, { timeout: 30000, polling: 100 });
+        return await p.evaluate(() => window.__xempty);
+      } finally {
+        await p.close();
+      }
+    };
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const p = await directBrowser.newPage();
+      await p.goto(`${targetBase}/xempty`, { waitUntil: 'domcontentloaded' });
+      direct = await collect(p);
+    } finally {
+      await directBrowser.close();
+    }
+    const proxied = await collect(await openProxiedPage(`${targetBase}/xempty`));
+    assert.deepEqual(direct, { errors: [], after: 1 });
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('innerHTML on a script, textarea, title and noscript sets text (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xrawtext`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xrawtext, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xrawtext);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xrawtext`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xrawtext, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xrawtext);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'raw-text-innerhtml.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct.script, { kids: 1, kidType: 3, text: true, ran: 3 });
+    assert.deepEqual(direct.textarea, ['<b>x</b> & <i>', 1]);
+    assert.deepEqual(direct.noscript, [1, 3, '<img src="https://other.example/x.png">']);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a playlist a media element loads has its URLs routed through the proxy (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xhls`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xhls, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xhls);
+    } finally {
+      await directBrowser.close();
+    }
+    await fetch(`${targetBase}/xhls-reset`);
+    const fresh = await openProxiedPage(`${targetBase}/xhls`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xhls, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xhls);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'hls-playlist.json'), JSON.stringify({ direct, proxied }, null, 2));
+    const requested = r => Object.fromEntries(Object.entries(r).filter(([k]) => !k.startsWith('hls:ranged:')));
+    assert.deepEqual(requested(direct), { 'hls:/xhls/master.m3u8': 'hit', 'hls:/xhls/v0.m3u8': 'hit', 'hls:/xhls/key.bin': 'hit', 'hls:/xhls/seg0.ts': 'hit' });
+    assert.deepEqual(requested(proxied), requested(direct));
+    // Media elements request playlists with Range: bytes=0-; the proxy fetches and rewrites the full playlist before slicing.
+    assert.equal(direct['hls:ranged:/xhls/v0.m3u8'], 'bytes=0-');
+    assert.equal(proxied['hls:ranged:/xhls/v0.m3u8'], null);
+  });
+
+  await t.test('complete documents keep html, head and body when parsed by DOMParser and srcdoc (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xdocparse`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xdocparse, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xdocparse);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xdocparse`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xdocparse, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xdocparse);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'document-parse.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct.domparser.bcls, 'b1');
+    assert.equal(direct.domparser.compat, 'CSS1Compat');
+    assert.equal(direct.srcdoc.saw, 'b1|CSS1Compat');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('globals read inside destructuring and for-of targets read through the membrane (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xdestr`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xdestr, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xdestr);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xdestr`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xdestr, { timeout: 120000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xdestr);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'destructuring-reads.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.equal(direct['array holes'], 's');
+    assert.equal(direct['computed member key'], '/xdestr:z');
+    assert.equal(direct['for-of member'], 'i2');
+    assert.ok(Object.values(direct).every(v => !String(v).startsWith('threw')), JSON.stringify(direct));
+    assert.deepEqual(proxied, direct);
+  });
+
+  // navigator.serviceWorker.controller is null inside srcdoc frames, so the parent binds the frame before its scripts fetch.
+  await t.test('scripts in a srcdoc frame run in order, external ones included (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xsdjs`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xsdjs, { timeout: 30000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xsdjs);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xsdjs`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xsdjs, { timeout: 60000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xsdjs);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'srcdoc-scripts.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { inline: 1, body: 'BODY:loading', lib: 1, after: 1, mod: 7, dyn: 1, dyn2: 1 });
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('request bodies are framed as natively (Content-Length, no chunking)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xclen?run=native`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xclen, { timeout: 60000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xclen);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xclen?run=proxied`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xclen, { timeout: 90000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xclen);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'content-length.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['post-empty'].cl, '0', 'a bodiless POST says Content-Length: 0');
+    assert.equal(direct['put-empty'].cl, '0');
+    assert.equal(direct.get.cl, null);
+    assert.equal(direct.delete.cl, null);
+    assert.equal(direct['post-string'].cl, '11');
+    assert.equal(direct['post-string'].te, null);
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('a script a written frame creates is loaded, with its load event (matches native)', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xwdyn`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xwdyn, { timeout: 30000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xwdyn);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xwdyn`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xwdyn, { timeout: 60000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xwdyn);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'written-dynamic-script.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.deepEqual(direct, { ran: 2, loads: 1, ploads: 1, markup: 1, nested: '1,1,1', alive: true, pixels: { 'wdynpix:new-image': 'hit', 'wdynpix:unattached': 'hit', 'wdynpix:attached': 'hit' } });
+    assert.deepEqual(proxied, direct);
+  });
+
+  // Omit duplicate CSP <meta> tags so Chrome's preload scanner still requests scripts inside script-disabled sandboxed frames.
+  await t.test('a script in a frame that may not run scripts is requested as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const readSeen = run => new Promise((resolve, reject) => http.get(`${targetBase}/xscr-seen?run=${run}`, res => { let b = ''; res.on('data', d => { b += d; }); res.on('end', () => resolve(JSON.parse(b))); }).on('error', reject));
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xscr?run=native`, { waitUntil: 'load' });
+      await new Promise(r => setTimeout(r, 4000));
+      direct = await readSeen('native');
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xscr?run=proxied`);
+    let proxied;
+    try {
+      await new Promise(r => setTimeout(r, 8000));
+      proxied = await readSeen('proxied');
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'scriptless-frames.json'), JSON.stringify({ direct, proxied }, null, 2));
+    for (const tag of ['m-empty', 'm-same', 'm-forms', 'm-scripts', 'm-scripts-same', 'm-none', 'd-empty', 'd-same', 'd-scripts', 'h-empty']) {
+      assert.ok(direct.includes(`${tag}-script`), `native fetches the script of ${tag}`);
+      assert.ok(direct.includes(`${tag}-img`), `native fetches the image of ${tag}`);
+    }
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('crossorigin elements, modules and fonts obey CORS as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xcorsel`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xcorsel, { timeout: 180000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xcorsel);
+    } finally {
+      await directBrowser.close();
+    }
+    const fresh = await openProxiedPage(`${targetBase}/xcorsel`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xcorsel, { timeout: 240000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xcorsel);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'cors-elements.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.equal(direct['i-anon-acao'], 'load');
+    assert.equal(direct['i-anon-missing'], 'error');
+    assert.equal(direct['i-plain-missing'], 'load', 'an image without crossorigin needs no permission');
+    assert.equal(direct['i-creds-star'], 'error', '* does not do for use-credentials');
+    assert.equal(direct['s-anon-missing'], 'error');
+    assert.equal(direct['s-plain-missing'], 'load+ran');
+    assert.equal(direct['m-missing'], 'error');
+    assert.equal(direct['m-acao'], 'load+ran');
+    assert.equal(direct['c-anon-missing'], 'error');
+    assert.equal(direct['f-acao'], 'loaded');
+    assert.equal(direct['f-missing'], 'err:NetworkError');
+    assert.equal(direct['fc-missing'].slice(0, 3), 'err');
+    assert.equal(direct.opaque['o-origin'], 'error', 'an opaque document is not the origin the target names');
+    assert.equal(direct.opaque['o-star'], 'load');
+    assert.equal(direct['written-dom-img-ok'], 'load');
+    assert.equal(direct['written-dom-img-missing'], 'error');
+    assert.equal(direct['written-img-ok'], 'load');
+    assert.equal(direct['written-img-missing'], 'error');
+    assert.equal(direct['written-css-ok'], 'applied');
+    assert.equal(direct['written-css-missing'], 'not applied');
+    assert.equal(direct['written-js-ok'], 'ran');
+    assert.equal(direct['written-js-missing'], 'not run');
+    assert.equal(direct['srcdoc-img-missing'], 'error');
+    assert.equal(direct['srcdoc-js-missing'], 'not run');
+    assert.equal(direct.__log['i-anon-cookie'][0].cookies, '', 'anonymous: no cookies across origins');
+    assert.equal(direct.__log['i-creds-ok'][0].cookies, 'xce');
+    assert.equal(direct.__log['i-plain-cookie'][0].cookies, 'xce', 'no-cors element loads carry cookies');
+    assert.equal(direct.__log['i-redir-self-star:b'][0].origin, 'null');
+    assert.equal(direct['i-redir-self-origin'], 'error');
+    assert.deepEqual(proxied, direct);
+  });
+
+  // Proxied frames need allow-same-origin at the browser layer for SW routing, so the membrane emulates opaque-origin sandboxes.
+  await t.test('sandboxed frames are opaque to the page and to each other, as natively', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/xsandbox`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__xsandbox, { timeout: 180000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__xsandbox);
+    } finally {
+      await directBrowser.close();
+    }
+    const wireBefore = wireRequests.length;
+    const fresh = await openProxiedPage(`${targetBase}/xsandbox`);
+    let proxied;
+    try {
+      await fresh.waitForFunction(() => window.__xsandbox, { timeout: 240000, polling: 100 });
+      proxied = await fresh.evaluate(() => window.__xsandbox);
+    } finally {
+      await fresh.close();
+    }
+    fs.writeFileSync(path.join(artifacts, 'sandboxed-frames.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    const attr = direct['attr.report'];
+    assert.match(attr, /^origin=null\n/, 'a sandboxed document speaks as "null"');
+    for (const line of ['self.origin=null', 'localStorage=threw:SecurityError', 'sessionStorage=threw:SecurityError', 'document.cookie=threw:SecurityError',
+      'indexedDB.open=threw:SecurityError', 'caches=threw:SecurityError', 'parent.document=threw:SecurityError', 'top.location.href=threw:SecurityError',
+      'top.location.assign=threw:SecurityError', 'frameElement=null', 'typeof frameElement=object', 'window.open=null', 'opener=null',
+      'egress.img=load', 'egress.ws=open']) {
+      assert.ok(attr.split('\n').includes(line), `native reference lost "${line}": ${attr}`);
+    }
+    for (const k of ['attr', 'property', 'tokens', 'src first', 'parsed', 'insertAdjacentHTML', 'srcdoc', 'parsed srcdoc', 'forms and popups']) {
+      assert.equal(direct[k + '.connected'], 'true', `${k}: the frame survives`);
+      assert.equal(direct[k + '.contentDocument'], 'null', `${k}: the embedder cannot read it`);
+      assert.match(direct[k + '.report'], /^origin=null\n/, `${k}: it ran and reported`);
+    }
+    assert.equal(direct['inert.report'], 'no report', 'a sandbox without allow-scripts runs nothing');
+    assert.equal(direct['attr.sandbox'], 'allow-scripts|allow-scripts|1|false|true', 'the page\'s own sandbox value');
+    assert.equal(direct['attr.contentWindow.document'], 'threw:SecurityError');
+    assert.match(direct['nav.scripts'], /top\.location\.href==threw:SecurityError/);
+    assert.match(direct['nav.tampered'], /top\.location\.href==threw:SecurityError/);
+    assert.equal(direct['nav.pathAfter'], '/xsandbox', 'the sandbox refused to navigate the top window');
+    assert.ok(wireRequests.slice(wireBefore).some(u => u.startsWith(proxyOrigin + '/')), 'no proxy-origin wire request observed');
+    for (const where of ['/xsb-egress-fetch', '/xsb-egress-xhr', '/xsb-egress-script.js', '/xsb-egress-style.css', '/xsb-egress-module.js', '/xsb-beacon']) {
+      assert.ok(requests.some(r => r.url === where && r.userAgent === TARGET_UA), `${where}: not seen through the proxy: ${JSON.stringify(requests.filter(r => r.url === where))}`);
+    }
+    assert.ok(requests.some(r => r.url.startsWith('/image-probe.png?sb=') && r.userAgent === TARGET_UA), 'the image load did not go through the proxy');
+    assert.ok(requests.some(r => r.upgrade && r.url === '/ws?sb=1' && r.userAgent === TARGET_UA), 'the WebSocket did not go through the proxy');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('frame load events and history match native', async () => {
+    const targetBase = `http://${targetHost}:${targetPort}`;
+    const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 30000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    let direct;
+    try {
+      const directPage = await directBrowser.newPage();
+      await directPage.goto(`${targetBase}/frame-loads`, { waitUntil: 'domcontentloaded' });
+      await directPage.waitForFunction(() => window.__frameLoads, { timeout: 30000, polling: 100 });
+      direct = await directPage.evaluate(() => window.__frameLoads);
+    } finally {
+      await directBrowser.close();
+    }
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `${targetBase}/frame-loads`);
+    await page.waitForFunction(() => window.__frameLoads, { timeout: 45000, polling: 100 });
+    const proxied = await page.evaluate(() => window.__frameLoads);
+    fs.writeFileSync(path.join(artifacts, 'frame-loads.json'), JSON.stringify({ direct, proxied }, null, 2));
+    assert.ok(!direct.__fatal, `native reference died: ${direct.__fatal}`);
+    assert.ok(!proxied.__fatal, `proxied fixture died: ${proxied.__fatal}`);
+    assert.deepEqual(direct, {
+      staticOnload: '1', staticListener: '1',
+      srcBeforeAppend: 'Lo', srcAfterAppend: 'LoLo', rapidSwap: 'LoLo|fh',
+      srcChange: 'LoLo', historyDelta: '1',
+    }, 'the native reference changed — re-measure before trusting the comparison');
+    assert.deepEqual(proxied, direct);
+  });
+
+  await t.test('surface suite', async t => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/surface-probes`);
+    try {
+      await page.waitForFunction(() => window.__surfaceProbes && window.__surfaceProbes.done && window.__surfaceProbes.moduleDone, { timeout: 60000 });
+    } catch (e) {
+      console.log('surface probes wait failed');
+      throw e;
+    }
+    const probes = await page.evaluate(() => window.__surfaceProbes);
+    const errs = await page.evaluate(() => window.__surfaceErrs);
+    fs.writeFileSync(path.join(artifacts, 'surface-probes.json'), JSON.stringify({ probes, errs }, null, 2));
+    assert.ok(!probes.__fatal, `surface fixture died: ${probes.__fatal}`);
+    await t.test('surface probes match native Chrome except documented divergences', async () => {
+      // Bound and retry the native reference browser in case headless Chrome stalls on protocol-handler or WebAuthn UI.
+      const collectNative = async () => {
+        const directBrowser = await puppeteer.launch({ headless: true, protocolTimeout: 20000, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        const killer = setTimeout(() => { try { directBrowser.process().kill('SIGKILL'); } catch {} }, 40000);
+        try {
+          const dp = await directBrowser.newPage();
+          // Native alert/confirm/prompt block the page; dismissing them yields
+          // exactly the stubs' values (undefined / false / null).
+          dp.on('dialog', d => { d.dismiss().catch(() => {}); });
+          // Attach a CDP virtual authenticator so native navigator.credentials.create({publicKey}) does not block on an OS modal dialog.
+          const cdp = await dp.target().createCDPSession();
+          await cdp.send('WebAuthn.enable', { enableUI: false });
+          await cdp.send('WebAuthn.addVirtualAuthenticator', { options: { protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true } });
+          await dp.goto(`http://${targetHost}:${targetPort}/surface-probes`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          // Use mutation polling instead of default raf polling, which can starve in background headless tabs.
+          await dp.waitForFunction(() => window.__surfaceProbes && window.__surfaceProbes.done && window.__surfaceProbes.moduleDone, { timeout: 30000, polling: 100 });
+          return await dp.evaluate(() => window.__surfaceProbes);
+        } finally {
+          clearTimeout(killer);
+          await directBrowser.close().catch(() => {});
+        }
+      };
+      let direct;
+      try { direct = await collectNative(); } catch (e) {
+        console.log('native surface reference retried after:', e && e.message);
+        direct = await collectNative();
+      }
+      fs.writeFileSync(path.join(artifacts, 'surface-differential.json'), JSON.stringify({ direct, proxied: probes }, null, 2));
+      const expected = {
+        webAuthn: 'credentials.create → NotAllowedError: the RP would be the proxy origin',
+        credGet: 'credentials.get → NotAllowedError, same reason',
+        paSurfaces: 'Privacy Sandbox APIs removed: keyed to the proxy origin',
+        swRegs: 'the virtual SW facade always reports one fake registration (D3 fail-soft)',
+        dynamicBase: "base-uri 'none': a runtime <base> does not move the virtual base",
+        framesItem: 'V8 names the rewritten callee in "is not a function" messages',
+        withEvalScope: 'direct eval inside with() does not see the with-object',
+        parseHTMLUnsafeHook: 'a base-less parsed document resolves anchor href against the virtual base',
+        ownKeysLeak: 'a var from a script rejected for redeclaration survives (eval instantiation)',
+        // Not a divergence: the probe folds in a clock reading.
+        realProps: 'includes a clock-derived field',
+      };
+      assert.deepEqual(Object.keys(probes).sort(), Object.keys(direct).sort(), 'surface probe key sets differ');
+      const unexpected = Object.keys(direct).filter(k => probes[k] !== direct[k] && !(k in expected))
+        .map(k => `${k}: native=${direct[k]} proxy=${probes[k]}`);
+      assert.deepEqual(unexpected, [], unexpected.join('\n'));
+      const healed = Object.keys(expected).filter(k => k !== 'realProps' && probes[k] === direct[k]);
+      assert.deepEqual(healed, [], `now match native — update ERRATA and this list: ${healed.join(', ')}`);
+    });
+    assert.equal(probes.importmapText, 'v:raw');
+    assert.equal(probes.specrulesText, 'v:raw');
+    assert.match(probes.shadowDom, /^v:shadow-img:clean/);
+    assert.match(probes.svgImage, /^v:clean:/);
+    assert.match(probes.svgAnchor, /^v:clean:/);
+    assert.match(probes.importmapBare, /^v:1\|http:\/\/localhost/);
+    for (const k of ['cloneLocation', 'portMsgLocation', 'cloneDocument', 'cloneWindow']) {
+      assert.match(probes[k], /DataCloneError/, `${k}: ${probes[k]}`);
+    }
+    assert.equal(probes.weakRefLocation, 'v:same-proxy');
+    assert.match(probes.framesByName, /^v:clean:/, `framesByName: ${probes.framesByName}`);
+    assert.match(probes.windowByName, /^v:clean:/, `windowByName: ${probes.windowByName}`);
+    assert.match(probes.selfIndex, /^v:clean/);
+    assert.match(probes.thisIndex, /^v:clean/);
+    assert.match(probes.framesItem, /^threw:TypeError/);
+    assert.match(probes.defineGetterLoc, /threw:TypeError/);
+    assert.match(probes.defineSetterLoc, /threw:TypeError/);
+    assert.equal(probes.lookupGetterLoc, 'v:fn');
+    assert.equal(probes.lookupSetterLoc, 'v:fn');
+    assert.match(probes.ownKeysLeak, /^v:clean:\d+$/, `ownKeysLeak: ${probes.ownKeysLeak}`);
+    assert.equal(probes.anchorPing, 'v:attr:https://evil.example/track|marker:none|prop:https://evil.example/track');
+    assert.match(probes.importMetaResolve, /^v:http:\/\/localhost:\d+\/x$/, `importMetaResolve: ${probes.importMetaResolve}`);
+    assert.match(probes.docWriteFrame, /^v:clean:/);
+    assert.match(probes.iframeCspAttr, /^v:attr:/);
+    assert.equal(probes.iframeCredentialless, 'v:set');
+    for (const k of ['targetFramename', 'baseTargetFrame']) {
+      assert.match(probes[k], /^v:navigated:http:\/\/localhost:\d+\/frame-dest\|not found$/, `${k}: ${probes[k]}`);
+    }
+    assert.match(probes.targetFramenameAttr, /^v:navigated:http:\/\/localhost:\d+\/frame-dest\|not found\|tfn2\|tfn2$/, `targetFramenameAttr: ${probes.targetFramenameAttr}`);
+    assert.equal(probes.targetAttrReadback, 'v:_blank|_blank|_top|x');
+    assert.match(probes.parentTargetLink, /^v:navigated:http:\/\/localhost:\d+\/frame-plain\|plain$/, `parentTargetLink: ${probes.parentTargetLink}`);
+    assert.match(probes.formTargetGet, /^v:navigated:http:\/\/localhost:\d+\/frame-plain\?q=one\+two\|plain$/, `formTargetGet: ${probes.formTargetGet}`);
+    assert.match(probes.formTargetPost, /^v:navigated:http:\/\/localhost:\d+\/post-echo\|a=b\+c$/, `formTargetPost: ${probes.formTargetPost}`);
+    assert.match(probes.popupRouted, /^v:fp\|(http:\/\/localhost:\d+\/frame-plain)\|\1$/, `popupRouted: ${probes.popupRouted}`);
+    assert.match(probes.namedOpen, /^v:navigated:http:\/\/localhost:\d+\/frame-dest\|not found\|true$/, `namedOpen: ${probes.namedOpen}`);
+    assert.match(probes.childLocAssign, /^v:(http:\/\/localhost:\d+\/frame-html)\|\1\|\1$/, `childLocAssign: ${probes.childLocAssign}`);
+    assert.match(probes.routedPlainEval, /^v:http:\/\/localhost:\d+\/frame-plain$/, `routedPlainEval: ${probes.routedPlainEval}`);
+    // A contained blank frame is at `about:blank` and the page in front of a pending route at the address the engine reports: both match native
+    // (the differential above), as does a srcdoc child (`framesByName`).
+    assert.equal(probes.staleBlankEval, 'v:about:blank', `staleBlankEval: ${probes.staleBlankEval}`);
+    assert.match(probes.childSharedWorker, /^v:clean:/, `childSharedWorker: ${probes.childSharedWorker}`);
+    assert.equal(probes.withShadow, 'v:obj-first', `withShadow: ${probes.withShadow}`);
+    assert.equal(probes.withDocIdentity, 'v:identity-ok', `withDocIdentity: ${probes.withDocIdentity}`);
+    assert.match(probes.withDocWrite, /^v:forwarded/, `withDocWrite: ${probes.withDocWrite}`);
+    assert.equal(probes.withEvalScope, 'v:virtual', `withEvalScope: ${probes.withEvalScope}`);
+    assert.equal(probes.scopeHoistVar, 'v:threw:TypeError', `scopeHoistVar: ${probes.scopeHoistVar}`);
+    assert.equal(probes.scopeTDZ, 'v:threw:ReferenceError', `scopeTDZ: ${probes.scopeTDZ}`);
+    assert.equal(probes.scopeCatch, 'v:bound:42', `scopeCatch: ${probes.scopeCatch}`);
+    assert.equal(probes.scopeDestructParam, 'v:bound', `scopeDestructParam: ${probes.scopeDestructParam}`);
+    assert.equal(probes.crossScriptVar, 'v:number:8', `crossScriptVar: ${probes.crossScriptVar}`);
+    assert.equal(probes.crossScriptLet, 'v:number', `crossScriptLet: ${probes.crossScriptLet}`);
+    assert.equal(probes.crossScriptConst, 'v:9', `crossScriptConst: ${probes.crossScriptConst}`);
+    assert.equal(probes.crossScriptClass, 'v:function', `crossScriptClass: ${probes.crossScriptClass}`);
+    assert.equal(probes.crossScriptLetWrite, 'v:42', `crossScriptLetWrite: ${probes.crossScriptLetWrite}`);
+    assert.ok(probes.crossScriptConstWrite && probes.crossScriptConstWrite.startsWith('threw:TypeError'), `crossScriptConstWrite: ${probes.crossScriptConstWrite}`);
+    assert.equal(probes.lexRedeclare, 'v:2', `lexRedeclare: ${probes.lexRedeclare} errs=${JSON.stringify(errs.slice(0, 4))}`);
+    assert.equal(probes.evalCallerScope, 'v:LOCAL', `evalCallerScope: ${probes.evalCallerScope}`);
+    assert.equal(probes.evalCallerWrite, 'v:7', `evalCallerWrite: ${probes.evalCallerWrite}`);
+    assert.equal(probes.evalCallerVar, 'v:VV', `evalCallerVar: ${probes.evalCallerVar}`);
+    assert.equal(probes.evalCallerConst, 'v:TypeError:C', `evalCallerConst: ${probes.evalCallerConst}`);
+    assert.equal(probes.evalThis, 'v:obj', `evalThis: ${probes.evalThis}`);
+    assert.equal(probes.evalArgs, 'v:3', `evalArgs: ${probes.evalArgs}`);
+    assert.equal(probes.evalNonString, 'v:[42,null,true,null]', `evalNonString: ${probes.evalNonString}`);
+    assert.equal(probes.evalVirtual, 'v:LOCALLOC', `evalVirtual: ${probes.evalVirtual}`);
+    assert.equal(probes.evalVirtualGlobal, `v:${targetHost}`, `evalVirtualGlobal: ${probes.evalVirtualGlobal}`);
+    assert.equal(probes.evalIndirectNoScope, 'v:global-only', `evalIndirectNoScope: ${probes.evalIndirectNoScope}`);
+    assert.equal(probes.evalOptionalNoScope, 'v:global-only', `evalOptionalNoScope: ${probes.evalOptionalNoScope}`);
+    assert.equal(probes.evalShadowed, 'v:shadow:x', `evalShadowed: ${probes.evalShadowed}`);
+    assert.equal(probes.annexBSloppy, 'v:function', `annexBSloppy: ${probes.annexBSloppy}`);
+    assert.equal(probes.labeledFnDecl, 'v:function', `labeledFnDecl: ${probes.labeledFnDecl}`);
+    assert.equal(probes.evalVarLocal, 'v:number', `evalVarLocal: ${probes.evalVarLocal}`);
+    assert.equal(probes.strictWith, 'v:SyntaxError', `strictWith: ${probes.strictWith}`);
+    assert.match(probes.sheetHref, /\/site\.css$/, `sheetHref: ${probes.sheetHref}`);
+    assert.ok(!/proxy\.localhost|\/zp\//.test(probes.sheetHref), `sheetHref leaked: ${probes.sheetHref}`);
+    assert.ok(/css-leak\.example\/a\.png/.test(probes.insertRuleUrl) && !/\/zp\//.test(probes.insertRuleUrl), `insertRuleUrl: ${probes.insertRuleUrl}`);
+    assert.ok(/css-leak\.example\/b\.png/.test(probes.styleAttrUrl) && !/\/zp\//.test(probes.styleAttrUrl), `styleAttrUrl: ${probes.styleAttrUrl}`);
+    const cssDirect = wireRequests.filter(u => /^https?:\/\/css-leak\.example/.test(u));
+    const cssProxied = wireRequests.filter(u => /css-leak\.example/.test(u) && u.includes('/zp/'));
+    assert.equal(cssDirect.length, 0, `CSS direct egress: ${JSON.stringify(cssDirect)}`);
+    assert.ok(cssProxied.length >= 1, `CSS url() not proxied: ${JSON.stringify(wireRequests.filter(u => /css-leak/.test(u)))}`);
+    assert.match(probes.mailtoNav, /^v:(no-throw|e:\w+)/, `mailtoNav: ${probes.mailtoNav}`);
+    assert.equal(probes.dialogStubs, 'v:alert:undefined|confirm:false|prompt:null', `dialogStubs: ${probes.dialogStubs}`);
+    assert.match(probes.webAuthn, /^v:(e:\w+|absent|created|pending)/, `webAuthn: ${probes.webAuthn}`);
+    assert.ok(/localhost|t\.example/.test(probes.dynamicBase) && !/evil-base/.test(probes.dynamicBase), `dynamicBase: ${probes.dynamicBase}`);
+    assert.equal(probes.locIdentity, 'v:true', `locIdentity: ${probes.locIdentity}`);
+    assert.equal(probes.optCallChain, 'v:undefined|undefined', `optCallChain: ${probes.optCallChain}`);
+    assert.equal(probes.deleteLoc, 'v:false|false', `deleteLoc: ${probes.deleteLoc}`);
+    assert.equal(probes.newEval, 'v:e:TypeError', `newEval: ${probes.newEval}`);
+    assert.equal(probes.anchorLiteral, 'v:/rel-x', `anchorLiteral: ${probes.anchorLiteral}`);
+    const virtURL = `v:http://${targetHost}:${targetPort}/surface-probes`;
+    assert.ok(probes.consoleString === virtURL || probes.consoleString === virtURL + '#withfrag', `consoleString: ${probes.consoleString}`);
+    assert.match(probes.shadowRealmEval, /^v:(absent|e:NotSupportedError)|^threw:NotSupportedError/, `shadowRealmEval: ${probes.shadowRealmEval}`);
+    assert.match(probes.shadowRealmImport, /^v:(absent|e:|timeout)/, `shadowRealmImport: ${probes.shadowRealmImport}`);
+    assert.equal(probes.credGet, 'v:e:NotAllowedError', `credGet: ${probes.credGet}`);
+    assert.match(probes.wasmStreamUrl, /^v:(e:TypeError|absent)/, `wasmStreamUrl: ${probes.wasmStreamUrl}`);
+    assert.equal(probes.navLocks, 'v:got:held', `navLocks: ${probes.navLocks}`);
+    assert.equal(probes.secureCtx, 'v:true', `secureCtx: ${probes.secureCtx}`);
+    assert.equal(probes.webkitURLAlias, `v:http://${targetHost}:${targetPort}/wk-page`, `webkitURLAlias: ${probes.webkitURLAlias}`);
+    assert.match(probes.webkitIDB, /^v:(alias|not-alias:undefined)$/, `webkitIDB: ${probes.webkitIDB}`);
+    assert.equal(probes.webkitFS, 'v:function|function|undefined|undefined', `webkitFS: ${probes.webkitFS}`);
+    if (probes.fetchLaterType !== 'v:absent') {
+      assert.equal(probes.fetchLaterType, 'v:function', `fetchLaterType: ${probes.fetchLaterType}`);
+      assert.match(probes.fetchLaterCall, /^v:activated:(true|false)/, `fetchLaterCall: ${probes.fetchLaterCall}`);
+    }
+    assert.match(probes.opfsName, /^v:name:$|^v:absent$/, `opfsName: ${probes.opfsName}`);
+    assert.equal(probes.customEl, 'v:ctor:true|up:true|names:x-probe-el|X-PROBE-EL|qs:true|tag:1', `customEl: ${probes.customEl}`);
+    assert.equal(probes.customElUpgrade, 'v:same:true|up:true|target:{"ok":1}|matches:true|w:7px', `customElUpgrade: ${probes.customElUpgrade}`);
+    assert.match(probes.permGeo, /^v:(state:prompt|state:denied|e:\w+|absent)/, `permGeo: ${probes.permGeo}`);
+    assert.equal(probes.paSurfaces, 'v:undefined|fn:[]|undefined|undefined|undefined|fn-gated', `paSurfaces: ${probes.paSurfaces}`);
+    if (probes.setHTMLHook !== 'v:absent') {
+      assert.equal(probes.setHTMLHook, `v:http://${targetHost}:${targetPort}/set-html-probe.png`, `setHTMLHook: ${probes.setHTMLHook}`);
+    }
+    if (probes.parseHTMLUnsafeHook !== 'v:absent') {
+      assert.equal(probes.parseHTMLUnsafeHook, `v:http://${targetHost}:${targetPort}/parse-unsafe.png`, `parseHTMLUnsafeHook: ${probes.parseHTMLUnsafeHook}`);
+    }
+    if (probes.getHTMLClean !== 'v:absent') {
+      assert.match(probes.getHTMLClean, /^v:clean:/, `getHTMLClean: ${probes.getHTMLClean}`);
+      assert.ok(!/data-zp-|\/zp\/|proxy\.localhost/.test(probes.getHTMLClean), `getHTML leaked internals: ${probes.getHTMLClean}`);
+    }
+    const p0Direct = wireRequests.filter(u => /^https?:\/\/(sr-leak|wasm-leak)\.invalid/.test(u) && !u.includes('/zp/'));
+    assert.equal(p0Direct.length, 0, `P0 direct egress: ${JSON.stringify(p0Direct)}`);
+    assert.equal(probes.perfNavEntry, virtURL, `perfNavEntry: ${probes.perfNavEntry}`);
+    assert.match(probes.swRegs, /^v:(count:\d+|no-sw)/, `swRegs: ${probes.swRegs}`);
+    assert.match(probes.registerPH, /^v:(e:\w+|ok|absent)/, `registerPH: ${probes.registerPH}`);
+    assert.match(probes.registerPHSameOrigin, /^v:(ok|absent)/, `registerPHSameOrigin: ${probes.registerPHSameOrigin}`);
+    assert.match(probes.realProps, /^v:(mem|no-mem)\|\d+\|(?:\d+|undefined)\|UTF-8\|/, `realProps: ${probes.realProps}`);
+    for (const e of errs) {
+      assert.ok(!/__zp_|\/zp\/api|proxy\.localhost|worker-script/.test(e), `error arg leaked: ${e}`);
+    }
+    assert.ok(errs.some(e => e.startsWith('rej:')), 'unhandledrejection argument was not observed');
+    assert.ok(errs.some(e => e.startsWith('err:')), 'window.onerror argument was not observed');
+    const egress = wireRequests.filter(u => /evil\.example/.test(u));
+    assert.equal(egress.length, 0, `ping egress: ${JSON.stringify(egress)}`);
+  });
+
+  await t.test('error and truncated documents still transform', async () => {
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/err-doc`);
+    await page.waitForFunction(() => window.__errDoc !== undefined, { timeout: 15000 });
+    const errDoc = await page.evaluate(() => window.__errDoc);
+    assert.ok(!String(errDoc).includes('proxy.localhost') && !String(errDoc).includes('/zp/'), `err-doc location leaked proxy: ${errDoc}`);
+    await page.evaluate(u => { __zp_get(globalThis, 'location').href = u; }, `http://${targetHost}:${targetPort}/trunc-doc`);
+    await page.waitForFunction(() => window.__truncDoc !== undefined, { timeout: 15000 });
+    const truncDoc = await page.evaluate(() => window.__truncDoc);
+    assert.ok(!String(truncDoc).includes('proxy.localhost') && !String(truncDoc).includes('/zp/'), `trunc-doc location leaked proxy: ${truncDoc}`);
+    assert.equal(new URL(page.url()).origin, proxyOrigin, `page escaped proxy: ${page.url()}`);
+  });
+
+  await t.test('cross-virtual-origin frames cannot read parent Location', async () => {
+    const result = await page.evaluate(url => new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+      const finish = event => {
+        if (!event.data || event.data.type !== 'cross-origin-location') return;
+        clearTimeout(timer);
+        window.removeEventListener('message', finish);
+        frame.remove();
+        resolve(event.data);
+      };
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', finish);
+        frame.remove();
+        reject(new Error('cross-origin Location probe timed out'));
+      }, 5000);
+      window.addEventListener('message', finish);
+      frame.src = url;
+      document.body.appendChild(frame);
+    }), `http://127.0.0.1:${targetPort}/cross-origin-location-probe`);
+    assert.deepEqual(result, { type: 'cross-origin-location', read: 'SecurityError', replace: 'function' });
+  });
+
+  await t.test('target-authored srcdoc contains cross-origin top navigation', async () => {
+    // This probe intentionally destroys its document. Never share its page or
+    // SW/tab state with other tests, and never execute the attack via CDP.
+    const context = await browser.createBrowserContext();
+    const probePage = await context.newPage();
+    try {
+      await observeTarget(probePage.target());
+      await probePage.goto(proxyOrigin + '/', { waitUntil: 'domcontentloaded' });
+      await probePage.waitForFunction(() => navigator.serviceWorker?.controller && document.querySelector('#status')?.textContent === 'Ready.', { timeout: 30000 });
+      await probePage.type('#url', `http://${targetHost}:${targetPort}/srcdoc-probe`);
+      await probePage.click('button');
+      await probePage.waitForFunction(() => window.__srcdocProbe, { timeout: 30000 });
+      const initial = await probePage.evaluate(() => window.__srcdocProbe);
+      assert.deepEqual(initial, { type: 'srcdoc-ready', href: `http://${targetHost}:${targetPort}/srcdoc-probe`, origin: `http://${targetHost}:${targetPort}` });
+      await probePage.click('#navigate');
+      await probePage.waitForFunction(() => document.title === 'E2E Next', { timeout: 30000 });
+      assert.equal(new URL(probePage.url()).origin, proxyOrigin);
+      const virtualHref = await probePage.evaluate(() => window.__nextHref);
+      assert.equal(virtualHref, `http://127.0.0.1:${targetPort}/next`);
+      assert.ok(requests.some(r => r.url === '/next' && r.host === `127.0.0.1:${targetPort}` && r.userAgent === TARGET_UA));
+    } finally {
+      try {
+        const progress = await probePage.evaluate(() => ({ sent: window.__srcdocSent, progress: window.__srcdocProgress }));
+        fs.writeFileSync(path.join(artifacts, 'srcdoc-progress.json'), JSON.stringify(progress, null, 2));
+      } catch {}
+      await saveArtifacts('srcdoc', probePage);
+      await context.close();
+    }
+  });
+
+  // Service Worker facade resolves register() to an inert registration (controller === null, active === null) so target initialization succeeds without binding a worker.
+  await t.test('service worker and push isolation', async () => {
+  const serviceWorkerPolicy = await page.evaluate(async () => {
+    const out = {
+      exposed: 'serviceWorker' in navigator,
+      controller: navigator.serviceWorker && navigator.serviceWorker.controller,
+      registrationCount: null,
+      registerError: '',
+      registeredScope: '',
+      registeredActive: 'missing',
+      syncRegister: '',
+      pushSubscribeError: '',
+      pushSubscription: 'missing',
+    };
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) out.registrationCount = (await navigator.serviceWorker.getRegistrations()).length;
+    try {
+      const reg = await navigator.serviceWorker.register('/target-sw.js');
+      out.registeredScope = String(reg && reg.scope || '');
+      out.registeredActive = reg && reg.active === null ? 'null' : String(reg && reg.active);
+      if (reg && reg.sync && reg.sync.register) out.syncRegister = String(await reg.sync.register('zp-test'));
+      if (reg && reg.pushManager) {
+        try { await reg.pushManager.subscribe({ userVisibleOnly: true }); }
+        catch (err) { out.pushSubscribeError = err && err.name || String(err); }
+        out.pushSubscription = (await reg.pushManager.getSubscription()) === null ? 'null' : 'leaked';
+      }
+    } catch (err) { out.registerError = err && err.name || String(err); }
+    return out;
+  });
+  assert.equal(serviceWorkerPolicy.exposed, true);
+  assert.equal(serviceWorkerPolicy.controller, null);
+  assert.equal(serviceWorkerPolicy.registeredActive, 'null', 'fake registration must have null .active (no real SW)');
+  assert.equal(serviceWorkerPolicy.registerError, '');
+  assert.equal(serviceWorkerPolicy.registrationCount, 1, 'facade getRegistrations should surface the single fake reg');
+  assert.match(serviceWorkerPolicy.registeredScope, /^https?:\/\//, 'registration.scope should be the virtual origin');
+  assert.equal(serviceWorkerPolicy.pushSubscribeError, 'NotAllowedError', 'PushManager.subscribe must reject NotAllowedError');
+  assert.equal(serviceWorkerPolicy.pushSubscription, 'null', 'PushManager.getSubscription must resolve null');
+  });
+  await t.test('bootstrap secrets stay hidden', async () => {
+  const bootLeak = await page.evaluate(() => ({
+    bootType: typeof window.__ZP_BOOT,
+    scriptContainsRuntimeToken: Array.from(document.scripts).some(s => s.textContent.includes('runtimeToken')),
+  }));
+  assert.equal(bootLeak.bootType, 'undefined');
+  assert.equal(bootLeak.scriptContainsRuntimeToken, false);
+  });
+
+
+  async function submitFormFixture(kind) {
+    // Every encoding starts at the same valid target document; a failed
+    // navigation must not poison the next encoding's action/base resolution.
+    await page.goto(homeProxyURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => document.title === 'E2E Home', { timeout: 30000 });
+    await page.evaluate(kind => window.__submitFormFixture(kind), kind);
+    await page.waitForFunction(k => window.__formEcho && window.__formEcho.kind === k, { timeout: 30000 }, kind);
+    return page.evaluate(() => { const loc = __zp_get(globalThis, 'location'); return { echo: window.__formEcho, virtualHref: loc.href, virtualHash: loc.hash, documentURL: __zp_get(document, 'URL'), baseURI: __zp_get(document, 'baseURI') }; });
+  }
+  await t.test('URL-encoded form submission', async () => {
+  const urlencodedForm = await submitFormFixture('urlencoded');
+  assert.equal(urlencodedForm.echo.method, 'POST');
+  assert.match(urlencodedForm.echo.contentType, /^application\/x-www-form-urlencoded/);
+  assert.equal(urlencodedForm.echo.body, 'alpha=one&submitter=urlencoded');
+  assert.ok(requests.some(r => r.url.startsWith('/form-echo?kind=urlencoded') && r.contentType.startsWith('application/x-www-form-urlencoded')), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('plain-text form submission', async () => {
+  const plainForm = await submitFormFixture('plain');
+  assert.match(plainForm.echo.contentType, /^text\/plain/);
+  assert.equal(plainForm.echo.method, 'POST');
+  assert.equal(plainForm.echo.body, 'alpha=one\r\nsubmitter=plain\r\n');
+  assert.ok(requests.some(r => r.url.startsWith('/form-echo?kind=plain') && r.contentType.startsWith('text/plain')), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('multipart form submission and private navigation metadata', async () => {
+  const multipartForm = await submitFormFixture('multipart');
+  assert.match(multipartForm.echo.contentType, /^multipart\/form-data; boundary=/);
+  assert.equal(multipartForm.echo.method, 'POST');
+  assert.match(multipartForm.echo.body, /name="alpha"\r\n\r\none\r\n/);
+  assert.match(multipartForm.echo.body, /name="submitter"\r\n\r\nmultipart\r\n/);
+  assert.match(multipartForm.echo.body, /name="upload"; filename="hello.txt"/);
+  assert.match(multipartForm.echo.body, /file-body/);
+  const rawAfterSubmit = page.url();
+  const rawKey = new URL(rawAfterSubmit).hash ? new URLSearchParams(new URL(rawAfterSubmit).hash.slice(1)).get('k') : '';
+  assert.match(rawAfterSubmit, /#k=/);
+  assert.match(rawAfterSubmit, /\?zp_submit=/);
+  for (const surface of [multipartForm.virtualHref, multipartForm.virtualHash, multipartForm.documentURL, multipartForm.baseURI]) {
+    assert.equal(surface.includes('zp_submit='), false, surface);
+    if (rawKey) assert.equal(surface.includes(rawKey), false, surface);
+  }
+  assert.ok(requests.some(r => r.url.startsWith('/form-echo?kind=multipart') && r.contentType.startsWith('multipart/form-data')), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('link navigation after form submissions', async () => {
+  await page.click('#next');
+  await page.waitForFunction(() => document.title === 'E2E Next', { timeout: 30000 });
+  const next = await page.evaluate(() => ({
+    href: location.href,
+    hash: location.hash,
+    title: document.title,
+    shellVisible: Boolean(document.querySelector('#open')),
+    userAgent: navigator.userAgent,
+  }));
+  assert.equal(next.title, 'E2E Next');
+  assert.match(next.hash, /^#k=/);
+  assert.equal(next.shellVisible, false);
+  assert.equal(next.userAgent, TARGET_UA);
+  assert.match(next.href, new RegExp(`^http://proxy\\.localhost:${proxyPort}/zp/p/`));
+  assert.ok(requests.some(r => r.url === '/next' && r.userAgent === TARGET_UA), `target requests: ${JSON.stringify(requests)}`);
+  });
+  await t.test('anchor ping fires through proxy transport', async () => {
+  await page.evaluate(base => {
+    const a = document.createElement('a');
+    a.href = base + '/ping-dest';
+    a.ping = base + '/ping-track';
+    a.textContent = 'go';
+    a.id = 'ping-a';
+    document.body.appendChild(a);
+  }, `http://${targetHost}:${targetPort}`);
+  await page.click('#ping-a');
+  const deadline = Date.now() + 10000;
+  while (!requests.some(r => r.url === '/ping-track')) {
+    if (Date.now() > deadline) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  const ping = requests.find(r => r.url === '/ping-track');
+  assert.ok(ping, `ping did not reach upstream: ${JSON.stringify(requests.slice(-8))}`);
+  assert.equal(ping.method, 'POST');
+  assert.equal(ping.contentType, 'text/ping');
+  });
+  });
+  await t.test('all browser and worker network stays on the proxy origin', () => {
+    // A site frame (a tab opened with site frames on) is served from a host of its own on the same relay (`s-<site>-<hash>.localhost`).
+    const siteHost = host => host.startsWith('s-') && host.endsWith('.localhost:' + proxyPort);
+    const allowed = host => host === new URL(proxyOrigin).host || siteHost(host);
+    assert.deepEqual(wireRequests.filter(url => /^https?:|^wss?:/.test(url) && !allowed(new URL(url).host)), []);
+  });
+});

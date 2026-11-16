@@ -1,0 +1,250 @@
+//! ZeroProxy JA3 mirror — captured ClientHello replay.
+//!
+//! Phase 4 of the JA3 work (phase 1 was cipher reorder via
+//! `CryptoProvider`, phase 2 was hardcoded Chrome 134 shape in
+//! `client::hs::apply_chrome_ja3_shape`). Phase 4 captures the user's
+//! real browser ClientHello at the ZeroProxy HTTPS listener and
+//! replays it on every upstream handshake so the JA3 hash matches the
+//! user's actual browser rather than our static guess.
+//!
+//! Data flow:
+//!
+//!  Browser → ZeroProxy HTTPS handshake
+//!     ↓
+//!  `crypto/tls.Config.GetConfigForClient` (Go server)
+//!     ↓
+//!  `/zp/api/fp` returns the captured spec as base64 JSON
+//!     ↓
+//!  Service Worker fetches it during `initBundle`
+//!     ↓
+//!  `zp-bundle` parses the JSON and calls `set_captured_spec`
+//!     ↓
+//!  `client::hs::apply_chrome_ja3_shape` reads `current()` and uses
+//!  the captured cipher order + extension layout instead of the
+//!  hardcoded Chrome 134 fallback.
+//!
+//! Storage is a `thread_local!` because the SW runs on a single thread
+//! (`!Send` async tasks via `spawn_local`), and there's exactly one
+//! browser identity per SW. Cross-thread access is not a concern.
+
+use alloc::vec::Vec;
+use core::cell::RefCell;
+
+use crate::enums::CipherSuite;
+use crate::NamedGroup;
+
+// Re-export so external callers (zp-bundle kernel) can name
+// `ExtensionType` without reaching into rustls's private `msgs` tree.
+pub use crate::msgs::enums::ExtensionType;
+
+// rustls is `#![no_std]`, so the `thread_local!` macro isn't in the
+// implicit prelude. We pull it in explicitly. `std` is available at
+// link time whenever this module is compiled — the feature is enabled
+// in zp-bundle's Cargo.toml (`features = ["std", "tls12", "logging"]`)
+// and the SW runtime provides a real `std` for wasm32.
+extern crate std;
+use std::thread_local;
+
+/// Snapshot of a ClientHello captured from the user's real browser.
+/// All fields are in the order the wire said. GREASE values (the
+/// `0x?A?A` family per RFC 8701) are preserved here; the encoder
+/// uses them to decide injection positions but rustls's own emitter
+/// strips them — see comments in `client::hs::apply_chrome_ja3_shape`.
+///
+/// `extensions` is the source of truth for ordering; the other fields
+/// (cipher list, curve list, ec point formats) tell us *what* to emit
+/// in each named extension's body.
+#[derive(Clone, Debug, Default)]
+pub struct CapturedSpec {
+    pub versions: Vec<u16>,
+    pub cipher_suites: Vec<CipherSuite>,
+    pub extensions: Vec<ExtensionType>,
+    pub named_groups: Vec<NamedGroup>,
+    pub ec_point_formats: Vec<u8>,
+    pub signature_schemes: Vec<u16>,
+    pub alpn_protocols: Vec<Vec<u8>>,
+}
+
+thread_local! {
+    /// The most recently installed captured spec, or `None` to fall
+    /// through to the hardcoded Chrome 134 layout in
+    /// `client::hs::apply_chrome_ja3_shape`. Wrapped in `RefCell` so
+    /// `set_captured_spec` can mutate it during SW boot.
+    static CAPTURED: RefCell<Option<CapturedSpec>> = const { RefCell::new(None) };
+}
+
+/// Install a captured spec. Called once during SW boot by the kernel
+/// after `/zp/api/fp` decodes. Last write wins — the SW only calls
+/// this once per activation, but if it ever needed to re-capture
+/// (e.g. browser update changed the fingerprint mid-session), the
+/// next call replaces.
+pub fn set_captured_spec(spec: CapturedSpec) {
+    CAPTURED.with(|c| {
+        *c.borrow_mut() = Some(spec);
+    });
+}
+
+/// Run `f` with a reference to the currently installed spec, if any.
+/// Returns whatever `f` returns. The closure dance keeps the borrow
+/// scoped — `RefCell::borrow()` panics on concurrent mut access, and
+/// `apply_chrome_ja3_shape` runs inside the rustls handshake state
+/// machine where another path might (theoretically) reentrantly call
+/// `set_captured_spec`. The closure form forces a hard scope on the
+/// borrow.
+pub fn with_current<R>(f: impl FnOnce(Option<&CapturedSpec>) -> R) -> R {
+    CAPTURED.with(|c| f(c.borrow().as_ref()))
+}
+
+thread_local! {
+    /// Phase 5.9 diagnostic: snapshot of named_groups Vec before/after
+    /// the captured-spec override fires inside
+    /// `apply_chrome_ja3_shape`. JS-side diag endpoint reads this back.
+    static LAST_NAMED_GROUPS_DUMP: RefCell<(Vec<u16>, Vec<u16>)> =
+        const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Phase 5.9 diagnostic setter.
+pub fn set_last_named_groups_dump(default: Vec<u16>, captured: Vec<u16>) {
+    LAST_NAMED_GROUPS_DUMP.with(|c| *c.borrow_mut() = (default, captured));
+}
+
+/// Phase 5.9 diagnostic getter.
+pub fn last_named_groups_dump() -> (Vec<u16>, Vec<u16>) {
+    LAST_NAMED_GROUPS_DUMP.with(|c| c.borrow().clone())
+}
+
+/// RFC 8701 GREASE values. The TLS protocol designates these 16
+/// `0x?A?A` code points as reserved for browsers to randomly inject
+/// into ClientHello cipher / extension / group lists. Servers must
+/// ignore them; if they don't, the protocol's intolerance is exposed
+/// and the deployment can be flagged.
+///
+/// JA3 strips GREASE before hashing — they don't change the JA3 hash.
+/// But the *absence* of GREASE is itself a strong fingerprint: every
+/// modern browser emits GREASE, so a ClientHello without GREASE is
+/// almost certainly a bot. NAVER's WAF appears to weight GREASE
+/// presence into its bot-detection signal.
+/// Length of the body emitted for ExtensionType::Padding (RFC 7685, id 21).
+/// Chrome 134 emits a variable-length zero body so total cleartext
+/// ClientHello hits 512 bytes (the legacy SSLv3 / F5 BIG-IP workaround
+/// threshold). Without knowing our offset inside the outer hello buffer
+/// at encode time we just pick a fixed value that's representative of
+/// what Chrome actually emits (~100 bytes); the *presence* of id 21 with
+/// a zero body is the fingerprint signal, not the exact length.
+pub const PADDING_BODY_LEN: usize = 100;
+
+/// Body of Chrome's `trust_anchors` extension (0xca34, TLS Trust Expressions), as Chrome 155.0.8059.85 sends it on every connection:
+/// a 2-byte list length (184) and 28 length-prefixed trust-anchor IDs (relative OIDs of its root-store versions). A real Chrome
+/// ClientHello has it; WebView2/Edge's does not, so a hello without it says "not Chrome" to a server that counts extensions.
+pub const CHROME_TRUST_ANCHORS: [u8; 186] = [
+    0x00, 0xb8, 0x05, 0x82, 0xdf, 0x13, 0x02, 0x01, 0x05, 0x82, 0xdf, 0x13, 0x02, 0x06, 0x05, 0x82,
+    0xdf, 0x13, 0x02, 0x0d, 0x05, 0x82, 0xdf, 0x13, 0x02, 0x0e, 0x05, 0x82, 0xdf, 0x13, 0x02, 0x0f,
+    0x05, 0x82, 0xdf, 0x13, 0x02, 0x12, 0x05, 0x82, 0xdf, 0x13, 0x02, 0x13, 0x05, 0x82, 0xdf, 0x13,
+    0x02, 0x14, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07, 0x08, 0x83, 0x9a, 0x64, 0x8c,
+    0x9b, 0x2d, 0x01, 0x08, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09, 0x08, 0x83, 0x9a,
+    0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b, 0x08,
+    0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01,
+    0x0d, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12, 0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b,
+    0x2d, 0x01, 0x13, 0x04, 0xd6, 0x79, 0x09, 0x01, 0x04, 0xd6, 0x79, 0x09, 0x04, 0x04, 0xd6, 0x79,
+    0x09, 0x05, 0x04, 0xd6, 0x79, 0x09, 0x06, 0x04, 0xd6, 0x79, 0x09, 0x07, 0x04, 0xd6, 0x79, 0x09,
+    0x08, 0x04, 0xd6, 0x79, 0x09, 0x0a, 0x04, 0xd6, 0x79, 0x09, 0x0b, 0x04, 0xd6, 0x79, 0x09, 0x0c,
+    0x04, 0xd6, 0x79, 0x09, 0x0d, 0x04, 0xd6, 0x79, 0x09, 0x0f,
+];
+
+pub const GREASE_VALUES: [u16; 16] = [
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+];
+
+/// True iff `v` is a GREASE code point (RFC 8701). The 16 GREASE values
+/// are `0x0A0A, 0x1A1A, … 0xFAFA` — i.e. the low nibble of each byte is
+/// `0xA` AND the two bytes are identical (the high nibble varies 0x0..0xF).
+/// The extension encoder uses this to emit a zero-byte body for any
+/// extension whose ID falls in this range — without it, `encode_one`'s
+/// catch-all arm would drop GREASE extension IDs on the floor.
+///
+/// BUG HISTORY: the previous test `(v & 0xf0f0) == 0xa0a0` required the
+/// *high* nibble of both bytes to be `0xA` too, which is true only for
+/// `0xAAAA` (1 of the 16 GREASE values). Since `random_grease()` picks
+/// uniformly, ~15/16 of GREASE extension IDs failed the check and were
+/// silently dropped → our ClientHello shipped WITHOUT the two bracketing
+/// GREASE extensions Chrome always sends. NAVER's raw TLS fingerprinter
+/// (ja3/peetprint, which unlike ja4 does NOT strip GREASE) flagged the
+/// absence as bot traffic and tar-pitted the connection. cipher/group
+/// GREASE survived because those are inline list-body values that never
+/// route through this predicate.
+pub fn is_grease_value(v: u16) -> bool {
+    (v & 0x0f0f) == 0x0a0a && (v >> 8) == (v & 0x00ff)
+}
+
+/// Pick a random GREASE value. The choice is per-emission so two
+/// ClientHellos from the same session present different GREASE bytes
+/// — that's part of the browser-like behaviour.
+///
+/// Uses a thread-local xorshift64 PRNG. The seed is a deterministic
+/// non-zero constant (golden-ratio bytes); on wasm32-unknown-unknown
+/// `std::time::SystemTime::now()` panics with "time not implemented",
+/// and we'd rather not pull in `web-time` or `rand_core` here. The
+/// first GREASE per SW activation is therefore deterministic, but
+/// every subsequent call advances the state — every ClientHello after
+/// the first sees a fresh value, which is what RFC 8701 requires.
+pub fn random_grease() -> u16 {
+    GREASE_RNG.with(|s| {
+        // xorshift64 step
+        let mut x = rng_state(s.get(), 0x9E3779B97F4A7C15);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        GREASE_VALUES[(x as usize) & 0x0f]
+    })
+}
+
+thread_local! {
+    static GREASE_RNG: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static BYTES_RNG: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static ENTROPY: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The generators' starting state: the entropy the host gave us mixed into the fixed constant, or the constant alone when
+/// none was given (a zero state would stay zero for ever). `state == 0` means "not started yet".
+fn rng_state(state: u64, constant: u64) -> u64 {
+    if state != 0 {
+        return state;
+    }
+    let mixed = ENTROPY.with(|e| e.get()) ^ constant;
+    if mixed == 0 { constant } else { mixed }
+}
+
+/// Give the GREASE draws and the ECH GREASE noise real entropy. Both used to start from a fixed constant, so the FIRST
+/// ClientHello after every worker start carried the same GREASE code points and the same `enc` and payload bytes, for
+/// every user: a constant no browser has (a real ECH `enc` is a fresh public key every time). The host calls this once at
+/// boot with random bytes (`std::time` is not available here, and nothing else in this crate has an entropy source).
+pub fn seed_entropy(seed: u64) {
+    ENTROPY.with(|e| e.set(seed));
+    GREASE_RNG.with(|s| s.set(0));
+    BYTES_RNG.with(|s| s.set(0));
+}
+
+/// Generate `n` pseudo-random bytes from the same xorshift64 state that
+/// drives `random_grease()`. Used by Phase 5.7 ECH GREASE to fill the
+/// outer hello's `enc` and `payload` fields — anti-bot fingerprinters
+/// only check that the body decodes as a valid `EncryptedClientHelloOuter`
+/// with non-empty payload; the actual bytes are server-decrypted noise
+/// for real ECH, so any bytes look identical to the WAF observer.
+pub fn random_bytes(n: usize) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    BYTES_RNG.with(|s| {
+        let mut x = rng_state(s.get(), 0xBF58476D1CE4E5B9);
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let bytes = x.to_le_bytes();
+            let take = core::cmp::min(8, n - out.len());
+            out.extend_from_slice(&bytes[..take]);
+        }
+        s.set(x);
+    });
+    out
+}
