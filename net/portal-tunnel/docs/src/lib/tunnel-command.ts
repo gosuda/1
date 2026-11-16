@@ -1,0 +1,28 @@
+import { normalizeExposeName } from './expose-name';
+import type { ShareInput } from './share-link';
+
+export type TunnelCommandOS = 'unix' | 'windows';
+
+export function buildTunnelCommand(
+	share: ShareInput,
+	name: string,
+	os: TunnelCommandOS
+) {
+	const target = share.kind === 'file' ? share.path : share.target || '3000';
+	const normalizedName = normalizeExposeName(name);
+	const args = share.kind === 'file' ? ['--serve', target] : [target];
+	if (normalizedName !== '') {
+		args.push('--name', normalizedName);
+	}
+	const run = 'portal expose ' + args.map((value) => {
+		if (/^[A-Za-z0-9:/.=_-]+$/.test(value)) return value;
+		return os === 'windows'
+			? "'" + value.replace(/'/g, "''") + "'"
+			: "'" + value.replace(/'/g, `'"'"'`) + "'";
+	}).join(' ');
+	const release = 'https://github.com/gosuda/portal-tunnel/releases/latest/download';
+	const install = os === 'windows'
+		? `$ProgressPreference = 'SilentlyContinue'\nirm ${release}/install.ps1 | iex`
+		: `curl -fsSL ${release}/install.sh | bash && export PATH="$HOME/.local/bin:$HOME/bin:$PATH"`;
+	return { install, run };
+}
