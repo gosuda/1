@@ -133,6 +133,10 @@ modules, so internal modules are never fetched. Go modules that the trunk's `go.
 built on their own: their commands run with `GOWORK=off`, and their `go mod download` runs per module with
 `GOWORK=off`.
 
+The default Go checks run `go vet ./...` before `go test -vet=off ./...`. The explicit vet command
+runs the full default analyzer set, including test packages, so the test command does not repeat
+its smaller default vet pass. A vet failure still stops the project before its tests run.
+
 Convention: a committed `go.mod` never contains a local `replace`; the root `go.work` resolves sibling
 modules; a `require` of an internal module names a published version.
 

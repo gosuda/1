@@ -239,11 +239,12 @@ func (cfg DockerPresubmit) testCommands(n *projectNode) []string {
 	}
 	switch n.Kind {
 	case kindGo:
+		// The explicit vet command runs the full analyzer set; go test need not repeat its subset.
 		if !n.workspace {
 			// Outside the trunk's workspace a module is built on its own, as before the workspace existed.
-			return []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}
+			return []string{"GOWORK=off go vet ./...", "GOWORK=off go test -vet=off ./..."}
 		}
-		return []string{"go vet ./...", "go test ./..."}
+		return []string{"go vet ./...", "go test -vet=off ./..."}
 	case kindCargo:
 		if n.lock {
 			return []string{"cargo test --offline --locked"}
