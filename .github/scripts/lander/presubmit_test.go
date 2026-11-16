@@ -248,8 +248,8 @@ func TestPresubmitDefaultTestCommands(t *testing.T) {
 		n    *projectNode
 		want []string
 	}{
-		{"go in workspace", &projectNode{Project: Project{Kind: kindGo}, workspace: true}, []string{"go vet ./...", "go test ./..."}},
-		{"go outside workspace", &projectNode{Project: Project{Kind: kindGo}}, []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}},
+		{"go in workspace", &projectNode{Project: Project{Kind: kindGo}, workspace: true}, []string{"go vet ./...", "go test -vet=off ./..."}},
+		{"go outside workspace", &projectNode{Project: Project{Kind: kindGo}}, []string{"GOWORK=off go vet ./...", "GOWORK=off go test -vet=off ./..."}},
 		{"cargo locked", &projectNode{Project: Project{Kind: kindCargo}, lock: true}, []string{"cargo test --offline --locked"}},
 		{"cargo unlocked", &projectNode{Project: Project{Kind: kindCargo}}, nil},
 		{"node tests", &projectNode{Project: Project{Kind: kindNode}, tests: true}, []string{"bun test"}},
@@ -263,6 +263,30 @@ func TestPresubmitDefaultTestCommands(t *testing.T) {
 	override := DockerPresubmit{TestCommands: func(Project) []string { return []string{"make check"} }}
 	if got := override.testCommands(&projectNode{Project: Project{Kind: kindGo}}); !slices.Equal(got, []string{"make check"}) {
 		t.Fatalf("override ignored: %q", got)
+	}
+}
+
+func TestPresubmitVetFailureStopsTests(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		workspace bool
+	}{{"workspace", true}, {"standalone", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DockerPresubmit{}
+			n := &projectNode{Project: Project{Dir: "module", Kind: kindGo}, workspace: tc.workspace}
+			// Stub the container setup and record Go invocations while making vet fail.
+			script := `cp() { :; }
+cd() { :; }
+go() { printf '%s\n' "$1"; [ "$1" != vet ]; }
+` + containerScript(n.Project, cfg.testCommands(n))
+			out, err := exec.Command("sh", "-c", script).CombinedOutput()
+			if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+				t.Fatalf("vet failure did not fail the sandbox script: %v\n%s", err, out)
+			}
+			if string(out) != "vet\n" {
+				t.Fatalf("Go invocations = %q, want only vet", out)
+			}
+		})
 	}
 }
 
@@ -473,7 +497,7 @@ func TestSandboxWorkspaceBuildsOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := Project{Dir: "app", Kind: kindGo}
-	args := sandboxArgs(cfg, name, dst, cfg.CacheDir, p, containerScript(p, []string{"go vet ./...", "go test ./..."}))
+	args := sandboxArgs(cfg, name, dst, cfg.CacheDir, p, containerScript(p, cfg.testCommands(&projectNode{Project: p, workspace: true})))
 	cmd := exec.CommandContext(ctx, docker, args...)
 	cmd.Env = inheritedEnv(dockerEnvNames)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -834,10 +858,10 @@ func TestGoWorkModulesOutsideTrunkUseRunWithoutWorkspace(t *testing.T) {
 		}
 	}
 	cfg := DockerPresubmit{}
-	if got := cfg.testCommands(g.nodes["go:devtools/potly"]); !slices.Equal(got, []string{"GOWORK=off go vet ./...", "GOWORK=off go test ./..."}) {
+	if got := cfg.testCommands(g.nodes["go:devtools/potly"]); !slices.Equal(got, []string{"GOWORK=off go vet ./...", "GOWORK=off go test -vet=off ./..."}) {
 		t.Fatalf("potly commands = %q", got)
 	}
-	if got := cfg.testCommands(g.nodes["go:lib"]); !slices.Equal(got, []string{"go vet ./...", "go test ./..."}) {
+	if got := cfg.testCommands(g.nodes["go:lib"]); !slices.Equal(got, []string{"go vet ./...", "go test -vet=off ./..."}) {
 		t.Fatalf("lib commands = %q", got)
 	}
 	spec, skip := cfg.prepareSpecFor(g, g.nodes["go:devtools/potly"])
@@ -871,11 +895,11 @@ func TestPresubmitOutsideWorkspaceCommandsDisableWorkspace(t *testing.T) {
 	for _, c := range calls {
 		switch {
 		case strings.Contains(c, "'/work/devtools/potly'"):
-			if !strings.Contains(c, "GOWORK=off go test ./...") {
+			if !strings.Contains(c, "GOWORK=off go test -vet=off ./...") {
 				t.Fatalf("module outside the workspace runs with the workspace: %s", c)
 			}
 		case strings.Contains(c, "'/work/app'"), strings.Contains(c, "'/work/lib'"):
-			if strings.Contains(c, "GOWORK=off") || !strings.Contains(c, "cd '/work/") || !strings.Contains(c, " go test ./...") {
+			if strings.Contains(c, "GOWORK=off") || !strings.Contains(c, "cd '/work/") || !strings.Contains(c, " go test -vet=off ./...") {
 				t.Fatalf("workspace module lacks the workspace: %s", c)
 			}
 		default:

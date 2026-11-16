@@ -129,6 +129,9 @@ This avoids one Git process per manifest while preserving the dependency closure
 
 ## Presubmit Go modules
 
+Each affected Go module runs `go vet ./...` first, then `go test -vet=off ./...` only if vet passes.
+The explicit vet step retains its full checks; disabling vet within `go test` avoids repeating them.
+
 Presubmit tests Go modules in the trunk's workspace (the root `go.work` of `refs/suda/main`) against the
 local code of their internal dependencies. The lander writes a `go.work` at the root of the staging
 directory. It lists the closure's Go modules that the trunk's `go.work` lists in `use`, nested modules
