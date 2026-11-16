@@ -1,0 +1,85 @@
+# chrome_net_server: the chromenet engine, built inside an official Chromium source tree.
+# scripts/engine/build.sh copies this directory to //third_party/chromenet and the HQQ C runtime
+# of the pinned gosuda.org/hqq module to //third_party/chromenet/hqq, then builds this target.
+
+import("//chrome/version.gni")
+
+config("hqq_config") {
+  include_dirs = [ "hqq/include" ]
+}
+
+# The HQQ shared-memory RPC runtime (C11), compiled with the Chromium toolchain.
+static_library("hqq") {
+  sources = [
+    "hqq/src/hqq_adv_core.c",
+    "hqq/src/hqq_adv_link.c",
+    "hqq/src/hqq_adv_msg.c",
+    "hqq/src/hqq_adv_route.c",
+    "hqq/src/hqq_adv_rx.c",
+    "hqq/src/hqq_adv_stream.c",
+    "hqq/src/hqq_lifeline.c",
+    "hqq/src/hqq_link.c",
+    "hqq/src/hqq_listener.c",
+    "hqq/src/hqq_named.c",
+    "hqq/src/hqq_names.c",
+    "hqq/src/hqq_rpc.c",
+    "hqq/src/hqq_rpc_server.c",
+    "hqq/src/hqq_rpc_session.c",
+    "hqq/src/hqq_superblock.c",
+    "hqq/src/hqq_util.c",
+  ]
+  if (is_win) {
+    sources += [ "hqq/src/hqq_platform_win32.c" ]
+    defines = [
+      "_CRT_SECURE_NO_WARNINGS",
+      "_CRT_NONSTDC_NO_WARNINGS",
+    ]
+    libs = [
+      "advapi32.lib",
+      "kernel32.lib",
+    ]
+  } else {
+    sources += [ "hqq/src/hqq_platform_posix.c" ]
+    defines = [ "_DEFAULT_SOURCE" ]
+  }
+  include_dirs = [ "hqq/src" ]
+  public_configs = [ ":hqq_config" ]
+  configs -= [ "//build/config/compiler:chromium_code" ]
+  configs += [ "//build/config/compiler:no_chromium_code" ]
+  if (is_win) {
+    cflags_c = [ "/std:c11" ]
+  } else {
+    cflags_c = [ "-std=c11" ]
+  }
+  if (is_linux) {
+    libs = [ "rt" ]
+  }
+}
+
+executable("chrome_net_server") {
+  sources = [
+    "chrome_net.h",
+    "chrome_net_server.c",
+    "chrome_net_server.h",
+    "engine.cc",
+    "internal.h",
+    "main.cc",
+    "request.cc",
+    "ws.cc",
+    "wt.cc",
+  ]
+  defines = [ "CHROMENET_CHROME_MAJOR=\"$chrome_version_major\"" ]
+  deps = [
+    ":hqq",
+    "//base",
+    "//base:i18n",
+    "//net",
+    "//url",
+  ]
+  configs -= [ "//build/config/compiler:chromium_code" ]
+  configs += [ "//build/config/compiler:no_chromium_code" ]
+}
+
+group("all") {
+  deps = [ ":chrome_net_server" ]
+}
