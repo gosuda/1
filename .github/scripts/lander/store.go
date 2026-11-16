@@ -5,6 +5,7 @@
 package lander
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -101,9 +102,21 @@ func (s *Store) GitStdin(ctx context.Context, stdin string, args ...string) (str
 	return s.run(ctx, nil, nil, strings.NewReader(stdin), args...)
 }
 
-// readBlobs reads the exact contents of entries in one git process, in input order. Entries must
-// name full blob object IDs, as returned by ListTree; paths are used only in error messages.
+// Project metadata is read in the lander before sandbox resource limits apply. Bound both the
+// number of responses and their total body bytes, including repeated requests for the same OID.
+const (
+	maxManifestBlobs      = 16384
+	maxManifestBlobBytes  = 1 << 20
+	maxManifestBatchBytes = 32 << 20
+	maxBatchStderrBytes   = 64 << 10
+)
+
+// readBlobs reads full blob object IDs from ListTree in one Git process. Results preserve request
+// order and exact bytes. Invalid, missing, non-blob, or over-budget objects fail the entire read.
 func (s *Store) readBlobs(ctx context.Context, entries []TreeEntry) ([]string, error) {
+	if len(entries) > maxManifestBlobs {
+		return nil, fmt.Errorf("read blobs: manifest count exceeds limit of %d", maxManifestBlobs)
+	}
 	if len(entries) == 0 {
 		return nil, nil
 	}
@@ -115,53 +128,111 @@ func (s *Store) readBlobs(ctx context.Context, entries []TreeEntry) ([]string, e
 		input.WriteString(e.OID)
 		input.WriteByte('\n')
 	}
-	out, err := s.runRaw(ctx, nil, strings.NewReader(input.String()), "cat-file", "--batch", "--buffer")
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	args := []string{"cat-file", "--batch", "--buffer"}
+	cmd := s.gitCommand(batchCtx, nil, args...)
+	cmd.Stdin = strings.NewReader(input.String())
+	var stderr cappedGitStderr
+	cmd.Stderr = &stderr
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("read blobs: open Git stdout: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("read blobs: %w", &GitError{Args: args, Err: err})
+	}
+	bodies, parseErr := parseBlobBatch(out, entries)
+	if parseErr != nil {
+		cancel() // Stop Git instead of draining an oversized or invalid response.
+	}
+	waitErr := cmd.Wait() // Reap the child and finish stderr collection on every started path.
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	if err != nil {
-		return nil, fmt.Errorf("read blobs: %w", err)
+	if waitErr != nil {
+		gitErr := &GitError{Args: args, Err: waitErr, Stderr: stderr.String()}
+		return nil, fmt.Errorf("read blobs: %w", errors.Join(parseErr, gitErr))
 	}
-	return parseBlobBatch(out, entries)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	return bodies, nil
 }
 
-// parseBlobBatch checks every response header and byte count before exposing any blob contents.
-// Bodies are slices of out: embedded NULs and trailing newlines have no framing role.
-func parseBlobBatch(out string, entries []TreeEntry) ([]string, error) {
+// parseBlobBatch consumes one size-delimited response per entry and then requires EOF. Each
+// iteration leaves the reader at the next header. Check the byte budget before allocating or
+// reading a body; contents cannot become framing, and rejected responses are never drained.
+func parseBlobBatch(out io.Reader, entries []TreeEntry) ([]string, error) {
+	if len(entries) > maxManifestBlobs {
+		return nil, fmt.Errorf("read blobs: manifest count exceeds limit of %d", maxManifestBlobs)
+	}
+	// A SHA-256 OID, type, and decimal size fit well within this fixed header buffer.
+	r := bufio.NewReaderSize(out, 256)
 	var bodies []string
 	if len(entries) > 0 {
-		bodies = make([]string, len(entries))
+		bodies = make([]string, 0, len(entries))
 	}
-	for i, e := range entries {
-		header, rest, ok := strings.Cut(out, "\n")
-		if !ok {
-			return nil, fmt.Errorf("read %s: truncated batch header", e.Path)
+	total := 0
+	for _, e := range entries {
+		header, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return nil, fmt.Errorf("read %s: batch header exceeds limit", e.Path)
 		}
-		fields := strings.Split(header, " ")
+		if err != nil {
+			return nil, fmt.Errorf("read %s: truncated batch header: %w", e.Path, err)
+		}
+		fields := strings.Split(string(header[:len(header)-1]), " ")
 		if len(fields) == 2 && fields[0] == e.OID && fields[1] == "missing" {
 			return nil, fmt.Errorf("read %s: object %s is missing", e.Path, e.OID)
 		}
 		if len(fields) != 3 || fields[0] != e.OID || fields[1] != "blob" {
 			return nil, fmt.Errorf("read %s: unexpected batch header %q", e.Path, header)
 		}
-		size, err := strconv.ParseUint(fields[2], 10, 64)
+		declared, err := strconv.ParseUint(fields[2], 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: invalid blob size %q: %w", e.Path, fields[2], err)
 		}
-		if size >= uint64(len(rest)) {
-			return nil, fmt.Errorf("read %s: truncated blob of size %d", e.Path, size)
+		if declared > maxManifestBlobBytes {
+			return nil, fmt.Errorf("read %s: blob size %d exceeds limit of %d bytes", e.Path, declared, maxManifestBlobBytes)
 		}
-		if rest[size] != '\n' {
+		size := int(declared) // Conversion is safe after the per-blob limit.
+		if size > maxManifestBatchBytes-total {
+			return nil, fmt.Errorf("read %s: blob batch exceeds limit of %d bytes", e.Path, maxManifestBatchBytes)
+		}
+		total += size
+		body := make([]byte, size+1) // Git's newline separator is required even for an empty blob.
+		if _, err := io.ReadFull(r, body); err != nil {
+			return nil, fmt.Errorf("read %s: truncated blob of size %d: %w", e.Path, size, err)
+		}
+		if body[size] != '\n' {
 			return nil, fmt.Errorf("read %s: missing blob terminator", e.Path)
 		}
-		bodies[i] = rest[:size]
-		out = rest[size+1:]
+		bodies = append(bodies, string(body[:size]))
 	}
-	if out != "" {
+	if _, err := r.ReadByte(); err == nil {
 		return nil, errors.New("read blobs: unexpected trailing batch output")
+	} else if err != io.EOF {
+		return nil, fmt.Errorf("read blobs: read trailing batch output: %w", err)
 	}
 	return bodies, nil
 }
+
+// cappedGitStderr keeps bounded diagnostics while allowing the subprocess to finish writing.
+type cappedGitStderr struct {
+	data []byte
+}
+
+func (b *cappedGitStderr) Write(p []byte) (int, error) {
+	n := min(len(p), maxBatchStderrBytes-len(b.data))
+	b.data = append(b.data, p[:n]...)
+	return len(p), nil
+}
+
+func (b *cappedGitStderr) String() string { return string(b.data) }
 
 // GitRemote runs git with credentials for remote injected through the environment, never argv.
 func (s *Store) GitRemote(ctx context.Context, r Remote, access Access, args ...string) (string, error) {
@@ -193,8 +264,8 @@ func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, a
 	return strings.TrimRight(out, "\n"), err
 }
 
-// runRaw preserves stdout bytes for framed protocols such as cat-file --batch.
-func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
+// gitCommand applies the same noninteractive environment to buffered and streaming Git commands.
+func (s *Store) gitCommand(ctx context.Context, env []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", s.Dir}, args...)...)
 	id := s.identity()
 	cmd.Env = append(os.Environ(),
@@ -205,6 +276,12 @@ func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args 
 		"GIT_COMMITTER_EMAIL="+id.Email,
 	)
 	cmd.Env = append(cmd.Env, env...)
+	return cmd
+}
+
+// runRaw preserves stdout byte for byte for Git callers that need buffered output.
+func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
+	cmd := s.gitCommand(ctx, env, args...)
 	cmd.Stdin = stdin
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

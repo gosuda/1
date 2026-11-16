@@ -120,6 +120,20 @@ read from the pull requests of `review/<id>` and of every other review branch wh
 same `Change-Id`. The landed commit gets `Suda-Review: gosuda/1#<N>` for the newest review pull
 request. Patchsets of one change are pruned together, 14 days after the newest one.
 
+## Presubmit project discovery
+
+Presubmit reads project manifests and the root `go.work` from one streaming `git cat-file --batch`
+process after listing the candidate tree. The reader checks object identity, type, size, and response
+boundaries before building the affected-project graph. Missing or malformed responses fail the scan.
+This avoids one Git process per manifest while preserving the dependency closure.
+
+Discovery runs in the lander before the sandbox starts. Each scan permits at most 16,384 manifests
+(including the root `go.work`), 1 MiB per blob, and 32 MiB of total blob bodies. Repeated references to
+one object count separately toward the total. Headers use a fixed 256-byte buffer, and each body must
+fit the remaining byte budget before it is allocated or read. A limit violation stops and reaps Git
+without draining its output and fails the scan without returning partial results. Git stderr retains
+at most 64 KiB of diagnostics.
+
 ## Presubmit Go modules
 
 Presubmit tests Go modules in the trunk's workspace (the root `go.work` of `refs/suda/main`) against the

@@ -120,7 +120,7 @@ func TestParseBlobBatchRejectsMalformedOutput(t *testing.T) {
 		{"signed size", oid + " blob +1\nx\n", "invalid blob size"},
 		{"invalid size", oid + " blob one\nx\n", "invalid blob size"},
 		{"size overflow", oid + " blob 18446744073709551616\nx\n", "invalid blob size"},
-		{"max size", oid + " blob 18446744073709551615\nx\n", "truncated blob"},
+		{"max size", oid + " blob 18446744073709551615\nx\n", "limit"},
 		{"truncated body", oid + " blob 2\nx\n", "truncated blob"},
 		{"missing terminator", oid + " blob 1\nx", "truncated blob"},
 		{"wrong terminator", oid + " blob 1\nx\x00", "missing blob terminator"},
@@ -128,7 +128,7 @@ func TestParseBlobBatchRejectsMalformedOutput(t *testing.T) {
 		{"extra newline", valid + "\n", "unexpected trailing batch output"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseBlobBatch(tc.out, []TreeEntry{entry})
+			got, err := parseBlobBatch(strings.NewReader(tc.out), []TreeEntry{entry})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("parseBlobBatch error = %v, want %q", err, tc.want)
 			}
@@ -139,7 +139,7 @@ func TestParseBlobBatchRejectsMalformedOutput(t *testing.T) {
 	}
 
 	second := TreeEntry{Type: "blob", OID: oid, Path: "second/go.mod"}
-	got, err := parseBlobBatch(valid, []TreeEntry{entry, second})
+	got, err := parseBlobBatch(strings.NewReader(valid), []TreeEntry{entry, second})
 	if err == nil || !strings.Contains(err.Error(), second.Path) || got != nil {
 		t.Fatalf("incomplete batch = %q, %v; want no contents and an error naming %s", got, err, second.Path)
 	}
