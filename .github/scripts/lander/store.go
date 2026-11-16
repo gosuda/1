@@ -131,8 +131,8 @@ func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, a
 	return strings.TrimRight(out, "\n"), err
 }
 
-// runRaw preserves stdout byte for byte, including Git's batch framing and blob contents.
-func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
+// gitCommand applies the same noninteractive environment to buffered and streaming Git commands.
+func (s *Store) gitCommand(ctx context.Context, env []string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", s.Dir}, args...)...)
 	id := s.identity()
 	cmd.Env = append(os.Environ(),
@@ -143,6 +143,12 @@ func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args 
 		"GIT_COMMITTER_EMAIL="+id.Email,
 	)
 	cmd.Env = append(cmd.Env, env...)
+	return cmd
+}
+
+// runRaw preserves stdout byte for byte for Git callers that need buffered output.
+func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
+	cmd := s.gitCommand(ctx, env, args...)
 	cmd.Stdin = stdin
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb

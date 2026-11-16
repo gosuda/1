@@ -118,6 +118,7 @@ func TestParseBlobBatchRejectsIncompleteOrInvalidResponses(t *testing.T) {
 		{"extra header field", []TreeEntry{a}, a.OID + " blob 3 extra\nabc\n"},
 		{"nonnumeric size", []TreeEntry{a}, a.OID + " blob three\nabc\n"},
 		{"negative size", []TreeEntry{a}, a.OID + " blob -1\n\n"},
+		{"signed size", []TreeEntry{a}, a.OID + " blob +1\nx\n"},
 		{"overflowing size", []TreeEntry{a}, a.OID + " blob 18446744073709551616\n"},
 		{"short body", []TreeEntry{a}, a.OID + " blob 4\nabc\n"},
 		{"missing separator", []TreeEntry{a}, a.OID + " blob 3\nabc"},
@@ -130,9 +131,21 @@ func TestParseBlobBatchRejectsIncompleteOrInvalidResponses(t *testing.T) {
 		{"unsolicited response", nil, frame(a, "first")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := parseBlobBatch(tc.entries, tc.out)
+			got, err := parseBlobBatch(strings.NewReader(tc.out), tc.entries)
 			if err == nil || got != nil {
 				t.Fatalf("invalid batch returned %q, %v; want no partial result and an error", got, err)
+			}
+		})
+	}
+}
+
+func TestReadBlobsRejectsInvalidObjectIDs(t *testing.T) {
+	s := &Store{Dir: filepath.Join(t.TempDir(), "not-a-store")}
+	for _, oid := range []string{"", "HEAD", strings.Repeat("g", 40), strings.Repeat("a", 39), strings.Repeat("a", 40) + "\n"} {
+		t.Run(oid, func(t *testing.T) {
+			_, err := s.readBlobs(context.Background(), []TreeEntry{{OID: oid, Path: "app/go.mod"}})
+			if err == nil || !strings.Contains(err.Error(), "invalid object ID") || !strings.Contains(err.Error(), "app/go.mod") {
+				t.Fatalf("readBlobs error = %v, want invalid object ID naming app/go.mod", err)
 			}
 		})
 	}

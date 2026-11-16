@@ -119,6 +119,9 @@ func loadProjects(ctx context.Context, s *Store, tree string) (*projectGraph, er
 		}
 		g.paths[e.Path] = true
 		if e.Path == goWorkName || (isManifestName(path.Base(e.Path)) && e.Mode != "120000" && !inNodeModules(e.Path)) {
+			if len(manifests) == maxManifestBlobs {
+				return nil, fmt.Errorf("read blobs: manifest count exceeds limit of %d", maxManifestBlobs)
+			}
 			manifests = append(manifests, e)
 		}
 	}
