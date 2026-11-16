@@ -118,29 +118,25 @@ func loadProjects(ctx context.Context, s *Store, tree string) (*projectGraph, er
 			continue // submodule commits are not part of any archive
 		}
 		g.paths[e.Path] = true
-		if isManifestName(path.Base(e.Path)) && e.Mode != "120000" && !inNodeModules(e.Path) {
+		if e.Path == goWorkName || (isManifestName(path.Base(e.Path)) && e.Mode != "120000" && !inNodeModules(e.Path)) {
 			manifests = append(manifests, e)
 		}
 	}
 
-	if g.paths[goWorkName] {
-		body, err := s.Git(ctx, "cat-file", "blob", tree+":"+goWorkName)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", goWorkName, err)
-		}
-		g.trunk = parseGoWork(body)
+	bodies, err := s.readBlobs(ctx, manifests)
+	if err != nil {
+		return nil, err
 	}
 
 	goFiles := map[string]goModFile{}
 	cargoFiles := map[string]cargoFile{}
 	pkgFiles := map[string]packageFile{}
-	for _, m := range manifests {
+	for i, m := range manifests {
 		dir := path.Dir(m.Path)
-		body, err := s.Git(ctx, "cat-file", "blob", m.OID)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", m.Path, err)
-		}
+		body := bodies[i]
 		switch path.Base(m.Path) {
+		case goWorkName:
+			g.trunk = parseGoWork(body)
 		case "go.mod":
 			f, err := parseGoMod(body)
 			if err != nil {

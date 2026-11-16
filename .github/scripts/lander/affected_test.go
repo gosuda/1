@@ -2,14 +2,16 @@ package lander
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
 // fixtureStore returns a fresh bare store holding one tree. files become regular blobs and links become
 // symlinks whose target is the map value.
-func fixtureStore(t *testing.T, files, links map[string]string) (*Store, string) {
+func fixtureStore(t testing.TB, files, links map[string]string) (*Store, string) {
 	t.Helper()
 	ctx := context.Background()
 	s := &Store{Dir: filepath.Join(t.TempDir(), "store.git")}
@@ -35,6 +37,36 @@ func fixtureStore(t *testing.T, files, links map[string]string) (*Store, string)
 		t.Fatal(err)
 	}
 	return s, tree
+}
+
+func BenchmarkLoadProjects(b *testing.B) {
+	for _, count := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("%d", count), func(b *testing.B) {
+			files := make(map[string]string, count+1)
+			var work strings.Builder
+			work.WriteString("go 1.21\n\nuse (\n")
+			for i := range count {
+				dir := fmt.Sprintf("projects/p%04d", i)
+				files[dir+"/go.mod"] = fmt.Sprintf("module example.com/p%04d\n\ngo 1.21\n", i)
+				fmt.Fprintf(&work, "\t./%s\n", dir)
+			}
+			work.WriteString(")\n")
+			files[goWorkName] = work.String()
+			s, tree := fixtureStore(b, files, nil)
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				g, err := loadProjects(ctx, s, tree)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(g.nodes) != count {
+					b.Fatalf("loaded %d projects, want %d", len(g.nodes), count)
+				}
+			}
+		})
+	}
 }
 
 // projectKeys renders projects as "dir kind" for comparison.

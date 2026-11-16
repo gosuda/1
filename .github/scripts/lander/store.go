@@ -127,6 +127,12 @@ func (s *Store) authEnv(ctx context.Context, r Remote, access Access) ([]string,
 }
 
 func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, args ...string) (string, error) {
+	out, err := s.runRaw(ctx, env, stdin, args...)
+	return strings.TrimRight(out, "\n"), err
+}
+
+// runRaw preserves stdout byte for byte, including Git's batch framing and blob contents.
+func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", s.Dir}, args...)...)
 	id := s.identity()
 	cmd.Env = append(os.Environ(),
@@ -141,9 +147,9 @@ func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, a
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return strings.TrimRight(out.String(), "\n"), &GitError{Args: redact(args), Err: err, Stderr: errb.String(), Stdout: out.String()}
+		return out.String(), &GitError{Args: redact(args), Err: err, Stderr: errb.String(), Stdout: out.String()}
 	}
-	return strings.TrimRight(out.String(), "\n"), nil
+	return out.String(), nil
 }
 
 // GitError carries stderr of a failed git invocation.

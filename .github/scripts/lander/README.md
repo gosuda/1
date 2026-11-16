@@ -120,6 +120,13 @@ read from the pull requests of `review/<id>` and of every other review branch wh
 same `Change-Id`. The landed commit gets `Suda-Review: gosuda/1#<N>` for the newest review pull
 request. Patchsets of one change are pruned together, 14 days after the newest one.
 
+## Presubmit project discovery
+
+Presubmit reads project manifests and the root `go.work` with one buffered `git cat-file --batch`
+process after listing the candidate tree. The reader checks object identity, type, size, and response
+boundaries before building the affected-project graph. Missing or malformed responses fail the scan.
+This avoids one Git process per manifest while preserving the dependency closure and sandbox limits.
+
 ## Presubmit Go modules
 
 Presubmit tests Go modules in the trunk's workspace (the root `go.work` of `refs/suda/main`) against the
