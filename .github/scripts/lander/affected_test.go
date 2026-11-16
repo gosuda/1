@@ -2,14 +2,16 @@ package lander
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
 // fixtureStore returns a fresh bare store holding one tree. files become regular blobs and links become
 // symlinks whose target is the map value.
-func fixtureStore(t *testing.T, files, links map[string]string) (*Store, string) {
+func fixtureStore(t testing.TB, files, links map[string]string) (*Store, string) {
 	t.Helper()
 	ctx := context.Background()
 	s := &Store{Dir: filepath.Join(t.TempDir(), "store.git")}
@@ -165,6 +167,83 @@ func TestAffectedRootProjectDependents(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantProjects(t, got, "sub go")
+}
+
+func TestLoadProjectsKeepsManifestSelection(t *testing.T) {
+	s, tree := fixtureStore(t, map[string]string{
+		"go.work":                          "go 1.21\n\nuse ./app\n\n",
+		"app/go.mod":                       "module example.com/app\n\ngo 1.21\n\n",
+		"node_modules/broken/package.json": "invalid JSON",
+		"app/node_modules/broken/go.mod":   "invalid go.mod",
+		"app/go.work":                      "nested workspace is not the trunk",
+	}, map[string]string{
+		"linked/go.mod":       "../app/go.mod",
+		"linked/package.json": "missing.json",
+	})
+	g, err := loadProjects(context.Background(), s, tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.nodes) != 1 || g.nodes["go:app"] == nil || !g.nodes["go:app"].workspace {
+		t.Fatalf("projects = %v, want only app in the trunk workspace", g.nodes)
+	}
+}
+
+func TestLoadProjectsAcceptsNewlinesInPaths(t *testing.T) {
+	s, tree := fixtureStore(t, map[string]string{"go.mod": "module example.com/app\ngo 1.21\n"}, nil)
+	ctx := context.Background()
+	dir := "app\nwith-newline"
+	tree, err := s.MkTree(ctx, []TreeEntry{{Mode: "040000", Type: "tree", OID: tree, Path: dir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := AffectedProjects(ctx, s, tree, []string{dir + "/main.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantProjects(t, got, dir+" go")
+}
+
+func TestLoadProjectsReportsInvalidManifestPath(t *testing.T) {
+	for name, body := range map[string]string{
+		"go.mod":       "go 1.21\n",
+		"package.json": "{\x00}\n\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := "app/" + name
+			s, tree := fixtureStore(t, map[string]string{p: body}, nil)
+			if _, err := loadProjects(context.Background(), s, tree); err == nil || !strings.Contains(err.Error(), p) {
+				t.Fatalf("loadProjects error = %v, want an error naming %s", err, p)
+			}
+		})
+	}
+}
+
+func BenchmarkLoadProjects(b *testing.B) {
+	const count = 60
+	files := make(map[string]string, count+1)
+	var work strings.Builder
+	work.WriteString("go 1.21\n\nuse (\n")
+	for i := range count {
+		dir := fmt.Sprintf("project%02d", i)
+		files[dir+"/go.mod"] = fmt.Sprintf("module example.com/%s\n\ngo 1.21\n", dir)
+		fmt.Fprintf(&work, "\t./%s\n", dir)
+	}
+	work.WriteString(")\n")
+	files[goWorkName] = work.String()
+	s, tree := fixtureStore(b, files, nil)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		g, err := loadProjects(ctx, s, tree)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(g.nodes) != count {
+			b.Fatalf("got %d projects, want %d", len(g.nodes), count)
+		}
+	}
 }
 
 func TestAffectedParseGoModDirectives(t *testing.T) {

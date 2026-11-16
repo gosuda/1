@@ -101,6 +101,68 @@ func (s *Store) GitStdin(ctx context.Context, stdin string, args ...string) (str
 	return s.run(ctx, nil, nil, strings.NewReader(stdin), args...)
 }
 
+// readBlobs reads the exact contents of entries in one git process, in input order. Entries must
+// name full blob object IDs, as returned by ListTree; paths are used only in error messages.
+func (s *Store) readBlobs(ctx context.Context, entries []TreeEntry) ([]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	var input strings.Builder
+	for _, e := range entries {
+		if (len(e.OID) != 40 && len(e.OID) != 64) || strings.Trim(e.OID, "0123456789abcdef") != "" {
+			return nil, fmt.Errorf("read %s: invalid object ID %q", e.Path, e.OID)
+		}
+		input.WriteString(e.OID)
+		input.WriteByte('\n')
+	}
+	out, err := s.runRaw(ctx, nil, strings.NewReader(input.String()), "cat-file", "--batch", "--buffer")
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read blobs: %w", err)
+	}
+	return parseBlobBatch(out, entries)
+}
+
+// parseBlobBatch checks every response header and byte count before exposing any blob contents.
+// Bodies are slices of out: embedded NULs and trailing newlines have no framing role.
+func parseBlobBatch(out string, entries []TreeEntry) ([]string, error) {
+	var bodies []string
+	if len(entries) > 0 {
+		bodies = make([]string, len(entries))
+	}
+	for i, e := range entries {
+		header, rest, ok := strings.Cut(out, "\n")
+		if !ok {
+			return nil, fmt.Errorf("read %s: truncated batch header", e.Path)
+		}
+		fields := strings.Split(header, " ")
+		if len(fields) == 2 && fields[0] == e.OID && fields[1] == "missing" {
+			return nil, fmt.Errorf("read %s: object %s is missing", e.Path, e.OID)
+		}
+		if len(fields) != 3 || fields[0] != e.OID || fields[1] != "blob" {
+			return nil, fmt.Errorf("read %s: unexpected batch header %q", e.Path, header)
+		}
+		size, err := strconv.ParseUint(fields[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: invalid blob size %q: %w", e.Path, fields[2], err)
+		}
+		if size >= uint64(len(rest)) {
+			return nil, fmt.Errorf("read %s: truncated blob of size %d", e.Path, size)
+		}
+		if rest[size] != '\n' {
+			return nil, fmt.Errorf("read %s: missing blob terminator", e.Path)
+		}
+		bodies[i] = rest[:size]
+		out = rest[size+1:]
+	}
+	if out != "" {
+		return nil, errors.New("read blobs: unexpected trailing batch output")
+	}
+	return bodies, nil
+}
+
 // GitRemote runs git with credentials for remote injected through the environment, never argv.
 func (s *Store) GitRemote(ctx context.Context, r Remote, access Access, args ...string) (string, error) {
 	env, err := s.authEnv(ctx, r, access)
@@ -127,6 +189,12 @@ func (s *Store) authEnv(ctx context.Context, r Remote, access Access) ([]string,
 }
 
 func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, args ...string) (string, error) {
+	out, err := s.runRaw(ctx, env, stdin, args...)
+	return strings.TrimRight(out, "\n"), err
+}
+
+// runRaw preserves stdout bytes for framed protocols such as cat-file --batch.
+func (s *Store) runRaw(ctx context.Context, env []string, stdin io.Reader, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", s.Dir}, args...)...)
 	id := s.identity()
 	cmd.Env = append(os.Environ(),
@@ -141,9 +209,9 @@ func (s *Store) run(ctx context.Context, _ any, env []string, stdin io.Reader, a
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return strings.TrimRight(out.String(), "\n"), &GitError{Args: redact(args), Err: err, Stderr: errb.String(), Stdout: out.String()}
+		return out.String(), &GitError{Args: redact(args), Err: err, Stderr: errb.String(), Stdout: out.String()}
 	}
-	return strings.TrimRight(out.String(), "\n"), nil
+	return out.String(), nil
 }
 
 // GitError carries stderr of a failed git invocation.
