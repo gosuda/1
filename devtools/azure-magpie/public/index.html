@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Magpie · gosuda/1</title>
+  <meta name="description" content="Magpie: changes, patchsets, workspaces, and diff links for the gosuda/1 monorepo.">
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem("magpie.theme");
+        if (stored === "light" || stored === "dark") {
+          document.documentElement.setAttribute("data-theme", stored);
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div class="app" id="app">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="Magpie overview">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span class="brand-name">Magpie</span>
+          <span class="brand-repo">gosuda/1</span>
+        </a>
+
+        <div class="trunk" aria-label="Trunk snapshots">
+          <div class="trunk-item">
+            <span class="trunk-label">suda/main</span>
+            <a id="trunk-main-link" class="trunk-sha" href="https://github.com/gosuda/1" target="_blank" rel="noopener">loading</a>
+            <button type="button" id="trunk-main-copy" class="btn btn-ghost btn-sm" disabled aria-label="Copy suda/main commit">Copy</button>
+          </div>
+          <div class="trunk-item trunk-item-history">
+            <span class="trunk-label">suda/history</span>
+            <a id="trunk-history-link" class="trunk-sha" href="https://github.com/gosuda/1" target="_blank" rel="noopener">loading</a>
+            <button type="button" id="trunk-history-copy" class="btn btn-ghost btn-sm" disabled aria-label="Copy suda/history commit">Copy</button>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <button type="button" id="nav-toggle" class="btn btn-secondary nav-toggle" aria-expanded="false" aria-controls="primary-nav">Menu</button>
+          <button type="button" id="theme-toggle" class="btn btn-secondary theme-toggle">Dark</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav id="primary-nav" class="sidenav" aria-label="Primary">
+        <ul class="nav-list">
+          <li><a href="/" data-nav="overview">Overview</a></li>
+          <li><a href="/changes" data-nav="changes">Changes</a></li>
+          <li><a href="/#workspaces" data-nav="workspaces">Workspaces</a></li>
+          <li><a href="/#projects" data-nav="projects">Projects</a></li>
+          <li><a href="/diff" data-nav="diff">Diff links</a></li>
+        </ul>
+        <p class="nav-foot">Read-only view of gosuda/1. Changes land through git and the lander.</p>
+      </nav>
+
+      <main id="main" class="content" tabindex="-1">
+        <div id="view" class="view" aria-busy="true">
+          <div class="loading" role="status"><span class="spinner" aria-hidden="true"></span>Loading…</div>
+        </div>
+      </main>
+    </div>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <span>gosuda/1 monorepo · Magpie</span>
+        <span class="footer-links">
+          <a href="/api/refs" target="_blank" rel="noopener">API: /api/refs</a>
+          <a href="/api/changes" target="_blank" rel="noopener">API: /api/changes</a>
+          <a href="https://github.com/gosuda/1" target="_blank" rel="noopener">gosuda/1 on GitHub</a>
+        </span>
+      </div>
+    </footer>
+  </div>
+
+  <div id="status" class="visually-hidden" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
