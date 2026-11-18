@@ -7,17 +7,15 @@ import (
 	"io"
 	"math/rand/v2"
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"gosuda.org/zstd"
 	"gosuda.org/hqq/bindgen/rt"
 	"gosuda.org/hqq/launch"
 	"gosuda.org/hqq/secureexec"
+	"gosuda.org/zstd"
 )
 
 // serverEnv names the zstd_server binary that build.sh prints. The tests that need a server skip
@@ -259,19 +257,6 @@ func randomData(n int, seed uint64) []byte {
 }
 
 // ---- process memory --------------------------------------------------------------------------
-
-// rssOf returns the resident set size of a process in KiB through ps, which macOS and Linux share.
-func rssOf(pid int) (int64, error) {
-	out, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return 0, fmt.Errorf("ps -p %d: %w", pid, err)
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse rss %q: %w", out, err)
-	}
-	return n, nil
-}
 
 // rssKiB is rssOf for the test goroutine.
 func rssKiB(t testing.TB, pid int) int64 {

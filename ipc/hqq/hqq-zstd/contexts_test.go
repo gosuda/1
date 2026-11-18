@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"os"
-	"runtime"
 	"testing"
 	"time"
 
-	"gosuda.org/zstd"
 	"gosuda.org/hqq/bindgen/rt"
 	"gosuda.org/hqq/launch"
+	"gosuda.org/zstd"
 )
 
 func mustCCtx(t testing.TB, c *zstd.Client) zstd.CCtx {
@@ -240,9 +239,6 @@ func growBy(t *testing.T, srv *launch.Server) (*zstd.Client, []zstd.CCtx, int64)
 // third scenario and shows that one of the two effects is visible on the platform; if neither is,
 // the other scenarios are skipped.
 func TestContextsAreReleasedWhenTheirOwnerGoes(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("rssOf uses POSIX ps")
-	}
 	scenarios := []struct {
 		name        string
 		endsSession bool
