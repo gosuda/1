@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to publish (e.g. v0.3.10507)'
-        required: true
-        default: 'v0.3.10507'
+        description: 'Release tag to publish (default: auto-computed next tag)'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -17,140 +17,27 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            runner: ubuntu-24.04
-          - goos: linux
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-          - goos: darwin
-            goarch: arm64
-            runner: macos-14
-          - goos: darwin
-            goarch: amd64
-            runner: macos-14
-          - goos: windows
-            goarch: amd64
-            runner: windows-2022
-          - goos: windows
-            goarch: arm64
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6.0.2
-      - name: Checkout HQQ core
-        shell: bash
-        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
-
-      - name: Install build tools (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build xz-utils
-
-      - name: Set up MSVC developer environment (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
-          cmd.exe /c "call `"$vcvars`" x64 >nul && set" | ForEach-Object {
-            if ($_ -match '^([^=]+)=(.*)$') {
-              if ($matches[1] -ieq 'PATH') {
-                $entries = @($matches[2] -split ';' | Where-Object { $_ })
-                [array]::Reverse($entries)
-                $entries | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-              } else {
-                "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-              }
-            }
-          }
-
-      - name: Build zstd_server (${{ matrix.goos }}/${{ matrix.goarch }})
-        shell: bash
-        run: |
-          set -euo pipefail
-          tmp_dir="$RUNNER_TEMP"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            tmp_dir=$(cygpath -u "$RUNNER_TEMP")
-          fi
-          zdir=$(scripts/release/fetch-zstd.sh -d "$tmp_dir/zstd-src")
-          bdir="$tmp_dir/hqq-zstd-build"
-          if [ "${{ matrix.goos }}" = "windows" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
-            mkdir -p "$tmp_dir/zig"
-            curl -fsSL https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar -xJ -C "$tmp_dir/zig" --strip-components=1
-            printf '#!/bin/sh\nexec "%s/zig/zig" cc -target aarch64-windows-gnu "$@"\n' "$tmp_dir" > "$tmp_dir/zig-cc"
-            printf '#!/bin/sh\nexec "%s/zig/zig" ar "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ar"
-            printf '#!/bin/sh\nexec "%s/zig/zig" ranlib "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ranlib"
-            chmod +x "$tmp_dir/zig-cc" "$tmp_dir/zig-ar" "$tmp_dir/zig-ranlib"
-            cmake -S server -B "$bdir" -G Ninja \
-              -DCMAKE_SYSTEM_NAME=Windows \
-              -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER="$tmp_dir/zig-cc" \
-              -DCMAKE_AR="$tmp_dir/zig-ar" \
-              -DCMAKE_RANLIB="$tmp_dir/zig-ranlib" \
-              -DCMAKE_EXE_LINKER_FLAGS="-s" \
-              -DHQQ_ZSTD_DIR="$zdir"
-          elif [ "${{ matrix.goos }}" = "windows" ]; then
-            zdir=$(cygpath -m "$zdir")
-            bdir=$(cygpath -m "$bdir")
-            cmake -S server -B "$bdir" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER=clang-cl \
-              -DCMAKE_CXX_COMPILER=clang-cl \
-              -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
-              -DHQQ_ZSTD_DIR="$zdir"
-          elif [ "${{ matrix.goos }}" = "darwin" ]; then
-            osx_arch="arm64"
-            if [ "${{ matrix.goarch }}" = "amd64" ]; then osx_arch="x86_64"; fi
-            cmake -S server -B "$bdir" -G "Unix Makefiles" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="$osx_arch" \
-              -DHQQ_ZSTD_DIR="$zdir"
-          else
-            cmake -S server -B "$bdir" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DHQQ_ZSTD_DIR="$zdir"
-          fi
-          cmake --build "$bdir" --target zstd_server
-          mkdir -p dist
-          ext=""
-          if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
-          out="dist/zstd_server_${{ matrix.goos }}_${{ matrix.goarch }}${ext}"
-          cp "$bdir/zstd_server${ext}" "$out"
-          if [ "${{ matrix.goos }}" = "linux" ]; then
-            strip --strip-all "$out"
-          elif [ "${{ matrix.goos }}" = "darwin" ]; then
-            strip -x "$out"
-            codesign --force --sign - "$out"
-          fi
-
-      - name: Attest SLSA Build Provenance
-        uses: actions/attest-build-provenance@v4.2.2
-        with:
-          subject-path: 'dist/zstd_server_*'
-
-      - uses: actions/upload-artifact@v7.0.2
-        with:
-          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-          if-no-files-found: error
+  build_and_test:
+    uses: ./.github/workflows/build-and-test.yml
 
   publish:
-    needs: [build]
-    runs-on: ubuntu-24.04
+    needs: [build_and_test]
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - uses: actions/setup-go@v6.4.0
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: false
 
       - name: Download artifacts
@@ -160,65 +47,33 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Compute SHA256SUMS and update hashes.go
+      - name: Attest SLSA Build Provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: 'dist/zstd_server_*'
+
+      - name: Compute SHA256SUMS and pin embedded binaries
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          git fetch origin --tags
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag=$(python3 scripts/release/zstd-release.py next-tag)
+          fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
-          (cd dist && sha256sum zstd_server_* | sort -k2 > SHA256SUMS)
+
+          chmod +x dist/zstd_server_linux_* dist/zstd_server_darwin_*
+          python3 scripts/release/zstd-release.py update-hashes --dist dist --tag "$tag" --update-docs
           cat dist/SHA256SUMS
-
-          {
-            cat <<EOF
-          package zstd
-
-          import "gosuda.org/hqq/secureexec"
-
-          // Version follows the v<WrapperMajor>.<WrapperMinor>.<NormalizedCVersion> scheme,
-          // where 10507 corresponds to ZSTD_VERSION_NUMBER (Zstandard 1.5.7).
-          const (
-          	Version           = "${tag}"
-          	ZstdVersionNumber = 10507
-          )
-
-          // ReleaseHashes maps "<GOOS>/<GOARCH>" to the SHA-256 digest of the prebuilt
-          // zstd_server binary published with this module version.
-          var ReleaseHashes = map[string]secureexec.Hash{
-          EOF
-            while read -r sum file; do
-              plat="${file#zstd_server_}"
-              plat="${plat%.exe}"
-              goos="${plat%_*}"
-              goarch="${plat#*_}"
-              printf '\t"%s/%s": mustHash("%s"),\n' "$goos" "$goarch" "$sum"
-            done < dist/SHA256SUMS
-            cat <<'EOF'
-          }
-
-          // ExpectedHash returns the pinned SHA-256 digest of zstd_server for goos/goarch.
-          func ExpectedHash(goos, goarch string) (secureexec.Hash, bool) {
-          	h, ok := ReleaseHashes[goos+"/"+goarch]
-          	return h, ok
-          }
-
-          func mustHash(s string) secureexec.Hash {
-          	h, err := secureexec.ParseHash(s)
-          	if err != nil {
-          		panic(err)
-          	}
-          	return h
-          }
-          EOF
-          } > hashes.go
-          gofmt -w hashes.go
           cat hashes.go
 
-          mkdir -p internal/embedded/bin
-          cp dist/zstd_server_* internal/embedded/bin/
-          git add hashes.go internal/embedded/bin/
+          git add hashes.go internal/embedded/bin/ README.md docs/ARCHITECTURE.md
           if [ "$GITHUB_REF_TYPE" != "tag" ] && ! git diff --cached --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
