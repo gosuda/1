@@ -91,7 +91,10 @@ foreach(srv_target sqlite3_server hqq-sqlite-server)
   hqq_apply_compile_options(${srv_target})
 endforeach()
 
-if(HQQ_BUILD_TESTS)
+option(SQLSRV_BUILD_TESTS "Build hqq-sqlite-server C unit tests" OFF)
+
+if(SQLSRV_BUILD_TESTS OR HQQ_BUILD_TESTS)
+  enable_testing()
   add_executable(hqqsqlite_server_unit_tests tests/test_units.c)
   target_link_libraries(hqqsqlite_server_unit_tests PRIVATE sqlite3gen_policy)
   hqq_apply_compile_options(hqqsqlite_server_unit_tests)
