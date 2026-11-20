@@ -1,0 +1,178 @@
+# Continuous integration for the SuperSQL repository.
+#
+# Actions are pinned to full commit SHAs because a tag can be moved; the
+# trailing comment records the release tag each SHA was resolved from.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vet:
+    name: build + vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: "Vet (accepted baseline: generated ragel scanner unreachable code)"
+        run: |
+          set -eu
+          findings="$(go vet ./... 2>&1 | grep -v '^#' | grep -v 'scan\.rl:[0-9]*: unreachable code$' || true)"
+          if [ -n "$findings" ]; then
+            printf '%s\n' "$findings"
+            exit 1
+          fi
+
+  test-short:
+    name: test (short)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -short -count=1 ./...
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test with -race
+        run: go test -race -count=1 ./internal/dataplane/... ./internal/controlplane/... ./clock/... .
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: Scan
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  test-full:
+    name: test (full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test -count=1 ./...
+
+  fuzz-smoke:
+    name: fuzz smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: FuzzEncodedBatchFraming,    pkg: ./internal/dataplane/storage }
+          - { target: FuzzDecodeMutation,         pkg: ./internal/dataplane/storage }
+          - { target: FuzzReverseMVCCVisibility,  pkg: ./internal/dataplane/storage/neosepia }
+          - { target: FuzzPAXColumnDecoding,      pkg: ./internal/dataplane/storage/neosepia }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Fuzz ${{ matrix.target }}
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 30s ${{ matrix.pkg }}
+
+  licensecheck:
+    name: licensecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: licensecheck
+        run: go run ./internal/tools/licensecheck
+
+  docgen-drift:
+    name: docgen drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: docgen check
+        run: go run ./internal/tools/docgen -check
+
+  generate-drift:
+    name: generate drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go generate + diff
+        run: |
+          set -eu
+          go generate ./internal/query/bind ./internal/query/builtin
+          git diff --exit-code
+
+  pg184:
+    name: postgres 18.4 differential + regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SUPERSQL_PG184_DSN: postgres://postgres:pw@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Differential gate
+        run: go test -count=1 -timeout 0 -run '^TestPG184Differential$' -v .
+      - name: Regression corpus
+        # Push/PR runs the pinned 18.4 reference corpus. The nightly schedule that
+        # also ran the REL_18_STABLE auxiliary corpus (189/233 files identical) is
+        # disabled: the workflow has no schedule trigger.
+        env:
+          SUPERSQL_REGRESS_CORPORA: ${{ github.event_name == 'schedule' && 'postgres184,postgres' || 'postgres184' }}
+        run: NEOSEPIA_POSTGRES_REGRESS=1 go test -count=1 -timeout 0 -run '^TestPostgres18OfficialRegression$' -v .
