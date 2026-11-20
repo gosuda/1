@@ -1,0 +1,6732 @@
+//! ZeroProxy JS rewriter based on the OXC AST.
+//!
+//! Patch-mode output returns a list of (offset, length, replacement) tuples that
+//! the caller applies in place rather than re-emitting the full source. This
+//! keeps unchanged source bytes shared and avoids the O(n) cost of full codegen
+//! on mostly unchanged scripts.
+//!
+//! Core rules:
+//! - Unresolved global identifier references to dangerous globals
+//!   (location, window, document, history, top, parent, opener, frames, self,
+//!   globalThis) become `__zp_get(globalThis, '<name>')`.
+//! - Locally bound identifiers with the same name are not rewritten
+//!   (tracked via a declaration stack walk).
+
+use oxc_allocator::Allocator;
+use oxc_ast::ast::*;
+use oxc_ast_visit::{walk, Visit};
+use oxc_parser::Parser;
+use oxc_span::{GetSpan, SourceType, Span};
+use std::collections::HashSet;
+use zp_shared::ErrorCode;
+
+pub mod sourcemap;
+pub use sourcemap::{chain_with_original_map, compose_rewrite_map};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKind {
+    Classic,
+    Module,
+    EventHandler,
+    Eval,
+    Function,
+    Worker,
+    /// A direct `eval` inside a function: a classic script's declaration semantics, but its top-level `this` is the
+    /// caller's, not the global object. Parsed and rewritten as `Classic`.
+    ClassicLocal,
+}
+
+impl ScriptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScriptKind::Classic => "classic",
+            ScriptKind::ClassicLocal => "classic-local",
+            ScriptKind::Module => "module",
+            ScriptKind::EventHandler => "event-handler",
+            ScriptKind::Eval => "eval",
+            ScriptKind::Function => "function",
+            ScriptKind::Worker => "worker",
+        }
+    }
+
+    fn source_type(self) -> SourceType {
+        match self {
+            ScriptKind::Module => SourceType::mjs(),
+            _ => SourceType::cjs(),
+        }
+    }
+}
+
+impl std::str::FromStr for ScriptKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "classic" => Ok(ScriptKind::Classic),
+            "classic-local" => Ok(ScriptKind::ClassicLocal),
+            "module" => Ok(ScriptKind::Module),
+            "event-handler" => Ok(ScriptKind::EventHandler),
+            "eval" => Ok(ScriptKind::Eval),
+            "function" => Ok(ScriptKind::Function),
+            "worker" => Ok(ScriptKind::Worker),
+            other => Err(other.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteOpts {
+    pub kind: ScriptKind,
+    pub target_url: String,
+    /// Proxy origin (e.g. `http://proxy.localhost:18080`). Dynamic-import URLs
+    /// are emitted absolute against it. A root-relative `/zp/api/script?…`
+    /// resolves against the importing context's base, which the membrane
+    /// virtualises to the target host; an inline script would then import
+    /// `https://www.naver.com/zp/api/script?…` and receive the target site's
+    /// 404 page. Empty keeps the root-relative form for host tests.
+    pub proxy_origin: String,
+}
+
+/// A single source patch: replace `source[span.start..span.end]` with `replacement`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Patch {
+    pub start: u32,
+    pub end: u32,
+    pub replacement: String,
+}
+
+#[derive(Debug, Default)]
+pub struct RewriteResult {
+    pub code: String,
+    pub patches: Vec<Patch>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RewriteError {
+    #[error("parse failed: {0}")]
+    ParseFailed(String),
+    #[error("rewrite failed: {0}")]
+    RewriteFailed(String),
+    #[error("unsupported syntax: {0}")]
+    UnsupportedSyntax(String),
+}
+
+impl RewriteError {
+    pub fn code(&self) -> ErrorCode {
+        ErrorCode::RewriteFailed
+    }
+}
+
+/// Names that, when referenced as an *unbound* global identifier, must be
+/// routed through the runtime membrane instead of touching the real native.
+pub(crate) const DANGEROUS_GLOBALS: &[&str] = &[
+    "location",
+    "window",
+    "document",
+    "history",
+    "top",
+    "parent",
+    "opener",
+    "frames",
+    // The embedding <iframe>: natively null when the embedder is another origin, but
+    // every proxied frame shares one physical origin, so the real element (and with
+    // it the embedder's whole DOM) is one bare identifier away.
+    "frameElement",
+    "self",
+    "globalThis",
+    // Navigation API: bare `navigation` resolves to the real Navigation
+    // object; entries()/currentEntry carry real proxy URLs and navigate()
+    // walks the real session. Route through the membrane facade.
+    "navigation",
+    // `Function` and `eval` allow dynamic code evaluation (`new Function('return globalThis')()`
+    // or indirect `var f = eval; f(...)`), so unbound identifier references must route
+    // through the membrane.
+    "Function",
+    "eval",
+];
+
+/// Member names that, when accessed on ANY object, must go through the
+/// runtime membrane (`__zp_get(obj, 'name')`). These are the cross-realm
+/// escape vectors that target code uses to reach an unmediated native
+/// `Location` / `Window` / `Document` even after the global identifier
+/// has been rewritten (e.g., `iframe.contentWindow.location`).
+pub(crate) const DANGEROUS_MEMBERS: &[&str] = &[
+    "location",
+    "document",
+    "window",
+    "self",
+    "globalThis",
+    "contentWindow",
+    "contentDocument",
+    "defaultView",
+    "frameElement",
+    "parent",
+    "top",
+    "opener",
+    "frames",
+    // URL-shape properties: the rewriter doesn't know if base is a Location
+    // instance, so wrap on every access. Membrane's Location-base intercept
+    // returns virtualURL.* values for true Location instances; falls
+    // through to native for unrelated objects (URL instances are
+    // legitimately different and return their own values).
+    "href",
+    "protocol",
+    "host",
+    "hostname",
+    "port",
+    "pathname",
+    "search",
+    "hash",
+    "origin",
+    // `frame.navigation` / `w.navigation` member access: same escape as the
+    // bare global; the facade is what pages must see.
+    "navigation",
+    // `Error.prepareStackTrace` holds the membrane's stack sanitizer, which V8 reads through the real property. A page
+    // reads its own view: natively nothing is there until it assigns one (and `delete` must not remove the sanitizer).
+    "prepareStackTrace",
+];
+
+/// Method names that, when called on ANY object, should be routed through the
+/// runtime membrane (`__zp_call(obj, 'method', [args])`). Calling these on a
+/// virtual Location or virtual Window must observe the proxy navigation
+/// semantics; calling them on an unrelated object is a no-op (the membrane
+/// `__zp_call` falls through to native).
+pub(crate) const DANGEROUS_METHODS: &[&str] = &[
+    "assign",
+    "replace",
+    "open",
+    "postMessage",
+    "pushState",
+    "replaceState",
+];
+
+/// The runtime helpers rewritten code names as free identifiers (`__zp_get(o,k)`, `__zp_this(this)`, …). The runtime
+/// keeps the same list (`ZP_WITH_HELPERS` in web/membrane/00-head.js and web/worker-prelude.js; static-policy compares
+/// them). Two things follow from naming them:
+/// - Whoever binds the name receives what the call passes, and the calls pass the real global object (`globalThis`, a
+///   sloppy `this`). A page binding or write of one of these names is refused (`reserved_name_violation`).
+/// - Inside `with(o)` every free name is looked up in `o` first, at run time, on every evaluation. A page's `with` body
+///   (and every `with` the runtime wraps code in) therefore starts by binding them as block constants
+///   (`with_helper_prefix`): a block inside the `with` resolves before the with object, statically.
+pub const RUNTIME_HELPERS: &[&str] = &[
+    "__zp_get",
+    "__zp_set",
+    "__zp_call",
+    "__zp_this",
+    "__zp_assign",
+    "__zp_update",
+    "__zp_delete",
+    "__zp_eval",
+    "__zp_has",
+    "__zp_oget",
+    "__zp_ocall",
+    "__zp_ocallv",
+    "__zp_ochain",
+    "__zp_odelete",
+    "__zp_okeys",
+    "__zp_rget",
+    "__zp_rset",
+    "__zp_ownKeys",
+    "__zp_getOwnPropertyDescriptor",
+    "__zp_getOwnPropertyDescriptors",
+    "__zp_getOwnPropertyNames",
+    "__zp_module_url",
+    "__zp_with_get",
+    "__zp_with_set",
+    "__zp_with_assign",
+    "__zp_with_update",
+    "__zp_with_delete",
+    "__zp_with_d",
+    "__zp_lex_decl",
+    "__zp_lex_bind",
+    "__zp_export_vars",
+    "__zp_fast",
+    "__zp_fastset",
+];
+
+fn is_runtime_helper(name: &str) -> bool {
+    RUNTIME_HELPERS.iter().any(|h| *h == name)
+}
+
+/// A name the page may not bind or write: the runtime's (`__zp_*` / `__ZP_*` on the global object: the helpers above,
+/// and the executors code outside the rewriter calls by name, like an `on*` attribute's `__ZP_EXEC_EVENT`). Not the
+/// temps the rewriter declares itself (rewritten code carries them when it is rewritten again), nor the names of the
+/// runtime's own wrappers (parameters and locals read only outside the code they wrap: `with(__zp_scope)`,
+/// `eval(__zp_src)`, `__zp_inner__.apply(__zp_self, __zp_args)`). A child frame that reuses its `about:blank` window
+/// boots its runtime with the parent's `Function` facade, which rewrites those wrappers too.
+fn is_reserved_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("__zp_").or_else(|| name.strip_prefix("__ZP_")) else { return false };
+    if name.starts_with("__ZP_") {
+        return true;
+    }
+    if matches!(rest, "bad" | "oc" | "dynamic__" | "dyn__" | "inner__" | "scope" | "args" | "self" | "env" | "src") {
+        return false;
+    }
+    let temp = rest.split_once('_').is_some_and(|(tag, n)| {
+        matches!(tag, "w" | "lc" | "lbl" | "vdcl" | "dp" | "sk" | "t") && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    });
+    !temp
+}
+
+/// `const{__zp_get,…}=(function(){return this})();`: the helpers as block constants, read off the global object
+/// without naming anything. Inside a `with` body the code is sloppy, so a plainly called function expression's `this` is
+/// the global object of its realm, and no with object can answer for it.
+pub fn with_helper_prefix() -> String {
+    format!("const{{{}}}=(function(){{return this}})();", RUNTIME_HELPERS.join(","))
+}
+
+/// A page binding (`var`, `let`, `const`, `function`, `class`, parameter, `catch`, import) or a write (`x = …`, `x++`,
+/// a destructuring or `for (x in …)` target) of a reserved name (`is_reserved_name`). The bound name would receive the
+/// real global object the rewritten calls pass; the overwritten global would be every later script's helper. No site
+/// names these.
+fn reserved_name_violation(program: &Program<'_>) -> Option<String> {
+    struct Scan {
+        hit: Option<String>,
+    }
+    impl Scan {
+        fn check(&mut self, name: &str) {
+            if self.hit.is_none() && is_reserved_name(name) {
+                self.hit = Some(name.to_string());
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Scan {
+        fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+            // Our own `with_helper_prefix`, met again when rewritten code is rewritten once more (a function's source
+            // run again). It binds the real helpers whoever writes it.
+            if !is_helper_prefix_declaration(it) {
+                walk::walk_variable_declaration(self, it);
+            }
+        }
+        fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+            self.check(it.name.as_str());
+        }
+        fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = it {
+                self.check(id.name.as_str());
+            }
+            walk::walk_simple_assignment_target(self, it);
+        }
+        fn visit_assignment_target_property_identifier(&mut self, it: &AssignmentTargetPropertyIdentifier<'a>) {
+            self.check(it.binding.name.as_str());
+            walk::walk_assignment_target_property_identifier(self, it);
+        }
+    }
+    let mut scan = Scan { hit: None };
+    scan.visit_program(program);
+    scan.hit
+}
+
+/// Exactly the shape `with_helper_prefix` emits: `const{<helpers, shorthand>}=(function(){return this})();`.
+fn is_helper_prefix_declaration(decl: &VariableDeclaration<'_>) -> bool {
+    if decl.kind != VariableDeclarationKind::Const || decl.declarations.len() != 1 {
+        return false;
+    }
+    let d = &decl.declarations[0];
+    let BindingPattern::ObjectPattern(pattern) = &d.id else { return false };
+    if pattern.rest.is_some() || pattern.properties.is_empty() {
+        return false;
+    }
+    let helpers_only = pattern.properties.iter().all(|p| {
+        p.shorthand
+            && !p.computed
+            && matches!(&p.value, BindingPattern::BindingIdentifier(id) if is_runtime_helper(id.name.as_str()))
+    });
+    if !helpers_only {
+        return false;
+    }
+    let Some(Expression::CallExpression(call)) = &d.init else { return false };
+    if call.optional || !call.arguments.is_empty() {
+        return false;
+    }
+    let mut callee = &call.callee;
+    while let Expression::ParenthesizedExpression(p) = callee {
+        callee = &p.expression;
+    }
+    let Expression::FunctionExpression(f) = callee else { return false };
+    if f.generator || f.r#async || f.id.is_some() || !f.params.items.is_empty() || f.params.rest.is_some() {
+        return false;
+    }
+    let Some(body) = &f.body else { return false };
+    body.directives.is_empty()
+        && body.statements.len() == 1
+        && matches!(&body.statements[0], Statement::ReturnStatement(r) if matches!(r.argument, Some(Expression::ThisExpression(_))))
+}
+
+/// What a script that names a reserved helper becomes: it throws before running anything. An error result would not
+/// do because a caller that ignores the error would run the unrewritten source. No braces, so the dynamic-function
+/// unwrappers (which slice the body out between the first `{` and the last `}`) refuse it as well.
+fn reserved_name_patch(source_len: usize, name: &str) -> Patch {
+    Patch {
+        start: 0,
+        end: source_len as u32,
+        replacement: format!("throw new SyntaxError(\"Unexpected identifier '{name}'\");"),
+    }
+}
+
+fn is_dangerous_global(name: &str) -> bool {
+    DANGEROUS_GLOBALS.iter().any(|g| *g == name)
+}
+
+fn is_dangerous_member(name: &str) -> bool {
+    DANGEROUS_MEMBERS.iter().any(|m| *m == name)
+}
+
+fn is_dangerous_method(name: &str) -> bool {
+    DANGEROUS_METHODS.iter().any(|m| *m == name)
+}
+
+/// Patch-mode rewrite: returns the patch list without the re-emit cost.
+/// Saves O(n) string-copy when the caller plans to apply patches in place
+/// over its own buffer (typical Service Worker / page-prelude path).
+/// `code` in the returned `RewriteResult` is empty;
+/// patches carry the offsets + replacements.
+pub fn rewrite_script_patches(
+    source: &str,
+    opts: &RewriteOpts,
+) -> Result<RewriteResult, RewriteError> {
+    let allocator = Allocator::default();
+    let (ret, kind) = parse_for_kind(&allocator, source, opts.kind);
+
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RewriteError::ParseFailed(msg));
+    }
+
+    let mut visitor =
+        RewriteVisitor::new(opts.target_url.clone(), opts.proxy_origin.clone(), kind);
+    visitor.local_this = opts.kind == ScriptKind::ClassicLocal;
+    visitor.visit_program(&ret.program);
+    visitor.refuse_reserved_names(&ret.program, source.len());
+
+    let mut patches = visitor.patches;
+    patches.sort_by_key(|p| p.start);
+
+    Ok(RewriteResult {
+        // Patch-mode: caller already has the original bytes; avoid
+        // a heap allocation reconstructing them.
+        code: String::new(),
+        patches,
+        diagnostics: visitor.diagnostics,
+    })
+}
+
+/// Re-runs the rewrite pipeline to derive patches,
+/// applies them over the stripped source, and emits a Source Map v3 JSON
+/// pointing each generated position back to its original byte offset.
+///
+/// `source_url` is what goes into `"sources": [source_url]`, typically the
+/// proxy-side target URL of the script. `sourcesContent` embeds the
+/// *stripped* original source so the browser can render the original
+/// listing without a separate round trip.
+pub fn compose_source_map(
+    source: &str,
+    opts: &RewriteOpts,
+    source_url: &str,
+) -> Result<String, RewriteError> {
+    let result = rewrite_script_patches(source, opts)?;
+    // The rewriter never patches the trailing sourceMappingURL pragma
+    // (those bytes live inside a `//#`-comment past the last identifier),
+    // so the patches' offsets in `source` are byte-identical to offsets
+    // in `strip_sourcemap_pragma(source)`. We strip first so the
+    // generated string the composer walks lines up 1:1 with what the
+    // browser is actually executing.
+    let stripped = strip_sourcemap_pragma(source);
+    let rewritten = apply_patches(&stripped, &result.patches);
+    Ok(compose_rewrite_map(
+        &stripped,
+        &rewritten,
+        &result.patches,
+        source_url,
+    ))
+}
+
+/// Same as `compose_source_map` but additionally composes the result
+/// with the target site's original `.map` (the one the bundler emitted
+/// alongside the source). The chained map points DevTools directly at
+/// the pre-bundle TypeScript / pre-minify origin instead of stopping at
+/// the bundled `.js`. When `original_map_json` is empty or malformed,
+/// the function falls back to the unchained map so a bad
+/// upstream `.map` never breaks DevTools.
+pub fn compose_source_map_chained(
+    source: &str,
+    opts: &RewriteOpts,
+    source_url: &str,
+    original_map_json: &str,
+) -> Result<String, RewriteError> {
+    let zp_map = compose_source_map(source, opts, source_url)?;
+    if original_map_json.is_empty() {
+        return Ok(zp_map);
+    }
+    Ok(chain_with_original_map(&zp_map, original_map_json, source_url))
+}
+
+/// Parse `source` for the requested kind, promoting a `Classic` request to
+/// module semantics when the program has static import/export (or
+/// import.meta). A classic script cannot contain them (natively a
+/// SyntaxError), so module semantics are right whichever way the browser
+/// loads it. The SW asks for `classic` when a module arrives without its
+/// script type (modulepreload to the generic fetch path), and classic-only
+/// emission would put every module-level const into the shared global
+/// lexical registry so two modules reusing a name throw "Identifier 'R'
+/// has already been declared". Re-parse as a module so module-only grammar
+/// (top-level await) holds. Dynamic `import()` is not module syntax.
+fn parse_for_kind<'a>(
+    allocator: &'a Allocator,
+    source: &'a str,
+    requested: ScriptKind,
+) -> (oxc_parser::ParserReturn<'a>, ScriptKind) {
+    let requested = if requested == ScriptKind::ClassicLocal { ScriptKind::Classic } else { requested };
+    let ret = Parser::new(allocator, source, requested.source_type()).parse();
+    if requested == ScriptKind::Classic && ret.module_record.has_module_syntax {
+        let module = Parser::new(allocator, source, ScriptKind::Module.source_type()).parse();
+        return (module, ScriptKind::Module);
+    }
+    (ret, requested)
+}
+
+pub fn rewrite_script(source: &str, opts: &RewriteOpts) -> Result<RewriteResult, RewriteError> {
+    let allocator = Allocator::default();
+    let (ret, kind) = parse_for_kind(&allocator, source, opts.kind);
+
+    if !ret.errors.is_empty() {
+        let msg = ret
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RewriteError::ParseFailed(msg));
+    }
+
+    let mut visitor =
+        RewriteVisitor::new(opts.target_url.clone(), opts.proxy_origin.clone(), kind);
+    visitor.local_this = opts.kind == ScriptKind::ClassicLocal;
+    visitor.visit_program(&ret.program);
+    visitor.refuse_reserved_names(&ret.program, source.len());
+
+    // Apply patches to produce final code. Patches sorted by start ascending
+    // and non-overlapping (visitor guarantees this for identifier rewrites).
+    let mut patches = visitor.patches;
+    patches.sort_by_key(|p| p.start);
+    let patched = apply_patches(source, &patches);
+    // Strip stale `sourceMappingURL` pragma; the original map describes
+    // the un-rewritten source and would misattribute lines in DevTools.
+    let code = strip_sourcemap_pragma(&patched);
+
+    Ok(RewriteResult {
+        code,
+        patches,
+        diagnostics: visitor.diagnostics,
+    })
+}
+
+/// Shift any embedded absolute spans inside a marker replacement string by
+/// `-offset` so they make sense in a sub-source view. Markers we know:
+/// - MEMBER_GET: obj_start, obj_end (positions 2, 3)
+/// - MEMBER_SET: obj_start, obj_end, val_start, val_end (positions 2, 3, 5, 6)
+/// - MEMBER_A: obj_start, obj_end, val_start, val_end (positions 2, 3, 6, 7; the operator is at 5)
+/// - METHOD_CALL: obj_start, obj_end, args_start, args_end (positions 2, 3, 5, 6)
+/// - MODULE_URL: src_start, src_end (positions 2, 3)
+fn shift_marker_positions(replacement: &str, offset: u32) -> String {
+    // OCHAIN is variable-length: cs/ce at 2,3, then one comma-packed field
+    // per split whose numeric members are all positions (the split kind and
+    // a method name never parse as numbers).
+    if replacement.starts_with("\u{1}OCHAIN\u{1}") {
+        let shift = |s: &str| match s.parse::<u32>() {
+            Ok(v) => v.saturating_sub(offset).to_string(),
+            Err(_) => s.to_string(),
+        };
+        return replacement
+            .split('\u{1}')
+            .enumerate()
+            .map(|(i, s)| match i {
+                2 | 3 => shift(s),
+                _ if i >= 4 && s.contains(',') => s
+                    .split(',')
+                    .enumerate()
+                    .map(|(j, f)| if j == 0 { f.to_string() } else { shift(f) })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                _ => s.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\u{1}");
+    }
+    let prefixes: &[(&str, &[usize])] = &[
+        ("\u{1}GLOBAL_GET\u{1}", &[]),
+        ("\u{1}THIS_MAP\u{1}", &[]),
+        ("\u{1}GLOBAL_SET\u{1}", &[3, 4]),
+        ("\u{1}GLOBAL_ASSIGN\u{1}", &[4, 5]),
+        ("\u{1}GLOBAL_UPDATE\u{1}", &[]),
+        ("\u{1}GLOBAL_DESTR\u{1}", &[]),
+        ("\u{1}MEMBER_GET\u{1}", &[2, 3]),
+        ("\u{1}MEMBER_REF\u{1}", &[2, 3]),
+        ("\u{1}MEMBER_REF_STMT\u{1}", &[2, 3]),
+        ("\u{1}MEMBER_SET\u{1}", &[2, 3, 5, 6]),
+        // The operator sits between the property and the value spans, so the value span is at 6 and 7 (MEMBER_SET has no operator field).
+        ("\u{1}MEMBER_A\u{1}", &[2, 3, 6, 7]),
+        ("\u{1}MEMBER_A_STMT\u{1}", &[2, 3, 6, 7]),
+        ("\u{1}METHOD_CALL\u{1}", &[2, 3, 5, 6]),
+        ("\u{1}MODULE_URL\u{1}", &[2, 3]),
+        ("\u{1}VAR_SET\u{1}", &[4, 5]),
+        ("\u{1}VAR_WSET\u{1}", &[4, 5]),
+        ("\u{1}WTREF\u{1}", &[]),
+        ("\u{1}WTREF_STMT\u{1}", &[]),
+        ("\u{1}WITH_OBJ\u{1}", &[3, 4]),
+        ("\u{1}WITH_SET\u{1}", &[3, 4]),
+        ("\u{1}WITH_ASSIGN\u{1}", &[4, 5]),
+        ("\u{1}CGET\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}CSET\u{1}", &[2, 3, 4, 5, 6, 7]),
+        ("\u{1}CASSIGN\u{1}", &[2, 3, 4, 5, 7, 8]),
+        ("\u{1}CASSIGN_STMT\u{1}", &[2, 3, 4, 5, 7, 8]),
+        ("\u{1}CREF\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}CREF_STMT\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}OGET\u{1}", &[2, 3, 5, 6]),
+        ("\u{1}OCALL\u{1}", &[2, 3, 6, 7, 8, 9]),
+        ("\u{1}CCALL\u{1}", &[2, 3, 4, 5, 6, 7]),
+        ("\u{1}DEVAL\u{1}", &[2, 3]),
+        ("\u{1}RGET\u{1}", &[2, 3, 4, 5, 7, 8]),
+        ("\u{1}RSET\u{1}", &[2, 3, 4, 5, 6, 7, 9, 10]),
+        ("\u{1}GOPD\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}GOPDS\u{1}", &[2, 3]),
+        ("\u{1}GOWN\u{1}", &[2, 3]),
+        ("\u{1}OKEYS\u{1}", &[2, 3]),
+        ("\u{1}RHAS\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}ROWK\u{1}", &[2, 3]),
+        ("\u{1}CDELE\u{1}", &[2, 3, 4, 5]),
+        ("\u{1}SDELE\u{1}", &[2, 3]),
+        ("\u{1}FOR_CAP\u{1}", &[3, 4]),
+    ];
+    for (prefix, shift_indices) in prefixes {
+        if replacement.starts_with(*prefix) {
+            let mut parts: Vec<String> = replacement.split('\u{1}').map(str::to_string).collect();
+            for &i in *shift_indices {
+                if i < parts.len() {
+                    if let Ok(v) = parts[i].parse::<u32>() {
+                        parts[i] = v.saturating_sub(offset).to_string();
+                    }
+                }
+            }
+            return parts.join("\u{1}");
+        }
+    }
+    replacement.to_string()
+}
+
+/// `__zp_with_d` accessor chain for write targets inside `with` bodies.
+/// `chain` is the `\u{2}`-joined temp list, outermost first; resolution
+/// prefers the innermost with-object, so the chain nests inside-out.
+fn with_d_chain(chain: &str, name: &str) -> String {
+    let mut e = "__zp_get.d".to_string();
+    for t in chain.split('\u{2}').filter(|t| !t.is_empty()) {
+        e = format!("__zp_with_d({t},{name:?},{e})");
+    }
+    e
+}
+
+/// Nested `__zp_with_set`: value is threaded through `(v)=>` fallbacks so a
+/// side-effecting RHS evaluates exactly once regardless of which scope owns
+/// the name.
+fn with_set_chain(chain: &str, name: &str, value: &str) -> String {
+    let mut e = format!("__zp_set(globalThis,{name:?},({value}))");
+    for t in chain.split('\u{2}').filter(|t| !t.is_empty()) {
+        e = format!("__zp_with_set({t},{name:?},({value}),(v)=>({e}))");
+    }
+    e
+}
+
+/// Nested `__zp_with_assign` for compound writes inside `with`. `value` is
+/// already the thunk form for logical operators.
+fn with_assign_chain(chain: &str, name: &str, op: &str, value: &str) -> String {
+    let mut e = format!("__zp_assign(globalThis,{name:?},{op:?},{value})");
+    for t in chain.split('\u{2}').filter(|t| !t.is_empty()) {
+        e = format!("__zp_with_assign({t},{name:?},{op:?},{value},()=>({e}))");
+    }
+    e
+}
+
+/// Marker field pair for `(rewritten_obj, rewritten_key)` starting at part
+/// index `i`. Returns None when the spans are malformed.
+fn obj_key(
+    parts: &[&str],
+    i: usize,
+    src_len: usize,
+    rewrite: &dyn Fn(usize, usize) -> String,
+) -> Option<((String, String), ())> {
+    if parts.len() < i + 4 {
+        return None;
+    }
+    let os: usize = parts[i].parse().ok()?;
+    let oe: usize = parts[i + 1].parse().ok()?;
+    let ks: usize = parts[i + 2].parse().ok()?;
+    let ke: usize = parts[i + 3].parse().ok()?;
+    if os >= oe || oe > src_len || ks >= ke || ke > src_len {
+        return None;
+    }
+    Some(((rewrite(os, oe), rewrite(ks, ke)), ()))
+}
+
+/// An inline-guarded site's marker tail: its temp group (0: none) and whether it starts a statement (`S`), where a
+/// leading `(` would continue the previous line (`var x = y` then `(…)` calls `y`).
+fn guard_fields(parts: &[&str], i: usize) -> (u32, bool) {
+    let group = parts.get(i).and_then(|g| g.parse::<u32>().ok()).unwrap_or(0);
+    (group, parts.get(i + 1) == Some(&"S"))
+}
+
+/// The three temps of a guard group (`RewriteVisitor::guard_claim`).
+fn guard_temps(group: u32) -> Option<(String, String, String)> {
+    if group == 0 {
+        return None;
+    }
+    let c = group * 3;
+    Some((format!("__zp_t_{}", c - 2), format!("__zp_t_{}", c - 1), format!("__zp_t_{c}")))
+}
+
+/// `obj_key` + a trailing value span at `i+4`,`i+5`.
+fn obj_key_val(
+    parts: &[&str],
+    vi: usize,
+    src_len: usize,
+    rewrite: &dyn Fn(usize, usize) -> String,
+) -> Option<((String, String), Option<String>)> {
+    let ((o, k), _) = obj_key(parts, 2, src_len, rewrite)?;
+    if parts.len() < vi + 2 {
+        return Some(((o, k), None));
+    }
+    let vs: usize = parts[vi].parse().ok()?;
+    let ve: usize = parts[vi + 1].parse().ok()?;
+    if vs >= ve || ve > src_len {
+        return Some(((o, k), None));
+    }
+    Some(((o, k), Some(rewrite(vs, ve))))
+}
+
+/// Marker with only an object span at parts[2..4].
+fn obj_only(
+    parts: &[&str],
+    src_len: usize,
+    rewrite: &dyn Fn(usize, usize) -> String,
+) -> Option<((String, ()), ())> {
+    if parts.len() < 4 {
+        return None;
+    }
+    let os: usize = parts[2].parse().ok()?;
+    let oe: usize = parts[3].parse().ok()?;
+    if os >= oe || oe > src_len {
+        return None;
+    }
+    Some(((rewrite(os, oe), ()), ()))
+}
+
+/// The patches that lie inside `[start, end)` of the marker patch `p`, shifted to start at 0, for re-rendering that sub-range of `p`
+/// (a receiver, a key, the arguments). A zero-width insertion on an edge of `p` is not inner: the outer pass already prints it next to
+/// `p`, before it or right after it, so a sub-range that took it too would print it a second time inside the helper call
+/// (`__zp_call(;{const __zp_bad=…` for `history.replaceState(x); var f;`, whose declaration prelude starts where the call does; the
+/// same for the prefix of an unbraced `with` body), a SyntaxError.
+fn inner_patches(patches: &[Patch], p: &Patch, start: usize, end: usize) -> Vec<Patch> {
+    let offset = start as u32;
+    patches
+        .iter()
+        .filter(|q| (q.start as usize) >= start && (q.end as usize) <= end)
+        .filter(|q| !std::ptr::eq(*q, p))
+        .filter(|q| !(q.start == q.end && (q.start == p.start || q.start == p.end)))
+        .map(|q| Patch {
+            start: q.start - offset,
+            end: q.end - offset,
+            replacement: shift_marker_positions(&q.replacement, offset),
+        })
+        .collect()
+}
+
+pub fn apply_patches(source: &str, patches: &[Patch]) -> String {
+    // Deduplicate overlapping patches: when patch B is fully contained inside
+    // patch A (A.start <= B.start && B.end <= A.end), prefer A (outer) and
+    // drop B. This matches the rewrite semantics where outer member-get
+    // already wraps the inner receiver text verbatim, including any
+    // dangerous identifier the inner pass also flagged.
+    let mut sorted: Vec<&Patch> = patches.iter().collect();
+    // Zero-width insertions (`var` hoists) at the same `start` sort before
+    // statement patches so `p.start < last_end` does not swallow them.
+    sorted.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| (b.end == b.start).cmp(&(a.end == a.start))) // insert first
+            .then_with(|| b.end.cmp(&a.end)) // outer first
+    });
+    let mut chosen: Vec<&Patch> = Vec::with_capacity(sorted.len());
+    let mut last_end: u32 = 0;
+    for p in sorted {
+        if p.start < last_end {
+            // Overlaps previous chosen; skip (inner contained in outer).
+            continue;
+        }
+        chosen.push(p);
+        last_end = p.end;
+    }
+
+    let mut out = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let mut cursor: usize = 0;
+    // Decide whether a patch emission requires a leading `(`:
+    // - If the preceding byte is identifier-continue (alphanumeric/`_`/`$`),
+    //   the replacement would glue onto a keyword like `return` or a free
+    //   identifier, so parenthesise it.
+    // - If the preceding non-whitespace token is `new`, `new MemberExpression Arguments`
+    //   would capture the call, so isolate it with parentheses.
+    // - Otherwise (`(`, `,`, `{`, `}`, `;`, `=`, `\n` not preceded by an identifier
+    //   character), omit the leading `(` to avoid ASI continuation hazards such as
+    //   `var x=1\n(call)`.
+    // The `0,` a statement-start form begins with must not join the token before it:
+    // minified `else(a||b)[k]=v` would otherwise become `else0,(…)`, an identifier `else0`.
+    let stmt_zero = |start: usize| -> &'static str {
+        let joins = start > 0 && {
+            let b = bytes[start - 1];
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+        };
+        if joins { " 0," } else { "0," }
+    };
+    let needs_paren_prefix = |start: usize| -> bool {
+        if start == 0 {
+            return false;
+        }
+        let prev = bytes[start - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
+            return true;
+        }
+        // Look back past whitespace for `new` keyword.
+        let mut i = start;
+        while i > 0 {
+            let c = bytes[i - 1];
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                i -= 1;
+                continue;
+            }
+            break;
+        }
+        if i >= 3 {
+            let kw = &bytes[i - 3..i];
+            if kw == b"new" {
+                // Ensure `new` is not part of a longer identifier like `renew`.
+                if i == 3 {
+                    return true;
+                }
+                let before = bytes[i - 4];
+                if !(before.is_ascii_alphanumeric() || before == b'_' || before == b'$') {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    for p in chosen {
+        let start = p.start as usize;
+        let end = p.end as usize;
+        if start < cursor || end > bytes.len() || start > end {
+            continue;
+        }
+        out.push_str(&source[cursor..start]);
+        // Marker patches need the receiver source text. Helper recursively
+        // applies any contained inner patches to a sub-range of source.
+        // When shifting markers into the sub-range, also shift the
+        // absolute spans embedded inside the marker replacement strings;
+        // those refer to positions in the original source, which would be wrong
+        // once the marker is applied against a sub-string.
+        let rewrite_range = |start: usize, end: usize| -> String {
+            if start >= end || end > bytes.len() {
+                return String::new();
+            }
+            let sub = &source[start..end];
+            let inner = inner_patches(patches, p, start, end);
+            if inner.is_empty() {
+                sub.to_string()
+            } else {
+                apply_patches(sub, &inner)
+            }
+        };
+        // `rewrite_range` with the chain prefix `[os, oe)` standing for the
+        // OCHAIN continuation parameter. The synthetic patch goes first so
+        // the stable sort prefers it over same-span link patches, and nested
+        // marker resolvers inherit it through their own `rewrite_range`.
+        let rewrite_range_ov = |start: usize, end: usize, ov: Option<(usize, usize)>| -> String {
+            let Some((os, oe)) = ov.filter(|&(os, oe)| start <= os && os < oe && oe <= end) else {
+                return rewrite_range(start, end);
+            };
+            if end > bytes.len() {
+                return String::new();
+            }
+            let offset = start as u32;
+            let mut inner: Vec<Patch> = vec![Patch {
+                start: os as u32 - offset,
+                end: oe as u32 - offset,
+                replacement: "__zp_oc".to_string(),
+            }];
+            inner.extend(inner_patches(patches, p, start, end));
+            apply_patches(&source[start..end], &inner)
+        };
+
+        if p.replacement.starts_with("\u{1}OCHAIN\u{1}") {
+            // \u{1}OCHAIN\u{1}<cs>\u{1}<ce>\u{1}<split>\u{1}…  (visit_chain_expression)
+            //   M,<base_end> | P,<callee_end> | S,<obj_end>,<callee_end>,<name>
+            //   | K,<obj_end>,<callee_end>,<ks>,<ke>
+            // Built from the innermost continuation outward: the text after
+            // the last split, then each split's base wrapping it.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            let num = |f: &[&str], i: usize| -> Option<usize> { f.get(i)?.parse().ok() };
+            let cs = num(&parts, 2);
+            let ce = num(&parts, 3);
+            let splits: Vec<Vec<&str>> = parts
+                .iter()
+                .skip(4)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.split(',').collect())
+                .collect();
+            let ends: Option<Vec<usize>> = splits
+                .iter()
+                .map(|f| match f[0] {
+                    "M" | "P" => num(f, 1),
+                    "S" | "K" => num(f, 2),
+                    _ => None,
+                })
+                .collect();
+            let rendered = (|| {
+                let (cs, ce, ends) = (cs?, ce?, ends?);
+                if cs >= ce || ce > bytes.len() || ends.is_empty() {
+                    return None;
+                }
+                let n = ends.len();
+                let mut acc = rewrite_range_ov(cs, ce, Some((cs, ends[n - 1])));
+                for i in (0..n).rev() {
+                    let prev = if i == 0 { None } else { Some((cs, ends[i - 1])) };
+                    let f = &splits[i];
+                    let base = match (f[0], num(f, 1)) {
+                        ("M" | "P", _) => rewrite_range_ov(cs, ends[i], prev),
+                        ("S", Some(oe)) => {
+                            format!("__zp_ocallv(({}),{:?})", rewrite_range_ov(cs, oe, prev), f.get(3)?)
+                        }
+                        ("K", Some(oe)) => {
+                            let (ks, ke) = (num(f, 3)?, num(f, 4)?);
+                            if ks >= ke || ke > bytes.len() {
+                                return None;
+                            }
+                            format!(
+                                "__zp_ocallv(({}),({}))",
+                                rewrite_range_ov(cs, oe, prev),
+                                rewrite_range(ks, ke)
+                            )
+                        }
+                        _ => return None,
+                    };
+                    acc = format!("__zp_ochain(({base}),__zp_oc=>{acc})");
+                }
+                Some(acc)
+            })();
+            match rendered {
+                Some(acc) if needs_paren_prefix(start) => out.push_str(&format!("({acc})")),
+                Some(acc) => out.push_str(&acc),
+                // Malformed marker: the per-link rendering is still valid code.
+                None => out.push_str(&rewrite_range(start, end)),
+            }
+            cursor = end;
+            continue;
+        } else if p.replacement.starts_with("\u{1}GLOBAL_SET\u{1}") {
+            // \u{1}GLOBAL_SET\u{1}<name>\u{1}<val_start>\u{1}<val_end>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let name = parts[2];
+                let vs: usize = parts[3].parse().unwrap_or(0);
+                let ve: usize = parts[4].parse().unwrap_or(0);
+                if vs < ve && ve <= bytes.len() {
+                    let value = rewrite_range(vs, ve);
+                    out.push_str(&format!(
+                        "__zp_set(globalThis,{:?},({}))",
+                        name, value
+                    ));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}GLOBAL_ASSIGN\u{1}") {
+            // \u{1}GLOBAL_ASSIGN\u{1}<name>\u{1}<op>\u{1}<vs>\u{1}<ve>\u{1}<logical>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 8 {
+                let name = parts[2];
+                let op = parts[3];
+                let vs: usize = parts[4].parse().unwrap_or(0);
+                let ve: usize = parts[5].parse().unwrap_or(0);
+                let logical = parts[6] == "1";
+                if vs < ve && ve <= bytes.len() {
+                    let value = rewrite_range(vs, ve);
+                    // Binary operator without the trailing '=': emit the
+                    // read/modify/write inline so evaluation order stays
+                    // native (get, then RHS, then set) and `await`/`yield` inside the
+                    // RHS keeps working (a helper-with-thunk can't cross an
+                    // await boundary).
+                    let bin = &op[..op.len() - 1];
+                    if logical {
+                        // `x ||= rhs`: `??`/`||`/`&&` must be parenthesized
+                        // because `a ?? b || c` is a SyntaxError and the emitted form
+                        // can land next to any neighbour operator.
+                        out.push_str(&format!(
+                            "(__zp_get(globalThis,{name:?}){bin}__zp_set(globalThis,{name:?},({value})))"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "__zp_set(globalThis,{name:?},__zp_get(globalThis,{name:?}){bin}({value}))"
+                        ));
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}GLOBAL_UPDATE\u{1}") {
+            // \u{1}GLOBAL_UPDATE\u{1}<name>\u{1}<op>\u{1}<prefix>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let name = parts[2];
+                let op = parts[3];
+                let prefix = parts[4] == "1";
+                out.push_str(&format!(
+                    "__zp_update(globalThis,{:?},{:?},{})",
+                    name, op, prefix
+                ));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}GLOBAL_DESTR\u{1}") {
+            // \u{1}GLOBAL_DESTR\u{1}<name>\u{1}[<chain>\u{1}]
+            // Shorthand destructuring target expands to explicit `key: <settable>` where
+            // the settable member is the prelude's write-only sink. Inside
+            // `with`, the sink prefers each with-object first.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 4 {
+                let name = parts[2];
+                let sink = if parts.len() >= 5 && !parts[3].is_empty() {
+                    format!("{}.v", with_d_chain(parts[3], name))
+                } else {
+                    format!("__zp_get.d.{name}")
+                };
+                out.push_str(&format!("{name}: {sink}"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}SHORTHAND_GLOBAL_GET\u{1}") {
+            // \u{1}SHORTHAND_GLOBAL_GET\u{1}<name>\u{1}
+            // Inside an object literal, so no `new`-prefix parenthesisation
+            // applies, but the key must be restored or the property is lost.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 4 {
+                let name = parts[2];
+                out.push_str(&format!("{}:__zp_get(globalThis,{:?})", name, name));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}GLOBAL_GET\u{1}") {
+            // \u{1}GLOBAL_GET\u{1}<name>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 4 {
+                let name = parts[2];
+                if needs_paren_prefix(start) {
+                    out.push_str(&format!("(__zp_get(globalThis,{:?}))", name));
+                } else {
+                    out.push_str(&format!("__zp_get(globalThis,{:?})", name));
+                }
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement == "\u{1}THIS_MAP\u{1}" {
+            // `new this.C()` must stay `new (…).C()` because a bare call there would become the constructor
+            out.push_str(if needs_paren_prefix(start) { "(__zp_this(this))" } else { "__zp_this(this)" });
+            cursor = end;
+            continue;
+        } else if p.replacement.starts_with("\u{1}MEMBER_GET\u{1}") {
+            // \u{1}MEMBER_GET\u{1}<obj_start>\u{1}<obj_end>\u{1}<prop>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let obj_start: usize = parts[2].parse().unwrap_or(0);
+                let obj_end: usize = parts[3].parse().unwrap_or(0);
+                let prop = parts[4];
+                if obj_start < obj_end && obj_end <= bytes.len() {
+                    let obj_src = rewrite_range(obj_start, obj_end);
+                    if needs_paren_prefix(start) {
+                        out.push_str(&format!("(__zp_get({},{:?}))", obj_src, prop));
+                    } else {
+                        out.push_str(&format!("__zp_get({},{:?})", obj_src, prop));
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}MEMBER_REF\u{1}")
+            || p.replacement.starts_with("\u{1}MEMBER_REF_STMT\u{1}")
+        {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let obj_start: usize = parts[2].parse().unwrap_or(0);
+                let obj_end: usize = parts[3].parse().unwrap_or(0);
+                let prop = parts[4];
+                if obj_start < obj_end && obj_end <= bytes.len() {
+                    let obj_src = rewrite_range(obj_start, obj_end);
+                    // Keep a Reference, not a call result. Native operators then
+                    // own GetValue-before-RHS, short circuiting and ToNumeric;
+                    // await/yield and defaults stay in their original scope.
+                    // The adapter retains the receiver once without a closure.
+                    if parts[1] == "MEMBER_REF_STMT" {
+                        // A leading '(' would join a preceding ASI statement.
+                        out.push_str(stmt_zero(start));
+                    }
+                    out.push_str(&format!(
+                        "({{b:({}),get v(){{return __zp_get(this.b,{:?})}},set v(v){{__zp_set(this.b,{:?},v)}}}}).v",
+                        obj_src, prop, prop
+                    ));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}MEMBER_SET\u{1}") {
+            // \u{1}MEMBER_SET\u{1}<obj_start>\u{1}<obj_end>\u{1}<prop>\u{1}<val_start>\u{1}<val_end>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 8 {
+                let obj_start: usize = parts[2].parse().unwrap_or(0);
+                let obj_end: usize = parts[3].parse().unwrap_or(0);
+                let prop = parts[4];
+                let val_start: usize = parts[5].parse().unwrap_or(0);
+                let val_end: usize = parts[6].parse().unwrap_or(0);
+                if obj_start < obj_end && val_start <= val_end && val_end <= bytes.len() {
+                    let obj_src = rewrite_range(obj_start, obj_end);
+                    let val_src = rewrite_range(val_start, val_end);
+                    if needs_paren_prefix(start) {
+                        out.push_str(&format!("(__zp_set({},{:?},{}))", obj_src, prop, val_src));
+                    } else {
+                        out.push_str(&format!("__zp_set({},{:?},{})", obj_src, prop, val_src));
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}MODULE_URL\u{1}") {
+            // \u{1}MODULE_URL\u{1}<src_start>\u{1}<src_end>\u{1}<target_url>\u{1}
+            // Emit as a span marker rather than zero-width boundary patches: if
+            // the argument itself is rewritten (`u.replace(...)`), a zero-width
+            // patch at `src_start` would be pulled inside the inner `METHOD_CALL`
+            // range (`__zp_call(__zp_module_url(u,"replace",[…]), "<ref>")`).
+            // Using a span marker recurses on the inner range via `rewrite_range`
+            // while keeping `__zp_module_url` on the outside.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let src_start: usize = parts[2].parse().unwrap_or(0);
+                let src_end: usize = parts[3].parse().unwrap_or(0);
+                let target = parts[4];
+                if src_start < src_end && src_end <= bytes.len() {
+                    let src = rewrite_range(src_start, src_end);
+                    out.push_str(&format!("__zp_module_url({},\"{}\")", src, target));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}METHOD_CALL\u{1}") {
+            // \u{1}METHOD_CALL\u{1}<obj_start>\u{1}<obj_end>\u{1}<method>\u{1}<args_start>\u{1}<args_end>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 8 {
+                let obj_start: usize = parts[2].parse().unwrap_or(0);
+                let obj_end: usize = parts[3].parse().unwrap_or(0);
+                let method = parts[4];
+                let args_start: usize = parts[5].parse().unwrap_or(0);
+                let args_end: usize = parts[6].parse().unwrap_or(0);
+                if obj_start < obj_end {
+                    let obj_src = rewrite_range(obj_start, obj_end);
+                    let args_src = if args_start < args_end && args_end <= bytes.len() {
+                        rewrite_range(args_start, args_end)
+                    } else {
+                        String::new()
+                    };
+                    if needs_paren_prefix(start) {
+                        out.push_str(&format!(
+                            "(__zp_call({},{:?},[{}]))",
+                            obj_src, method, args_src
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "__zp_call({},{:?},[{}])",
+                            obj_src, method, args_src
+                        ));
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}VAR_SET\u{1}")
+            || p.replacement.starts_with("\u{1}VAR_WSET\u{1}")
+        {
+            // \u{1}VAR_SET\u{1}<tmp>\u{1}<name>\u{1}<vs>\u{1}<ve>\u{1}
+            // \u{1}VAR_WSET\u{1}<tmp>\u{1}<name>\u{1}<vs>\u{1}<ve>\u{1}<chain>\u{1}
+            // `var location = x`: the declarator becomes a fresh binding
+            // initialised to the membrane write's (void 0) result.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 7 {
+                let tmp = parts[2];
+                let name = parts[3];
+                let vs: usize = parts[4].parse().unwrap_or(0);
+                let ve: usize = parts[5].parse().unwrap_or(0);
+                if vs < ve && ve <= bytes.len() {
+                    let value = rewrite_range(vs, ve);
+                    let write = if parts[1] == "VAR_WSET" && parts.len() >= 8 {
+                        with_set_chain(parts[6], name, &value)
+                    } else {
+                        format!("__zp_set(globalThis,{name:?},({value}))")
+                    };
+                    // Declaration position: never parenthesise.
+                    out.push_str(&format!("{tmp}=({write},void 0)"));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}WTREF\u{1}")
+            || p.replacement.starts_with("\u{1}WTREF_STMT\u{1}")
+        {
+            // \u{1}WTREF\u{1}<chain>\u{1}<name>\u{1}: write target inside `with`,
+            // emitting a `__zp_with_d` accessor whose `.v` prefers the with-object.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 5 {
+                let name = parts[3];
+                let sink = with_d_chain(parts[2], name);
+                if parts[1] == "WTREF_STMT" {
+                    out.push_str(stmt_zero(start));
+                }
+                out.push_str(&format!("{sink}.v"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}WITH_OBJ\u{1}") {
+            // \u{1}WITH_OBJ\u{1}<tmp>\u{1}<os>\u{1}<oe>\u{1}: `with (<tmp>=(obj))`.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let tmp = parts[2];
+                let os: usize = parts[3].parse().unwrap_or(0);
+                let oe: usize = parts[4].parse().unwrap_or(0);
+                if os < oe && oe <= bytes.len() {
+                    let obj = rewrite_range(os, oe);
+                    out.push_str(&format!("{tmp}=({obj})"));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}WITH_SET\u{1}") {
+            // \u{1}WITH_SET\u{1}<name>\u{1}<vs>\u{1}<ve>\u{1}<chain>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 7 {
+                let name = parts[2];
+                let vs: usize = parts[3].parse().unwrap_or(0);
+                let ve: usize = parts[4].parse().unwrap_or(0);
+                if vs < ve && ve <= bytes.len() {
+                    let value = rewrite_range(vs, ve);
+                    out.push_str(&with_set_chain(parts[5], name, &value));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}WITH_ASSIGN\u{1}") {
+            // \u{1}WITH_ASSIGN\u{1}<name>\u{1}<op>\u{1}<vs>\u{1}<ve>\u{1}<logical>\u{1}<chain>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 9 {
+                let name = parts[2];
+                let op = parts[3];
+                let vs: usize = parts[4].parse().unwrap_or(0);
+                let ve: usize = parts[5].parse().unwrap_or(0);
+                if vs < ve && ve <= bytes.len() {
+                    let value = rewrite_range(vs, ve);
+                    // Always a thunk: `__zp_with_assign`/`__zp_assign` call it
+                    // only after the get, so RHS ordering stays native and a
+                    // side-effecting RHS still evaluates exactly once through
+                    // the fallback chain.
+                    let value = format!("()=>({value})");
+                    out.push_str(&with_assign_chain(parts[7], name, op, &value));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}CGET\u{1}") {
+            // \u{1}CGET\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<group>\u{1}[S\u{1}]
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                let (group, at_stmt) = guard_fields(&parts, 6);
+                let e = match guard_temps(group) {
+                    Some((a, b, _)) => format!("({a}=(0,{obj}),{b}=(0,{key}),__zp_fast({a},{b})?{a}[{b}]:__zp_get({a},{b}))"),
+                    None => format!("__zp_get(({obj}),({key}))"),
+                };
+                if group > 0 && at_stmt {
+                    out.push_str(stmt_zero(start));
+                    out.push_str(&e);
+                } else if needs_paren_prefix(start) {
+                    out.push_str(&format!("({e})"));
+                } else {
+                    out.push_str(&e);
+                }
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}CSET\u{1}") {
+            // \u{1}CSET\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<vs>\u{1}<ve>\u{1}<group>\u{1}[S\u{1}]
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), vs)) =
+                obj_key_val(&parts, 6, bytes.len(), &rewrite_range)
+            {
+                if let Some(v) = vs {
+                    let (group, at_stmt) = guard_fields(&parts, 8);
+                    // The value lands in a temp too: it is evaluated once, after the object and the key, as natively.
+                    let e = match guard_temps(group) {
+                        Some((a, b, c)) => format!(
+                            "({a}=(0,{obj}),{b}=(0,{key}),{c}=(0,{v}),__zp_fastset({a},{b})?{a}[{b}]={c}:__zp_set({a},{b},{c}))"
+                        ),
+                        None => format!("__zp_set(({obj}),({key}),({v}))"),
+                    };
+                    if group > 0 && at_stmt {
+                        out.push_str(stmt_zero(start));
+                        out.push_str(&e);
+                    } else if needs_paren_prefix(start) {
+                        out.push_str(&format!("({e})"));
+                    } else {
+                        out.push_str(&e);
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}CASSIGN\u{1}")
+            || p.replacement.starts_with("\u{1}CASSIGN_STMT\u{1}")
+        {
+            // \u{1}CASSIGN\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<op>\u{1}<vs>\u{1}<ve>\u{1}<logical>\u{1}
+            // Same accessor-adapter Reference as CREF: the key is captured
+            // once in `b/k` and the engine keeps native ordering.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 11 {
+                if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                    let op = parts[6];
+                    let vs: usize = parts[7].parse().unwrap_or(0);
+                    let ve: usize = parts[8].parse().unwrap_or(0);
+                    if vs < ve && ve <= bytes.len() {
+                        let v = rewrite_range(vs, ve);
+                        let e = format!(
+                            "({{b:({obj}),k:({key}),get v(){{return __zp_get(this.b,this.k)}},set v(v){{__zp_set(this.b,this.k,v)}}}}).v{op}({v})"
+                        );
+                        if needs_paren_prefix(start) {
+                            out.push_str(&format!("({e})"));
+                        } else {
+                            if parts[1] == "CASSIGN_STMT" {
+                                out.push_str(stmt_zero(start));
+                            }
+                            out.push_str(&e);
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}CREF\u{1}")
+            || p.replacement.starts_with("\u{1}CREF_STMT\u{1}")
+        {
+            // \u{1}CREF\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}: computed member in
+            // a Reference position (`x[k]++`, destructuring / for-of targets).
+            // Same accessor-adapter pattern as MEMBER_REF, with a stored key.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                if parts[1] == "CREF_STMT" {
+                    out.push_str(stmt_zero(start));
+                }
+                out.push_str(&format!(
+                    "({{b:({obj}),k:({key}),get v(){{return __zp_get(this.b,this.k)}},set v(v){{__zp_set(this.b,this.k,v)}}}}).v"
+                ));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}OGET\u{1}") {
+            // \u{1}OGET\u{1}<os>\u{1}<oe>\u{1}L\u{1}<prop>\u{1}: `x?.prop`
+            // \u{1}OGET\u{1}<os>\u{1}<oe>\u{1}E\u{1}<ks>\u{1}<ke>\u{1}: `x?.[k]`
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let os: usize = parts[2].parse().unwrap_or(0);
+                let oe: usize = parts[3].parse().unwrap_or(0);
+                if os < oe && oe <= bytes.len() {
+                    let obj = rewrite_range(os, oe);
+                    let key = if parts[4] == "L" {
+                        format!("{:?}", parts[5])
+                    } else if parts[4] == "E" && parts.len() >= 8 {
+                        let ks: usize = parts[5].parse().unwrap_or(0);
+                        let ke: usize = parts[6].parse().unwrap_or(0);
+                        if ks < ke && ke <= bytes.len() {
+                            format!("({})", rewrite_range(ks, ke))
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    if !key.is_empty() {
+                        let e = format!("__zp_oget(({obj}),{key})");
+                        if needs_paren_prefix(start) {
+                            out.push_str(&format!("({e})"));
+                        } else {
+                            out.push_str(&e);
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}OCALL\u{1}")
+            || p.replacement.starts_with("\u{1}CCALL\u{1}")
+        {
+            // \u{1}CCALL\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<as>\u{1}<ae>\u{1}
+            // \u{1}OCALL\u{1}<os>\u{1}<oe>\u{1}L\u{1}<prop>\u{1}<as>\u{1}<ae>\u{1}
+            // \u{1}OCALL\u{1}<os>\u{1}<oe>\u{1}E\u{1}<ks>\u{1}<ke>\u{1}<as>\u{1}<ae>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 7 {
+                let optional = parts[1] == "OCALL";
+                let os: usize = parts[2].parse().unwrap_or(0);
+                let oe: usize = parts[3].parse().unwrap_or(0);
+                if os < oe && oe <= bytes.len() {
+                    let obj = rewrite_range(os, oe);
+                    // OCALL: parts[4] packs (base_opt<<1)|call_opt, parts[5]
+                    // the L/E key kind; CCALL has neither flag nor kind.
+                    let (flags, kind_idx) = if optional {
+                        (parts[4].parse::<u8>().unwrap_or(0), 5)
+                    } else {
+                        (0u8, 4)
+                    };
+                    let (key, ai) = if optional {
+                        if parts[kind_idx] == "L" {
+                            (format!("{:?}", parts[kind_idx + 1]), kind_idx + 2)
+                        } else if parts.len() > kind_idx + 4 {
+                            let ks: usize = parts[kind_idx + 1].parse().unwrap_or(0);
+                            let ke: usize = parts[kind_idx + 2].parse().unwrap_or(0);
+                            if ks < ke && ke <= bytes.len() {
+                                (format!("({})", rewrite_range(ks, ke)), kind_idx + 3)
+                            } else {
+                                (String::new(), 0)
+                            }
+                        } else {
+                            (String::new(), 0)
+                        }
+                    } else {
+                        let ks: usize = parts[4].parse().unwrap_or(0);
+                        let ke: usize = parts[5].parse().unwrap_or(0);
+                        if ks < ke && ke <= bytes.len() {
+                            (format!("({})", rewrite_range(ks, ke)), 6)
+                        } else {
+                            (String::new(), 0)
+                        }
+                    };
+                    if !key.is_empty() && ai + 1 < parts.len() {
+                        let as_: usize = parts[ai].parse().unwrap_or(0);
+                        let ae: usize = parts[ai + 1].parse().unwrap_or(0);
+                        let args = if as_ < ae && ae <= bytes.len() {
+                            rewrite_range(as_, ae)
+                        } else {
+                            String::new()
+                        };
+                        // \u{1}CCALL\u{1}…\u{1}<as>\u{1}<ae>\u{1}<group>\u{1}[S\u{1}]
+                        let (group, at_stmt) = if optional { (0, false) } else { guard_fields(&parts, ai + 2) };
+                        // The arguments appear in both arms (one runs): only short ones, and none holding guards of their
+                        // own; a copy of those would double again at every level.
+                        let guard = guard_temps(group).filter(|_| args.len() <= 512 && !args.contains("__zp_t_"));
+                        let e = if optional {
+                            format!("__zp_ocall(({obj}),{key},[{args}],{flags})")
+                        } else if let Some((a, b, _)) = &guard {
+                            format!("({a}=(0,{obj}),{b}=(0,{key}),__zp_fast({a},{b})?{a}[{b}]({args}):__zp_call({a},{b},[{args}]))")
+                        } else {
+                            format!("__zp_call(({obj}),{key},[{args}])")
+                        };
+                        if guard.is_some() && at_stmt {
+                            out.push_str(stmt_zero(start));
+                            out.push_str(&e);
+                        } else if needs_paren_prefix(start) {
+                            out.push_str(&format!("({e})"));
+                        } else {
+                            out.push_str(&e);
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}DEVAL\u{1}") {
+            // \u{1}DEVAL\u{1}<as>\u{1}<ae>\u{1}<strict>\u{1}<global-site>\u{1}<desc-object>
+            // `eval(args)` becomes `__zp_eval.call(this, [args][0], desc, strict[, 1])`.
+            // `[args][0]` evaluates every argument in order (native eager
+            // evaluation) and yields the first (`eval(a,b)` semantics).
+            // A trailing `1` marks a sloppy eval in the top level of a classic script: natively its `var` and `function`
+            // declarations become properties of the global object, which the runtime can only do by running it as global
+            // code (inside the helper that gives a direct eval its caller's bindings they stay local to the helper).
+            let parts: Vec<&str> = p.replacement.splitn(7, '\u{1}').collect();
+            if parts.len() >= 7 {
+                let as_: usize = parts[2].parse().unwrap_or(0);
+                let ae: usize = parts[3].parse().unwrap_or(0);
+                let args = if as_ < ae && ae <= bytes.len() {
+                    rewrite_range(as_, ae)
+                } else {
+                    String::new()
+                };
+                let strict = if parts[5] == "1" && parts[4] == "0" {
+                    format!("{},1", parts[4])
+                } else {
+                    parts[4].to_string()
+                };
+                let desc = parts[6].trim_end_matches('\u{1}');
+                // `.call(this)` forwards the caller's `this` through `__zp_eval` to the
+                // eval `thisEnv` (direct-eval `this` parity).
+                // Pass the callee alongside it so if `eval` was rebound (`var eval = f`),
+                // the runtime invokes that function rather than the intrinsic.
+                let e = format!(
+                    "__zp_eval.call(this,__zp_get(globalThis,\"eval\"),[{args}],{desc},{strict})"
+                );
+                if needs_paren_prefix(start) {
+                    out.push_str(&format!("({e})"));
+                } else {
+                    out.push_str(&e);
+                }
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}RGET\u{1}") {
+            // \u{1}RGET\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<has_r>\u{1}<rs>\u{1}<re>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                if parts.len() >= 10 {
+                    let has_r = parts[6] == "1";
+                    let rs: usize = parts[7].parse().unwrap_or(0);
+                    let re: usize = parts[8].parse().unwrap_or(0);
+                    let recv = if has_r && rs < re && re <= bytes.len() {
+                        format!(",({})", rewrite_range(rs, re))
+                    } else {
+                        String::new()
+                    };
+                    let e = format!("__zp_rget(({obj}),({key}){recv})");
+                    if needs_paren_prefix(start) {
+                        out.push_str(&format!("({e})"));
+                    } else {
+                        out.push_str(&e);
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}RSET\u{1}") {
+            // \u{1}RSET\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<vs>\u{1}<ve>\u{1}<has_r>\u{1}<rs>\u{1}<re>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                if parts.len() >= 12 {
+                    let vs: usize = parts[6].parse().unwrap_or(0);
+                    let ve: usize = parts[7].parse().unwrap_or(0);
+                    let has_r = parts[8] == "1";
+                    let rs: usize = parts[9].parse().unwrap_or(0);
+                    let re: usize = parts[10].parse().unwrap_or(0);
+                    if vs < ve && ve <= bytes.len() {
+                        let v = rewrite_range(vs, ve);
+                        let recv = if has_r && rs < re && re <= bytes.len() {
+                            format!(",({})", rewrite_range(rs, re))
+                        } else {
+                            String::new()
+                        };
+                        let e = format!("__zp_rset(({obj}),({key}),({v}){recv})");
+                        if needs_paren_prefix(start) {
+                            out.push_str(&format!("({e})"));
+                        } else {
+                            out.push_str(&e);
+                        }
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}GOPD\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_getOwnPropertyDescriptor(({obj}),({key}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}GOPDS\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, _), _)) = obj_only(&parts, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_getOwnPropertyDescriptors(({obj}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}GOWN\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, _), _)) = obj_only(&parts, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_getOwnPropertyNames(({obj}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}OKEYS\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, _), _)) = obj_only(&parts, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_okeys(({obj}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}RHAS\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_has(({obj}),({key}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}ROWK\u{1}") {
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, _), _)) = obj_only(&parts, bytes.len(), &rewrite_range) {
+                out.push_str(&format!("__zp_ownKeys(({obj}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}CDELE\u{1}") {
+            // \u{1}CDELE\u{1}<os>\u{1}<oe>\u{1}<ks>\u{1}<ke>\u{1}<opt>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if let Some(((obj, key), _)) = obj_key(&parts, 2, bytes.len(), &rewrite_range) {
+                let helper = if parts.get(6) == Some(&"1") { "__zp_odelete" } else { "__zp_delete" };
+                out.push_str(&format!("{helper}(({obj}),({key}))"));
+                cursor = end;
+                continue;
+            }
+        } else if p.replacement.starts_with("\u{1}SDELE\u{1}") {
+            // \u{1}SDELE\u{1}<os>\u{1}<oe>\u{1}<prop>\u{1}<opt>\u{1}
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 7 {
+                let os: usize = parts[2].parse().unwrap_or(0);
+                let oe: usize = parts[3].parse().unwrap_or(0);
+                if os < oe && oe <= bytes.len() {
+                    let obj = rewrite_range(os, oe);
+                    let prop = parts[4];
+                    let helper = if parts[5] == "1" { "__zp_odelete" } else { "__zp_delete" };
+                    out.push_str(&format!("{helper}(({obj}),{prop:?})"));
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}MEMBER_A\u{1}")
+            || p.replacement.starts_with("\u{1}MEMBER_A_STMT\u{1}")
+        {
+            // \u{1}MEMBER_A\u{1}<os>\u{1}<oe>\u{1}<prop>\u{1}<op>\u{1}<vs>\u{1}<ve>\u{1}<logical>\u{1}
+            // Accessor-adapter Reference (same pattern as MEMBER_REF): the
+            // engine itself owns get/RHS/set evaluation order, logical
+            // short-circuiting, and await/yield in the RHS.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 10 {
+                let os: usize = parts[2].parse().unwrap_or(0);
+                let oe: usize = parts[3].parse().unwrap_or(0);
+                let prop = parts[4];
+                let op = parts[5];
+                let vs: usize = parts[6].parse().unwrap_or(0);
+                let ve: usize = parts[7].parse().unwrap_or(0);
+                if os < oe && vs < ve && ve <= bytes.len() {
+                    let obj = rewrite_range(os, oe);
+                    let v = rewrite_range(vs, ve);
+                    let e = format!(
+                        "({{b:({obj}),get v(){{return __zp_get(this.b,{prop:?})}},set v(v){{__zp_set(this.b,{prop:?},v)}}}}).v{op}({v})"
+                    );
+                    if needs_paren_prefix(start) {
+                        out.push_str(&format!("({e})"));
+                    } else {
+                        if parts[1] == "MEMBER_A_STMT" {
+                            // A leading '(' would join a preceding ASI statement.
+                            out.push_str(stmt_zero(start));
+                        }
+                        out.push_str(&e);
+                    }
+                    cursor = end;
+                    continue;
+                }
+            }
+        } else if p.replacement.starts_with("\u{1}FOR_CAP\u{1}") {
+            // \u{1}FOR_CAP\u{1}<counter>\u{1}<rs>\u{1}<re>\u{1}: splice the
+            // counter into the (empty) test slot of `for(init;;update)`.
+            // The covered region is `;…;` between init and update/body;
+            // insert right after its first `;`.
+            let parts: Vec<&str> = p.replacement.split('\u{1}').collect();
+            if parts.len() >= 6 {
+                let counter = parts[2];
+                let rs: usize = parts[3].parse().unwrap_or(0);
+                let re: usize = parts[4].parse().unwrap_or(0);
+                if rs < re && re <= bytes.len() {
+                    let mid = rewrite_range(rs, re);
+                    if let Some(semi) = mid.find(';') {
+                        out.push_str(&format!(
+                            "{}{}++<10000000||(console.warn('[ZeroProxy] infinite-loop cap reached'),false){}",
+                            &mid[..=semi],
+                            counter,
+                            &mid[semi + 1..]
+                        ));
+                        cursor = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(&p.replacement);
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
+    out
+}
+
+/// Remove a trailing `sourceMappingURL` pragma. Per the source-map spec
+/// it must be on the last non-empty line of the file. Strict about the
+/// last occurrence and forgiving about whitespace.
+pub fn strip_sourcemap_pragma(src: &str) -> String {
+    // Scan only the tail; pragmas live at the end of the file (4 KiB
+    // is generous since typical pragmas are < 200 bytes).
+    //
+    // `len() - 4096` is a raw byte offset and can land inside a
+    // multi-byte UTF-8 character, where slicing panics. Snap back to a
+    // char boundary before slicing.
+    let mut scan_from = src.len().saturating_sub(4096);
+    while scan_from > 0 && !src.is_char_boundary(scan_from) {
+        scan_from -= 1;
+    }
+    let tail = &src[scan_from..];
+    let needle = "sourceMappingURL=";
+    let Some(rel_idx) = tail.rfind(needle) else {
+        return src.to_string();
+    };
+    let abs_idx = scan_from + rel_idx;
+    // Find the comment opener on the same line.
+    let line_start = src[..abs_idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    let before_needle = &src[line_start..abs_idx];
+    let trimmed = before_needle.trim_start();
+    let comment_opens = trimmed.starts_with("//#")
+        || trimmed.starts_with("//@")
+        || trimmed.starts_with("/*#")
+        || trimmed.starts_with("/*@");
+    if !comment_opens {
+        return src.to_string();
+    }
+    // Trim the entire trailing line (including the preceding newline if
+    // present) so we don't leave a dangling empty line at EOF.
+    let cut_at = if line_start > 0 && src.as_bytes()[line_start - 1] == b'\n' {
+        line_start - 1
+    } else {
+        line_start
+    };
+    src[..cut_at].to_string()
+}
+
+/// Persistent rewriter instance that reuses a single bump allocator across
+/// calls so warm-path rewrites amortise the arena allocation cost.
+///
+/// The OXC AST is a bump arena. Allocating a fresh `Allocator` per call
+/// walks `mmap` / `VirtualAlloc` system calls and reserves new pages every
+/// time; for small (<= 10 KB) scripts the arena init cost dominates parse
+/// cost. Owning one `Allocator`, running parse + visit + emit inside a
+/// single method scope so the AST never escapes, and calling `reset()`
+/// reclaims the bytes while keeping page capacity for the next call.
+pub struct RewriterInstance {
+    allocator: Allocator,
+}
+
+impl Default for RewriterInstance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RewriterInstance {
+    pub fn new() -> Self {
+        Self {
+            allocator: Allocator::default(),
+        }
+    }
+
+    pub fn rewrite(
+        &mut self,
+        source: &str,
+        opts: &RewriteOpts,
+    ) -> Result<RewriteResult, RewriteError> {
+        // Parse + visit + apply_patches must all complete inside this
+        // method so the AST (which borrows from `self.allocator`) never
+        // escapes our scope. The final `reset()` reclaims the arena bytes
+        // for the next call.
+        let (ret, kind) = parse_for_kind(&self.allocator, source, opts.kind);
+
+        if !ret.errors.is_empty() {
+            let msg = ret
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.allocator.reset();
+            return Err(RewriteError::ParseFailed(msg));
+        }
+
+        let mut visitor =
+            RewriteVisitor::new(opts.target_url.clone(), opts.proxy_origin.clone(), kind);
+        visitor.local_this = opts.kind == ScriptKind::ClassicLocal;
+        visitor.visit_program(&ret.program);
+        visitor.refuse_reserved_names(&ret.program, source.len());
+
+        let mut patches = visitor.patches;
+        patches.sort_by_key(|p| p.start);
+        let patched = apply_patches(source, &patches);
+        let code = strip_sourcemap_pragma(&patched);
+
+        // Reset must happen after `code` (an owned String) is built and
+        // `patches` (which carry owned `String` replacements) are detached
+        // from the AST nodes. Both are heap-allocated outside the arena.
+        self.allocator.reset();
+
+        Ok(RewriteResult {
+            code,
+            patches,
+            diagnostics: visitor.diagnostics,
+        })
+    }
+
+    /// Patch-mode rewrite reusing the persistent bump arena. Returns the
+    /// sorted patch list without allocating or emitting the full output string.
+    pub fn rewrite_patches(
+        &mut self,
+        source: &str,
+        opts: &RewriteOpts,
+    ) -> Result<RewriteResult, RewriteError> {
+        let (ret, kind) = parse_for_kind(&self.allocator, source, opts.kind);
+
+        if !ret.errors.is_empty() {
+            let msg = ret
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.allocator.reset();
+            return Err(RewriteError::ParseFailed(msg));
+        }
+
+        let mut visitor =
+            RewriteVisitor::new(opts.target_url.clone(), opts.proxy_origin.clone(), kind);
+        visitor.local_this = opts.kind == ScriptKind::ClassicLocal;
+        visitor.visit_program(&ret.program);
+        visitor.refuse_reserved_names(&ret.program, source.len());
+
+        let mut patches = visitor.patches;
+        patches.sort_by_key(|p| p.start);
+
+        self.allocator.reset();
+
+        Ok(RewriteResult {
+            code: String::new(),
+            patches,
+            diagnostics: visitor.diagnostics,
+        })
+    }
+
+    /// Explicit reset hook; usually unnecessary (`rewrite` resets at the
+    /// end of each call), but exposed for callers that want to force-drop
+    /// arena capacity after a one-off large rewrite.
+    pub fn reset(&mut self) {
+        self.allocator.reset();
+    }
+}
+
+/// AST visitor that walks programs and produces global-identifier patches.
+struct RewriteVisitor {
+    patches: Vec<Patch>,
+    diagnostics: Vec<String>,
+    /// Inline guards (`guard_claim`): one entry per function being visited, recording where its temps are declared
+    /// (the body's closing brace, or `None` where a `var` cannot go: the top level, an expression-bodied arrow,
+    /// parameters, a class body) and how many temp groups its sites used.
+    guard_fns: Vec<(Option<u32>, u32)>,
+    /// The highest temp group claimed inside the operands visited since the enclosing site began.
+    guard_height: u32,
+    /// The callee of a computed call (`o[k](…)`): the call is the site, its member expression is not.
+    ccall_callees: HashSet<(u32, u32)>,
+    /// Stack of lexical scopes; each scope holds names that should NOT be
+    /// rewritten because they shadow the dangerous globals.
+    scopes: Vec<HashSet<String>>,
+    // (`varEnv` index in `scopes`, `var` insertion offset), pushed when
+    // entering a function or arrow. `eval('var x=1')` in sloppy direct eval
+    // binds in the caller's `varEnv`, so `var` names from literal eval
+    // strings are hoisted into the enclosing `varEnv`.
+    var_env_stack: Vec<(usize, u32)>,
+    /// Counts infinite-loop detections so the trap notebook can be
+    /// updated with prevalence data after a real-site capture.
+    infinite_loop_caps: u32,
+    /// Target page URL used as base when resolving dynamic
+    /// `import("./relative.js")` arguments to an absolute proxy
+    /// route. When empty or unparsable, dynamic import rewriting falls
+    /// back to leaving the source alone (the original URL still
+    /// passes through the SW fetch path; only relative paths break).
+    target_url: String,
+    /// See [`RewriteOpts::proxy_origin`]: makes dynamic-import URLs absolute
+    /// so a virtualised document base can't redirect them to the target host.
+    proxy_origin: String,
+    /// Input script kind. Classic global `var`/`function` declarations for
+    /// browser-unforgeable names (`location`, `document`, …) do not create
+    /// bindings, so they must not be recorded as shadowing at `fn_depth == 0`
+    /// of a classic program.
+    kind: ScriptKind,
+    /// Number of enclosing *function* scopes. Arrows DO count: `var` inside
+    /// an arrow body binds to the arrow itself, never the outer program.
+    fn_depth: u32,
+    /// Non-arrow function depth. `new.target` inside an arrow inherits the
+    /// enclosing *real* function's newTarget, so only real functions count.
+    nt_depth: u32,
+    /// >0 inside a class body (its field initializers and static blocks have their own `this`, and no function depth).
+    class_depth: u32,
+    /// `ScriptKind::ClassicLocal`: top-level `this` belongs to the caller of the eval and is left alone.
+    local_this: bool,
+    /// >0 while walking an assignment-target subtree (for-of/in left,
+    /// destructuring targets, update operands). Dangerous identifiers there
+    /// become `__zp_get.d.<name>` member refs because calls are not valid targets.
+    in_target: u32,
+    /// Fresh-name sequence for `__zp_vdcl_*` / `__zp_dp_*` / `__zp_sk_*` /
+    /// `__zp_w_*` temporaries the transform introduces.
+    decl_seq: u32,
+    /// Active `with` object temps, outermost to innermost. Dangerous
+    /// identifier reads inside a `with` body must resolve against the object
+    /// first (`__zp_with_get`), falling back to the next `with`/global.
+    with_temps: Vec<String>,
+    /// Span starts of the synthetic `ExpressionStatement` OXC wraps an
+    /// expression-bodied arrow's body in (not a statement position).
+    arrow_expr_bodies: HashSet<u32>,
+    /// Per `for-of`/`for-in` head: (dangerous name, temp it was renamed to)
+    /// pairs whose sinks must run once per iteration inside the loop body.
+    iter_sinks: Vec<Vec<(String, String)>>,
+    /// True while visiting the `left` of a `for-of`/`for-in`: var
+    /// declarators there have no initializer, so dangerous bindings rename
+    /// to temps and sink inside the body instead of a `var` transform.
+    for_iter_head: bool,
+    /// >0 while visiting a *bare* statement body (`if(c) stmt`, `while(c)
+    /// stmt`, `label: stmt`, …). A `let` inserted in front of such a
+    /// statement is a SyntaxError, so capped loops must block-wrap instead.
+    unbraced_body: u32,
+    /// Label names of the labeled statement(s) whose *direct* body is the
+    /// statement about to be visited. Consumed by loop visitors so a
+    /// block-wrapped capped loop re-binds them on a fresh inner label and
+    /// `continue outer` keeps working.
+    pending_labels: Vec<String>,
+    /// (source label, fresh label) rewrites active for `break`/`continue`
+    /// inside a block-wrapped capped loop.
+    label_renames: Vec<(String, String)>,
+    /// Whether the current traversal position is in sloppy mode. Under
+    /// Annex B.3.2/B.3.3/B.3.4, function declarations in block, labeled, or
+    /// single-statement positions in sloppy mode hoist a `var` binding to the
+    /// enclosing `varEnv` and must be registered as var-like during scope
+    /// collection. Disabled at program/function/class boundaries with `'use strict'`.
+    cur_sloppy: bool,
+}
+
+impl RewriteVisitor {
+    fn new(target_url: String, proxy_origin: String, kind: ScriptKind) -> Self {
+        Self {
+            patches: Vec::new(),
+            diagnostics: Vec::new(),
+            guard_fns: Vec::new(),
+            guard_height: 0,
+            ccall_callees: HashSet::new(),
+            scopes: vec![HashSet::new()],
+            var_env_stack: Vec::new(),
+            infinite_loop_caps: 0,
+            target_url,
+            proxy_origin,
+            kind,
+            fn_depth: 0,
+            nt_depth: 0,
+            class_depth: 0,
+            local_this: false,
+            in_target: 0,
+            decl_seq: 0,
+            with_temps: Vec::new(),
+            arrow_expr_bodies: HashSet::new(),
+            iter_sinks: Vec::new(),
+            for_iter_head: false,
+            unbraced_body: 0,
+            pending_labels: Vec::new(),
+            label_renames: Vec::new(),
+            cur_sloppy: true,
+        }
+    }
+
+    /// Check whether the directive prologue contains `'use strict'` (only
+    /// leading directives of a program or function body affect strictness).
+    fn has_use_strict<'a>(directives: &[Directive<'a>]) -> bool {
+        directives.iter().any(|d| d.directive.as_str() == "use strict")
+    }
+
+    /// A statement in single-statement body position. Blocks start a fresh
+    /// statement list, so the bare counter only wraps non-block bodies.
+    fn visit_body_statement<'a>(&mut self, stmt: &Statement<'a>) {
+        let bare = !matches!(stmt, Statement::BlockStatement(_));
+        if bare {
+            self.unbraced_body += 1;
+        }
+        self.visit_statement(stmt);
+        if bare {
+            self.unbraced_body -= 1;
+        }
+    }
+
+    /// Scope descriptor for a direct-eval call site: emits get/set accessors
+    /// for all currently visible declared names. Identifiers inside accessor
+    /// bodies are emitted text and resolve at the call site's lexical position
+    /// without rewriting; duplicate names across nested scopes resolve to the
+    /// innermost binding so deduplication suffices. Writes to `const` bindings
+    /// throw a native `TypeError` inside the setter body `n=v`. `arguments`,
+    /// `this`, `new.target`, and `super` are not in the scope list and are
+    /// inherited by the runner arrow from the caller environment.
+    fn caller_desc_object(&self) -> String {
+        let mut seen = HashSet::new();
+        let mut parts: Vec<String> = Vec::new();
+        for scope in &self.scopes {
+            for name in scope {
+                if seen.insert(name.clone()) {
+                    parts.push(format!("get {0}(){{return {0}}},set {0}(v){{{0}=v}}", name));
+                }
+            }
+        }
+        // `arguments` is an implicit binding not present in the scope list;
+        // emit it as a shorthand data property carrying the caller's `arguments`
+        // object (inside a getter body, `arguments` would refer to the getter's
+        // own arguments). Excluded for arrows (`nt_depth == 0` at top level).
+        if self.nt_depth > 0 {
+            parts.push("arguments".to_string());
+        }
+        format!("{{{}}}", parts.join(","))
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashSet::new());
+    }
+
+    /// `var` hoist insertion offset: after the directive prologue (inserting
+    /// `var` before `'use strict'` would invalidate the directive), or
+    /// immediately after `{` when the body is empty.
+    fn body_insert_pos(body: &FunctionBody) -> u32 {
+        if let Some(d) = body.directives.last() {
+            return d.span.end;
+        }
+        if let Some(s) = body.statements.first() {
+            return s.span().start;
+        }
+        body.span.start + 1
+    }
+
+    /// Hoist top-level `var`/`function` names declared in a sloppy direct
+    /// `eval` string literal into the enclosing `varEnv`. In the evaluated
+    /// source, `var x=1` rewrites to `__zp_set(globalThis,"x",1)`, which
+    /// consults the scope descriptor setter to route the write to the caller
+    /// binding, requiring that binding to exist in the caller's `varEnv`.
+    /// Unnecessary for strict eval (which does not leak `var`) or top-level
+    /// classic scope (where `varEnv` is already the global object).
+    fn hoist_eval_var_decls(&mut self, src: &str) {
+        let Some(&(scope_idx, insert_pos)) = self.var_env_stack.last() else { return };
+        if insert_pos == u32::MAX {
+            return; // expression-bodied arrow or other non-insertable context
+        }
+        let alloc = Allocator::new();
+        let ret = Parser::new(&alloc, src, SourceType::cjs()).parse();
+        if !ret.errors.is_empty() {
+            return; // runtime will throw SyntaxError; do not speculate on hoists
+        }
+        let mut names: Vec<String> = Vec::new();
+        collect_scope_decl_names(&ret.program.body, true, true, &mut |name, cat| {
+            if cat == BindCat::VarLike && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        });
+        let mut fresh: Vec<String> = Vec::new();
+        for n in names {
+            // Names already declared in the same `varEnv` scope need no extra
+            // `var` insertion; the descriptor accessor already targets them.
+            if self.scopes[scope_idx].insert(n.clone()) {
+                fresh.push(n);
+            }
+        }
+        if !fresh.is_empty() {
+            self.patches.push(Patch {
+                start: insert_pos,
+                end: insert_pos,
+                replacement: format!("var {};", fresh.join(",")),
+            });
+        }
+    }
+
+    /// Classic top-level `let`/`const`/`class` bindings live in the shared
+    /// global lexical environment across scripts, whereas separate `eval`
+    /// invocations discard their lexical environment on return. Register
+    /// top-level lexical names up front via `__zp_lex_decl` (detecting
+    /// redeclarations, `var` collisions, and non-configurable global property
+    /// conflicts) and append `__zp_lex_bind` accessor closures after each
+    /// declaration so subsequent scripts read and write the live binding.
+    /// `varlikes` holds top-level `var`/`function` names in the same program
+    /// to catch same-script `var x; let x` collisions at declaration time.
+    ///
+    /// A strict script run through `eval` keeps its top-level `var` and function
+    /// declarations to itself (a sloppy one makes them properties of the global, as
+    /// a script of the document does), so a later script, an event-handler attribute
+    /// or a `window.f` read finds them undefined. For a strict script, hand the
+    /// names with closures onto the script's own bindings to `__zp_export_vars`,
+    /// which gives the global accessors for them; a function replaces an earlier
+    /// strict script's function of the same name, as a function declaration does.
+    fn emit_lex_registry<'a>(&mut self, program: &Program<'a>, varlikes: &[String]) {
+        let mut lex: Vec<(String, &'static str)> = Vec::new();
+        let mut binds: Vec<(u32, String)> = Vec::new();
+        for stmt in &program.body {
+            match stmt {
+                Statement::VariableDeclaration(d) if d.kind != VariableDeclarationKind::Var => {
+                    let kind = if d.kind == VariableDeclarationKind::Const { "const" } else { "let" };
+                    let mut names: Vec<String> = Vec::new();
+                    for dec in &d.declarations {
+                        collect_binding_pattern(&dec.id, &mut |n| names.push(n.to_string()));
+                    }
+                    let mut calls = String::new();
+                    for n in &names {
+                        lex.push((n.clone(), kind));
+                        // For `const`, emit a throwing setter closure inside the
+                        // evaluated script so the error stack attributes the
+                        // `TypeError` to the script's `sourceURL` rather than
+                        // the prelude.
+                        calls += &if kind == "const" {
+                            format!("__zp_lex_bind({n:?},()=>{n},v=>{{throw new TypeError('Assignment to constant variable.')}});")
+                        } else {
+                            format!("__zp_lex_bind({n:?},()=>{n},v=>{{{n}=v}});")
+                        };
+                    }
+                    binds.push((d.span.end, calls));
+                }
+                Statement::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        let n = id.name.to_string();
+                        lex.push((n.clone(), "class"));
+                        binds.push((c.span.end, format!("__zp_lex_bind({n:?},()=>{n},v=>{{{n}=v}});")));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if lex.is_empty() && varlikes.is_empty() {
+            return;
+        }
+        // Insert after directives and before the first statement so `'use strict'` stays intact.
+        let pos = program
+            .directives
+            .last()
+            .map(|d| d.span.end)
+            .or_else(|| program.body.first().map(|s| s.span().start))
+            .unwrap_or(program.span.end);
+        let lexmap = lex
+            .iter()
+            .map(|(n, k)| format!("{n:?}:{k:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let vararr = varlikes
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Throw inside the evaluated code so error event filenames match the
+        // script rather than the prelude URL. `__zp_lex_decl` returns the
+        // colliding identifier name when a conflict is found.
+        let mut replacement = format!(
+            ";{{const __zp_bad=__zp_lex_decl({{{lexmap}}},[{vararr}]);if(__zp_bad!==undefined)throw new SyntaxError(\"Identifier '\"+__zp_bad+\"' has already been declared\");}}"
+        );
+        if !self.cur_sloppy {
+            // After the conflict check, so a redeclaration throws before anything is exported. Dangerous globals (`window`, `location`…) never get a binding.
+            let functions: Vec<String> = program
+                .body
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    Statement::FunctionDeclaration(func) => func.id.as_ref().map(|id| id.name.to_string()),
+                    _ => None,
+                })
+                .filter(|n| varlikes.contains(n) && !is_dangerous_global(n))
+                .collect();
+            let vars: Vec<String> = varlikes
+                .iter()
+                .filter(|n| !functions.contains(n) && !is_dangerous_global(n))
+                .cloned()
+                .collect();
+            for (names, replace) in [(&vars, false), (&functions, true)] {
+                if names.is_empty() {
+                    continue;
+                }
+                let list = names.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(",");
+                let gets = names.iter().map(|n| format!("()=>{n}")).collect::<Vec<_>>().join(",");
+                let sets = names.iter().map(|n| format!("__zp_v=>{{{n}=__zp_v}}")).collect::<Vec<_>>().join(",");
+                replacement += &format!("__zp_export_vars([{list}],[{gets}],[{sets}],{replace});");
+            }
+        }
+        self.patches.push(Patch {
+            start: pos,
+            end: pos,
+            replacement,
+        });
+        // A leading `;` is required: semicolon-terminated declarations include
+        // `;` in their span, but ASI declarations (`const a = { x: 1 }\n`) end
+        // at the initializer and would otherwise glue onto `__zp_lex_bind(`.
+        for (pos, calls) in binds {
+            self.patches.push(Patch {
+                start: pos,
+                end: pos,
+                replacement: format!(";{calls}"),
+            });
+        }
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    // Inline guards:
+    // Every computed member read, write, and call goes through a helper (`__zp_get(o,k)`, `__zp_set`, `__zp_call`). That
+    // is one access site in the runtime for every access the page makes: V8's inline cache there sees every shape and
+    // stays megamorphic, and a call allocates its argument array.
+    // An array, a string, a typed array, or a function is never a window, document, Location, or facade, so for those the
+    // native access is the membrane's answer too (the helpers' own fast path, `__zp_fast` / `__zp_fastset`). The site
+    // keeps it behind that guard, its operands in temps so each is evaluated once, in native order; anything else takes
+    // the helper. Temps are `var`s of the enclosing function (declared at its end), in groups of three: a site's group
+    // is one above every group inside its operands, so sites inside one another never share and siblings do.
+
+    fn guard_enter(&mut self) -> u32 {
+        std::mem::replace(&mut self.guard_height, 0)
+    }
+
+    fn guard_leave(&mut self, saved: u32) {
+        self.guard_height = self.guard_height.max(saved);
+    }
+
+    /// The temp group for the site whose operands were just visited (0 where no `var` can hold them, and inside a page
+    /// `with`, whose object answers for every name first).
+    fn guard_claim(&mut self) -> u32 {
+        if !self.with_temps.is_empty() {
+            return 0;
+        }
+        match self.guard_fns.last_mut() {
+            Some((Some(_), max)) => {
+                let group = self.guard_height + 1;
+                *max = (*max).max(group);
+                self.guard_height = group;
+                group
+            }
+            _ => 0,
+        }
+    }
+
+    /// A function-like scope begins: its temps go at `at` (the body's closing brace), or nowhere.
+    fn guard_fn_enter(&mut self, at: Option<u32>) -> u32 {
+        self.guard_fns.push((at, 0));
+        std::mem::replace(&mut self.guard_height, 0)
+    }
+
+    /// …and ends. The declaration goes after everything in the body, on a line of its own, so nothing the page wrote
+    /// moves (error positions, the dynamic-function unwrapper's slice) and a trailing `//` comment cannot swallow it.
+    /// It replaces the closing brace rather than going in front of it: an insertion there is also the end of whatever
+    /// the body ends with, and a site ending there (`function(){ o[k] = !0 }`) took it into its own operand.
+    fn guard_fn_leave(&mut self, saved: u32) {
+        if let Some((Some(at), groups)) = self.guard_fns.pop() {
+            if groups > 0 {
+                let temps: Vec<String> = (1..=groups * 3).map(|i| format!("__zp_t_{i}")).collect();
+                self.patches.push(Patch { start: at, end: at + 1, replacement: format!("\n;var {};}}", temps.join(",")) });
+            }
+        }
+        self.guard_height = saved;
+    }
+
+    /// A script that binds or writes a runtime helper's name is replaced by one that throws (`reserved_name_violation`).
+    fn refuse_reserved_names(&mut self, program: &Program<'_>, source_len: usize) {
+        if let Some(name) = reserved_name_violation(program) {
+            self.patches = vec![reserved_name_patch(source_len, &name)];
+            self.diagnostics.push(format!("reserved identifier refused: {name}"));
+        }
+    }
+
+    fn declare(&mut self, name: &str) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name.to_string());
+        }
+    }
+
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    /// Rewrite one module specifier string literal to a proxy-routed URL.
+    ///
+    /// Shared by dynamic `import()` and every static form (`import … from`,
+    /// bare `import 'x'`, `export … from`, `export * from`). Because modules are
+    /// served from `<proxy>/zp/api/script?u=<target>&kind=module`, an unrewritten
+    /// relative specifier resolves against `/zp/api/` and requests
+    /// `<proxy>/zp/api/<name>`, which the SW maps onto the target host and 404s.
+    fn rewrite_module_specifier(&mut self, lit: &StringLiteral<'_>) {
+        let raw = lit.value.as_str();
+        // Skip schemes the SW cannot proxy and bare specifiers (package-manager
+        // names with no URL semantics that never round-trip through fetch).
+        let lower = raw.trim_start().to_ascii_lowercase();
+        // A `data:` module is code in its own address, which the service worker serves decoded and rewritten on the module route; the browser would otherwise load it as it is.
+        if lower.starts_with("data:") {
+            self.patches.push(Patch {
+                start: lit.span.start,
+                end: lit.span.end,
+                replacement: format!("'{}'", module_route_url(raw.trim_start(), &self.proxy_origin)),
+            });
+            return;
+        }
+        // A `blob:` module's source is only known where the blob lives, so the page's own rewriter swaps the placeholder for a rewritten copy
+        // (`resolveModuleImportPlaceholders`); anywhere else the unknown scheme fails to load.
+        if lower.starts_with("blob:") {
+            use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+            self.patches.push(Patch {
+                start: lit.span.start,
+                end: lit.span.end,
+                replacement: format!("'zp-import:{}'", utf8_percent_encode(raw.trim_start(), NON_ALPHANUMERIC)),
+            });
+            return;
+        }
+        if lower.starts_with("javascript:")
+            || lower.starts_with("about:")
+            || (!raw.starts_with("./")
+                && !raw.starts_with("../")
+                && !raw.starts_with('/')
+                && !lower.starts_with("http://")
+                && !lower.starts_with("https://"))
+        {
+            return;
+        }
+        let Some(proxied) = proxied_module_url(raw, &self.target_url, &self.proxy_origin) else {
+            return;
+        };
+        // The span covers the literal node including its quotes. Re-quote
+        // with single quotes; the proxied URL never contains one (the query
+        // string is percent-encoded).
+        self.patches.push(Patch {
+            start: lit.span.start,
+            end: lit.span.end,
+            replacement: format!("'{proxied}'"),
+        });
+    }
+
+    /// Shorthand object property whose value is a dangerous global. The single
+    /// identifier is both the key and the value, so the plain GLOBAL_GET patch
+    /// would turn `{ window }` into `{__zp_get(globalThis,"window")}`, a
+    /// syntax error. Emit the expanded `window: __zp_get(globalThis,"window")`
+    /// form instead.
+    fn emit_shorthand_global_get(&mut self, span: Span, name: &str) {
+        self.patches.push(Patch {
+            start: span.start,
+            end: span.end,
+            replacement: format!("\u{1}SHORTHAND_GLOBAL_GET\u{1}{}\u{1}", name),
+        });
+    }
+
+    fn emit_global_get(&mut self, span: Span, name: &str) {
+        // Parenthesization is decided contextually in apply_patches; emit a marker here.
+        self.patches.push(Patch {
+            start: span.start,
+            end: span.end,
+            replacement: format!("\u{1}GLOBAL_GET\u{1}{}\u{1}", name),
+        });
+    }
+
+    /// Allocate a fresh ID for an infinite-loop cap so each replacement
+    /// declares its own counter variable (no cross-loop collision).
+    fn next_loop_id(&mut self) -> u32 {
+        self.infinite_loop_caps += 1;
+        self.infinite_loop_caps
+    }
+
+    /// `await`/`yield` in a loop body means each iteration can suspend;
+    /// an infinite async poll loop is a legitimate pattern (not a V8
+    /// wedge vector), so those loops keep native uncapped semantics.
+    /// Nested functions are a different async context (their `await`
+    /// does not yield the outer loop), so the walk stops at function
+    /// boundaries.
+    fn body_yields<'b>(body: &Statement<'b>) -> bool {
+        struct Y { hit: bool }
+        impl<'b> Visit<'b> for Y {
+            fn visit_await_expression(&mut self, _: &AwaitExpression<'b>) { self.hit = true; }
+            fn visit_yield_expression(&mut self, _: &YieldExpression<'b>) { self.hit = true; }
+            fn visit_for_of_statement(&mut self, s: &ForOfStatement<'b>) {
+                if s.r#await { self.hit = true; return; }
+                walk::walk_for_of_statement(self, s);
+            }
+            fn visit_function(&mut self, _: &Function<'b>, _: oxc_syntax::scope::ScopeFlags) {}
+            fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'b>) {}
+        }
+        let mut y = Y { hit: false };
+        walk::walk_statement(&mut y, body);
+        y.hit
+    }
+
+    /// Warn once when the iteration cap is reached, then exit the loop.
+    fn cap_test(counter: &str) -> String {
+        format!("{counter}++<10000000||(console.warn('[ZeroProxy] infinite-loop cap reached'),false)")
+    }
+
+    /// Fresh temporary name for transform-introduced bindings. `__zp_`
+    /// prefixed so it cannot collide with target identifiers in practice
+    /// (and any accidental collision still routes through the membrane).
+    fn fresh(&mut self, tag: &str) -> String {
+        self.decl_seq += 1;
+        format!("__zp_{tag}_{}", self.decl_seq)
+    }
+
+    /// Classic top-level program scope, where `var`/`function` declarations
+    /// for browser-unforgeable names silently fail to bind.
+    fn global_classic(&self) -> bool {
+        self.kind == ScriptKind::Classic && self.fn_depth == 0
+    }
+
+    /// `__zp_set(globalThis,"name",<tmp>)` or, inside `with`, a nested
+    /// `__zp_with_set` chain that gives each with-object precedence.
+    fn sink_expr(&self, name: &str, tmp: &str) -> String {
+        let mut e = format!("__zp_set(globalThis,{name:?},{tmp})");
+        for t in self.with_temps.iter() {
+            e = format!("__zp_with_set({t},{name:?},{tmp},()=>({e}))");
+        }
+        e
+    }
+
+    /// Direct text for a dangerous identifier used as an assignment target
+    /// (for-of/in left, destructuring element). Member-expression form
+    /// (`__zp_get.d.location`) whose set lands on the prelude write sink.
+    fn emit_target_ident(&mut self, span: Span, name: &str) {
+        if self.with_temps.is_empty() {
+            self.patches.push(Patch {
+                start: span.start,
+                end: span.end,
+                replacement: format!("__zp_get.d.{name}"),
+            });
+        } else {
+            self.patches.push(Patch {
+                start: span.start,
+                end: span.end,
+                replacement: format!(
+                    "\u{1}WTREF\u{1}{}\u{1}{}\u{1}",
+                    self.with_temps.join("\u{2}"),
+                    name
+                ),
+            });
+        }
+    }
+
+    /// Direct text for a dangerous identifier read inside a `with` body:
+    /// object-first resolution, then fall through to the next `with` or the
+    /// membrane global.
+    fn with_get_chain(&self, name: &str) -> String {
+        let mut e = format!("__zp_get(globalThis,{name:?})");
+        for t in self.with_temps.iter() {
+            e = format!("__zp_with_get({t},{name:?},()=>({e}))");
+        }
+        e
+    }
+
+    /// Fallback chain used inside write/update helpers: evaluates to the
+    /// membrane global op when no with-object owns the name.
+    fn with_update_chain(&self, name: &str, op: &str, prefix: bool) -> String {
+        let mut e = format!("__zp_update(globalThis,{name:?},{op:?},{})", prefix as u8);
+        for t in self.with_temps.iter() {
+            e = format!("__zp_with_update({t},{name:?},{op:?},{},()=>({e}))", prefix as u8);
+        }
+        e
+    }
+
+    fn with_delete_chain(&self, name: &str) -> String {
+        let mut e = format!("__zp_delete(globalThis,{name:?})");
+        for t in self.with_temps.iter() {
+            e = format!("__zp_with_delete({t},{name:?},()=>({e}))");
+        }
+        e
+    }
+
+    /// Rename dangerous bindings inside a `var` destructuring pattern to
+    /// fresh temps (patching the pattern text) and queue the sinks that
+    /// forward each temp into the membrane. Non-dangerous names are returned
+    /// for normal declaration.
+    fn transform_dangerous_pattern<'a>(
+        &mut self,
+        pat: &BindingPattern<'a>,
+        sinks: &mut Vec<(String, String)>,
+        declares: &mut Vec<String>,
+    ) {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                let name = id.name.as_str();
+                if is_dangerous_global(name) {
+                    let tmp = self.fresh("dp");
+                    self.patches.push(Patch {
+                        start: id.span.start,
+                        end: id.span.end,
+                        replacement: tmp.clone(),
+                    });
+                    sinks.push((name.to_string(), tmp));
+                } else {
+                    declares.push(name.to_string());
+                }
+            }
+            BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    if prop.shorthand {
+                        // `{location}` / `{location = 1}`: one identifier is
+                        // both key and binding; expand to `location: <tmp>`
+                        // so the rename keeps the property key.
+                        if let Some((id, _)) = shorthand_binding(&prop.value) {
+                            let name = id.name.as_str();
+                            if is_dangerous_global(name) {
+                                let tmp = self.fresh("dp");
+                                self.patches.push(Patch {
+                                    start: id.span.start,
+                                    end: id.span.end,
+                                    replacement: format!("{name}: {tmp}"),
+                                });
+                                sinks.push((name.to_string(), tmp));
+                                continue;
+                            }
+                        }
+                    }
+                    self.transform_dangerous_pattern(&prop.value, sinks, declares);
+                }
+                if let Some(rest) = &obj.rest {
+                    self.transform_dangerous_pattern(&rest.argument, sinks, declares);
+                }
+            }
+            BindingPattern::ArrayPattern(arr) => {
+                for el in &arr.elements {
+                    if let Some(el) = el {
+                        self.transform_dangerous_pattern(el, sinks, declares);
+                    }
+                }
+                if let Some(rest) = &arr.rest {
+                    self.transform_dangerous_pattern(&rest.argument, sinks, declares);
+                }
+            }
+            BindingPattern::AssignmentPattern(asn) => {
+                self.transform_dangerous_pattern(&asn.left, sinks, declares);
+            }
+        }
+    }
+
+    /// One declarator of a classic global `var` statement. Dangerous names
+    /// cannot bind (`var location` is silently ignored by the engine and the
+    /// identifier keeps resolving to the real global), so they are either
+    /// left untouched (no init, a harmless no-op) or rewritten into a
+    /// membrane-set expression for the initializer.
+    fn global_var_declarator<'a>(&mut self, d: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(id) = &d.id {
+            let name = id.name.as_str();
+            if is_dangerous_global(name) {
+                if self.for_iter_head {
+                    // `for (var location of xs)`: no init allowed; bind a
+                    // temp per iteration and sink it inside the body.
+                    let tmp = self.fresh("dp");
+                    self.patches.push(Patch {
+                        start: id.span.start,
+                        end: id.span.end,
+                        replacement: tmp.clone(),
+                    });
+                    if let Some(top) = self.iter_sinks.last_mut() {
+                        top.push((name.to_string(), tmp));
+                    }
+                } else if let Some(init) = &d.init {
+                    // `var location = x` becomes `__zp_vdcl_N = (set(globalThis,
+                    // "location", (x)), void 0)` so the write lands on the
+                    // virtual location, mirroring native `location = x`.
+                    let tmp = self.fresh("vdcl");
+                    let ispan = init.span();
+                    let replacement = if self.with_temps.is_empty() {
+                        format!(
+                            "\u{1}VAR_SET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            tmp, name, ispan.start, ispan.end
+                        )
+                    } else {
+                        format!(
+                            "\u{1}VAR_WSET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            tmp,
+                            name,
+                            ispan.start,
+                            ispan.end,
+                            self.with_temps.join("\u{2}")
+                        )
+                    };
+                    self.patches.push(Patch {
+                        start: d.span.start,
+                        end: d.span.end,
+                        replacement,
+                    });
+                }
+                // `var location` (no init): silently ignored by the engine;
+                // leave the text and do not declare the name.
+                return;
+            }
+            self.declare(name);
+            if let Some(init) = &d.init {
+                self.visit_expression(init);
+            }
+            return;
+        }
+        // Destructuring `var`: rename dangerous bindings to temps, then
+        // sink each into the membrane once the pattern has been assigned.
+        let mut sinks: Vec<(String, String)> = Vec::new();
+        let mut declares: Vec<String> = Vec::new();
+        self.transform_dangerous_pattern(&d.id, &mut sinks, &mut declares);
+        for n in declares {
+            self.declare(&n);
+        }
+        walk::walk_binding_pattern(self, &d.id);
+        if let Some(init) = &d.init {
+            self.visit_expression(init);
+        }
+        if sinks.is_empty() {
+            return;
+        }
+        if self.for_iter_head {
+            if let Some(top) = self.iter_sinks.last_mut() {
+                top.extend(sinks);
+            }
+        } else {
+            let sets = sinks
+                .iter()
+                .map(|(n, t)| self.sink_expr(n, t))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sk = self.fresh("sk");
+            self.patches.push(Patch {
+                start: d.span.end,
+                end: d.span.end,
+                replacement: format!(",{sk}=({sets},void 0)"),
+            });
+        }
+    }
+
+    /// Inject per-iteration sinks at the top of a `for-of`/`for-in` body.
+    /// Block bodies get an insertion just inside `{`; single-statement
+    /// bodies are wrapped in a block so the sink runs every iteration.
+    fn inject_iter_sinks<'a>(&mut self, body: &Statement<'a>, sinks: &[(String, String)]) {
+        if sinks.is_empty() {
+            return;
+        }
+        let sets = sinks
+            .iter()
+            .map(|(n, t)| self.sink_expr(n, t))
+            .collect::<Vec<_>>()
+            .join(";");
+        match body {
+            Statement::BlockStatement(b) => {
+                self.patches.push(Patch {
+                    start: b.span.start + 1,
+                    end: b.span.start + 1,
+                    replacement: format!("{sets};"),
+                });
+            }
+            _ => {
+                self.patches.push(Patch {
+                    start: body.span().start,
+                    end: body.span().start,
+                    replacement: format!("{{{sets};"),
+                });
+                self.patches.push(Patch {
+                    start: body.span().end,
+                    end: body.span().end,
+                    replacement: "}".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// `{location}` / `{location = 1}` inside a binding object pattern: the
+/// shorthand identifier carries both the key and the binding.
+fn shorthand_binding<'a>(pat: &'a BindingPattern<'a>) -> Option<(&'a BindingIdentifier<'a>, bool)> {
+    match pat {
+        BindingPattern::BindingIdentifier(id) => Some((id, false)),
+        BindingPattern::AssignmentPattern(asn) => {
+            if let BindingPattern::BindingIdentifier(id) = &asn.left {
+                Some((id, true))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Category of a collected declaration name. Only `VarLike` matters: at
+/// classic top level, var-like declarations for unforgeable globals never
+/// produce a binding and must not shadow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindCat {
+    VarLike,
+    Lexical,
+}
+
+/// Pre-collect declaration names for one statement list (scope body).
+///
+/// - `top_level` marks statements belonging directly to the collected list;
+///   nested statements are only scanned for `var` names (which hoist out).
+/// - `fn_like` marks program/function bodies, where a top-level function
+///   declaration is var-like; block-level function declarations are treated
+///   as lexical (strict semantics; sloppy Annex B stays jail-safe).
+/// - `sloppy`: in sloppy mode, function declarations inside nested blocks,
+///   labeled statements, or single-statement positions also hoist a `var`
+///   binding into the enclosing `varEnv` per Annex B.3.2/3.3/3.4. Registering
+///   them as `VarLike` on the collecting function/program scope prevents
+///   references outside the block from leaking to the virtual global. The
+///   emitted declaration stays in place so the JS engine performs the actual
+///   hoisting while the rewriter only adjusts reference resolution.
+fn collect_scope_decl_names<'a>(
+    stmts: &'a [Statement<'a>],
+    fn_like: bool,
+    sloppy: bool,
+    out: &mut dyn FnMut(&'a str, BindCat),
+) {
+    fn one<'a>(
+        stmt: &'a Statement<'a>,
+        top_level: bool,
+        fn_like: bool,
+        sloppy: bool,
+        out: &mut dyn FnMut(&'a str, BindCat),
+    ) {
+        match stmt {
+            Statement::VariableDeclaration(d) => {
+                let cat = if d.kind == VariableDeclarationKind::Var {
+                    BindCat::VarLike
+                } else {
+                    BindCat::Lexical
+                };
+                if cat == BindCat::VarLike || top_level {
+                    for dec in &d.declarations {
+                        collect_binding_pattern(&dec.id, &mut |n| out(n, cat));
+                    }
+                }
+            }
+            Statement::FunctionDeclaration(f) => {
+                if top_level {
+                    if let Some(id) = &f.id {
+                        out(id.name.as_str(), if fn_like { BindCat::VarLike } else { BindCat::Lexical });
+                    }
+                } else if sloppy {
+                    // Annex B: var-side binding of a function declaration inside a
+                    // block, label, or single-statement position. The block-local
+                    // lexical binding is collected separately when visiting the block.
+                    if let Some(id) = &f.id {
+                        out(id.name.as_str(), BindCat::VarLike);
+                    }
+                }
+            }
+            Statement::ClassDeclaration(c) => {
+                if top_level {
+                    if let Some(id) = &c.id {
+                        out(id.name.as_str(), BindCat::Lexical);
+                    }
+                }
+            }
+            Statement::ImportDeclaration(i) => {
+                if top_level {
+                    if let Some(specs) = &i.specifiers {
+                        for spec in specs {
+                            let local = match spec {
+                                ImportDeclarationSpecifier::ImportSpecifier(s) => &s.local,
+                                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => &s.local,
+                                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => &s.local,
+                            };
+                            out(local.name.as_str(), BindCat::Lexical);
+                        }
+                    }
+                }
+            }
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(decl) = &e.declaration {
+                    match decl {
+                        Declaration::VariableDeclaration(d) => {
+                            for dec in &d.declarations {
+                                collect_binding_pattern(&dec.id, &mut |n| out(n, BindCat::Lexical));
+                            }
+                        }
+                        Declaration::FunctionDeclaration(f) => {
+                            if let Some(id) = &f.id {
+                                out(id.name.as_str(), BindCat::Lexical);
+                            }
+                        }
+                        Declaration::ClassDeclaration(c) => {
+                            if let Some(id) = &c.id {
+                                out(id.name.as_str(), BindCat::Lexical);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Statement::ExportDefaultDeclaration(e) => {
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(f) = &e.declaration {
+                    if let Some(id) = &f.id {
+                        out(id.name.as_str(), BindCat::Lexical);
+                    }
+                }
+            }
+            Statement::BlockStatement(b) => {
+                for s in &b.body {
+                    one(s, false, fn_like, sloppy, out);
+                }
+            }
+            Statement::IfStatement(i) => {
+                one(&i.consequent, false, fn_like, sloppy, out);
+                if let Some(alt) = &i.alternate {
+                    one(alt, false, fn_like, sloppy, out);
+                }
+            }
+            Statement::ForStatement(f) => {
+                if let Some(ForStatementInit::VariableDeclaration(d)) = &f.init {
+                    if d.kind == VariableDeclarationKind::Var {
+                        for dec in &d.declarations {
+                            collect_binding_pattern(&dec.id, &mut |n| out(n, BindCat::VarLike));
+                        }
+                    }
+                }
+                one(&f.body, false, fn_like, sloppy, out);
+            }
+            Statement::ForInStatement(_) | Statement::ForOfStatement(_) => {
+                // handled by shared arm below
+                let (left, body) = match stmt {
+                    Statement::ForInStatement(s) => (&s.left, &s.body),
+                    Statement::ForOfStatement(s) => (&s.left, &s.body),
+                    _ => unreachable!(),
+                };
+                if let ForStatementLeft::VariableDeclaration(d) = left {
+                    if d.kind == VariableDeclarationKind::Var {
+                        for dec in &d.declarations {
+                            collect_binding_pattern(&dec.id, &mut |n| out(n, BindCat::VarLike));
+                        }
+                    }
+                }
+                one(body, false, fn_like, sloppy, out);
+            }
+            Statement::WhileStatement(w) => one(&w.body, false, fn_like, sloppy, out),
+            Statement::DoWhileStatement(w) => one(&w.body, false, fn_like, sloppy, out),
+            Statement::TryStatement(t) => {
+                for s in &t.block.body {
+                    one(s, false, fn_like, sloppy, out);
+                }
+                if let Some(h) = &t.handler {
+                    for s in &h.body.body {
+                        one(s, false, fn_like, sloppy, out);
+                    }
+                }
+                if let Some(f) = &t.finalizer {
+                    for s in &f.body {
+                        one(s, false, fn_like, sloppy, out);
+                    }
+                }
+            }
+            Statement::SwitchStatement(s) => {
+                for case in &s.cases {
+                    for st in &case.consequent {
+                        one(st, false, fn_like, sloppy, out);
+                    }
+                }
+            }
+            Statement::LabeledStatement(l) => one(&l.body, false, fn_like, sloppy, out),
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        one(stmt, true, fn_like, sloppy, out);
+    }
+}
+
+/// Resolve `raw` against `base` per RFC 3986 §5.3, covering relative path,
+/// absolute path, and absolute URL module specifiers. Restricted to http(s)
+/// ASCII inputs; punycode / IDN handling is omitted to avoid pulling the full
+/// `url` crate (~250 KB in the page bundle via ICU). Returns `None` for
+/// unparsable or non-http(s) inputs.
+pub(crate) fn resolve_module_base(raw: &str, base: &str) -> Option<String> {
+    let raw = raw.trim();
+    // 1. raw is already an absolute URL: return as-is (after scheme check).
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        // Reject bytes outside printable ASCII to keep the encoder predictable.
+        if raw.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
+            return None;
+        }
+        return Some(raw.to_string());
+    }
+    // Parse `base` into (scheme, authority, path). RFC 3986 §3.
+    let scheme_end = base.find("://")?;
+    let scheme = &base[..scheme_end];
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let rest = &base[scheme_end + 3..];
+    // Authority is everything before the next '/' '?' or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let base_path_with_q = &rest[auth_end..];
+    // Strip query and fragment from base path per RFC 3986 §5.3.
+    let path_end = base_path_with_q.find(['?', '#']).unwrap_or(base_path_with_q.len());
+    let base_path = if path_end == 0 { "/" } else { &base_path_with_q[..path_end] };
+
+    // 2. raw is host-absolute: keep authority, replace path.
+    if let Some(after_slash) = raw.strip_prefix('/') {
+        return Some(format!("{scheme}://{authority}/{after_slash}"));
+    }
+    // 3. raw is relative: resolve against base_path's directory.
+    // Take everything up to the last '/' in base_path (the "directory").
+    let dir_end = base_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let dir = &base_path[..dir_end];
+    let combined = format!("{dir}{raw}");
+
+    // Collapse `./` and `../` segments per RFC 3986 §5.2.4.
+    let trailing_slash = combined.ends_with('/');
+    let mut segments: Vec<String> = Vec::new();
+    for seg in combined.split('/') {
+        match seg {
+            "" => continue,
+            "." => continue,
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other.to_string()),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segments.join("/"));
+    if trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    Some(format!("{scheme}://{authority}{out}"))
+}
+
+/// Escape a string for embedding inside a double-quoted JS literal. Only the
+/// two characters that can terminate or escape the literal need handling; the
+/// values we embed are URLs, which never contain raw newlines.
+fn js_quote_body(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Source spelling of a compound assignment operator, as `__zp_assign`'s
+/// switch expects it. `None` for plain `=` (handled by `__zp_set`) so an
+/// unmapped operator degrades to "leave native" instead of emitting a call the
+/// membrane would reject.
+fn assignment_operator_str(op: oxc_syntax::operator::AssignmentOperator) -> Option<&'static str> {
+    use oxc_syntax::operator::AssignmentOperator as A;
+    Some(match op {
+        A::Assign => return None,
+        A::Addition => "+=",
+        A::Subtraction => "-=",
+        A::Multiplication => "*=",
+        A::Division => "/=",
+        A::Remainder => "%=",
+        A::Exponential => "**=",
+        A::ShiftLeft => "<<=",
+        A::ShiftRight => ">>=",
+        A::ShiftRightZeroFill => ">>>=",
+        A::BitwiseAnd => "&=",
+        A::BitwiseOR => "|=",
+        A::BitwiseXOR => "^=",
+        A::LogicalAnd => "&&=",
+        A::LogicalOr => "||=",
+        A::LogicalNullish => "??=",
+    })
+}
+
+/// Logical compound assignments short-circuit, so `__zp_assign` receives their
+/// right-hand side as a thunk and only calls it when the write happens.
+fn is_logical_assignment(op: oxc_syntax::operator::AssignmentOperator) -> bool {
+    use oxc_syntax::operator::AssignmentOperator as A;
+    matches!(op, A::LogicalAnd | A::LogicalOr | A::LogicalNullish)
+}
+
+fn proxied_module_url(raw: &str, target_url: &str, proxy_origin: &str) -> Option<String> {
+    if target_url.is_empty() {
+        return None;
+    }
+    let abs = resolve_module_base(raw, target_url)?;
+    Some(module_route_url(&abs, proxy_origin))
+}
+
+/// The service worker's module route for an absolute address: `http(s):`, or a `data:` module, which carries its own code.
+fn module_route_url(abs: &str, proxy_origin: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    const QUERY_ENC: &AsciiSet = &CONTROLS
+        .add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'&').add(b'=')
+        .add(b'+').add(b'%').add(b'?').add(b'/').add(b':').add(b';').add(b'\'')
+        .add(b'\\').add(b'`').add(b'{').add(b'}').add(b'[').add(b']').add(b'^').add(b'|');
+    let encoded = utf8_percent_encode(abs, QUERY_ENC).to_string();
+    format!("{}/zp/api/script?u={encoded}&kind=module", proxy_origin.trim_end_matches('/'))
+}
+
+/// Detect a `true`-equivalent constant expression (`true` literal or non-zero
+/// numeric literal). Strings, objects, and other truthy forms are left alone
+/// so only unambiguous infinite loop forms are capped.
+fn is_truthy_constant(expr: &Expression) -> bool {
+    match expr {
+        Expression::BooleanLiteral(b) => b.value,
+        Expression::NumericLiteral(n) => n.value != 0.0,
+        // Parenthesised: peer through.
+        Expression::ParenthesizedExpression(p) => is_truthy_constant(&p.expression),
+        _ => false,
+    }
+}
+
+/// The site visitors, wrapped by the `Visit` methods of the same names, which measure inline-guard heights around them
+/// (`guard_enter` / `guard_leave`).
+impl RewriteVisitor {
+    fn call_site<'a>(&mut self, expr: &CallExpression<'a>) {
+        if let Expression::ComputedMemberExpression(member) = &expr.callee {
+            self.ccall_callees.insert((member.span.start, member.span.end));
+        }
+        // First walk children (args + callee) so global identifiers are
+        // patched normally. Then check if this is a dangerous method call.
+        walk::walk_call_expression(self, expr);
+
+        // Unshadowed direct `eval(args)`: caller-scope parity.
+        // Emitted form: `__zp_eval.call(this, [args][0], desc, strict)`.
+        // The runtime turns it back into a real direct eval whose env chain
+        // is the helper's, while `with(desc)` (accessors evaluated in the
+        // caller's lexical position) exposes every in-scope binding and
+        // `.call(this)` forwards the caller's thisEnv. Literal strings take
+        // the same path because `__zp_eval` rewrites the source at runtime.
+        // `eval?.()`, `(0,eval)`, and shadowed `eval` stay indirect because
+        // native gives those no caller scope either.
+        if !expr.optional {
+            if let Expression::Identifier(callee) = &expr.callee {
+                if callee.name.as_str() == "eval" && !self.is_shadowed("eval") {
+                    // Hoist `var`/`function` declarations from a sloppy literal
+                    // `eval` into the caller's `varEnv` before building `desc`
+                    // so `desc` accessors bind those names and evaluated
+                    // `__zp_set` calls reach them through `desc`.
+                    if self.cur_sloppy {
+                        if let Some(Argument::StringLiteral(lit)) = expr.arguments.first() {
+                            self.hoist_eval_var_decls(&lit.value);
+                        }
+                    }
+                    let desc = self.caller_desc_object();
+                    let (as_, ae) = call_args_span(expr);
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        // `<strict>` records whether the call site is strict. A
+                        // strict caller's `eval` is a strict `eval` where a
+                        // `with` wrapper is illegal, so the runtime takes the
+                        // raw path.
+                        replacement: format!(
+                            "\u{1}DEVAL\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            as_, ae, !self.cur_sloppy as u8, self.global_classic() as u8, desc
+                        ),
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Computed callee `x[k](args)`: the callee's CGET patch stays
+        // inside the outer span and is dropped; the resolver rewrites
+        // object/key/args via rewrite_range.
+        if let Expression::ComputedMemberExpression(member) = &expr.callee {
+            if !matches!(member.object, Expression::Super(_)) {
+                use oxc_span::GetSpan;
+                let obj_span = member.object.span();
+                let key_span = member.expression.span();
+                let (as_, ae) = call_args_span(expr);
+                let marker = if expr.optional || member.optional {
+                    // Bit0: the CALL is optional (`?.()`), bit1: the BASE
+                    // access is optional (`x?.[k]`). `x[k]?.()` must still
+                    // throw when x is null; only the call is guarded.
+                    let flags = (member.optional as u8) * 2 + expr.optional as u8;
+                    format!(
+                        "\u{1}OCALL\u{1}{}\u{1}{}\u{1}{}\u{1}E\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, flags,
+                        key_span.start, key_span.end, as_, ae
+                    )
+                } else {
+                    let group = self.guard_claim();
+                    format!(
+                        "\u{1}CCALL\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, key_span.start, key_span.end, as_, ae, group
+                    )
+                };
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement: marker,
+                });
+                return;
+            }
+        }
+
+        if let Expression::StaticMemberExpression(member) = &expr.callee {
+            let method = member.property.name.as_str();
+
+            // Reflect.get(obj, 'dangerous') / Reflect.set(obj, 'dangerous', val) /
+            // Object.getOwnPropertyDescriptor(obj, 'dangerous'): rewrite to the
+            // membrane equivalent so the descriptor / value returned is the
+            // proxy-wrapped one rather than a clean native reference.
+            if let Expression::Identifier(recv) = &member.object {
+                let recv_name = recv.name.as_str();
+                if !self.is_shadowed(recv_name) {
+                    use oxc_span::GetSpan;
+                    if recv_name == "Reflect" && (method == "get" || method == "set") {
+                        // `Reflect.get`/`Reflect.set` on a dangerous name goes through `__zp_rget`/`__zp_rset` like a
+                        // computed key does: they keep Reflect's own contract (a non-object throws, `set` answers `true`,
+                        // and the receiver argument is honoured), which a member read or write would not.
+                        // Computed/dynamic property (`Reflect.get(doc, k)`,
+                        // `Reflect.set(doc, k, v)`) routes through the
+                        // membrane helpers, which fall through to native
+                        // Reflect for unrelated names. A static safe prop
+                        // keeps the native call to avoid an extra hop.
+                        let static_prop = static_string_arg(&expr.arguments, 1);
+                        let needs_mediation = match static_prop {
+                            Some(p) => is_dangerous_member(p) || is_dangerous_global(p),
+                            None => true,
+                        };
+                        if needs_mediation {
+                        if let Some(arg0) = expr.arguments.first() {
+                            let obj_span = arg0.span();
+                            let key_span = expr.arguments.get(1).map(|a| a.span());
+                            if method == "get" && expr.arguments.len() >= 2 {
+                                let ks = key_span.unwrap();
+                                let (has_r, rs, re) = if let Some(r) = expr.arguments.get(2) {
+                                    let s = r.span();
+                                    (1, s.start, s.end)
+                                } else {
+                                    (0, 0, 0)
+                                };
+                                self.patches.push(Patch {
+                                    start: expr.span.start,
+                                    end: expr.span.end,
+                                    replacement: format!(
+                                        "\u{1}RGET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                                        obj_span.start, obj_span.end, ks.start, ks.end, has_r, rs, re
+                                    ),
+                                });
+                                return;
+                            }
+                            if method == "set" && expr.arguments.len() >= 3 {
+                                let ks = key_span.unwrap();
+                                let vs = expr.arguments[2].span();
+                                let (has_r, rs, re) = if let Some(r) = expr.arguments.get(3) {
+                                    let s = r.span();
+                                    (1, s.start, s.end)
+                                } else {
+                                    (0, 0, 0)
+                                };
+                                self.patches.push(Patch {
+                                    start: expr.span.start,
+                                    end: expr.span.end,
+                                    replacement: format!(
+                                        "\u{1}RSET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                                        obj_span.start, obj_span.end, ks.start, ks.end,
+                                        vs.start, vs.end, has_r, rs, re
+                                    ),
+                                });
+                                return;
+                            }
+                        }
+                        }
+                    }
+                    if recv_name == "Reflect" || recv_name == "Object" {
+                        if let Some(arg0) = expr.arguments.first() {
+                            let obj_span = arg0.span();
+                            match method {
+                                "getOwnPropertyDescriptor" if expr.arguments.len() >= 2 => {
+                                    let ks = expr.arguments[1].span();
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}GOPD\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end, ks.start, ks.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "getOwnPropertyDescriptors" if recv_name == "Object" => {
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}GOPDS\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "getOwnPropertyNames" if recv_name == "Object" => {
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}GOWN\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "keys" if recv_name == "Object" => {
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}OKEYS\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "has" if recv_name == "Reflect" && expr.arguments.len() >= 2 => {
+                                    let ks = expr.arguments[1].span();
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}RHAS\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end, ks.start, ks.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "deleteProperty" if recv_name == "Reflect" && expr.arguments.len() >= 2 => {
+                                    let ks = expr.arguments[1].span();
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}CDELE\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}0\u{1}",
+                                            obj_span.start, obj_span.end, ks.start, ks.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                "ownKeys" if recv_name == "Reflect" => {
+                                    self.patches.push(Patch {
+                                        start: expr.span.start,
+                                        end: expr.span.end,
+                                        replacement: format!(
+                                            "\u{1}ROWK\u{1}{}\u{1}{}\u{1}",
+                                            obj_span.start, obj_span.end
+                                        ),
+                                    });
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Same reason as visit_static_member_expression / assignment:
+            // `super.method(...)` must stay literal; wrapping it strips the
+            // class context and triggers "'super' keyword unexpected here".
+            if matches!(member.object, Expression::Super(_)) {
+                return;
+            }
+            // A dangerous PROP in callee position is a method call, not a get.
+            // Rewriting `s.search(re)` as `__zp_get(s,"search")(re)` drops the
+            // receiver so `String.prototype.search` throws "called on null or
+            // undefined". `__zp_call` keeps the receiver and falls through to
+            // native for unrelated objects.
+            if is_dangerous_method(method) || is_dangerous_member(method) {
+                use oxc_span::GetSpan;
+                // Drop the callee's own MEMBER_GET patch first: it spans
+                // `obj.prop`, which straddles the METHOD_CALL's object range,
+                // and two overlapping patches cannot both be rendered.
+                if is_dangerous_member(method) {
+                    let callee_span = member.span();
+                    self.patches
+                        .retain(|p| !(p.start == callee_span.start && p.end == callee_span.end));
+                }
+                let obj_span = member.object.span();
+                let (args_start, args_end) = call_args_span(expr);
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement: if expr.optional || member.optional {
+                        let flags = (member.optional as u8) * 2 + expr.optional as u8;
+                        format!(
+                            "\u{1}OCALL\u{1}{}\u{1}{}\u{1}{}\u{1}L\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            obj_span.start, obj_span.end, flags,
+                            method, args_start, args_end
+                        )
+                    } else {
+                        format!(
+                            "\u{1}METHOD_CALL\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            obj_span.start, obj_span.end, method, args_start, args_end
+                        )
+                    },
+                });
+            }
+        }
+    }
+
+    fn assignment_site<'a>(&mut self, expr: &AssignmentExpression<'a>) {
+        // A bare dangerous global as the assignment target (`location = url`).
+        // The identifier visitor patches it to `__zp_get(globalThis,"location")`,
+        // which is not a valid assignment target (`ReferenceError: Invalid
+        // left-hand side in assignment` at runtime). Route the write through
+        // the membrane setter instead.
+        if let AssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.left {
+            let name = ident.name.as_str();
+            if is_dangerous_global(name) && !self.is_shadowed(name) {
+                use oxc_span::GetSpan;
+                self.visit_expression(&expr.right);
+                let value_span = expr.right.span();
+                let op = expr.operator;
+                if !self.with_temps.is_empty() {
+                    // `with(o){ location = x }`: object-first write, global
+                    // membrane fallback.
+                    let replacement = if op == oxc_syntax::operator::AssignmentOperator::Assign {
+                        format!(
+                            "\u{1}WITH_SET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            name,
+                            value_span.start,
+                            value_span.end,
+                            self.with_temps.join("\u{2}")
+                        )
+                    } else {
+                        let Some(op_str) = assignment_operator_str(op) else {
+                            return;
+                        };
+                        format!(
+                            "\u{1}WITH_ASSIGN\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            name,
+                            op_str,
+                            value_span.start,
+                            value_span.end,
+                            if is_logical_assignment(op) { "1" } else { "0" },
+                            self.with_temps.join("\u{2}")
+                        )
+                    };
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        replacement,
+                    });
+                    return;
+                }
+                let replacement = if op == oxc_syntax::operator::AssignmentOperator::Assign {
+                    format!(
+                        "\u{1}GLOBAL_SET\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        name, value_span.start, value_span.end
+                    )
+                } else {
+                    // `__zp_assign` mirrors every compound operator, including
+                    // the short-circuiting logical forms, which take the value
+                    // as a thunk so it is not evaluated when the assignment is
+                    // skipped.
+                    let Some(op_str) = assignment_operator_str(op) else {
+                        return;
+                    };
+                    format!(
+                        "\u{1}GLOBAL_ASSIGN\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        name,
+                        op_str,
+                        value_span.start,
+                        value_span.end,
+                        if is_logical_assignment(op) { "1" } else { "0" }
+                    )
+                };
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement,
+                });
+                return;
+            }
+            // Non-dangerous identifier target: walk both sides normally.
+            self.visit_assignment_target(&expr.left);
+            self.visit_expression(&expr.right);
+            return;
+        }
+        // Computed member target `x[k] = v` / `x[k] += v`.
+        if let AssignmentTarget::ComputedMemberExpression(target) = &expr.left {
+            if matches!(target.object, Expression::Super(_)) {
+                walk::walk_assignment_expression(self, expr);
+                return;
+            }
+            use oxc_span::GetSpan;
+            self.visit_expression(&target.object);
+            self.visit_expression(&target.expression);
+            self.visit_expression(&expr.right);
+            let obj_span = target.object.span();
+            let key_span = target.expression.span();
+            let value_span = expr.right.span();
+            let op = expr.operator;
+            let replacement = if op == oxc_syntax::operator::AssignmentOperator::Assign {
+                let group = self.guard_claim();
+                format!(
+                    "\u{1}CSET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                    obj_span.start, obj_span.end, key_span.start, key_span.end,
+                    value_span.start, value_span.end, group
+                )
+            } else {
+                let Some(op_str) = assignment_operator_str(op) else {
+                    return;
+                };
+                format!(
+                    "\u{1}CASSIGN\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                    obj_span.start, obj_span.end, key_span.start, key_span.end,
+                    op_str, value_span.start, value_span.end,
+                    if is_logical_assignment(op) { "1" } else { "0" }
+                )
+            };
+            self.patches.push(Patch {
+                start: expr.span.start,
+                end: expr.span.end,
+                replacement,
+            });
+            return;
+        }
+        if let AssignmentTarget::StaticMemberExpression(target) = &expr.left {
+            // `super.x = v`: keep literal for the same reason as reads.
+            if matches!(target.object, Expression::Super(_)) {
+                walk::walk_assignment_expression(self, expr);
+                return;
+            }
+            let prop = target.property.name.as_str();
+            if is_dangerous_member(prop) {
+                use oxc_span::GetSpan;
+                self.visit_expression(&target.object);
+                self.visit_expression(&expr.right);
+                let obj_span = target.object.span();
+                let value_span = expr.right.span();
+                let op = expr.operator;
+                let replacement = if op == oxc_syntax::operator::AssignmentOperator::Assign {
+                    format!(
+                        "\u{1}MEMBER_SET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, prop, value_span.start, value_span.end
+                    )
+                } else {
+                    // `x.location += v`: `__zp_assign` preserves operator and
+                    // logical short-circuit semantics.
+                    let Some(op_str) = assignment_operator_str(op) else {
+                        return;
+                    };
+                    format!(
+                        "\u{1}MEMBER_A\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, prop, op_str,
+                        value_span.start, value_span.end,
+                        if is_logical_assignment(op) { "1" } else { "0" }
+                    )
+                };
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement,
+                });
+                return;
+            }
+            // Non-dangerous member: normal walk (receiver reads rewrite).
+            walk::walk_assignment_expression(self, expr);
+            return;
+        }
+        // Destructuring / rest / default targets: identifiers inside are
+        // write targets, not reads.
+        self.in_target += 1;
+        self.visit_assignment_target(&expr.left);
+        self.in_target -= 1;
+        self.visit_expression(&expr.right);
+    }
+
+    fn computed_member_site<'a>(&mut self, expr: &ComputedMemberExpression<'a>) {
+        // Route every non-literal or dangerous-literal computed member access
+        // through `__zp_cget`, which falls back to plain `x[k]` for unrelated
+        // names and preserves the nullish TypeError.
+        walk::walk_computed_member_expression(self, expr);
+        if matches!(expr.object, Expression::Super(_)) {
+            return;
+        }
+        if let Expression::StringLiteral(lit) = &expr.expression {
+            let name = lit.value.as_str();
+            if !is_dangerous_member(name) && !is_dangerous_global(name) && !is_dangerous_method(name) {
+                return;
+            }
+        }
+        use oxc_span::GetSpan;
+        let obj_span = expr.object.span();
+        let key_span = expr.expression.span();
+        // A computed call's callee: the call is the site (`call_site`).
+        let group = if expr.optional || self.ccall_callees.contains(&(expr.span.start, expr.span.end)) {
+            0
+        } else {
+            self.guard_claim()
+        };
+        self.patches.push(Patch {
+            start: expr.span.start,
+            end: expr.span.end,
+            replacement: if expr.optional {
+                format!(
+                    "\u{1}OGET\u{1}{}\u{1}{}\u{1}E\u{1}{}\u{1}{}\u{1}",
+                    obj_span.start, obj_span.end, key_span.start, key_span.end
+                )
+            } else {
+                format!(
+                    "\u{1}CGET\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                    obj_span.start, obj_span.end, key_span.start, key_span.end, group
+                )
+            },
+        });
+    }
+}
+
+impl<'a> Visit<'a> for RewriteVisitor {
+    fn visit_program(&mut self, program: &Program<'a>) {
+        // Hoist-aware pre-collection: collect every binding that this scope
+        // level owns before walking the body so hoisted locals (`f(){ location;
+        // var location; }`) shadow before their declaration text.
+        //
+        // Classic top level only: `var`/`function` declarations for
+        // unforgeable browser globals do not create bindings (`var location`
+        // is silently ignored and `location` still resolves to the real
+        // window.location). Lexical, module, and function-local declarations
+        // shadow normally.
+        self.cur_sloppy = self.kind != ScriptKind::Module && !Self::has_use_strict(&program.directives);
+        let mut top_varlikes: Vec<String> = Vec::new();
+        collect_scope_decl_names(&program.body, true, self.cur_sloppy, &mut |name, cat| {
+            // Internal wrapper function names such as `__zp_dynamic__` are not
+            // subject to `checkvar`. Emitting a prefix before the wrapper would
+            // cause `rewriteDynamicFunctionBody` to slice through the declaration.
+            if cat == BindCat::VarLike
+                && !name.starts_with("__zp_")
+                && !name.starts_with("__ZP_")
+                && !top_varlikes.iter().any(|n| n == name)
+            {
+                top_varlikes.push(name.to_string());
+            }
+            if !(cat == BindCat::VarLike && self.global_classic() && is_dangerous_global(name)) {
+                self.declare(name);
+            }
+        });
+        // Classic top-level `let`/`const`/`class` bindings live in the shared
+        // global lexical environment across scripts. Because `eval` discards its
+        // lexical environment, register those names in `__zp_lex` and plant
+        // accessor closures after each declaration so subsequent scripts read
+        // the live binding.
+        if self.kind == ScriptKind::Classic {
+            self.emit_lex_registry(program, &top_varlikes);
+        }
+        walk::walk_program(self, program);
+    }
+
+    fn visit_function(&mut self, func: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.push_scope();
+        self.var_env_stack.push(match &func.body {
+            Some(b) => (self.scopes.len() - 1, Self::body_insert_pos(b)),
+            None => (self.scopes.len() - 1, u32::MAX),
+        });
+        for param in &func.params.items {
+            collect_binding_pattern(&param.pattern, &mut |a| self.declare(a));
+        }
+        if let Some(id) = &func.id {
+            self.declare(id.name.as_str());
+        }
+        let prev_sloppy = self.cur_sloppy;
+        if let Some(body) = &func.body {
+            self.cur_sloppy = prev_sloppy && !Self::has_use_strict(&body.directives);
+            collect_scope_decl_names(&body.statements, true, self.cur_sloppy, &mut |name, _cat| {
+                self.declare(name);
+            });
+        }
+        self.fn_depth += 1;
+        self.nt_depth += 1;
+        let guards = self.guard_fn_enter(func.body.as_ref().map(|b| b.span.end - 1));
+        walk::walk_function(self, func, flags);
+        self.guard_fn_leave(guards);
+        self.fn_depth -= 1;
+        self.nt_depth -= 1;
+        self.cur_sloppy = prev_sloppy;
+        self.pop_scope();
+        self.var_env_stack.pop();
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.push_scope();
+        // `var` declarations cannot be inserted into an expression-body arrow (`() => expr`).
+        self.var_env_stack.push(if arrow.expression {
+            (self.scopes.len() - 1, u32::MAX)
+        } else {
+            (self.scopes.len() - 1, Self::body_insert_pos(&arrow.body))
+        });
+        for param in &arrow.params.items {
+            collect_binding_pattern(&param.pattern, &mut |a| self.declare(a));
+        }
+        let prev_sloppy = self.cur_sloppy;
+        self.cur_sloppy = prev_sloppy && !Self::has_use_strict(&arrow.body.directives);
+        // OXC synthesizes an `ExpressionStatement` for the body of `x => expr`.
+        // Because it is not in statement position, emitting the `_STMT` form
+        // (with ASI guard `0,`) would turn `(e,t)=>t[e]??=[]` into
+        // `(e,t)=>0,(…).v??=…` and cause a SyntaxError.
+        if arrow.expression {
+            if let Some(Statement::ExpressionStatement(s)) = arrow.body.statements.first() {
+                self.arrow_expr_bodies.insert(s.span.start);
+            }
+        }
+        collect_scope_decl_names(&arrow.body.statements, true, self.cur_sloppy, &mut |name, _cat| {
+            self.declare(name);
+        });
+        // Arrow bodies are real function scopes for `var`; the counter
+        // keeps `var location` inside `() => {}` out of the global transform.
+        // `nt_depth` is not bumped: an arrow's new.target is the enclosing
+        // real function's, so dynamic-body mapping still applies.
+        self.fn_depth += 1;
+        let guards = self.guard_fn_enter(if arrow.expression { None } else { Some(arrow.body.span.end - 1) });
+        walk::walk_arrow_function_expression(self, arrow);
+        self.guard_fn_leave(guards);
+        self.fn_depth -= 1;
+        self.cur_sloppy = prev_sloppy;
+        self.pop_scope();
+        self.var_env_stack.pop();
+    }
+
+    /// A default value runs in the parameters' own scope, which the body's `var`s are not in.
+    fn visit_formal_parameters(&mut self, params: &FormalParameters<'a>) {
+        let guards = self.guard_fn_enter(None);
+        walk::walk_formal_parameters(self, params);
+        self.guard_fn_leave(guards);
+    }
+
+    fn visit_block_statement(&mut self, block: &BlockStatement<'a>) {
+        self.push_scope();
+        // Block-level pre-collection: `let`/`const`/`class` are TDZ'd, so a
+        // reference before the declaration text must still be treated as
+        // shadowed (the engine throws ReferenceError; emitting __zp_get
+        // would silently return a value). `var` names hoist past the block;
+        // the fn_depth==0 classic filter drops the unforgeable ones.
+        collect_scope_decl_names(&block.body, false, self.cur_sloppy, &mut |name, cat| {
+            if !(cat == BindCat::VarLike && self.global_classic() && is_dangerous_global(name)) {
+                self.declare(name);
+            }
+        });
+        walk::walk_block_statement(self, block);
+        self.pop_scope();
+    }
+
+    fn visit_class(&mut self, class: &Class<'a>) {
+        // Class names bind: declaration names are collected by the enclosing
+        // pre-collection pass; expression names bind inside the class body.
+        self.push_scope();
+        if let Some(id) = &class.id {
+            self.declare(id.name.as_str());
+        }
+        // Class bodies and methods are always strict even without a directive, so Annex B never applies.
+        let prev_sloppy = self.cur_sloppy;
+        self.cur_sloppy = false;
+        self.class_depth += 1;
+        // Field initializers and static blocks are scopes of their own; methods open theirs.
+        let guards = self.guard_fn_enter(None);
+        walk::walk_class(self, class);
+        self.guard_fn_leave(guards);
+        self.class_depth -= 1;
+        self.cur_sloppy = prev_sloppy;
+        self.pop_scope();
+    }
+
+    /// `'prepareStackTrace' in Error`: presence test of the one routed member
+    /// a page checks with `in` (the membrane's sanitizer is installed there,
+    /// whereas natively nothing is). Other `in` tests stay native.
+    fn visit_binary_expression(&mut self, expr: &BinaryExpression<'a>) {
+        if expr.operator == BinaryOperator::In {
+            if let Expression::StringLiteral(s) = &expr.left {
+                if s.value == "prepareStackTrace" {
+                    let (os, ks) = (expr.right.span(), s.span);
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        replacement: format!("\u{1}RHAS\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}", os.start, os.end, ks.start, ks.end),
+                    });
+                }
+            }
+        }
+        walk::walk_binary_expression(self, expr);
+    }
+
+    /// `this` in the top level of a classic script is the global object (`this === window`).
+    /// Because the page's `window` is the membrane facade rather than the real global,
+    /// top-level `this` reads the same facade as `window` (`self` in a classic worker).
+    /// Everywhere else in sloppy non-module code outside class bodies, `this` is mapped
+    /// at runtime via `__zp_this` so plain calls (`f()`, `Function('return this')()`,
+    /// `[].map(f)`) receive the facade instead of the real global, while other receivers
+    /// pass through.
+    fn visit_this_expression(&mut self, expr: &ThisExpression) {
+        let top = !self.local_this && self.nt_depth == 0 && self.class_depth == 0;
+        if self.kind == ScriptKind::Classic && top {
+            self.emit_global_get(expr.span, "window");
+        } else if self.kind == ScriptKind::Worker && top {
+            // a classic worker script's top level: the global, which worker code knows as `self` (the worker's facade)
+            self.emit_global_get(expr.span, "self");
+        } else if self.cur_sloppy && self.class_depth == 0 && self.kind != ScriptKind::Module {
+            self.patches.push(Patch { start: expr.span.start, end: expr.span.end, replacement: "\u{1}THIS_MAP\u{1}".to_string() });
+        }
+    }
+
+    fn visit_variable_declaration(&mut self, decl: &VariableDeclaration<'a>) {
+        // Our own helper bindings met again (rewritten code rewritten once more): left exactly as they are. Their
+        // `this` is the global object they read the helpers off; mapped to the window facade it hides them.
+        if is_helper_prefix_declaration(decl) {
+            return;
+        }
+        // Names were already declared by the enclosing scope's
+        // pre-collection; this visit handles initializer reads and the
+        // classic-global `var` transform for unforgeable names.
+        let global_var_ctx = decl.kind == VariableDeclarationKind::Var && self.global_classic();
+        for d in &decl.declarations {
+            if global_var_ctx {
+                self.global_var_declarator(d);
+            } else {
+                let mut names: Vec<String> = Vec::new();
+                collect_binding_pattern(&d.id, &mut |n| names.push(n.to_string()));
+                for n in names {
+                    self.declare(&n);
+                }
+                walk::walk_binding_pattern(self, &d.id);
+                if let Some(init) = &d.init {
+                    self.visit_expression(init);
+                }
+            }
+        }
+    }
+
+    fn visit_catch_parameter(&mut self, param: &CatchParameter<'a>) {
+        collect_binding_pattern(&param.pattern, &mut |a| self.declare(a));
+        walk::walk_catch_parameter(self, param);
+    }
+
+    fn visit_statement(&mut self, stmt: &Statement<'a>) {
+        // `pending_labels` only describes the immediate child of a labeled
+        // statement. Any other statement shape arriving here consumed the
+        // slot, so stale names cannot leak into a deeper loop.
+        if !matches!(
+            stmt,
+            Statement::ForStatement(_)
+                | Statement::WhileStatement(_)
+                | Statement::DoWhileStatement(_)
+        ) {
+            self.pending_labels.clear();
+        }
+        // Classic top-level `function location(){}`: like `var location`,
+        // the binding cannot overwrite the unforgeable global. Keep the
+        // declaration (hoisting shape, arity) but rename it to a temp so the
+        // emitted code never assigns the real global slot.
+        if self.global_classic() {
+            if let Statement::FunctionDeclaration(f) = stmt {
+                if let Some(id) = &f.id {
+                    if is_dangerous_global(id.name.as_str()) {
+                        let tmp = self.fresh("vdcl");
+                        self.patches.push(Patch {
+                            start: id.span.start,
+                            end: id.span.end,
+                            replacement: tmp,
+                        });
+                    }
+                }
+            }
+        }
+        walk::walk_statement(self, stmt);
+    }
+
+    fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+        let name = ident.name.as_str();
+        if !is_dangerous_global(name) || self.is_shadowed(name) {
+            return;
+        }
+        if self.in_target > 0 {
+            self.emit_target_ident(ident.span, name);
+            return;
+        }
+        if !self.with_temps.is_empty() {
+            let replacement = self.with_get_chain(name);
+            self.patches.push(Patch {
+                start: ident.span.start,
+                end: ident.span.end,
+                replacement,
+            });
+            return;
+        }
+        self.emit_global_get(ident.span, name);
+    }
+
+    fn visit_object_property(&mut self, prop: &ObjectProperty<'a>) {
+        // `{ window, document, navigator }`: shorthand properties reuse one
+        // identifier as key and value, so patching it as a plain reference
+        // produces invalid syntax `{__zp_get(globalThis,"window"), ...}`.
+        // Expand to the explicit `key: value` form.
+        if prop.shorthand {
+            if let Expression::Identifier(ident) = &prop.value {
+                let name = ident.name.as_str();
+                if is_dangerous_global(name) && !self.is_shadowed(name) {
+                    if self.with_temps.is_empty() {
+                        self.emit_shorthand_global_get(ident.span, name);
+                    } else {
+                        // `{location}` inside `with`: value resolves against
+                        // the with-object first, then the membrane global.
+                        let value = self.with_get_chain(name);
+                        self.patches.push(Patch {
+                            start: ident.span.start,
+                            end: ident.span.end,
+                            replacement: format!("{name}: {value}"),
+                        });
+                    }
+                    // Do not walk the value; it would re-emit the plain patch
+                    // over the same span. The key is an IdentifierName and is
+                    // never rewritten.
+                    return;
+                }
+            }
+        }
+        walk::walk_object_property(self, prop);
+    }
+
+    fn visit_import_expression(&mut self, expr: &ImportExpression<'a>) {
+        // Computed sources (variable, template, concatenation) cannot be
+        // resolved at rewrite time, so wrap them in `__zp_module_url` via the
+        // MODULE_URL marker. Leaving them alone resolves the specifier against
+        // the importing script's proxy URL (`<proxy>/zp/api/script?…`).
+        //
+        // `data:` and `blob:` literals also take the runtime path so the
+        // runtime fetches, rewrites, and re-imports the module via blob URL.
+        let runtime_literal = match &expr.source {
+            Expression::StringLiteral(lit) => {
+                let l = lit.value.as_str().trim_start().to_ascii_lowercase();
+                l.starts_with("data:") || l.starts_with("blob:")
+            }
+            _ => false,
+        };
+        let static_literal = match &expr.source {
+            Expression::StringLiteral(lit) if !runtime_literal => Some(lit),
+            _ => None,
+        };
+        let Some(lit) = static_literal else {
+            let span = expr.source.span();
+            if !self.target_url.is_empty() {
+                // Push before walking children. Because `apply_patches` uses a
+                // stable sort, pushing first ensures this marker wraps outside
+                // any inner marker that shares the exact same span (e.g., when
+                // the entire argument is a call like `import(u.replace(…))`).
+                self.patches.push(Patch {
+                    start: span.start,
+                    end: span.end,
+                    replacement: format!(
+                        "\u{1}MODULE_URL\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        span.start,
+                        span.end,
+                        js_quote_body(&self.target_url)
+                    ),
+                });
+            }
+            // Recurse so dangerous-global identifiers inside the argument
+            // expression still get patched (e.g. `import(window.__cdn + '/mod.js')`).
+            walk::walk_import_expression(self, expr);
+            return;
+        };
+        walk::walk_import_expression(self, expr);
+        self.rewrite_module_specifier(lit);
+    }
+
+    fn visit_import_declaration(&mut self, decl: &ImportDeclaration<'a>) {
+        walk::walk_import_declaration(self, decl);
+        self.rewrite_module_specifier(&decl.source);
+    }
+
+    fn visit_export_named_declaration(&mut self, decl: &ExportNamedDeclaration<'a>) {
+        walk::walk_export_named_declaration(self, decl);
+        // `export { a }` with no `from` clause has no specifier to rewrite.
+        if let Some(source) = &decl.source {
+            self.rewrite_module_specifier(source);
+        }
+    }
+
+    fn visit_export_all_declaration(&mut self, decl: &ExportAllDeclaration<'a>) {
+        walk::walk_export_all_declaration(self, decl);
+        self.rewrite_module_specifier(&decl.source);
+    }
+
+    fn visit_call_expression(&mut self, expr: &CallExpression<'a>) {
+        let saved = self.guard_enter();
+        self.call_site(expr);
+        self.guard_leave(saved);
+    }
+
+    fn visit_with_statement(&mut self, stmt: &WithStatement<'a>) {
+        // `with(obj){...}` resolves free identifiers against obj first.
+        // Bind the object to a temp once so side effects are not re-evaluated
+        // per reference, then emit `__zp_with_*` resolvers inside the body.
+        let tmp = self.fresh("w");
+        self.patches.push(Patch {
+            start: stmt.span.start,
+            end: stmt.span.start,
+            replacement: format!("{{let {tmp};"),
+        });
+        self.patches.push(Patch {
+            start: stmt.span.end,
+            end: stmt.span.end,
+            replacement: "}".to_string(),
+        });
+        let obj_span = stmt.object.span();
+        self.patches.push(Patch {
+            start: obj_span.start,
+            end: obj_span.end,
+            replacement: format!(
+                "\u{1}WITH_OBJ\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                tmp, obj_span.start, obj_span.end
+            ),
+        });
+        // The helpers the body's rewritten code calls, bound before anything in it runs: otherwise each would resolve
+        // through the page's object first, and `with({__zp_get: f}) location` handed `f` the real global object.
+        // (Also the cheap way to name them: a with-object lookup is a run-time search on every evaluation.)
+        let prefix = with_helper_prefix();
+        // A body that already starts with them is code of ours rewritten once more (a child frame booted into a reused
+        // window runs its wrappers through the parent's facade): a second set in the same block is a redeclaration.
+        let bound = matches!(&stmt.body, Statement::BlockStatement(b)
+            if matches!(b.body.first(), Some(Statement::VariableDeclaration(d)) if is_helper_prefix_declaration(d)));
+        match &stmt.body {
+            _ if bound => {}
+            Statement::BlockStatement(block) => {
+                let at = block.span.start + 1;
+                self.patches.push(Patch { start: at, end: at, replacement: prefix });
+            }
+            body => {
+                let span = body.span();
+                self.patches.push(Patch { start: span.start, end: span.start, replacement: format!("{{{prefix}") });
+                self.patches.push(Patch { start: span.end, end: span.end, replacement: "}".to_string() });
+            }
+        }
+        self.visit_expression(&stmt.object);
+        self.with_temps.push(tmp);
+        self.visit_body_statement(&stmt.body);
+        self.with_temps.pop();
+    }
+
+    /// `label: stmt`: collect the whole label chain (a label's body may be
+    /// another labeled statement) and expose it to the final body via
+    /// `pending_labels`. The final body is a bare statement position.
+    fn visit_labeled_statement(&mut self, stmt: &LabeledStatement<'a>) {
+        let mut names = vec![stmt.label.name.to_string()];
+        let mut body: &Statement<'a> = &stmt.body;
+        while let Statement::LabeledStatement(inner) = body {
+            names.push(inner.label.name.to_string());
+            body = &inner.body;
+        }
+        let saved = std::mem::replace(&mut self.pending_labels, names);
+        self.visit_body_statement(body);
+        self.pending_labels = saved;
+    }
+
+    /// `if/else` arms are bare statement positions so `let`-prefixing
+    /// transforms (loop caps) block-wrap when needed.
+    fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
+        self.visit_expression(&stmt.test);
+        self.visit_body_statement(&stmt.consequent);
+        if let Some(alt) = &stmt.alternate {
+            self.visit_body_statement(alt);
+        }
+    }
+
+    /// `break outer` / `continue outer` inside a block-wrapped capped loop:
+    /// the loop re-bound its labels on a fresh inner name (`__zp_lbl_N`), so
+    /// references to the source label must follow it.
+    fn visit_continue_statement(&mut self, it: &ContinueStatement<'a>) {
+        if let Some(label) = &it.label {
+            if let Some((_, new)) = self
+                .label_renames
+                .iter()
+                .rev()
+                .find(|(old, _)| old.as_str() == label.name.as_str())
+            {
+                self.patches.push(Patch {
+                    start: label.span.start,
+                    end: label.span.end,
+                    replacement: new.clone(),
+                });
+                return;
+            }
+        }
+        walk::walk_continue_statement(self, it);
+    }
+
+    fn visit_break_statement(&mut self, it: &BreakStatement<'a>) {
+        if let Some(label) = &it.label {
+            if let Some((_, new)) = self
+                .label_renames
+                .iter()
+                .rev()
+                .find(|(old, _)| old.as_str() == label.name.as_str())
+            {
+                self.patches.push(Patch {
+                    start: label.span.start,
+                    end: label.span.end,
+                    replacement: new.clone(),
+                });
+                return;
+            }
+        }
+        walk::walk_break_statement(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'a>) {
+        let saved = self.guard_enter();
+        self.assignment_site(expr);
+        self.guard_leave(saved);
+    }
+
+    fn visit_update_expression(&mut self, expr: &UpdateExpression<'a>) {
+        // `location++` has the same invalid-target problem as `location = x`.
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.argument {
+            let name = ident.name.as_str();
+            if is_dangerous_global(name) && !self.is_shadowed(name) {
+                let op = expr.operator.as_str();
+                let replacement = if self.with_temps.is_empty() {
+                    format!(
+                        "\u{1}GLOBAL_UPDATE\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        name,
+                        op,
+                        if expr.prefix { "1" } else { "0" }
+                    )
+                } else {
+                    self.with_update_chain(name, op, expr.prefix)
+                };
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement,
+                });
+                return;
+            }
+        }
+        walk::walk_update_expression(self, expr);
+    }
+
+    fn visit_expression_statement(&mut self, stmt: &ExpressionStatement<'a>) {
+        let first_patch = self.patches.len();
+        walk::walk_expression_statement(self, stmt);
+        if self.arrow_expr_bodies.contains(&stmt.span.start) {
+            return;
+        }
+        // Only the outermost patch at the statement's start is emitted there; one inside it is emitted inside its
+        // operand (`e.ports[0].postMessage(x)`: the guard is the base argument of `__zp_call(…)`, where `0,` would be
+        // a separate argument).
+        let outer_end = self.patches[first_patch..]
+            .iter()
+            .filter(|p| p.start == stmt.span.start)
+            .map(|p| p.end)
+            .max()
+            .unwrap_or(0);
+        for patch in &mut self.patches[first_patch..] {
+            if patch.start != stmt.span.start {
+                continue;
+            }
+            // An inline-guarded site renders as a parenthesized sequence (`guard_fields`).
+            if ["\u{1}CGET\u{1}", "\u{1}CSET\u{1}", "\u{1}CCALL\u{1}"].iter().any(|m| patch.replacement.starts_with(m)) {
+                if patch.end == outer_end {
+                    patch.replacement.push_str("S\u{1}");
+                }
+                continue;
+            }
+            for (plain, stmted) in [
+                ("\u{1}MEMBER_REF\u{1}", "\u{1}MEMBER_REF_STMT\u{1}"),
+                ("\u{1}CREF\u{1}", "\u{1}CREF_STMT\u{1}"),
+                ("\u{1}WTREF\u{1}", "\u{1}WTREF_STMT\u{1}"),
+                ("\u{1}MEMBER_A\u{1}", "\u{1}MEMBER_A_STMT\u{1}"),
+                ("\u{1}CASSIGN\u{1}", "\u{1}CASSIGN_STMT\u{1}"),
+            ] {
+                if patch.replacement.starts_with(plain) {
+                    patch.replacement = patch.replacement.replacen(plain, stmted, 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn visit_simple_assignment_target(&mut self, target: &SimpleAssignmentTarget<'a>) {
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(ident) = target {
+            // Dangerous identifier in a write position (`for (location of x)`,
+            // `[location] = a`, `({p: location} = o)`): a call is not a
+            // valid target, so emit the `__zp_get.d.<name>` member ref whose
+            // write lands on the prelude's membrane sink.
+            let name = ident.name.as_str();
+            if is_dangerous_global(name) && !self.is_shadowed(name) {
+                self.emit_target_ident(ident.span, name);
+            }
+            return;
+        }
+        if let SimpleAssignmentTarget::ComputedMemberExpression(member) = target {
+            // `x[k]++`, `for (x[k] of y)`, `({a: x[k]} = o)`: keep a real
+            // Reference through the accessor adapter, same as MEMBER_REF.
+            if !matches!(member.object, Expression::Super(_)) {
+                self.visit_read(&member.object);
+                self.visit_read(&member.expression);
+                use oxc_span::GetSpan;
+                let obj_span = member.object.span();
+                let key_span = member.expression.span();
+                self.patches.push(Patch {
+                    start: member.span.start,
+                    end: member.span.end,
+                    replacement: format!(
+                        "\u{1}CREF\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, key_span.start, key_span.end
+                    ),
+                });
+                return;
+            }
+        }
+        if let SimpleAssignmentTarget::StaticMemberExpression(member) = target {
+            // Only the receiver is a read. Walking the whole member would
+            // replace the write target with __zp_get(...), invalid in compound
+            // assignments, updates and nested destructuring/for-in/of targets.
+            self.visit_read(&member.object);
+            let prop = member.property.name.as_str();
+            if !matches!(member.object, Expression::Super(_)) && is_dangerous_member(prop) {
+                let obj_span = member.object.span();
+                self.patches.push(Patch {
+                    start: member.span.start,
+                    end: member.span.end,
+                    replacement: format!(
+                        "\u{1}MEMBER_REF\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        obj_span.start, obj_span.end, prop
+                    ),
+                });
+            }
+            return;
+        }
+        if let SimpleAssignmentTarget::PrivateFieldExpression(member) = target {
+            self.visit_read(&member.object);
+            return;
+        }
+        walk::walk_simple_assignment_target(self, target);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        prop: &AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        // `({ location } = obj)`: shorthand destructuring target. One
+        // identifier is both the key and the write target, and a target must be
+        // a settable reference, so `__zp_set(...)` (a call) cannot go here.
+        // Expand to `location: __zp_get.d.location`, whose write lands on the
+        // prelude's write-only sink and routes through the membrane setter.
+        //
+        // Only the binding is replaced, so a default (`{ location = 1 }`)
+        // survives as `location: __zp_get.d.location = 1`.
+        let name = prop.binding.name.as_str();
+        if is_dangerous_global(name) && !self.is_shadowed(name) {
+            let replacement = if self.with_temps.is_empty() {
+                format!("\u{1}GLOBAL_DESTR\u{1}{}\u{1}", name)
+            } else {
+                // `with(o){ ({location} = x) }`: the write must prefer o's
+                // own `location` before falling back to the membrane sink.
+                format!(
+                    "\u{1}GLOBAL_DESTR\u{1}{}\u{1}{}\u{1}",
+                    name,
+                    self.with_temps.join("\u{2}")
+                )
+            };
+            self.patches.push(Patch {
+                start: prop.binding.span.start,
+                end: prop.binding.span.end,
+                replacement,
+            });
+            // Walk only the default expression; walking the binding would
+            // re-emit the plain patch over the same span.
+            if let Some(init) = &prop.init {
+                self.visit_read(init);
+            }
+            return;
+        }
+        // The binding is not dangerous (or is shadowed), so only the default needs a walk.
+        if let Some(init) = &prop.init {
+            self.visit_read(init);
+        }
+    }
+
+    fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
+        // Walk children first (so receiver is rewritten before we wrap).
+        walk::walk_static_member_expression(self, expr);
+        // `super.x` is only legal as part of a class method's body; `super`
+        // is a keyword and cannot appear as an identifier expression, so
+        // `__zp_get(super, "x")` is a SyntaxError. Leave super member access
+        // untouched (it is already restricted to its class context).
+        if matches!(expr.object, Expression::Super(_)) {
+            return;
+        }
+        // `import.meta.url`: exposes the module's own URL. Without rewriting,
+        // the proxy URL (`<proxy>/zp/api/script?…`) leaks and bundler-derived
+        // `publicPath` values request `<proxy>/zp/api/<chunk>`.
+        if let Expression::MetaProperty(meta) = &expr.object {
+            if meta.meta.name == "import"
+                && meta.property.name == "meta"
+                && expr.property.name == "url"
+                && !self.target_url.is_empty()
+            {
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement: format!("\"{}\"", js_quote_body(&self.target_url)),
+                });
+                return;
+            }
+            // `import.meta.resolve(spec)`: native resolves against the module's
+            // proxy URL, so replace it with a resolver anchored at the virtual
+            // target URL.
+            if meta.meta.name == "import"
+                && meta.property.name == "meta"
+                && expr.property.name == "resolve"
+                && !self.target_url.is_empty()
+            {
+                self.patches.push(Patch {
+                    start: expr.span.start,
+                    end: expr.span.end,
+                    replacement: format!(
+                        "(s=>new URL(s,\"{}\").href)",
+                        js_quote_body(&self.target_url)
+                    ),
+                });
+                return;
+            }
+        }
+        let prop = expr.property.name.as_str();
+        // If the receiver is a shadowed local identifier:
+        // - When the receiver name itself is a shadowed dangerous global
+        //   (`function f(location){ return location.href; }`), keep it unmediated
+        //   because the parameter shadows the global.
+        // - Otherwise, wrap `URL_SHAPE_MEMBERS` even on local receivers so
+        //   single-hop local aliases (`var u = n.location; u.protocol`, such as
+        //   desugared optional chains `n.location?.protocol`) still route
+        //   through the membrane.
+        // `prepareStackTrace` is here for the aliases bundles make of `Error` (`const be = Error; be.prepareStackTrace`): left alone, the read returns the membrane's
+        // stack sanitizer, which natively is not there until the page assigns a hook, and a library that saves the hook and calls it (Transcend's airgap) throws.
+        const URL_SHAPE_MEMBERS: &[&str] = &[
+            "href", "protocol", "host", "hostname", "port", "pathname", "search", "hash",
+            "origin", "location", "top", "parent", "opener", "frameElement",
+            "window", "self", "globalThis", "frames", "document", "defaultView",
+            "contentWindow", "contentDocument", "prepareStackTrace",
+        ];
+        if let Expression::Identifier(recv) = &expr.object {
+            let recv_name = recv.name.as_str();
+            let url_shape = URL_SHAPE_MEMBERS.contains(&prop);
+            if self.is_shadowed(recv_name)
+                && (!url_shape || is_dangerous_global(recv_name))
+            {
+                return;
+            }
+        }
+        if is_dangerous_member(prop) {
+            // Keep the inner identifier patch that visit_identifier_reference
+            // may have emitted for the receiver. `apply_patches` sorts
+            // overlapping patches outer-first into `chosen` and drops the inner
+            // one from the top-level apply set, while the `MEMBER_GET` marker
+            // resolver re-runs `rewrite_range` over the receiver substring so
+            // `location.href` renders as
+            // `__zp_get(__zp_get(globalThis,"location"),"href")`.
+            self.patches.push(Patch {
+                start: expr.span.start,
+                end: expr.span.end,
+                replacement: if expr.optional {
+                    format!(
+                        "\u{1}OGET\u{1}{}\u{1}{}\u{1}L\u{1}{}\u{1}",
+                        expr.object_span().start,
+                        expr.object_span().end,
+                        prop
+                    )
+                } else {
+                    format!(
+                        "\u{1}MEMBER_GET\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                        expr.object_span().start,
+                        expr.object_span().end,
+                        prop
+                    )
+                },
+            });
+        }
+    }
+
+    /// Optional chains whose rewritten links straddle a `?.`.
+    ///
+    /// Links are rewritten one by one into helper calls (`__zp_oget(o,k)`,
+    /// `__zp_get(o,k)`, `__zp_call(o,k,[a])`), and a helper call evaluates
+    /// its arguments eagerly and returns into the rest of the chain. Native
+    /// `?.` does neither: `e.poster?.[!e.poster.mobile ? …]` never evaluates
+    /// the key when `e.poster` is nullish, and `a?.[k].b` short-circuits the
+    /// whole chain.
+    ///
+    /// Each split becomes a continuation that only runs on a non-nullish
+    /// base: `__zp_ochain(a, __zp_oc => <rest with a := __zp_oc>)`. Inside,
+    /// the existing link patches remain valid because their base is known
+    /// non-nullish. Optional calls on a member callee keep their receiver
+    /// through `__zp_ocallv(obj, key)`.
+    fn visit_chain_expression(&mut self, chain: &ChainExpression<'a>) {
+        let before = self.patches.len();
+        walk::walk_chain_expression(self, chain);
+        let Some(splits) = chain_splits(chain) else { return };
+        let Some(first) = splits.first() else { return };
+        let (cs, ce) = (chain.span.start, chain.span.end);
+        let first_end = first.base_end();
+        // Only a patch that crosses the first `?.` breaks short-circuiting;
+        // patches inside keys/args still sit inside a native chain.
+        let crossing: Vec<&Patch> = self.patches[before..]
+            .iter()
+            .filter(|p| p.start == cs && p.end > first_end)
+            .collect();
+        if crossing.is_empty() {
+            return;
+        }
+        // `x?.location` alone: a literal key and nothing after it, so the
+        // per-link `__zp_oget((x),"location")` is already exact.
+        if let [only] = crossing.as_slice() {
+            if only.end == ce
+                && only.replacement.starts_with("\u{1}OGET\u{1}")
+                && only.replacement.split('\u{1}').nth(4) == Some("L")
+            {
+                return;
+            }
+        }
+        if chain_suspends_after(chain, first_end) {
+            return;
+        }
+        // The optional call itself renders as `__zp_oc?.(args)` inside its
+        // continuation, so its generic call patch is removed. Special forms
+        // such as `Reflect.get?.(o,'location')` carry mediation themselves and
+        // keep per-link emission.
+        let calls: Vec<(u32, u32)> = splits
+            .iter()
+            .filter_map(|s| match s {
+                ChainSplit::Method { call, .. } => Some(*call),
+                _ => None,
+            })
+            .collect();
+        let generic = |r: &str| {
+            r.starts_with("\u{1}CCALL\u{1}")
+                || r.starts_with("\u{1}OCALL\u{1}")
+                || r.starts_with("\u{1}METHOD_CALL\u{1}")
+        };
+        if self.patches[before..]
+            .iter()
+            .any(|p| calls.contains(&(p.start, p.end)) && !generic(&p.replacement))
+        {
+            return;
+        }
+        let mut i = before;
+        while i < self.patches.len() {
+            let p = &self.patches[i];
+            if calls.contains(&(p.start, p.end)) {
+                self.patches.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let enc: Vec<String> = splits.iter().map(ChainSplit::encode).collect();
+        // Inserted ahead of the link patches: the last link spans the whole
+        // chain too, and the stable sort must keep OCHAIN outermost.
+        self.patches.insert(
+            before,
+            Patch {
+                start: cs,
+                end: ce,
+                replacement: format!("\u{1}OCHAIN\u{1}{cs}\u{1}{ce}\u{1}{}\u{1}", enc.join("\u{1}")),
+            },
+        );
+    }
+
+    fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'a>) {
+        let saved = self.guard_enter();
+        self.computed_member_site(expr);
+        self.guard_leave(saved);
+    }
+
+    /// Cap unbounded `for` loops (`for (;;)` or `for (init;;update)` with a
+    /// missing or constant-true test) at 10M iterations using a fresh counter
+    /// variable so tight anti-bot probe loops cannot wedge V8.
+    fn visit_for_statement(&mut self, stmt: &ForStatement<'a>) {
+        use oxc_span::GetSpan;
+        let empty_loop =
+            stmt.init.is_none() && stmt.test.is_none() && stmt.update.is_none();
+        let truthy = stmt
+            .test
+            .as_ref()
+            .map(|t| is_truthy_constant(t))
+            .unwrap_or(true);
+        let needs_cap =
+            (empty_loop || (truthy && !(stmt.init.is_none() && stmt.update.is_none())))
+                && !Self::body_yields(&stmt.body);
+        // `for(;;)` rewrites the header only (still a single statement),
+        // whereas `let counter` prefix forms must block-wrap in bare
+        // statement positions (`if(c) for…`, `outer: for…`).
+        let needs_wrap = needs_cap && !empty_loop && self.unbraced_body > 0;
+        let labels = std::mem::take(&mut self.pending_labels);
+        let inner_lbl = if needs_wrap && !labels.is_empty() {
+            let l = self.fresh("lbl");
+            for old in &labels {
+                self.label_renames.push((old.clone(), l.clone()));
+            }
+            Some(l)
+        } else {
+            None
+        };
+        if let Some(init) = &stmt.init {
+            self.visit_for_statement_init(init);
+        }
+        if let Some(test) = &stmt.test {
+            self.visit_expression(test);
+        }
+        if let Some(update) = &stmt.update {
+            self.visit_expression(update);
+        }
+        self.visit_body_statement(&stmt.body);
+        for _ in &labels {
+            self.label_renames.pop();
+        }
+        if !needs_cap {
+            return;
+        }
+        if empty_loop {
+            let id = self.next_loop_id();
+            let body_start = stmt.body.span().start;
+            // The `for(;;)` header is everything from `stmt.span.start`
+            // up to the body. Replace with a counted form; body is left
+            // untouched so `break` / `continue` / closures retain their
+            // semantics.
+            self.patches.push(Patch {
+                start: stmt.span.start,
+                end: body_start,
+                replacement: format!(
+                    "for(let __zp_lc_{id}=0;{};)", Self::cap_test(&format!("__zp_lc_{id}"))
+                ),
+            });
+            return;
+        }
+        let id = self.next_loop_id();
+        let counter = format!("__zp_lc_{id}");
+        let prefix = if needs_wrap {
+            match &inner_lbl {
+                // `outer:{let c=0;__zp_lbl_N:for(…)}`: the inner label keeps
+                // `continue outer`/`break outer` aimed at the loop itself.
+                Some(l) => format!("{{let {counter}=0;{l}:"),
+                None => format!("{{let {counter}=0;"),
+            }
+        } else {
+            format!("let {counter}=0;")
+        };
+        self.patches.push(Patch {
+            start: stmt.span.start,
+            end: stmt.span.start,
+            replacement: prefix,
+        });
+        if needs_wrap {
+            self.patches.push(Patch {
+                start: stmt.span.end,
+                end: stmt.span.end,
+                replacement: "}".to_string(),
+            });
+        }
+        if let Some(test) = &stmt.test {
+            // `for(i=0;true;i++)`: replace the constant test with the counter.
+            let ts = test.span();
+            self.patches.push(Patch {
+                start: ts.start,
+                end: ts.end,
+                replacement: Self::cap_test(&counter),
+            });
+        } else {
+            // Empty test slot: the FOR_CAP marker covers `;;` (or `(;;` when
+            // there is no init) and the resolver injects the counter after the
+            // first `;`. With no init the region starts after the `for` keyword
+            // (`stmt.span.start + 3`) so it does not overlap the `let counter`
+            // prefix patch at `stmt.span.start`.
+            let rs = stmt
+                .init
+                .as_ref()
+                .map(|i| i.span().end)
+                .unwrap_or(stmt.span.start + 3);
+            let re = stmt
+                .update
+                .as_ref()
+                .map(|u| u.span().start)
+                .unwrap_or_else(|| stmt.body.span().start);
+            self.patches.push(Patch {
+                start: rs,
+                end: re,
+                replacement: format!("\u{1}FOR_CAP\u{1}{}\u{1}{}\u{1}{}\u{1}", counter, rs, re),
+            });
+        }
+    }
+
+    /// `while(true) body` / `while(1) body`: the header rewrite stays a single
+    /// statement, so bare bodies and labels need no extra wrapping.
+    fn visit_while_statement(&mut self, stmt: &WhileStatement<'a>) {
+        let needs_cap = is_truthy_constant(&stmt.test) && !Self::body_yields(&stmt.body);
+        self.pending_labels.clear();
+        self.visit_expression(&stmt.test);
+        self.visit_body_statement(&stmt.body);
+        if needs_cap {
+            use oxc_span::GetSpan;
+            let id = self.next_loop_id();
+            let body_start = stmt.body.span().start;
+            self.patches.push(Patch {
+                start: stmt.span.start,
+                end: body_start,
+                replacement: format!(
+                    "for(let __zp_lc_{id}=0;{};)", Self::cap_test(&format!("__zp_lc_{id}"))
+                ),
+            });
+        }
+    }
+
+    /// `do body while(true);` / `do body while(1);`. Because `do` requires a
+    /// trailing `while(test);`, patch the test expression itself with a
+    /// post-increment counter and declare the counter immediately before the
+    /// `do` (block-wrapping bare statement positions).
+    fn visit_do_while_statement(&mut self, stmt: &DoWhileStatement<'a>) {
+        use oxc_span::GetSpan;
+        let needs_cap = is_truthy_constant(&stmt.test) && !Self::body_yields(&stmt.body);
+        let needs_wrap = needs_cap && self.unbraced_body > 0;
+        let labels = std::mem::take(&mut self.pending_labels);
+        let inner_lbl = if needs_wrap && !labels.is_empty() {
+            let l = self.fresh("lbl");
+            for old in &labels {
+                self.label_renames.push((old.clone(), l.clone()));
+            }
+            Some(l)
+        } else {
+            None
+        };
+        self.visit_body_statement(&stmt.body);
+        self.visit_expression(&stmt.test);
+        for _ in &labels {
+            self.label_renames.pop();
+        }
+        if needs_cap {
+            let id = self.next_loop_id();
+            let counter = format!("__zp_lc_{id}");
+            let prefix = if needs_wrap {
+                match &inner_lbl {
+                    Some(l) => format!("{{let {counter}=0;{l}:"),
+                    None => format!("{{let {counter}=0;"),
+                }
+            } else {
+                format!("let {counter}=0;")
+            };
+            self.patches.push(Patch {
+                start: stmt.span.start,
+                end: stmt.span.start,
+                replacement: prefix,
+            });
+            if needs_wrap {
+                self.patches.push(Patch {
+                    start: stmt.span.end,
+                    end: stmt.span.end,
+                    replacement: "}".to_string(),
+                });
+            }
+            let test_span = stmt.test.span();
+            self.patches.push(Patch {
+                start: test_span.start,
+                end: test_span.end,
+                replacement: Self::cap_test(&counter),
+            });
+        }
+    }
+
+    /// `delete`: `__zp_delete` preserves `Reflect.deleteProperty` semantics,
+    /// and the optional flag keeps `delete x?.y`'s nullish short-circuit.
+    fn visit_unary_expression(&mut self, expr: &UnaryExpression<'a>) {
+        if expr.operator != oxc_syntax::operator::UnaryOperator::Delete {
+            walk::walk_unary_expression(self, expr);
+            return;
+        }
+        use oxc_span::GetSpan;
+        match &expr.argument {
+            Expression::ChainExpression(c) => match &c.expression {
+                // `delete obj?.location`: optional member inside the chain.
+                ChainElement::StaticMemberExpression(member) => {
+                    let prop = member.property.name.as_str();
+                    if !matches!(member.object, Expression::Super(_))
+                        && is_dangerous_member(prop)
+                    {
+                        self.visit_expression(&member.object);
+                        let obj_span = member.object.span();
+                        self.patches.push(Patch {
+                            start: expr.span.start,
+                            end: expr.span.end,
+                            replacement: format!(
+                                "\u{1}SDELE\u{1}{}\u{1}{}\u{1}{}\u{1}1\u{1}",
+                                obj_span.start, obj_span.end, prop
+                            ),
+                        });
+                        return;
+                    }
+                }
+                ChainElement::ComputedMemberExpression(member) => {
+                    if !matches!(member.object, Expression::Super(_)) {
+                        self.visit_expression(&member.object);
+                        self.visit_expression(&member.expression);
+                        let obj_span = member.object.span();
+                        let key_span = member.expression.span();
+                        self.patches.push(Patch {
+                            start: expr.span.start,
+                            end: expr.span.end,
+                            replacement: format!(
+                                "\u{1}CDELE\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}1\u{1}",
+                                obj_span.start, obj_span.end,
+                                key_span.start, key_span.end
+                            ),
+                        });
+                        return;
+                    }
+                }
+                _ => {}
+            },
+            Expression::Identifier(ident) => {
+                let name = ident.name.as_str();
+                if is_dangerous_global(name) && !self.is_shadowed(name) {
+                    let replacement = if self.with_temps.is_empty() {
+                        format!("__zp_delete(globalThis,{name:?})")
+                    } else {
+                        self.with_delete_chain(name)
+                    };
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        replacement,
+                    });
+                    return;
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                let prop = member.property.name.as_str();
+                if !matches!(member.object, Expression::Super(_)) && is_dangerous_member(prop) {
+                    self.visit_expression(&member.object);
+                    let obj_span = member.object.span();
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        replacement: format!(
+                            "\u{1}SDELE\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            obj_span.start, obj_span.end, prop,
+                            if member.optional { 1 } else { 0 }
+                        ),
+                    });
+                    return;
+                }
+            }
+            Expression::ComputedMemberExpression(member) => {
+                if !matches!(member.object, Expression::Super(_)) {
+                    self.visit_expression(&member.object);
+                    self.visit_expression(&member.expression);
+                    let obj_span = member.object.span();
+                    let key_span = member.expression.span();
+                    self.patches.push(Patch {
+                        start: expr.span.start,
+                        end: expr.span.end,
+                        replacement: format!(
+                            "\u{1}CDELE\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                            obj_span.start, obj_span.end, key_span.start, key_span.end,
+                            if member.optional { 1 } else { 0 }
+                        ),
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+        walk::walk_unary_expression(self, expr);
+    }
+
+    /// `for (location of xs)` / `for (location in xs)`: the loop-variable
+    /// position is a write target, not a read; and `for (var location of …)`
+    /// at classic top level needs the per-iteration sink.
+    fn visit_for_of_statement(&mut self, stmt: &ForOfStatement<'a>) {
+        self.visit_for_iter(&stmt.left, &stmt.right, &stmt.body);
+    }
+
+    fn visit_for_in_statement(&mut self, stmt: &ForInStatement<'a>) {
+        self.visit_for_iter(&stmt.left, &stmt.right, &stmt.body);
+    }
+
+    /// `{a: TARGET = default}`: the default is an expression (reads), the
+    /// binding is a write target.
+    fn visit_assignment_target_with_default(&mut self, it: &AssignmentTargetWithDefault<'a>) {
+        self.in_target += 1;
+        self.visit_assignment_target(&it.binding);
+        self.in_target -= 1;
+        self.visit_read(&it.init);
+    }
+
+    /// `{key: TARGET}`: a computed key is evaluated as an expression; the
+    /// binding position is a write target.
+    fn visit_assignment_target_property_property(
+        &mut self,
+        it: &AssignmentTargetPropertyProperty<'a>,
+    ) {
+        if it.computed {
+            let saved = std::mem::replace(&mut self.in_target, 0);
+            walk::walk_property_key(self, &it.name);
+            self.in_target = saved;
+        }
+        self.in_target += 1;
+        self.visit_assignment_target_maybe_default(&it.binding);
+        self.in_target -= 1;
+    }
+
+    fn visit_assignment_target_rest(&mut self, it: &AssignmentTargetRest<'a>) {
+        self.in_target += 1;
+        self.visit_assignment_target(&it.target);
+        self.in_target -= 1;
+    }
+}
+
+impl RewriteVisitor {
+    /// An expression nested in an assignment target (a member's receiver or
+    /// computed key, a default value, or a computed pattern key) is read even
+    /// though the enclosing pattern is written. Only the identifier that is
+    /// itself the target takes the write-only sink (`__zp_get.d.<name>`).
+    fn visit_read<'a>(&mut self, expr: &Expression<'a>) {
+        let saved = std::mem::replace(&mut self.in_target, 0);
+        self.visit_expression(expr);
+        self.in_target = saved;
+    }
+
+    /// Shared `for-of`/`for-in` walk: declaration heads get the var-decl
+    /// pipeline (with per-iteration sinks at classic top level), bare
+    /// targets get the write-target flag.
+    fn visit_for_iter<'a>(
+        &mut self,
+        left: &ForStatementLeft<'a>,
+        right: &Expression<'a>,
+        body: &Statement<'a>,
+    ) {
+        // for-in/of are never capped, but a label may still sit directly on
+        // them; consume it so a deeper capped loop cannot see it.
+        self.pending_labels.clear();
+        match left {
+            ForStatementLeft::VariableDeclaration(decl) => {
+                if decl.kind == VariableDeclarationKind::Var && self.global_classic() {
+                    self.for_iter_head = true;
+                    self.iter_sinks.push(Vec::new());
+                    self.visit_variable_declaration(decl);
+                    self.for_iter_head = false;
+                    self.visit_expression(right);
+                    let sinks = self.iter_sinks.pop().unwrap_or_default();
+                    self.inject_iter_sinks(body, &sinks);
+                    self.visit_body_statement(body);
+                } else {
+                    self.visit_variable_declaration(decl);
+                    self.visit_expression(right);
+                    self.visit_body_statement(body);
+                }
+            }
+            _ => {
+                self.in_target += 1;
+                walk::walk_for_statement_left(self, left);
+                self.in_target -= 1;
+                self.visit_expression(right);
+                self.visit_body_statement(body);
+            }
+        }
+    }
+}
+
+/// A `?.` along an optional chain's object/callee spine (see
+/// `visit_chain_expression`). Every split's base is the source prefix
+/// `[chain_start, base_end)` as chain links nest leftward.
+enum ChainSplit {
+    /// `base?.p` / `base?.[k]` / `base?.#p`.
+    Member { base_end: u32 },
+    /// `callee?.(args)` with a non-member callee (`this` is undefined anyway).
+    Plain { callee_end: u32 },
+    /// `obj.p?.(args)` / `obj[k]?.(args)`: the callee is read and bound to
+    /// `obj` by `__zp_ocallv`, so the continuation keeps the receiver.
+    Method { obj_end: u32, key: ChainKey, callee_end: u32, call: (u32, u32) },
+}
+
+enum ChainKey {
+    Name(String),
+    Expr(u32, u32),
+}
+
+impl ChainSplit {
+    /// End of the prefix the continuation receives as `__zp_oc`.
+    fn base_end(&self) -> u32 {
+        match self {
+            ChainSplit::Member { base_end } => *base_end,
+            ChainSplit::Plain { callee_end } | ChainSplit::Method { callee_end, .. } => *callee_end,
+        }
+    }
+
+    fn encode(&self) -> String {
+        match self {
+            ChainSplit::Member { base_end } => format!("M,{base_end}"),
+            ChainSplit::Plain { callee_end } => format!("P,{callee_end}"),
+            ChainSplit::Method { obj_end, key: ChainKey::Name(n), callee_end, .. } => {
+                format!("S,{obj_end},{callee_end},{n}")
+            }
+            ChainSplit::Method { obj_end, key: ChainKey::Expr(ks, ke), callee_end, .. } => {
+                format!("K,{obj_end},{callee_end},{ks},{ke}")
+            }
+        }
+    }
+}
+
+/// Optional links of a chain, innermost (leftmost) first. `None` when a `?.`
+/// cannot be split without losing semantics (`super.m?.()`, `o.#m?.()`, and a
+/// parenthesized member callee cannot hand their receiver to `__zp_ocallv`).
+fn chain_splits<'a>(chain: &ChainExpression<'a>) -> Option<Vec<ChainSplit>> {
+    fn call<'a>(c: &CallExpression<'a>, out: &mut Vec<ChainSplit>) -> Option<()> {
+        if !c.optional {
+            return Some(());
+        }
+        let callee_end = c.callee.span().end;
+        let call = (c.span.start, c.span.end);
+        match &c.callee {
+            Expression::StaticMemberExpression(m) if !matches!(m.object, Expression::Super(_)) => {
+                out.push(ChainSplit::Method {
+                    obj_end: m.object.span().end,
+                    key: ChainKey::Name(m.property.name.to_string()),
+                    callee_end,
+                    call,
+                });
+            }
+            Expression::ComputedMemberExpression(m) if !matches!(m.object, Expression::Super(_)) => {
+                let k = m.expression.span();
+                out.push(ChainSplit::Method {
+                    obj_end: m.object.span().end,
+                    key: ChainKey::Expr(k.start, k.end),
+                    callee_end,
+                    call,
+                });
+            }
+            Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::PrivateFieldExpression(_) => return None,
+            Expression::ParenthesizedExpression(p)
+                if matches!(
+                    p.expression.without_parentheses(),
+                    Expression::StaticMemberExpression(_)
+                        | Expression::ComputedMemberExpression(_)
+                        | Expression::PrivateFieldExpression(_)
+                ) =>
+            {
+                return None
+            }
+            _ => out.push(ChainSplit::Plain { callee_end }),
+        }
+        Some(())
+    }
+    fn member(optional: bool, object: &Expression<'_>, out: &mut Vec<ChainSplit>) {
+        if optional {
+            out.push(ChainSplit::Member { base_end: object.span().end });
+        }
+    }
+    let mut out = Vec::new();
+    let mut cur: &Expression<'a> = match &chain.expression {
+        ChainElement::CallExpression(c) => {
+            call(c, &mut out)?;
+            &c.callee
+        }
+        ChainElement::ComputedMemberExpression(m) => {
+            member(m.optional, &m.object, &mut out);
+            &m.object
+        }
+        ChainElement::StaticMemberExpression(m) => {
+            member(m.optional, &m.object, &mut out);
+            &m.object
+        }
+        ChainElement::PrivateFieldExpression(m) => {
+            member(m.optional, &m.object, &mut out);
+            &m.object
+        }
+        ChainElement::TSNonNullExpression(t) => &t.expression,
+    };
+    loop {
+        cur = match cur {
+            Expression::CallExpression(c) => {
+                call(c, &mut out)?;
+                &c.callee
+            }
+            Expression::ComputedMemberExpression(m) => {
+                member(m.optional, &m.object, &mut out);
+                &m.object
+            }
+            Expression::StaticMemberExpression(m) => {
+                member(m.optional, &m.object, &mut out);
+                &m.object
+            }
+            Expression::PrivateFieldExpression(m) => {
+                member(m.optional, &m.object, &mut out);
+                &m.object
+            }
+            Expression::TSNonNullExpression(t) => &t.expression,
+            _ => break,
+        };
+    }
+    out.reverse();
+    Some(out)
+}
+
+/// Does the chain suspend (`await`/`yield`) at or after `from`? The
+/// continuation is an arrow, which can hold neither. Nested functions are
+/// their own context and are not searched.
+fn chain_suspends_after<'a>(chain: &ChainExpression<'a>, from: u32) -> bool {
+    struct S {
+        from: u32,
+        hit: bool,
+    }
+    impl<'b> Visit<'b> for S {
+        fn visit_await_expression(&mut self, e: &AwaitExpression<'b>) {
+            if e.span.start >= self.from {
+                self.hit = true;
+            }
+            walk::walk_await_expression(self, e);
+        }
+        fn visit_yield_expression(&mut self, e: &YieldExpression<'b>) {
+            if e.span.start >= self.from {
+                self.hit = true;
+            }
+            walk::walk_yield_expression(self, e);
+        }
+        fn visit_function(&mut self, _: &Function<'b>, _: oxc_syntax::scope::ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'b>) {}
+    }
+    let mut s = S { from, hit: false };
+    walk::walk_chain_expression(&mut s, chain);
+    s.hit
+}
+
+/// First..last argument span for a call (the resolver splices them into
+/// `[args]`), or `(0,0)` when the call has no arguments.
+fn call_args_span<'a>(expr: &CallExpression<'a>) -> (u32, u32) {
+    if expr.arguments.is_empty() {
+        return (0, 0);
+    }
+    (
+        expr.arguments.first().unwrap().span().start,
+        expr.arguments.last().unwrap().span().end,
+    )
+}
+
+/// Object span of a static member expression `obj.prop`.
+trait StaticMemberExt {
+    fn object_span(&self) -> Span;
+}
+impl<'a> StaticMemberExt for StaticMemberExpression<'a> {
+    fn object_span(&self) -> Span {
+        use oxc_span::GetSpan;
+        self.object.span()
+    }
+}
+
+/// Extract a static string-literal argument from a call's argument list.
+/// Used to recognise patterns like `Reflect.get(x, 'location')` where the
+/// property is statically known. Returns None for computed/dynamic args.
+fn static_string_arg<'a>(
+    args: &oxc_allocator::Vec<'a, Argument<'a>>,
+    idx: usize,
+) -> Option<&'a str> {
+    let arg = args.get(idx)?;
+    match arg {
+        Argument::StringLiteral(s) => Some(s.value.as_str()),
+        _ => None,
+    }
+}
+
+/// Walk a BindingPattern (destructuring, etc.) and call `out` for each
+/// declared name.
+fn collect_binding_pattern<'a, F: FnMut(&'a str)>(pat: &'a BindingPattern<'a>, out: &mut F) {
+    match pat {
+        BindingPattern::BindingIdentifier(id) => out(id.name.as_str()),
+        BindingPattern::ObjectPattern(obj) => {
+            for prop in &obj.properties {
+                collect_binding_pattern(&prop.value, out);
+            }
+            if let Some(rest) = &obj.rest {
+                collect_binding_pattern(&rest.argument, out);
+            }
+        }
+        BindingPattern::ArrayPattern(arr) => {
+            for el in &arr.elements {
+                if let Some(el) = el {
+                    collect_binding_pattern(el, out);
+                }
+            }
+            if let Some(rest) = &arr.rest {
+                collect_binding_pattern(&rest.argument, out);
+            }
+        }
+        BindingPattern::AssignmentPattern(asn) => {
+            collect_binding_pattern(&asn.left, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> RewriteOpts {
+        RewriteOpts {
+            kind: ScriptKind::Classic,
+            target_url: "https://example.com/".into(),
+            proxy_origin: "http://proxy.localhost:18080".into(),
+        }
+    }
+
+    // The sourcemap-pragma tail scan starts at a raw byte offset (`len() - 4096`).
+    // Landing inside a multi-byte character must not panic on a non-char boundary.
+    // Computed dynamic imports must also be wrapped in the runtime helper so the
+    // specifier resolves against the virtual target URL rather than `/zp/api/script`.
+    // Local receiver aliasing (`var u = n.location; u.protocol`) must still route
+    // URL-shape members through `__zp_get` because `Location` accessors are own
+    // non-configurable properties that cannot be masked on the prototype.
+    #[test]
+    fn dangerous_member_survives_local_aliasing() {
+        let o = opts();
+        // Local receivers are wrapped on both inner and outer accesses.
+        let out = rewrite_script("function f(n){ return n.location.protocol; }", &o).unwrap();
+        assert!(
+            out.code.contains("__zp_get(n,\"location\")"),
+            "local receiver .location must be wrapped: {}",
+            out.code
+        );
+        assert!(
+            out.code.contains("\"protocol\")"),
+            "outer URL component must also be wrapped: {}",
+            out.code
+        );
+        // Reading through an alias variable still routes through the membrane.
+        let aliased =
+            rewrite_script("function f(n){ var u = n.location; return u.protocol; }", &o).unwrap();
+        assert!(
+            aliased.code.contains("__zp_get(u,\"protocol\")"),
+            "access through an alias variable must route through the membrane: {}",
+            aliased.code
+        );
+        // When the receiver identifier itself is a shadowed dangerous global, keep the local binding.
+        let shadowed = rewrite_script("function f(location){ return location.href; }", &o).unwrap();
+        assert!(
+            !shadowed.code.contains("__zp_get(location,"),
+            "shadowed global name is a local binding and must not be wrapped: {}",
+            shadowed.code
+        );
+    }
+
+    // Bundles alias `Error` (`const be = Error`), and a library that saves the stack hook before installing its own reads `be.prepareStackTrace`: the page's view of it
+    // (nothing until it assigns one) has to come from the membrane, as it does for `Error.prepareStackTrace`.
+    #[test]
+    fn prepare_stack_trace_read_through_an_alias_routes_through_the_membrane() {
+        let o = opts();
+        let out = rewrite_script("const be = Error; function f(){ let i = be.prepareStackTrace; return i; }", &o).unwrap();
+        assert!(out.code.contains("__zp_get(be,\"prepareStackTrace\")"), "alias read must route: {}", out.code);
+        let param = rewrite_script("function f(E){ return E.prepareStackTrace; }", &o).unwrap();
+        assert!(param.code.contains("__zp_get(E,\"prepareStackTrace\")"), "parameter read must route: {}", param.code);
+    }
+
+    #[test]
+    fn computed_dynamic_import_is_wrapped_at_runtime() {
+        let o = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://cdn.example.com/a/b.js".into(),
+            proxy_origin: "http://proxy.localhost:18080".into(),
+        };
+        let out = rewrite_script("const p = import(base + '/mod.js');", &o)
+            .unwrap()
+            .code;
+        assert!(out.contains("__zp_module_url("), "computed import must be wrapped: {out}");
+        assert!(
+            out.contains("https://cdn.example.com/a/b.js"),
+            "referrer must be passed: {out}"
+        );
+        assert!(
+            out.contains("'/mod.js'"),
+            "inner expression must be preserved: {out}"
+        );
+    }
+
+    // Nesting order when the dynamic import specifier is itself rewritten (such as a
+    // method call sharing the same start offset). If the outer `__zp_module_url` wrapper
+    // is absorbed into the inner receiver span, the method name lands in the referrer
+    // slot and `new URL(spec, referrer)` throws `Invalid base URL`.
+    #[test]
+    fn computed_dynamic_import_wraps_outside_nested_rewrite() {
+        let o = RewriteOpts {
+            kind: ScriptKind::Classic,
+            target_url: "https://cdn.example.com/a/b.js".into(),
+            proxy_origin: "http://proxy.localhost:18080".into(),
+        };
+        let out = rewrite_script("import(u.replace('.png','.js'));", &o)
+            .unwrap()
+            .code;
+        let m = out
+            .find("__zp_module_url(")
+            .unwrap_or_else(|| panic!("computed import must be wrapped: {out}"));
+        // Verify nesting order when the inner call is rewritten.
+        if let Some(inner) = out.find("__zp_call(") {
+            assert!(
+                m < inner,
+                "__zp_module_url must wrap outside the inner rewrite: {out}"
+            );
+        }
+        // The referrer must remain the second argument of `__zp_module_url`.
+        assert!(
+            out.contains(",\"https://cdn.example.com/a/b.js\")")
+                || out.contains(", \"https://cdn.example.com/a/b.js\")"),
+            "referrer must be module_url's last argument: {out}"
+        );
+        assert!(
+            !out.contains("__zp_module_url(u,\"replace\""),
+            "method name must not land in the referrer slot: {out}"
+        );
+    }
+
+    // Literal imports stay statically resolved without the runtime helper.
+    #[test]
+    fn literal_dynamic_import_stays_static() {
+        let o = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://cdn.example.com/a/b.js".into(),
+            proxy_origin: "http://proxy.localhost:18080".into(),
+        };
+        let out = rewrite_script("import('./mod.js');", &o).unwrap().code;
+        assert!(
+            out.contains("http://proxy.localhost:18080/zp/api/script?u="),
+            "literal must resolve to an absolute proxy URL: {out}"
+        );
+        assert!(
+            !out.contains("__zp_module_url("),
+            "literal must not need the helper: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_sourcemap_pragma_survives_multibyte_tail() {
+        for pad in 0..8usize {
+            // `\u{AC00}` is 3 bytes in UTF-8; varying the ASCII padding walks the
+            // cut point across all three byte positions of a character.
+            let src = format!("var x=1;{}{}", "a".repeat(pad), "\u{AC00}".repeat(2000));
+            let out = strip_sourcemap_pragma(&src);
+            assert_eq!(out, src, "pad={pad} must be returned unchanged");
+        }
+        // And it still strips a real pragma when one is present after CJK text.
+        let src = format!("var x=1;{}\n//# sourceMappingURL=app.js.map", "\u{AC00}".repeat(2000));
+        let out = strip_sourcemap_pragma(&src);
+        assert!(!out.contains("sourceMappingURL"), "pragma must be stripped: {out}");
+    }
+
+    #[test]
+    fn html_body_must_parse_error() {
+        // Strict-mode parse rejection is required for the SW's fail-closed posture
+        // when an upstream returns an HTML error page for a script subresource.
+        for html in &[
+            "<!DOCTYPE html\n<html><head><title>404</title></head><body><h1>not found</h1></body></html>",
+            "<!DOCTYPE html\n    PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n<html xmlns=\"http://www.w3.org/1999/xhtml\">\n<head>\n<title>Not Found</title>\n<script type=text/javascript>\nif (!['/', '/index.html'].includes(window.location.pathname)) { window.location.href = '/'; }\n</script>\n</head>\n<body><h1>not found</h1></body>\n</html>",
+        ] {
+            let r = rewrite_script(html, &opts());
+            assert!(
+                matches!(r, Err(RewriteError::ParseFailed(_))),
+                "strict mode must reject HTML-as-JS; got: {:?}",
+                r,
+            );
+            let r2 = rewrite_script_patches(html, &opts());
+            assert!(
+                matches!(r2, Err(RewriteError::ParseFailed(_))),
+                "patch-mode strict must also reject HTML-as-JS; got: {:?}",
+                r2,
+            );
+        }
+    }
+
+    #[test]
+    fn function_global_is_rewritten_to_membrane() {
+        // Accessing `Function.prototype` or `new Function(...)` reaches the native
+        // Function constructor unless `Function` is classified as a dangerous global.
+        let src = "var i = Function.prototype; return new Function('return globalThis')();";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"Function\")"),
+            "Function global must route through membrane: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn eval_global_is_rewritten_to_membrane() {
+        // Indirect `eval` references (`var f = eval; f("...")`) must route through the membrane.
+        let src = "var f = eval; f('return globalThis');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"eval\")"),
+            "eval global must route through membrane: {}",
+            r.code,
+        );
+    }
+
+    // Sloppy Annex B block, labeled, and single-statement functions hoist to varEnv.
+    // The emitted declaration stays in place while outer references resolve to the local binding.
+    #[test]
+    fn sloppy_block_function_binds_dangerous_name_in_fn_scope() {
+        let src = "function g(){ { function location(){ return 1; } } return location(); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get(globalThis,\"location\")"),
+            "Annex B sloppy block fn must shadow, not virtualize: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn strict_block_function_stays_block_scoped() {
+        let src = "function g(){ 'use strict'; { function location(){ return 1; } } return location; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "strict block fn must NOT hoist; outer ref stays virtual: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn sloppy_labeled_function_binds_dangerous_name() {
+        // Annex B.3.3: `l: function document(){}` hoists to varEnv in sloppy mode.
+        let src = "function g(){ l: function document(){ return 1; } return document(); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get(globalThis,\"document\")"),
+            "sloppy labeled fn must shadow document: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn sloppy_single_statement_function_binds() {
+        // Annex B.3.4: `if (c) function f(){}` single-statement function declaration.
+        let src = "function g(){ if (x) function history(){ return 1; } return history; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get(globalThis,\"history\")"),
+            "sloppy single-statement fn must shadow history: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn toplevel_sloppy_block_unforgeable_stays_virtual() {
+        // Unforgeable names in the global varEnv ignore Annex B hoisting,
+        // keeping virtualization active just like top-level `var location`.
+        let src = "{ function location(){ return 1; } } location;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "top-level unforgeable must stay virtual: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn module_block_function_stays_lexical() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        let src = "function g(){ { function location(){ return 1; } } return location; }";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "module is strict; no Annex B hoisting: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn class_method_body_is_strict_for_annex_b() {
+        // Class method bodies are always strict, so block functions do not hoist.
+        let src = "class C { m(){ { function location(){ return 1; } } return location; } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "class method body is strict; outer ref must virtualize: {}",
+            r.code,
+        );
+    }
+
+    #[test]
+    fn naver_ndp_loader_round_trips_as_valid_js() {
+        // Verify that both `rewrite_script` (full re-emit) and `rewrite_script_patches`
+        // + `apply_patches` (patch envelope) produce identical, syntactically valid JS
+        // on the real-world `ndp-loader-fixture.js` bundle.
+        let src = include_str!("../tests/fixtures/ndp-loader-fixture.js");
+        let alloc1 = oxc_allocator::Allocator::default();
+        let st = oxc_span::SourceType::cjs();
+        let r1 = rewrite_script(src, &opts()).expect("full re-emit must succeed");
+        let p1 = oxc_parser::Parser::new(&alloc1, &r1.code, st).parse();
+        assert!(
+            p1.errors.is_empty(),
+            "full re-emit produced invalid JS: {:#?}\n----\n{}",
+            p1.errors,
+            r1.code,
+        );
+        let r2 = rewrite_script_patches(src, &opts()).expect("patch-mode must succeed");
+        let patched = apply_patches(src, &r2.patches);
+        let alloc2 = oxc_allocator::Allocator::default();
+        let p2 = oxc_parser::Parser::new(&alloc2, &patched, st).parse();
+        assert!(
+            p2.errors.is_empty(),
+            "patch-mode produced invalid JS: {:#?}\n----\n{}",
+            p2.errors,
+            patched,
+        );
+        assert_eq!(r1.code, patched, "patch-mode vs full re-emit divergence");
+    }
+
+    #[test]
+    fn super_constructor_with_extends_globalthis_member() {
+        // Class extends a rewritten global and constructor calls `super(args)`.
+        let src =
+            "class A extends globalThis.X { constructor(p) { super(p); this.location = p; } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(r.code.contains("super(p)"), "super(p) gone: {}", r.code);
+        // Do not rewrite `super.location` to `__zp_set(super, ...)`.
+        assert!(
+            !r.code.contains("__zp_set(super"),
+            "super target wrapped: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn super_method_call_not_rewritten() {
+        // `super.write(...)` must not be wrapped in `__zp_call(super, ...)`.
+        let src = "class C extends B { m() { super.write('x'); } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_call(super"),
+            "super.method() must stay native, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("super.write"),
+            "super.write missing: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn super_call_not_rewritten() {
+        // `super(...)` in a constructor must stay literal so class context is preserved.
+        let src = "class C extends B { constructor() { super(); this.x = 1; } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("super()"),
+            "super() must remain in output, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn super_member_access_not_rewritten() {
+        // `super.foo` and `super.foo = v` must stay untouched even when `foo` is on the
+        // dangerous-member list because `__zp_get(super, "foo")` is a SyntaxError.
+        let src = "class C extends B { m() { return super.location; } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get(super"),
+            "super.x must stay native, got: {}",
+            r.code
+        );
+        let src2 = "class C extends B { m(v) { super.location = v; } }";
+        let r2 = rewrite_script(src2, &opts()).unwrap();
+        assert!(
+            !r2.code.contains("__zp_set(super"),
+            "super.x = v must stay native, got: {}",
+            r2.code
+        );
+    }
+
+    // Shorthand object properties reuse one identifier as both key and value.
+    // Patching it as a plain reference would emit `{__zp_get(globalThis,"window"), ...}`,
+    // which is a SyntaxError.
+    #[test]
+    fn expands_shorthand_object_property_for_dangerous_globals() {
+        let r = rewrite_script("var a = { window, document, navigator };", &opts()).unwrap();
+        assert!(
+            r.code.contains("window:__zp_get(globalThis,\"window\")"),
+            "shorthand `window` must expand to `key: value`, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("document:__zp_get(globalThis,\"document\")"),
+            "shorthand `document` must expand to `key: value`, got: {}",
+            r.code
+        );
+        // The bare broken form must never appear.
+        assert!(
+            !r.code.contains("{ __zp_get(globalThis,\"window\")")
+                && !r.code.contains("{__zp_get(globalThis,\"window\")"),
+            "shorthand must not collapse into a keyless property, got: {}",
+            r.code
+        );
+        // Non-dangerous shorthand stays untouched.
+        assert!(r.code.contains("navigator }"), "got: {}", r.code);
+    }
+
+    #[test]
+    fn shorthand_expansion_respects_shadowing_and_non_shorthand_forms() {
+        // A shadowed `window` is a local binding and must stay shorthand.
+        let shadowed =
+            rewrite_script("(function(window){ return { window }; })();", &opts()).unwrap();
+        assert!(
+            shadowed.code.contains("{ window }"),
+            "shadowed shorthand must stay untouched, got: {}",
+            shadowed.code
+        );
+        // Methods and getters named after a global are property keys, not references.
+        let method = rewrite_script("f({ window() { return 1; } });", &opts()).unwrap();
+        assert!(
+            !method.code.contains("__zp_get"),
+            "method key must not be rewritten, got: {}",
+            method.code
+        );
+        let getter = rewrite_script("f({ get window() { return 1; } });", &opts()).unwrap();
+        assert!(
+            !getter.code.contains("__zp_get"),
+            "getter key must not be rewritten, got: {}",
+            getter.code
+        );
+        // Computed keys ARE references and must still be rewritten.
+        let computed = rewrite_script("f({ [window]: 1 });", &opts()).unwrap();
+        assert!(
+            computed
+                .code
+                .contains("[__zp_get(globalThis,\"window\")]"),
+            "computed key must be rewritten, got: {}",
+            computed.code
+        );
+        // Explicit `key: value` keeps working (value side rewritten only).
+        let explicit = rewrite_script("f({ window: window });", &opts()).unwrap();
+        assert!(
+            explicit
+                .code
+                .contains("window: __zp_get(globalThis,\"window\")"),
+            "explicit form must rewrite the value, got: {}",
+            explicit.code
+        );
+        // Nested / arrow-returned object literals go through the same path.
+        let nested = rewrite_script("var f = () => ({ window });", &opts()).unwrap();
+        assert!(
+            nested
+                .code
+                .contains("window:__zp_get(globalThis,\"window\")"),
+            "arrow-returned object literal must expand, got: {}",
+            nested.code
+        );
+    }
+
+    // Modules are served from `<proxy>/zp/api/script?u=<target>&kind=module`, so
+    // relative static specifiers must be resolved against `target_url` rather than `/zp/api/`.
+    #[test]
+    fn rewrites_static_module_specifiers() {
+        let opts = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://ssl.pstatic.net/tveta/libs/glad/prod/3.10.7/gfp-display-sdk.js"
+                .to_string(),
+            proxy_origin: "http://proxy.localhost:18080".to_string(),
+        };
+        // Every static form that carries a specifier, plus dynamic import for
+        // parity. Each must resolve relative to the TARGET url, not /zp/api/.
+        let cases = [
+            "import x from './gfp-display-nda.js';",
+            "import './side.js';",
+            "export { a } from './dep.js';",
+            "export * from './all.js';",
+            "const p = import('./dyn.js');",
+        ];
+        let expected_names = [
+            "gfp-display-nda.js",
+            "side.js",
+            "dep.js",
+            "all.js",
+            "dyn.js",
+        ];
+        for (src, name) in cases.iter().zip(expected_names.iter()) {
+            let r = rewrite_script(src, &opts).unwrap();
+            assert!(
+                r.code
+                    .contains("'http://proxy.localhost:18080/zp/api/script?u="),
+                "specifier must become an absolute proxy URL for {src:?}, got: {}",
+                r.code
+            );
+            assert!(
+                r.code.contains("&kind=module'"),
+                "specifier must be tagged kind=module for {src:?}, got: {}",
+                r.code
+            );
+            // Resolved against the target's directory, not the proxy API path.
+            let want = format!("prod%2F3.10.7%2F{name}");
+            assert!(
+                r.code.contains(&want),
+                "{src:?} must resolve against the target dir ({want}), got: {}",
+                r.code
+            );
+            assert!(
+                !r.code.contains("'./"),
+                "no relative specifier may survive in {src:?}, got: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_import_meta_url_to_the_target_url() {
+        let opts = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://github.githubassets.com/assets/app-runtime.js".to_string(),
+            proxy_origin: "http://proxy.localhost:18080".to_string(),
+        };
+        // Bundlers derive `publicPath` from `import.meta.url`. If the proxy URL leaks,
+        // subsequent chunks are requested under `<proxy>/zp/api/<chunk>` and fail with 502.
+        let r = rewrite_script("const p = import.meta.url;", &opts).unwrap();
+        assert!(
+            r.code.contains("\"https://github.githubassets.com/assets/app-runtime.js\""),
+            "import.meta.url was not rewritten to the target URL: {}",
+            r.code
+        );
+        assert!(!r.code.contains("import.meta.url"), "original import.meta.url survived: {}", r.code);
+
+        // Relative URL resolution against `import.meta.url` uses the same replacement.
+        let r2 = rewrite_script("new URL('./chunk.css', import.meta.url)", &opts).unwrap();
+        assert!(
+            r2.code.contains("\"https://github.githubassets.com/assets/app-runtime.js\""),
+            "{}",
+            r2.code
+        );
+
+        // Leave `import.meta.url` untouched when `target_url` is empty in host tests.
+        let bare = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: String::new(),
+            proxy_origin: String::new(),
+        };
+        let r3 = rewrite_script("const p = import.meta.url;", &bare).unwrap();
+        assert!(r3.code.contains("import.meta.url"), "{}", r3.code);
+    }
+
+    #[test]
+    fn rewrites_import_meta_resolve_against_the_target_url() {
+        let opts = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://example.com/dir/app.js".to_string(),
+            proxy_origin: "http://proxy.localhost:18080".to_string(),
+        };
+        // Native `import.meta.resolve` resolves against the module's physical URL
+        // (`/zp/api/script?...`), leaking the proxy origin or throwing on non-hierarchical
+        // bases. Replace it with a resolver anchored at the virtual target URL.
+        let r = rewrite_script("const u = import.meta.resolve('./x');", &opts).unwrap();
+        assert!(
+            r.code.contains("new URL(s,\"https://example.com/dir/app.js\").href"),
+            "import.meta.resolve replacement missing: {}",
+            r.code
+        );
+        assert!(!r.code.contains("import.meta.resolve"), "original import.meta.resolve survived: {}", r.code);
+
+        // Leave `import.meta.resolve` untouched when `target_url` is empty.
+        let bare = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: String::new(),
+            proxy_origin: String::new(),
+        };
+        let r2 = rewrite_script("const u = import.meta.resolve('./x');", &bare).unwrap();
+        assert!(r2.code.contains("import.meta.resolve"), "{}", r2.code);
+    }
+
+    #[test]
+    fn leaves_bare_and_inert_module_specifiers_alone() {
+        let opts = RewriteOpts {
+            kind: ScriptKind::Module,
+            target_url: "https://example.com/app/main.js".to_string(),
+            proxy_origin: "http://proxy.localhost:18080".to_string(),
+        };
+        // Bare specifiers are package names with no URL semantics, and blob: modules
+        // never round-trip through fetch. Rewriting either would break the module graph
+        // rather than fix it (a data: module has its own route, see
+        // `static_data_imports_go_to_the_module_route`).
+        for src in [
+            "import react from 'react';",
+            "export { x } from 'lodash-es';",
+            "import 'blob:http://h.example/3f2a-9';",
+        ] {
+            let r = rewrite_script(src, &opts).unwrap();
+            assert!(
+                !r.code.contains("/zp/api/script"),
+                "{src:?} must not be proxied, got: {}",
+                r.code
+            );
+        }
+        // `export { a }` without a `from` clause has no specifier at all.
+        let local = rewrite_script("const a = 1; export { a };", &opts).unwrap();
+        assert!(
+            !local.code.contains("/zp/api/script"),
+            "local re-export must be untouched, got: {}",
+            local.code
+        );
+    }
+
+    // Bare dangerous globals used as assignment targets (`location = url`,
+    // `location += '#x'`, `location++`) must route through `__zp_set` / `__zp_update`
+    // rather than emitting an invalid call expression on the left-hand side.
+    #[test]
+    fn routes_bare_global_writes_through_the_membrane() {
+        let plain = rewrite_script("location = url;", &opts()).unwrap();
+        assert!(
+            plain.code.contains("__zp_set(globalThis,\"location\",(url))"),
+            "plain assignment must use __zp_set, got: {}",
+            plain.code
+        );
+        let compound = rewrite_script("location += '#x';", &opts()).unwrap();
+        assert!(
+            compound
+                .code
+                .contains("__zp_set(globalThis,\"location\",__zp_get(globalThis,\"location\")+('#x'))"),
+            "compound assignment must emit get+op+set, got: {}",
+            compound.code
+        );
+        // Logical compound assignments short-circuit inline without a thunk so
+        // `await` and `yield` in the RHS remain valid.
+        let logical = rewrite_script("location ||= url;", &opts()).unwrap();
+        assert!(
+            logical
+                .code
+                .contains("__zp_get(globalThis,\"location\")||__zp_set(globalThis,\"location\",(url))"),
+            "logical assignment must emit inline short-circuit, got: {}",
+            logical.code
+        );
+        let update = rewrite_script("location++;", &opts()).unwrap();
+        assert!(
+            update
+                .code
+                .contains("__zp_update(globalThis,\"location\",\"++\",false)"),
+            "postfix update must use __zp_update, got: {}",
+            update.code
+        );
+        let prefix = rewrite_script("--top;", &opts()).unwrap();
+        assert!(
+            prefix
+                .code
+                .contains("__zp_update(globalThis,\"top\",\"--\",true)"),
+            "prefix update must record prefix=true, got: {}",
+            prefix.code
+        );
+        // No form may leave a call expression in the target position.
+        for src in ["location = url;", "location += 1;", "location++;"] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.contains("__zp_get(globalThis,\"location\") ="),
+                "{src:?} must not assign to a call expression, got: {}",
+                r.code
+            );
+        }
+    }
+
+    // Shorthand destructuring targets (`({ location } = obj)`) require a settable
+    // reference, so they expand to the prelude's write-only sink (`__zp_get.d.location`).
+    #[test]
+    fn routes_destructured_global_writes_through_the_write_only_sink() {
+        let simple = rewrite_script("({ location } = obj);", &opts()).unwrap();
+        assert!(
+            simple
+                .code
+                .contains("({ location: __zp_get.d.location } = obj)"),
+            "shorthand target must expand to the sink, got: {}",
+            simple.code
+        );
+        // A default survives because only the binding span is replaced.
+        let defaulted = rewrite_script("({ location = 1 } = obj);", &opts()).unwrap();
+        assert!(
+            defaulted
+                .code
+                .contains("({ location: __zp_get.d.location = 1 } = obj)"),
+            "default must be preserved, got: {}",
+            defaulted.code
+        );
+        // Nested inside an array pattern, and alongside untouched properties.
+        let nested = rewrite_script("[{ location }] = arr;", &opts()).unwrap();
+        assert!(
+            nested
+                .code
+                .contains("[{ location: __zp_get.d.location }]"),
+            "nested pattern must expand, got: {}",
+            nested.code
+        );
+        let mixed = rewrite_script("({ location, a } = obj);", &opts()).unwrap();
+        assert!(
+            mixed
+                .code
+                .contains("({ location: __zp_get.d.location, a } = obj)"),
+            "non-dangerous siblings must stay shorthand, got: {}",
+            mixed.code
+        );
+        // The broken keyless form must never come back.
+        for src in [
+            "({ location } = obj);",
+            "({ location = 1 } = obj);",
+            "[{ location }] = arr;",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.contains("{ __zp_get(globalThis,\"location\") }"),
+                "{src:?} must not emit a keyless property, got: {}",
+                r.code
+            );
+        }
+    }
+
+    // Because `__zp_get.d` is write-only (reading it yields `undefined`), a dangerous
+    // global that is only read inside an assignment target (such as a member's receiver
+    // `[window.a.b] = x`, a computed key, or a default value) must use the normal read path.
+    #[test]
+    fn globals_read_inside_assignment_targets_are_not_sunk() {
+        for src in [
+            "[window.dotcom.x] = a;",
+            "[,,,window.dotcom.data.k, window.dotcom.data.j] = a.split('/');",
+            "({ y: document.title } = o);",
+            "({ ...window.rest } = o);",
+            "[document.title = window.name] = q;",
+            "[a[location.href]] = q;",
+            "({ [window.k]: v } = o);",
+            "({ a = window.x } = o);",
+            "({ a: b = window.x } = o);",
+            "for (window.x of arr) {}",
+            "for (a[window.k] of arr) {}",
+            "for (document.title in o) {}",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.contains("__zp_get.d."),
+                "a global that is only read in a target must not use the write sink in {src:?}, got: {}",
+                r.code
+            );
+        }
+        let r = rewrite_script("[window.dotcom.x] = a;", &opts()).unwrap();
+        assert!(
+            r.code.contains("[__zp_get(globalThis,\"window\").dotcom.x] = a;"),
+            "the receiver is read through the membrane, got: {}",
+            r.code
+        );
+        // The identifier that IS the target keeps the sink, next to a read.
+        let r = rewrite_script("[location, window.a] = q;", &opts()).unwrap();
+        assert!(
+            r.code
+                .contains("[__zp_get.d.location, __zp_get(globalThis,\"window\").a] = q;"),
+            "target keeps the sink, receiver is read, got: {}",
+            r.code
+        );
+        let r = rewrite_script("({ location = window.name } = o);", &opts()).unwrap();
+        assert!(
+            r.code
+                .contains("({ location: __zp_get.d.location = __zp_get(globalThis,\"window\").name } = o);"),
+            "a default value is a read, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn shadowed_globals_keep_native_write_semantics() {
+        // A local binding named after a global is not the global, so neither the
+        // setter helpers nor the sink may appear. Classic top-level `var location`
+        // is not a shadow because `location` is unforgeable on `Window`, so these
+        // cases use function scope where `var`, `let`, and parameters bind locally.
+        for src in [
+            "function f(){ var location = 2; location = 3; }",
+            "(function(location){ location = 1; })();",
+            "(function(location){ ({ location } = o); })();",
+            "(function(top){ top++; })();",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.contains("__zp_set(globalThis")
+                    && !r.code.contains("__zp_assign(globalThis")
+                    && !r.code.contains("__zp_update(globalThis")
+                    && !r.code.contains("__zp_get.d."),
+                "shadowed binding must stay native in {src:?}, got: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn empty_source_no_patches() {
+        let r = rewrite_script("", &opts()).unwrap();
+        assert_eq!(r.patches.len(), 0);
+        assert_eq!(r.code, "");
+    }
+
+    #[test]
+    fn rewrites_unbound_location() {
+        let src = "var x = location.href;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn rewrites_unbound_window() {
+        let src = "console.log(window);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"window\")"),
+            "got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_shadowed_location() {
+        let src = "function f(location){ return location.href; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get"),
+            "shadowed param should not be rewritten, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_var_decl_with_same_name() {
+        // Function-scoped `var location` shadows the global and needs no mediation.
+        let src = "function f(){ var location = 'x'; use(location); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get"),
+            "shadowed var should not be rewritten, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn classic_toplevel_var_dangerous_is_not_a_shadow() {
+        // At classic top level, `var location` does not redeclare the unforgeable
+        // global, so reads and initializers must still route through the membrane.
+        for (src, needle) in [
+            ("var location; location.href;", "__zp_get(globalThis,\"location\")"),
+            ("var document; document.title;", "__zp_get(globalThis,\"document\")"),
+            ("var location = 'x'; location.href;", "__zp_set(globalThis,\"location\",('x'))"),
+            ("var location = 'x'; location.href;", "__zp_get(globalThis,\"location\")"),
+            ("function location(){} location.href;", "__zp_get(globalThis,\"location\")"),
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                r.code.contains(needle),
+                "{src:?} must still mediate the global, got: {}",
+                r.code
+            );
+            // A bare `var location;` (no init) is a no-op natively; initializers
+            // and function declarations that touch the real global must be mediated.
+            assert!(
+                !r.code.contains("var location =") && !r.code.contains("function location"),
+                "{src:?} left a dangerous declaration that escapes: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn classic_toplevel_var_dangerous_patterns_sink() {
+        // Top-level `var {location} = o` and `var [location] = a` bind to a temporary
+        // and forward the value into the membrane.
+        for src in [
+            "var {location} = o;",
+            "var [location] = a;",
+            "var {a: location, b: x} = o;",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                r.code.contains("__zp_set(globalThis,\"location\""),
+                "{src:?} must sink the destructured write, got: {}",
+                r.code
+            );
+            assert!(
+                !r.code.contains("location ="),
+                    "{src:?} left a bare binding, got: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn classic_toplevel_let_still_shadows() {
+        // Top-level `let`, `const`, and `class` create lexical bindings that shadow globals.
+        for src in [
+            "let location = 'x'; location;",
+            "const location = 'x'; use(location);",
+            "class location {} new location();",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.contains("__zp_get(globalThis,\"location\")"),
+                "{src:?} lexical binding should shadow, got: {}",
+                r.code
+            );
+        }
+    }
+
+    // Literal-URL `import("./mod")` calls resolve against `target_url` and rewrite
+    // to `/zp/api/script?u=<percent-encoded-abs>` so the SW transports them.
+    #[test]
+    fn dynamic_import_relative_literal_routes_through_proxy() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        o.target_url = "https://ssl.pstatic.net/tveta/libs/glad/prod/gfp-core.js".into();
+        let src = "await import('./gfp-display-glog-logger.js')";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            r.code.contains("/zp/api/script?u="),
+            "import literal must be proxy-routed: {}",
+            r.code
+        );
+        // The encoded absolute URL must reflect the resolved path.
+        assert!(
+            r.code.contains("gfp-display-glog-logger.js")
+                || r.code.contains("gfp-display-glog-logger.js")
+                || r.code.contains("gfp-display-glog-logger.js"),
+            "proxied URL must encode the resolved absolute path: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn dynamic_import_absolute_https_literal_routes_through_proxy() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        let src = "import('https://cdn.example.com/m.js?v=1').then(use);";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            r.code.contains("/zp/api/script?u="),
+            "absolute https import must be proxy-routed: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn dynamic_import_data_uri_is_left_alone() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        let src = "import('data:text/javascript,export const x=1').then(use);";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            !r.code.contains("/zp/api/script"),
+            "data: import must NOT be proxy-routed (SW can't fetch data:): {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn static_blob_imports_become_placeholders_that_cannot_load() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        let src = "import a from 'blob:http://h.example/3f2a-9';
+export * from \"blob:http://h.example/x\";";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(!r.code.contains("'blob:") && !r.code.contains("\"blob:"), "a blob: specifier must not reach the browser as it is: {}", r.code);
+        assert_eq!(r.code.matches("'zp-import:").count(), 2, "every static specifier is marked: {}", r.code);
+        assert!(r.code.contains("zp-import:blob%3Ahttp%3A%2F%2Fh%2Eexample%2F3f2a%2D9"), "the original rides along percent-encoded: {}", r.code);
+        // the dynamic literal form takes the runtime path and is not marked
+        let dynamic = rewrite_script("import('blob:http://h.example/y');", &o).unwrap();
+        assert!(!dynamic.code.contains("zp-import:"), "a dynamic import is resolved by the runtime: {}", dynamic.code);
+    }
+
+    #[test]
+    fn static_data_imports_go_to_the_module_route() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        o.proxy_origin = "http://proxy.example".to_string();
+        let src = "import 'data:text/javascript,1';
+export { b } from 'DATA:text/javascript;base64,ZXhwb3J0IGNvbnN0IGI9MQ==';
+import * as c from \"data:text/javascript,export default 2\";";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(!r.code.contains("'data:") && !r.code.contains("'DATA:") && !r.code.contains("\"data:"), "a data: specifier must not reach the browser as it is: {}", r.code);
+        assert!(!r.code.contains("zp-import:"), "a data: module is served, not marked: {}", r.code);
+        assert_eq!(r.code.matches("http://proxy.example/zp/api/script?u=").count(), 3, "every static specifier is routed: {}", r.code);
+        assert!(r.code.contains("u=data%3Atext%2Fjavascript,1&kind=module"), "the address rides along percent-encoded: {}", r.code);
+        assert!(r.code.contains("u=DATA%3Atext%2Fjavascript%3Bbase64,ZXhwb3J0IGNvbnN0IGI9MQ%3D%3D&kind=module"), "base64 padding is encoded too: {}", r.code);
+    }
+
+    #[test]
+    fn dynamic_import_bare_specifier_left_alone() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        // Bare specifiers (`react`, `lodash/find`) are resolved by an import map or bundler.
+        let src = "import('lodash').then(use);";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            !r.code.contains("/zp/api/script"),
+            "bare specifier must NOT be proxy-routed: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn dynamic_import_computed_left_alone_but_inner_globals_still_rewritten() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        // Computed specifiers cannot be resolved statically, but inner global
+        // references (`location.href`) must still route through the membrane.
+        let src = "import(location.href + 'mod.js').then(use);";
+        let r = rewrite_script(src, &o).unwrap();
+        assert!(
+            r.code.contains("__zp_get"),
+            "inner location reference must be membrane-rewritten even when import is computed: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn rewrites_history_and_top() {
+        let src = "history.pushState({}, '', top.location.pathname);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"history\")"),
+            "history not rewritten: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"top\")"),
+            "top not rewritten: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn nested_compound_member_assignment_leaves_no_marker() {
+        // A compound write to a dangerous member (`top`, `location`, `href`, …) inside another rewritten range is rebased with the range, and
+        // its value span sits one field later than a plain write's: the table of rebased fields once missed that, and the marker reached the
+        // output (a control character: the whole script failed to parse; YouTube's 11 MB bundle holds `v[0].top=v[1].top+=U.height`).
+        for src in [
+            "v[0].top=v[1].top+=U.height;",
+            "a.top = (b.top += 1);",
+            "x.location = y.location += z;",
+            "location.assign(a.href += 'x');",
+            "if (1) a.top = b.top -= 1;",
+            "a.top = { k: b.top += 1 };",
+            "[a.top = b.top += 1];",
+            "a.top = b.top += c.top += 1;",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert!(
+                !r.code.chars().any(|c| ('\u{1}'..='\u{8}').contains(&c)),
+                "marker left in the output of `{src}`: {}",
+                r.code.escape_debug()
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_bare_frame_element() {
+        let src = "var el = frameElement; if (frameElement) { frameElement.remove(); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"frameElement\")"),
+            "a bare frameElement reaches the embedder's element: {}",
+            r.code
+        );
+        assert!(
+            !r.code.contains("(frameElement)") && !r.code.contains(" frameElement."),
+            "no raw read is left: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn parse_failure_is_strict_error() {
+        let r = rewrite_script("function {", &opts());
+        assert!(
+            matches!(r, Err(RewriteError::ParseFailed(_))),
+            "got: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn module_mode_handles_import() {
+        let mut o = opts();
+        o.kind = ScriptKind::Module;
+        let r = rewrite_script("import { x } from './mod.js'; use(window);", &o).unwrap();
+        assert!(r.code.contains("__zp_get(globalThis,\"window\")"));
+    }
+
+    #[test]
+    fn patches_are_in_source_order() {
+        let src = "a(window); b(location); c(history);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        for win in r.patches.windows(2) {
+            assert!(win[0].start <= win[1].start, "patches not sorted");
+        }
+    }
+
+    #[test]
+    fn destructuring_param_shadows() {
+        let src = "function f({location}) { return location.href; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get"),
+            "destructured param should shadow, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn catch_clause_param_shadows() {
+        let src = "try { use(window); } catch (window) { use(window); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // The first window is unbound and should be rewritten; the second is shadowed by catch param.
+        // Patch count: only the first window.
+        let zp_gets = r.code.matches("__zp_get").count();
+        assert_eq!(zp_gets, 1, "expected exactly one rewrite, got: {}", r.code);
+    }
+
+    #[test]
+    fn iframe_content_window_rewrites() {
+        let src = "iframe.contentWindow.fetch();";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(iframe,\"contentWindow\")"),
+            "iframe.contentWindow not rewritten: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn document_default_view_rewrites() {
+        let src = "var v = document.defaultView;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // document is also a dangerous global so it'll be rewritten as the receiver.
+        assert!(
+            r.code.contains("\"defaultView\""),
+            "defaultView not rewritten: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn member_access_to_safe_prop_left_alone() {
+        let src = "obj.foo.bar();";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_get"),
+            "safe member must not be rewritten: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn obj_location_member_access_rewrites() {
+        let src = "var u = obj.location;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(obj,\"location\")"),
+            "obj.location not rewritten: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn patches_returned_for_post_processing() {
+        let src = "var u = location;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // patch[0] = R1 `__zp_lex_decl` checkvar prefix (top-level `var u`),
+        // patch[1] = the `location` identifier rewrite.
+        assert_eq!(r.patches.len(), 2, "expected 2 patches for one location ref + lex prefix");
+        assert_eq!(r.patches[1].start, 8);
+        assert_eq!(r.patches[1].end, 16);
+    }
+
+    #[test]
+    fn large_source_with_few_changes_returns_few_patches() {
+        // Simulate "90% of code unchanged": one tiny rewrite in a large source.
+        let mut src = String::with_capacity(10_000);
+        for _ in 0..200 {
+            src.push_str("function a(){ return 42; }\n");
+        }
+        src.push_str("var u = location.href;\n");
+        let r = rewrite_script(&src, &opts()).unwrap();
+        // The changed region needs two patches (the bare `location` identifier
+        // and the outer `location.href` member access), plus one `__zp_lex_decl`
+        // prefix covering the top-level declarations.
+        assert_eq!(
+            r.patches.len(),
+            3,
+            "patch-mode should emit only changed regions, got {} patches",
+            r.patches.len()
+        );
+    }
+
+    #[test]
+    fn lexical_prelude_appears_once_when_the_first_statement_is_rewritten() {
+        // The prelude sits exactly where the first statement starts; a call or an assignment rewrite that rebuilds its receiver
+        // text from the sub-range used to carry a second copy of it inside `__zp_call(` / `__zp_set(`.
+        for src in [
+            "history.replaceState(null, '', '/x'); var f;",
+            "\n  history.replaceState(null, '', '/x');\n  var f = 1;",
+            "location.href = '/y'; var f;",
+            "'use strict'; history.pushState(1, '', '/z'); function g() {}",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert_eq!(
+                r.code.matches("__zp_lex_decl(").count(),
+                1,
+                "the registry prelude must appear exactly once for {src:?}: {}",
+                r.code
+            );
+            assert!(
+                !r.code.contains("__zp_call(;") && !r.code.contains("__zp_set(;"),
+                "a prelude landed inside a helper call for {src:?}: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn unbraced_with_body_gets_one_helper_prefix() {
+        // The helper bindings of a `with` are a zero-width insertion where its body starts, which is where a rewritten body statement
+        // starts too; a sub-range that took them again printed `const{__zp_get,…}=(function(){return this})();` a second time inside
+        // `__zp_call(` / `__zp_set(`, a SyntaxError.
+        for src in [
+            "with (o) location.href = '/y';",
+            "with (o) history.replaceState(1, '', '/x');",
+            "with (o) foo.bar(1);",
+            "with (o) { history.replaceState(1); }",
+        ] {
+            let r = rewrite_script(src, &opts()).unwrap();
+            assert_eq!(
+                r.code.matches("(function(){return this})()").count(),
+                1,
+                "the helper bindings of the with must appear exactly once for {src:?}: {}",
+                r.code
+            );
+        }
+    }
+
+    #[test]
+    fn location_assign_call_routed() {
+        let src = "location.assign('https://example.com/');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code
+                .contains("__zp_call(__zp_get(globalThis,\"location\"),\"assign\","),
+            "location.assign() not routed: {}",
+            r.code
+        );
+    }
+
+    // `search` is in `DANGEROUS_PROPS` for `location.search`, so a `.search(re)` call
+    // on a string must route through `__zp_call` to preserve its receiver rather than
+    // being wrapped as `__zp_get(s, "search")(re)`.
+    #[test]
+    fn dangerous_prop_in_callee_position_keeps_its_receiver() {
+        let r = rewrite_script("navigator.userAgent.search('Trident');", &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_call(") && r.code.contains("\"search\","),
+            "prop-named method call not routed through __zp_call: {}",
+            r.code
+        );
+        // The callee's own MEMBER_GET must be gone, or the receiver is lost
+        // again and the two patches overlap.
+        assert!(
+            !r.code.contains("__zp_get(navigator.userAgent,\"search\")("),
+            "callee still wrapped as a get: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn dangerous_prop_read_is_still_a_get() {
+        // Only the CALLEE position changes: reading `location.search` must keep
+        // going through the membrane get.
+        let r = rewrite_script("var q = location.search;", &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_get(") && r.code.contains("\"search\""),
+            "plain read must still be wrapped: {}",
+            r.code
+        );
+        assert!(
+            !r.code.contains("__zp_call("),
+            "a read must not become a call: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn location_replace_call_routed() {
+        let src = "var p = 'x'; location.replace(p);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(r.code.contains("__zp_call("), "no call rewrite: {}", r.code);
+        assert!(
+            r.code.contains("\"replace\","),
+            "method name missing: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn iframe_post_message_routed() {
+        let src = "iframe.contentWindow.postMessage(payload, '*');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // contentWindow member -> __zp_get wrap + postMessage method -> __zp_call.
+        assert!(r.code.contains("__zp_call("), "no call rewrite: {}", r.code);
+        assert!(
+            r.code.contains("__zp_get(iframe,\"contentWindow\")"),
+            "iframe wrap missing: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn window_location_assignment_routed() {
+        let src = "window.location = 'https://target/';";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // window is dangerous global -> wrapped; .location = ... is dangerous member set.
+        assert!(r.code.contains("__zp_set("), "no set rewrite: {}", r.code);
+        assert!(
+            r.code.contains("\"location\","),
+            "set property name missing: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn safe_method_call_left_alone() {
+        let src = "obj.someMethod(arg);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_call"),
+            "safe call must not be rewritten: {}",
+            r.code
+        );
+    }
+
+
+    #[test]
+    fn reflect_get_window_location_routed() {
+        let src = "var x = Reflect.get(window, 'location');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // The Reflect.get(...) call site is replaced by __zp_rget(window, 'location').
+        // The `window` arg is itself rewritten to __zp_get(globalThis,'window').
+        assert!(
+            r.code
+                .contains("__zp_rget((__zp_get(globalThis,\"window\")),('location'))"),
+            "Reflect.get not routed: {}",
+            r.code
+        );
+        assert!(
+            !r.code.contains("Reflect.get"),
+            "stale Reflect.get remained: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn reflect_set_window_location_routed() {
+        let src = "Reflect.set(window, 'location', 'https://x/');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_rset("),
+            "Reflect.set not routed: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("('location')"),
+            "prop name missing: {}",
+            r.code
+        );
+        assert!(
+            !r.code.contains("Reflect.set"),
+            "stale Reflect.set remained: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn reflect_get_with_safe_prop_unchanged() {
+        let src = "Reflect.get(obj, 'foo');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("Reflect.get"),
+            "safe Reflect.get must pass through: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn reflect_shadowed_does_not_rewrite() {
+        // If `Reflect` is locally bound, do not rewrite; it is not the native global.
+        let src = "function f(Reflect){ return Reflect.get(window, 'location'); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // The Reflect.get(...) wrapper should NOT be applied (shadowed).
+        assert!(
+            r.code.contains("Reflect.get("),
+            "shadowed Reflect must remain: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn get_own_property_descriptor_dangerous_mediated() {
+        // The descriptor path used to emit only a diagnostic and pass the
+        // native accessor through. Now it routes through the
+        // membrane helper that wraps location descriptors.
+        let src = "Object.getOwnPropertyDescriptor(window, 'location');";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_getOwnPropertyDescriptor("),
+            "descriptor access must be mediated, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn with_statement_resolves_object_first() {
+        // `with(obj)` identifier reads must prefer obj's own properties and
+        // fall back to the membrane rather than statically pinning to the global.
+        let src = "with (obj) { use(location); }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_with_get("),
+            "with-body read must go through the resolver chain, got: {}",
+            r.code
+        );
+        // Fall-back to the membrane global when the object lacks the name.
+        assert!(
+            r.code.contains("__zp_get(globalThis,\"location\")"),
+            "with fallback missing, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn with_statement_write_and_update() {
+        let src = "with (obj) { location = 'x'; top++; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_with_set("),
+            "with-body write missing, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("__zp_with_update("),
+            "with-body update missing, got: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn destructuring_binding_rhs_rewritten() {
+        // Destructuring out of `window` reads from the rewritten window proxy.
+        // The destructured local then holds the membrane-proxied location.
+        let src = "const { location } = window; location.href;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("= __zp_get(globalThis,\"window\")"),
+            "destructuring RHS not rewritten: {}",
+            r.code
+        );
+        // The destructured `location` is locally bound, so no further rewrite is needed.
+    }
+
+    #[test]
+    fn return_followed_by_parenthesized_method_call() {
+        // NAVER kw-owner ch() function:
+        //   function ch(e){return("string"==typeof e?e:""+e).replace(cd,"\n").replace(cf,"")}
+        // The outer `.replace(cf,"")` METHOD_CALL replacement consumes the
+        // leading `(` of `("string"==typeof e?e:""+e)`. Without leading paren
+        // in our emitted replacement, the result becomes `return__zp_call(...)`
+        // which JS parses as a single identifier and throws a ReferenceError.
+        let src = "function ch(e){return(\"string\"==typeof e?e:\"\"+e).replace(cd,\"\\n\").replace(cf,\"\")}";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("return__zp_"),
+            "rewriter glued __zp_call to return keyword: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn new_global_member_constructor_preserved() {
+        // Regression: NAVER comic.naver.com (kw-owner/index.js) does
+        // `new globalThis.Request("https://empty.invalid", {body:...})`.
+        // Without parentheses around our globalThis patch, `new` would bind to
+        // `__zp_get(globalThis,"globalThis")` (consuming those arguments) and
+        // `.Request(args)` would degenerate to a function call, throwing
+        // `Failed to construct 'Request': Please use the 'new' operator`.
+        let src = r#"new globalThis.Request("https://empty.invalid", {body:null});"#;
+        let r = rewrite_script(src, &opts()).unwrap();
+        // The crucial property: between `new` and the next `(`, the patched
+        // globalThis must be parenthesised so the `new MemberExpression
+        // Arguments` rule consumes `.Request(...)` as a single member-call.
+        assert!(
+            r.code
+                .contains("new (__zp_get(globalThis,\"globalThis\")).Request("),
+            "new globalThis.Request(...) not preserved as constructor: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn iframe_clean_realm_fetch_routed() {
+        // window.frames[0].fetch is a typical iframe clean-realm escape.
+        // We only rewrite the `window` and `frames` properties; the call
+        // surface (`fetch(...)`) is captured by the service worker.
+        let src = "window.frames;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // `window` is a dangerous global (wrapped); `.frames` is also a
+        // dangerous member, so the outer __zp_get wraps the wrapped window.
+        assert!(
+            r.code
+                .contains("__zp_get(__zp_get(globalThis,\"window\"),\"frames\")"),
+            "nested rewrite missing: {}",
+            r.code
+        );
+    }
+
+    // D2: sourcemap pragma strip
+    #[test]
+    fn d2_strips_line_comment_pragma() {
+        let src = "var a=1;\n//# sourceMappingURL=app.js.map";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(!r.code.contains("sourceMappingURL"), "line pragma not stripped: {}", r.code);
+        assert!(r.code.contains("var a=1"));
+    }
+
+    #[test]
+    fn d2_strips_legacy_at_pragma() {
+        let src = "var a=1;\n//@ sourceMappingURL=app.js.map";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(!r.code.contains("sourceMappingURL"));
+    }
+
+    #[test]
+    fn d2_strips_block_comment_pragma() {
+        let src = "var a=1;\n/*# sourceMappingURL=app.js.map */";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(!r.code.contains("sourceMappingURL"));
+    }
+
+    #[test]
+    fn d2_strips_data_url_pragma() {
+        let map = "data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==";
+        let src = format!("var a=1;\n//# sourceMappingURL={}", map);
+        let r = rewrite_script(&src, &opts()).unwrap();
+        assert!(!r.code.contains("sourceMappingURL"));
+        assert!(!r.code.contains("data:application/json"));
+    }
+
+    #[test]
+    fn d2_preserves_source_without_pragma() {
+        let src = "var sourceMappingURL = 'not a pragma';\nvar a=1;";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(r.code.contains("sourceMappingURL"));
+    }
+
+    #[test]
+    fn d2_only_strips_last_pragma() {
+        let src = "var s = '//# sourceMappingURL=fake.map';\nvar a=1;\n//# sourceMappingURL=real.map";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(!r.code.contains("real.map"));
+        assert!(r.code.contains("fake.map"));
+    }
+
+    // Perf: persistent arena rewriter reuses one Allocator across calls.
+    #[test]
+    fn rewriter_instance_reuses_arena() {
+        let mut inst = RewriterInstance::new();
+        for _ in 0..5 {
+            let src = "location.href; window.open('x');";
+            let r = inst.rewrite(src, &opts()).expect("rewrite");
+            assert!(r.code.contains("__zp_get"), "warm path produced: {}", r.code);
+        }
+    }
+
+    // ----- Infinite-loop cap (NAVER warm-session V8 wedge fix) -----
+
+    #[test]
+    fn caps_bare_for_infinite_loop() {
+        // `for(;;) body` is the canonical anti-bot probe shape; it
+        // wedges V8 if the loop body never breaks. Rewriter must inject
+        // a counter so the loop terminates after a generous bound.
+        let src = "function probe(){ for(;;) { a(); } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("for(;;)"),
+            "bare for(;;) must be replaced with a capped form, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("__zp_lc_1"),
+            "expected counter __zp_lc_1, got: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("<10000000"),
+            "expected iteration cap constant, got: {}",
+            r.code
+        );
+        // The body identifier `a()` must remain; only the header is
+        // rewritten.
+        assert!(r.code.contains("a()"), "body lost: {}", r.code);
+    }
+
+    #[test]
+    fn caps_while_true() {
+        let src = "while (true) { step() }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("while (true)") && !r.code.contains("while(true)"),
+            "while(true) must be replaced: {}",
+            r.code
+        );
+        assert!(r.code.contains("__zp_lc_"), "no counter: {}", r.code);
+    }
+
+    #[test]
+    fn caps_while_one() {
+        let src = "while(1){step()}";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("while(1)"),
+            "while(1) must be replaced: {}",
+            r.code
+        );
+        assert!(r.code.contains("__zp_lc_"), "no counter: {}", r.code);
+    }
+
+    #[test]
+    fn caps_do_while_true() {
+        let src = "do{step()}while(true);";
+        let r = rewrite_script(src, &opts()).unwrap();
+        // The do-while form requires the trailing `while(test)` so we
+        // patch the test slot rather than the header. The counter is
+        // declared before the `do`.
+        assert!(
+            r.code.contains("let __zp_lc_") && r.code.contains("=0;do"),
+            "do-while counter decl missing: {}",
+            r.code
+        );
+        assert!(
+            r.code.contains("__zp_lc_1++<10000000"),
+            "do-while test not capped: {}",
+            r.code
+        );
+        // Body unchanged.
+        assert!(r.code.contains("step()"), "body lost: {}", r.code);
+    }
+
+    #[test]
+    fn does_not_cap_finite_loops() {
+        // A loop with a finite test condition must not be touched;
+        // capping would change semantics for legitimate code.
+        let src = "for (let i = 0; i < 5; i++) { sum += i }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_lc_"),
+            "finite for-loop must not be capped: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn does_not_cap_while_with_variable_test() {
+        let src = "while (running) { tick() }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_lc_"),
+            "variable-test while must not be capped: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn does_not_cap_for_with_nonconst_test() {
+        // Non-constant loop tests such as `for(i=0;x();i++)` are intentionally
+        // left uncapped. Native execution runs until the test evaluates to
+        // false, and injecting a cap would silently terminate legitimate
+        // long-running loops (pollers or scanners) at 10M iterations. Caps
+        // apply only to constant-truthy infinite forms (`while(true)`, `for(;;)`).
+        let src = "for(let i=0;keepGoing();i++){ step() }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            !r.code.contains("__zp_lc_"),
+            "nonconst-test for must not be capped: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn nested_infinite_loops_get_distinct_counters() {
+        // Each infinite loop must allocate its own counter ID so the
+        // inner cap doesn't shadow the outer one (which would let the
+        // inner reset on every outer iteration).
+        let src = "for(;;){ while(true){ y() } }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        assert!(
+            r.code.contains("__zp_lc_1") && r.code.contains("__zp_lc_2"),
+            "nested loops must have distinct counters: {}",
+            r.code
+        );
+    }
+
+    #[test]
+    fn local_alias_window_chain_members_route_through_membrane() {
+        let src = "function g(w, d, f) { return [w.top, w.parent, w.opener, w.frameElement, w.document, w.window, w.self, w.globalThis, w.frames, f.contentWindow, f.contentDocument, d.defaultView]; }";
+        let r = rewrite_script(src, &opts()).unwrap();
+        for prop in [
+            "top",
+            "parent",
+            "opener",
+            "frameElement",
+            "document",
+            "window",
+            "self",
+            "globalThis",
+            "frames",
+        ] {
+            let needle = format!("__zp_get(w,\"{prop}\")");
+            assert!(
+                r.code.contains(&needle),
+                "local alias w.{prop} must route through __zp_get, got: {}",
+                r.code
+            );
+        }
+        assert!(
+            r.code.contains("__zp_get(f,\"contentWindow\")")
+                && r.code.contains("__zp_get(f,\"contentDocument\")")
+                && r.code.contains("__zp_get(d,\"defaultView\")"),
+            "local alias f.contentWindow/contentDocument and d.defaultView must route through __zp_get, got: {}",
+            r.code
+        );
+    }
+}
+
+#[cfg(test)]
+mod dynamic_import_probe {
+    use super::*;
+    // Relative dynamic imports must route through the script-proxy URL in both
+    // classic and module scripts; otherwise the browser resolves the specifier
+    // against the script's own proxy URL (`/zp/api/script?...`) and requests
+    // `/zp/api/<name>.js` (resulting in a 404).
+    #[test]
+    fn relative_dynamic_import_resolves_to_proxy_url() {
+        for kind in [ScriptKind::Classic, ScriptKind::Module] {
+            let opts = RewriteOpts {
+                kind,
+                target_url: "https://ssl.pstatic.net/tveta/libs/glad/prod/gfp-core.js".into(),
+                proxy_origin: "http://proxy.localhost:18080".into(),
+            };
+            let src = r#"async function f(){ const m = await import("./gfp-display-sdk.js"); return m; }"#;
+            let out = rewrite_script(src, &opts).expect("rewrite");
+            assert!(
+                out.code.contains("/zp/api/script?u=https%3A%2F%2Fssl.pstatic.net%2Ftveta%2Flibs%2Fglad%2Fprod%2Fgfp-display-sdk.js"),
+                "{kind:?}: relative import not routed to proxy script URL: {}",
+                out.code
+            );
+        }
+    }
+}
