@@ -193,7 +193,7 @@ func (d *BoundSchemaDDL) FinalizeSequences(ctx context.Context, descriptors []*m
 			return nil, err
 		}
 		if actual.OID() != expected.OID() || actual.Name() != expected.Name() || actual.Version() != expected.Version() ||
-			actual.State() != expected.State() || actualSpec.Physical != expectedSpec.Physical || *actualSpec.Sequence != *expectedSpec.Sequence ||
+			actual.State() != expected.State() || actualSpec.Physical != expectedSpec.Physical || !actualSpec.Sequence.Equal(*expectedSpec.Sequence) ||
 			!slices.Equal(actualSpec.Dependencies, expectedSpec.Dependencies) {
 			return nil, bindError("22023", "owned sequence does not match its reserved declaration", 0)
 		}

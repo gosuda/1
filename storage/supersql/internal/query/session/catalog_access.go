@@ -219,7 +219,7 @@ func (a *CatalogAccess) Access(ctx context.Context, request opt.AccessRequest) (
 			break
 		}
 		forward := result.Paths[i]
-		if len(forward.Keys) == 0 {
+		if len(forward.Keys) == 0 || forward.GIN.Enabled {
 			continue
 		}
 		savedBudget := budget
@@ -636,6 +636,54 @@ func (a *CatalogAccess) secondary(ctx context.Context, table, index *model.Descr
 	owned, err := budget.copyRequest(ctx, storage.PushdownRequest{Target: plan.Target(), Layout: layout.Columns, KeyLayout: keys})
 	if err != nil {
 		return opt.AccessPath{}, err
+	}
+	if metadata.IsGIN() {
+		ownedGINLayout, used, err := model.CopyPhysicalTypeLayout(ctx, plan.GINLayout(), budget.remaining)
+		if err != nil {
+			return opt.AccessPath{}, err
+		}
+		budget.remaining -= used
+		base, err := budget.copyRequest(ctx, storage.PushdownRequest{Target: primary.Target, Layout: primary.Layout, KeyLayout: primary.Keys, Direction: storage.ScanForward})
+		if err != nil {
+			return opt.AccessPath{}, err
+		}
+		if err := budget.charge(uint64(len(primary.ColumnMap)), uint64(unsafe.Sizeof(physical.ScanColumn{}))); err != nil {
+			return opt.AccessPath{}, err
+		}
+		baseMap := make([]physical.ScanColumn, len(primary.ColumnMap))
+		copy(baseMap, primary.ColumnMap)
+		path := opt.AccessPath{
+			Algorithm: physical.SecondaryScan,
+			Index:     model.IndexID(plan.Target().ObjectID),
+			Target:    owned.Target,
+			Layout:    owned.Layout,
+			Keys:      owned.KeyLayout,
+			Direction: storage.ScanForward,
+			Lookup:    opt.LookupAccess{Enabled: true, OwnerColumn: plan.OwnerColumn(), Target: base.Target, Layout: base.Layout, ColumnMap: baseMap, Keys: base.KeyLayout},
+			GIN: opt.GINAccess{
+				Enabled:   true,
+				IndexName: index.Name().Name,
+				TableName: table.Name().Name,
+				OpClass:   plan.OpClass(),
+				Column:    plan.GINColumn(),
+				Layout:    ownedGINLayout,
+			},
+		}
+		if metadata.Predicate != nil {
+			if compiler == nil {
+				return opt.AccessPath{}, opt.ErrInvalid
+			}
+			boolean := model.TypeLayout{Type: model.Type{ID: 16, Modifier: -1, Storage: model.TypeBoolean}}
+			binding, err := compiler.BindIndexExpression(ctx, metadata.Predicate, primary.Layout, boolean)
+			if err != nil {
+				return opt.AccessPath{}, err
+			}
+			path.Predicate, err = catalogAccessExpression(ctx, binding, budget)
+			if err != nil {
+				return opt.AccessPath{}, err
+			}
+		}
+		return path, nil
 	}
 	if err := budget.charge(uint64(len(metadata.Keys)+len(metadata.Include)), uint64(unsafe.Sizeof(physical.ScanColumn{}))); err != nil {
 		return opt.AccessPath{}, err

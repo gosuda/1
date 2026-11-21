@@ -471,6 +471,8 @@ func (state *declarationState) tableLikeIdentitySequences(ctx context.Context, s
 		}
 		configuration := *sequenceSpec.Sequence
 		configuration.Owner = state.options.Owner
+		configuration.OwnerName = spec.Table.OwnerName
+		configuration.ACL = nil
 		configuration.Identity = 0
 		configuration.Incarnation = 0
 		configuration.OwnerTable = spec.ID

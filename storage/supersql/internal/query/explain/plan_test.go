@@ -239,3 +239,109 @@ func TestPlanJSONHonorsOutputBoundsAndWriterFailures(t *testing.T) {
 		t.Fatalf("cancellation=%v", err)
 	}
 }
+
+func TestExplainBuffersFormats(t *testing.T) {
+	graph := scanPlan(t, "value")
+	analysis := exec.Observation{
+		ExecutionNanos: 42,
+		Buffers: exec.BufferStats{
+			SharedHitBlocks:   11,
+			SharedReadBlocks:  7,
+			TempReadBlocks:    3,
+			TempWrittenBlocks: 5,
+			TempReadBytes:     24576,
+			TempWrittenBytes:  40960,
+		},
+		Nodes: []exec.NodeObservation{{Node: 1, Rows: 2, Batches: 1, Loops: 1}},
+	}
+
+	// Buffers=false must omit buffer fields across all formats.
+	optsOff := options()
+	optsOff.Analysis = &analysis
+	var jsonOff bytes.Buffer
+	if err := explain.Write(t.Context(), &jsonOff, graph, explain.FormatJSON, optsOff); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(jsonOff.String(), "Shared Hit Blocks") {
+		t.Fatalf("Buffers=false rendered buffer metrics in JSON: %s", jsonOff.String())
+	}
+	var textOff bytes.Buffer
+	if err := explain.Write(t.Context(), &textOff, graph, explain.FormatText, optsOff); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(textOff.String(), "Buffers:") {
+		t.Fatalf("Buffers=false rendered Buffers in Text: %s", textOff.String())
+	}
+
+	// Buffers=true renders PG18-compatible buffer fields in Text, JSON, YAML, XML.
+	optsOn := options()
+	optsOn.Analysis = &analysis
+	optsOn.Buffers = true
+
+	var textOut bytes.Buffer
+	if err := explain.Write(t.Context(), &textOut, graph, explain.FormatText, optsOn); err != nil {
+		t.Fatal(err)
+	}
+	wantTextLine := "Buffers: shared hit=11 read=7, temp read=3 written=5\n"
+	if !strings.Contains(textOut.String(), wantTextLine) {
+		t.Fatalf("Text output missing %q:\n%s", wantTextLine, textOut.String())
+	}
+
+	var jsonOut bytes.Buffer
+	if err := explain.Write(t.Context(), &jsonOut, graph, explain.FormatJSON, optsOn); err != nil {
+		t.Fatal(err)
+	}
+	var jsonDoc struct {
+		SharedHit   uint64 `json:"Shared Hit Blocks"`
+		SharedRead  uint64 `json:"Shared Read Blocks"`
+		TempRead    uint64 `json:"Temp Read Blocks"`
+		TempWritten uint64 `json:"Temp Written Blocks"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &jsonDoc); err != nil {
+		t.Fatalf("unmarshal JSON: %v\n%s", err, jsonOut.String())
+	}
+	if jsonDoc.SharedHit != 11 || jsonDoc.SharedRead != 7 || jsonDoc.TempRead != 3 || jsonDoc.TempWritten != 5 {
+		t.Fatalf("JSON buffer stats = %+v", jsonDoc)
+	}
+
+	var yamlOut bytes.Buffer
+	if err := explain.Write(t.Context(), &yamlOut, graph, explain.FormatYAML, optsOn); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Shared Hit Blocks: 11",
+		"Shared Read Blocks: 7",
+		"Temp Read Blocks: 3",
+		"Temp Written Blocks: 5",
+	} {
+		if !strings.Contains(yamlOut.String(), want) {
+			t.Fatalf("YAML output missing %q:\n%s", want, yamlOut.String())
+		}
+	}
+
+	var xmlOut bytes.Buffer
+	if err := explain.Write(t.Context(), &xmlOut, graph, explain.FormatXML, optsOn); err != nil {
+		t.Fatal(err)
+	}
+	wantXML := "<Buffers><Shared-Hit-Blocks>11</Shared-Hit-Blocks><Shared-Read-Blocks>7</Shared-Read-Blocks><Temp-Read-Blocks>3</Temp-Read-Blocks><Temp-Written-Blocks>5</Temp-Written-Blocks></Buffers>"
+	if !strings.Contains(xmlOut.String(), wantXML) {
+		t.Fatalf("XML output missing %q:\n%s", wantXML, xmlOut.String())
+	}
+
+	// Buffers=true without Analysis (e.g. EXPLAIN (BUFFERS, FORMAT JSON)) renders zero counters cleanly.
+	optsNoAnalysis := options()
+	optsNoAnalysis.Buffers = true
+	var jsonNoAnalysis bytes.Buffer
+	if err := explain.Write(t.Context(), &jsonNoAnalysis, graph, explain.FormatJSON, optsNoAnalysis); err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(jsonNoAnalysis.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal JSON without analysis: %v", err)
+	}
+	for _, key := range []string{"Shared Hit Blocks", "Shared Read Blocks", "Temp Read Blocks", "Temp Written Blocks"} {
+		if val, ok := raw[key]; !ok || val != float64(0) {
+			t.Fatalf("JSON without analysis key %q = %v (present=%v), want 0", key, val, ok)
+		}
+	}
+}

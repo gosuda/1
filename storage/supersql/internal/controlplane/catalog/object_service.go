@@ -93,7 +93,7 @@ func (s *Store) PlanObjectDrops(ctx context.Context, snapshot *CatalogSnapshot, 
 // descriptor's dependencies instead.
 func ordinaryObjectKind(kind model.ObjectKind) bool {
 	switch kind {
-	case model.ObjectSchema, model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectCompositeRelation, model.ObjectType, model.ObjectRoutine, model.ObjectOperator, model.ObjectCast, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectRole:
+	case model.ObjectSchema, model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectCompositeRelation, model.ObjectType, model.ObjectRoutine, model.ObjectOperator, model.ObjectCast, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectRole, model.ObjectCollation:
 		return true
 	default:
 		return false

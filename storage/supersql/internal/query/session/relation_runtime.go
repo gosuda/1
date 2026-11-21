@@ -318,7 +318,7 @@ func validCatalogKinds(kinds []model.ObjectKind) bool {
 		return false
 	}
 	for _, kind := range kinds {
-		if kind < model.ObjectSchema || kind > model.ObjectTextSearchTemplate {
+		if kind < model.ObjectSchema || kind > model.ObjectCollation {
 			return false
 		}
 	}

@@ -81,7 +81,7 @@ func (p *identityValueExpression) Evaluate(ctx context.Context, row []model.Valu
 	if runtime.Sequences == nil {
 		return model.Value{}, &model.Error{Code: "55000", Message: "identity default requires sequence runtime"}
 	}
-	next, err := runtime.Sequences.NextSequence(ctx, p.oid)
+	next, err := runtime.Sequences.NextSequence(withIdentitySequenceBypass(ctx), p.oid)
 	if err != nil {
 		return model.Value{}, err
 	}

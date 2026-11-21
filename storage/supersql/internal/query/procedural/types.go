@@ -100,6 +100,7 @@ type RoutineInvocation struct {
 	Procedure       bool
 	Atomic          bool
 	SecurityDefiner bool
+	OwnerName       string
 	Result          model.TypeLayout
 	Settings        []model.RoutineSetting
 }

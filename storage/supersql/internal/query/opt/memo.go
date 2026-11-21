@@ -447,7 +447,7 @@ func (o *optimizer) exploreLookups(id, rightID ir.RelID, node physical.NodeSpec,
 	}
 }
 func lookupMatches(o *optimizer, right *expression, keys []physical.JoinKey) bool {
-	if right.node.Algorithm != physical.PrimaryKeyScan && right.node.Algorithm != physical.SecondaryScan {
+	if (right.node.Algorithm != physical.PrimaryKeyScan && right.node.Algorithm != physical.SecondaryScan) || right.node.Scan.GIN.Enabled {
 		return false
 	}
 	limited := right.node.Scan.Request.SafeLimit.Enabled || right.node.Scan.AppliedLimit.Enabled || right.node.Scan.LimitOwner != 0

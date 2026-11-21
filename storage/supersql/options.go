@@ -233,6 +233,27 @@ type OpenOptions struct {
 	MaxTransactions int
 	// MaxOperations overrides the maximum concurrent snapshot/read operations (default 64).
 	MaxOperations int
+	// Observer receives one QueryEvent after each completed SQL statement.
+	// Nil disables per-query observer notifications.
+	Observer QueryObserver
+	// SlowQueryThreshold marks statements whose duration meets or exceeds this
+	// value as slow queries. Zero disables slow-query tracking; negative values
+	// are rejected by Open.
+	SlowQueryThreshold time.Duration
+	// OnSlowQuery is invoked when a statement's duration meets or exceeds
+	// SlowQueryThreshold. Nil disables the callback while still incrementing
+	// DatabaseMetrics.SlowQueriesTotal when SlowQueryThreshold > 0.
+	OnSlowQuery func(context.Context, QueryEvent)
+	// EncryptionKey enables optional pure-Go AES-256-GCM at-rest encryption for
+	// newly written SST runs, WAL files, and encrypted backups when set to a
+	// 32-byte key. Nil disables at-rest encryption.
+	EncryptionKey []byte
+	// WALArchiveDir enables continuous WAL segment archiving into the given
+	// directory for Point-in-Time Recovery (PITR). Empty disables WAL archiving.
+	WALArchiveDir string
+	// WALArchiveKey optionally encrypts archived WAL segments with a 32-byte
+	// AES-256-GCM key when WALArchiveDir is set.
+	WALArchiveKey []byte
 }
 
 // CopyResult reports the completed command tag and row count of one CopyFrom or

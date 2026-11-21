@@ -27,6 +27,9 @@ func scanDecision(ctx context.Context, plan storage.PushdownPlan, limit uint64) 
 }
 
 func (c *invocation) scan(node physical.NodeSpec) (storage.BatchCursor, error) {
+	if node.Scan.GIN.Enabled {
+		return c.ginScan(node)
+	}
 	p := c.portal
 	spec := node.Scan
 	decision, err := scanDecision(p.ctx, storage.PushdownPlan{Request: spec.Request, Accepted: spec.Accepted, Residual: spec.Residual, Projection: spec.Projection, Ordering: spec.Ordering, AppliedLimit: spec.AppliedLimit}, p.env.Limits.MetadataBytes)

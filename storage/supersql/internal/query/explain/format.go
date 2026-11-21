@@ -59,6 +59,13 @@ func documentWriter(ctx context.Context, output io.Writer, graph *fragment.Fragm
 	return &jsonWriter{ctx: ctx, output: output, remaining: limits.MaxOutputBytes, depth: limits.MaxValueDepth}, nil
 }
 
+func explainBuffers(analysis *exec.Observation) exec.BufferStats {
+	if analysis == nil {
+		return exec.BufferStats{}
+	}
+	return analysis.Buffers
+}
+
 func writeText(ctx context.Context, output io.Writer, graph *fragment.FragmentGraph, options Options) error {
 	w, err := documentWriter(ctx, output, graph, options)
 	if err != nil {
@@ -73,7 +80,7 @@ func writeText(ctx context.Context, output io.Writer, graph *fragment.FragmentGr
 		w.raw("Node ")
 		w.raw(strconv.FormatUint(uint64(id), 10))
 		w.raw(" ")
-		w.raw(algorithmName(node.Algorithm))
+		w.raw(nodeAlgorithmName(node))
 		if options.Costs {
 			w.raw(" cost=")
 			w.fixed(node.Cost)
@@ -130,6 +137,18 @@ func writeText(ctx context.Context, output io.Writer, graph *fragment.FragmentGr
 			w.raw(strconv.Itoa(usage.PeakReaders))
 			w.raw("\n")
 		}
+	}
+	if options.Buffers {
+		buffers := explainBuffers(options.Analysis)
+		w.raw("Buffers: shared hit=")
+		w.raw(strconv.FormatUint(buffers.SharedHitBlocks, 10))
+		w.raw(" read=")
+		w.raw(strconv.FormatUint(buffers.SharedReadBlocks, 10))
+		w.raw(", temp read=")
+		w.raw(strconv.FormatUint(buffers.TempReadBlocks, 10))
+		w.raw(" written=")
+		w.raw(strconv.FormatUint(buffers.TempWrittenBlocks, 10))
+		w.raw("\n")
 	}
 	if options.Serialization != "" {
 		w.raw("Serialization: ")
@@ -205,7 +224,7 @@ func writeXML(ctx context.Context, output io.Writer, graph *fragment.FragmentGra
 		w.raw("<Node id=\"")
 		w.raw(strconv.FormatUint(uint64(id), 10))
 		w.raw("\"><Algorithm>")
-		xmlText(w, algorithmName(node.Algorithm))
+		xmlText(w, nodeAlgorithmName(node))
 		w.raw("</Algorithm>")
 		if options.Costs {
 			w.raw("<Cost>")
@@ -286,6 +305,18 @@ func writeXML(ctx context.Context, output io.Writer, graph *fragment.FragmentGra
 			w.raw("\"/>")
 		}
 		w.raw("</Execution>")
+	}
+	if options.Buffers {
+		buffers := explainBuffers(options.Analysis)
+		w.raw("<Buffers><Shared-Hit-Blocks>")
+		w.raw(strconv.FormatUint(buffers.SharedHitBlocks, 10))
+		w.raw("</Shared-Hit-Blocks><Shared-Read-Blocks>")
+		w.raw(strconv.FormatUint(buffers.SharedReadBlocks, 10))
+		w.raw("</Shared-Read-Blocks><Temp-Read-Blocks>")
+		w.raw(strconv.FormatUint(buffers.TempReadBlocks, 10))
+		w.raw("</Temp-Read-Blocks><Temp-Written-Blocks>")
+		w.raw(strconv.FormatUint(buffers.TempWrittenBlocks, 10))
+		w.raw("</Temp-Written-Blocks></Buffers>")
 	}
 	w.raw("</Plan>")
 	for _, setting := range options.SettingValues {
@@ -370,6 +401,17 @@ func writeYAML(ctx context.Context, output io.Writer, graph *fragment.FragmentGr
 			w.raw(strconv.FormatUint(*options.SerializedBytes, 10))
 		}
 	}
+	if options.Buffers {
+		buffers := explainBuffers(options.Analysis)
+		w.raw("\nShared Hit Blocks: ")
+		w.raw(strconv.FormatUint(buffers.SharedHitBlocks, 10))
+		w.raw("\nShared Read Blocks: ")
+		w.raw(strconv.FormatUint(buffers.SharedReadBlocks, 10))
+		w.raw("\nTemp Read Blocks: ")
+		w.raw(strconv.FormatUint(buffers.TempReadBlocks, 10))
+		w.raw("\nTemp Written Blocks: ")
+		w.raw(strconv.FormatUint(buffers.TempWrittenBlocks, 10))
+	}
 	if options.Serialization != "" {
 		w.raw("\nSerialization: ")
 		w.text(options.Serialization)
@@ -385,7 +427,7 @@ func writeYAML(ctx context.Context, output io.Writer, graph *fragment.FragmentGr
 		w.raw("  - Node ID: ")
 		w.raw(strconv.FormatUint(uint64(id), 10))
 		w.raw("\n    Algorithm: ")
-		w.text(algorithmName(node.Algorithm))
+		w.text(nodeAlgorithmName(node))
 		if options.Costs {
 			w.raw("\n    Cost: ")
 			w.fixed(node.Cost)

@@ -92,6 +92,7 @@ type AccessPath struct {
 	Direction  storage.ScanDirection
 	Partitions []PartitionAccess
 	Lookup     LookupAccess
+	GIN        GINAccess
 }
 
 type pathStatistic struct {
@@ -353,11 +354,20 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 		}
 		if i > 0 && compareAccess(available.Paths[i-1], path) == 0 {
 			previous := available.Paths[i-1]
-			if previous.Target != path.Target || !equalAccessColumns(previous.Layout, path.Layout) || !slices.Equal(previous.ColumnMap, path.ColumnMap) || !storage.KeyLayoutsEqual(previous.Keys, path.Keys) || !equalAccessExpressions(previous.KeyExpressions, path.KeyExpressions) || !equalAccessExpression(previous.Predicate, path.Predicate) || !slices.Equal(previous.Operators, path.Operators) || !equalPartitionAccess(previous.Partitions, path.Partitions) || !equalLookupAccess(previous.Lookup, path.Lookup) {
+			if previous.Target != path.Target || !equalAccessColumns(previous.Layout, path.Layout) || !slices.Equal(previous.ColumnMap, path.ColumnMap) || !storage.KeyLayoutsEqual(previous.Keys, path.Keys) || !equalAccessExpressions(previous.KeyExpressions, path.KeyExpressions) || !equalAccessExpression(previous.Predicate, path.Predicate) || !slices.Equal(previous.Operators, path.Operators) || !equalPartitionAccess(previous.Partitions, path.Partitions) || !equalLookupAccess(previous.Lookup, path.Lookup) || !equalGINAccess(previous.GIN, path.GIN) {
 				o.err = ErrInvalid
 				return nil
 			}
 			continue
+		}
+		var ginOpID model.OperatorID
+		var ginQueryExpr ir.ScalarID
+		if path.GIN.Enabled {
+			var matched bool
+			ginOpID, ginQueryExpr, matched = o.matchGINPredicate(id, node.Output, path.GIN)
+			if !matched {
+				continue
+			}
 		}
 		if path.Target != available.Target {
 			o.loadPathStatistics(id, r.Object, o.predicates[id], path)
@@ -366,9 +376,11 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 			}
 		}
 		request := storage.PushdownRequest{Target: path.Target, Occurrence: r.Occurrence, Layout: path.Layout, KeyLayout: path.Keys, IndexID: path.Index, Direction: path.Direction}
-		request.Predicate = o.scanPredicate(id, node.Output, path.ColumnMap)
-		if o.err != nil {
-			return nil
+		if !path.GIN.Enabled {
+			request.Predicate = o.scanPredicate(id, node.Output, path.ColumnMap)
+			if o.err != nil {
+				return nil
+			}
 		}
 		request.ColumnIDs = allocate[model.ColumnID](o, uint64(len(node.Output)+1))
 		if o.err != nil {
@@ -390,9 +402,11 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 			return nil
 		}
 		request.Spans[0] = storage.KeySpan{Lower: storage.KeyBound{Unbounded: true}, Upper: storage.KeyBound{Unbounded: true}}
-		request.Spans = o.scanSpans(id, node.Output, path, request.Spans)
-		if o.err != nil {
-			return nil
+		if !path.GIN.Enabled {
+			request.Spans = o.scanSpans(id, node.Output, path, request.Spans)
+			if o.err != nil {
+				return nil
+			}
 		}
 		decision, ok := o.negotiateScan(request)
 		if !ok {
@@ -405,7 +419,7 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 		}
 		if path.Lookup.Enabled {
 			baseRequest := storage.PushdownRequest{Target: path.Lookup.Target, Occurrence: r.Occurrence, Layout: path.Lookup.Layout, KeyLayout: path.Lookup.Keys, Direction: storage.ScanForward}
-			baseRequest.ColumnIDs = allocate[model.ColumnID](o, uint64(len(node.Output)))
+			baseRequest.ColumnIDs = allocate[model.ColumnID](o, uint64(max(1, len(node.Output))))
 			if o.err != nil {
 				return nil
 			}
@@ -420,6 +434,9 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 					continue
 				}
 				baseRequest.ColumnIDs = append(baseRequest.ColumnIDs, column)
+			}
+			if len(baseRequest.ColumnIDs) == 0 && path.GIN.Enabled && len(path.Lookup.Keys) > 0 {
+				baseRequest.ColumnIDs = append(baseRequest.ColumnIDs, path.Lookup.Keys[0].ColumnID)
 			}
 			if len(baseRequest.ColumnIDs) == 0 {
 				o.err = ErrInvalid
@@ -443,7 +460,21 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 				BaseResidual:   baseDecision.Residual,
 				BaseProjection: baseDecision.Projection,
 			}
-			decision.Estimate.IndexProbes += decision.Estimate.Rows
+			if !path.GIN.Enabled {
+				decision.Estimate.IndexProbes += decision.Estimate.Rows
+			}
+		}
+		if path.GIN.Enabled {
+			decision.GIN = physical.GINScanSpec{
+				Enabled:    true,
+				IndexName:  path.GIN.IndexName,
+				TableName:  path.GIN.TableName,
+				OpClass:    path.GIN.OpClass,
+				Column:     path.GIN.Column,
+				Layout:     path.GIN.Layout,
+				OperatorID: ginOpID,
+				QueryExpr:  physical.ScalarRef{Graph: node.Logical.Graph, Scalar: ginQueryExpr},
+			}
 		}
 		candidate := node
 		candidate.Algorithm, candidate.Scan = path.Algorithm, decision
@@ -452,6 +483,16 @@ func (o *optimizer) scans(id ir.RelID, node physical.NodeSpec) []*expression {
 			candidate.Estimate.Rows, candidate.Estimate.LowerRows, candidate.Estimate.UpperRows = 0, 0, 0
 		}
 		candidate.Delivered.Ordering = nil
+		if path.GIN.Enabled {
+			candidate.Estimate.Rows = max(1, base.Rows*0.05)
+			candidate.Estimate.LowerRows = 0
+			candidate.Estimate.UpperRows = max(candidate.Estimate.Rows, base.UpperRows)
+			paths[i] = o.newExpression(candidate, nil, nil)
+			if o.err != nil {
+				return nil
+			}
+			continue
+		}
 		for j, order := range decision.Ordering {
 			if j >= len(path.Operators) || path.Operators[j] == 0 || int(order.KeyOrdinal) >= len(path.Keys) {
 				break
@@ -607,6 +648,9 @@ func validateAccessPath(access Access, path AccessPath, columns []model.ColumnID
 		return err
 	}
 	if err := validateLookupAccess(access, path); err != nil {
+		return err
+	}
+	if err := validateGINAccess(access, path); err != nil {
 		return err
 	}
 	scan := physical.ScanSpec{ColumnMap: path.ColumnMap}

@@ -23,6 +23,12 @@ provider, because a live database holds fences certified by that provider.
 | TransactionSpillBytes | uint64 | - | TransactionSpillBytes overrides the per-transaction spill limit (default 32 MiB). |
 | MaxTransactions | int | - | MaxTransactions overrides the maximum concurrent active transactions (default 64). |
 | MaxOperations | int | - | MaxOperations overrides the maximum concurrent snapshot/read operations (default 64). |
+| Observer | QueryObserver | - | Observer receives one QueryEvent after each completed SQL statement. Nil disables per-query observer notifications. |
+| SlowQueryThreshold | time.Duration | - | SlowQueryThreshold marks statements whose duration meets or exceeds this value as slow queries. Zero disables slow-query tracking; negative values are rejected by Open. |
+| OnSlowQuery | func(context.Context, QueryEvent) | - | OnSlowQuery is invoked when a statement's duration meets or exceeds SlowQueryThreshold. Nil disables the callback while still incrementing DatabaseMetrics.SlowQueriesTotal when SlowQueryThreshold > 0. |
+| EncryptionKey | []byte | - | EncryptionKey enables optional pure-Go AES-256-GCM at-rest encryption for newly written SST runs, WAL files, and encrypted backups when set to a 32-byte key. Nil disables at-rest encryption. |
+| WALArchiveDir | string | - | WALArchiveDir enables continuous WAL segment archiving into the given directory for Point-in-Time Recovery (PITR). Empty disables WAL archiving. |
+| WALArchiveKey | []byte | - | WALArchiveKey optionally encrypts archived WAL segments with a 32-byte AES-256-GCM key when WALArchiveDir is set. |
 
 Open rejects an empty `Directory` with `ErrDirectoryRequired`, a nil or unavailable `Clock` with `ErrClockRequired`, and maps an incompatible directory layout to `*UpgradeRequired`. A nonzero `Compaction` replaces the whole backend envelope rather than merging field by field.
 
@@ -83,7 +89,7 @@ The root package fixes its own envelope when it opens a database; the table list
 
 | Location | Fields |
 | --- | --- |
-| catalog.go:143 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
+| catalog.go:160 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
 | internal/controlplane/schema/column_policy.go:67 | MaxBytes=options.MetadataBytes MaxDepth=64 MaxItems=int(options.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:122 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:163 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
@@ -91,7 +97,7 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/controlplane/schema/constraint_validation.go:43 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:75 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/generation_plan.go:81 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=int(min(limits.MetadataBytes, uint64(math.MaxInt))) |
-| internal/controlplane/schema/index_plan.go:121 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=int(limits.MetadataBytes) |
+| internal/controlplane/schema/index_plan.go:127 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=int(limits.MetadataBytes) |
 | internal/controlplane/schema/index_policy.go:310 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/index_resolver.go:193 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=max(s.limits.MaxColumns, len(s.indexes)) |
 | internal/controlplane/schema/index_resolver.go:246 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=max(s.limits.MaxColumns, len(s.indexes)) |
@@ -131,9 +137,9 @@ The root package's `Catalog.irLimits` supplies the default envelope for statemen
 | Location | Fields |
 | --- | --- |
 | internal/query/exec/aggregate_project.go:69 | MaxBytes=p.env.Limits.MetadataBytes MaxDepth=512 MaxNodes=handles MaxOperands=handles MaxSlots=handles SourceBytes=math.MaxUint32 |
-| internal/query/exec/residual.go:108 | MaxBytes=limits.MaxBytes MaxDepth=uint32(limits.MaxDepth) MaxNodes=uint32(limits.MaxInstructions) MaxOperands=uint32(limits.MaxInstructions) MaxSlots=uint32(limits.MaxInstructions) SourceBytes=1 |
+| internal/query/exec/residual.go:111 | MaxBytes=limits.MaxBytes MaxDepth=uint32(limits.MaxDepth) MaxNodes=uint32(limits.MaxInstructions) MaxOperands=uint32(limits.MaxInstructions) MaxSlots=uint32(limits.MaxInstructions) SourceBytes=1 |
 | internal/query/session/setting_command.go:20 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
-| session_scope.go:120 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
+| session_scope.go:121 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
 
 ## `supersql.CopyOptions`
 
@@ -159,16 +165,21 @@ the retention coordinator and the backend's collection engine.
 | WALThreshold | uint64 | WALThreshold is the published commit-segment count at which one pass runs. Zero selects DefaultWALThreshold. |
 | RunThreshold | uint64 | RunThreshold is the live run-file count at which one pass runs. Zero selects DefaultRunThreshold. |
 | MaxRetiredTargets | uint64 | MaxRetiredTargets caps the retired objects one pass collects. Zero selects DefaultMaxRetiredTargets. |
+| AutoAnalyzeDisabled | bool | AutoAnalyzeDisabled stops background maintenance from automatically running ANALYZE on mutated tables. |
+| AutoAnalyzeMinRows | uint64 | AutoAnalyzeMinRows is the base mutation count required before auto-ANALYZE triggers on a table. Zero selects DefaultAutoAnalyzeMinRows. |
+| AutoAnalyzeScaleFactor | float64 | AutoAnalyzeScaleFactor scales the auto-ANALYZE trigger threshold by the table's last analyzed live row count. Zero selects DefaultAutoAnalyzeScaleFactor; negative values are rejected by Open. |
 
 Constants declared alongside the type:
 
 | Constant | Value | Location |
 | --- | --- | --- |
-| DefaultMaintenanceInterval | 30 * time.Second | maintenance.go:40 |
-| MinMaintenanceInterval | 100 * time.Millisecond | maintenance.go:42 |
-| DefaultWALThreshold | 64 | maintenance.go:45 |
-| DefaultRunThreshold | 64 | maintenance.go:48 |
-| DefaultMaxRetiredTargets | 1024 | maintenance.go:50 |
+| DefaultMaintenanceInterval | 30 * time.Second | maintenance.go:51 |
+| MinMaintenanceInterval | 100 * time.Millisecond | maintenance.go:53 |
+| DefaultWALThreshold | 64 | maintenance.go:56 |
+| DefaultRunThreshold | 64 | maintenance.go:59 |
+| DefaultMaxRetiredTargets | 1024 | maintenance.go:61 |
+| DefaultAutoAnalyzeMinRows | 50 | maintenance.go:64 |
+| DefaultAutoAnalyzeScaleFactor | 0.2 | maintenance.go:67 |
 
 ## Internal limit structs
 
@@ -193,12 +204,12 @@ Constants declared alongside the type:
 | pointReadLimits | internal/dataplane/storage/neosepia/point_read.go | 2 |
 | runPreparationLimits | internal/dataplane/storage/neosepia/prepare_runs.go | 5 |
 | runRecoveryLimits | internal/dataplane/storage/neosepia/recover_runs.go | 5 |
-| recoveryLimits | internal/dataplane/storage/neosepia/recovery.go | 2 |
+| recoveryLimits | internal/dataplane/storage/neosepia/recovery.go | 4 |
 | runSetLimits | internal/dataplane/storage/neosepia/run_set.go | 3 |
 | pinnedPointLimits | internal/dataplane/storage/neosepia/run_set_point.go | 4 |
 | pinnedScanLimits | internal/dataplane/storage/neosepia/run_set_scan.go | 4 |
 | readLimits | internal/dataplane/storage/neosepia/snapshot.go | 13 |
-| sstLimits | internal/dataplane/storage/neosepia/sst_write.go | 4 |
+| sstLimits | internal/dataplane/storage/neosepia/sst_write.go | 5 |
 | mutationLogLimits | internal/dataplane/txn/mutation_log.go | 6 |
 | AdvisoryLimits | internal/locks/advisory.go | 6 |
 | WaitGraphLimits | internal/locks/wait_graph.go | 3 |

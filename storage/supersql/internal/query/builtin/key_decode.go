@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"math"
 	"strconv"
@@ -200,6 +201,30 @@ func (d *keyDecoder) field(ctx context.Context, column storage.KeyColumn, depth 
 		}
 		value.FloatVal = math.Float64frombits(encoded)
 	case model.TypeString, model.TypeBytes:
+		if column.Type.Storage == model.TypeString {
+			coll := column.Type.Collation
+			if coll == 100 {
+				coll = cmp.Or(d.encoder.defaultCollation, model.CollationID(950))
+			}
+			if !IsBinaryCollation(coll) {
+				spec, ok := LookupICUCollation(coll, d.encoder.collations)
+				if !ok {
+					return model.Value{}, sqlError("42P22", "SQL text key requires a supported collation")
+				}
+				if !spec.Deterministic {
+					return model.Value{}, storage.ErrInvalidEncoding
+				}
+				if _, err := d.escaped(ctx, mask, false, 0); err != nil {
+					return model.Value{}, err
+				}
+				raw, err := d.escaped(ctx, mask, true, 0)
+				if err != nil {
+					return model.Value{}, err
+				}
+				value.StrVal = string(raw)
+				break
+			}
+		}
 		raw, err := d.escaped(ctx, mask, column.Type.Storage == model.TypeString, 0)
 		if err != nil {
 			return model.Value{}, err

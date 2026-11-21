@@ -220,6 +220,13 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 		if runErr != nil {
 			return errors.Join(runErr, spool.Close(), spoolQuery.Close(), sourceQuery.Close())
 		}
+		if options.Catalog != nil {
+			discovery, depErr := catalogDiscoveryDependencies(statementContext, transactions.transaction, options.Catalog, catalogDiscovery{}, options.Dependencies, options.Environment.Limits.MetadataBytes)
+			if depErr != nil {
+				return errors.Join(depErr, spool.Close(), spoolQuery.Close(), sourceQuery.Close())
+			}
+			dependencies = append(dependencies, discovery...)
+		}
 		view, runErr := openPreparedTransactionReadView(statementContext, transactions.transaction, compiled, dependencies)
 		if runErr != nil {
 			return errors.Join(runErr, spool.Close(), spoolQuery.Close(), sourceQuery.Close())

@@ -673,13 +673,13 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-121 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+128 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
 | connector.go:1515 | `model.Error{Code: "0A000"}` |
 | connector.go:334 | `model.Error{Code: "0A000"}` |
-| execution.go:201 | `model.Error{Code: "0A000"}` |
+| execution.go:271 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/catalog/type_service.go:1051 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |
 | internal/dataplane/txn/transaction_historical.go:12 | `model.Error{Code: "0A000"}` |
@@ -687,7 +687,7 @@ No resolved catalog objects.
 | internal/query/bind/aggregate_invocation.go:208 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/aggregate_invocation.go:211 | `aggregate ORDER BY is not implemented for window functions` |
 | internal/query/bind/catalog_relation.go:17 | `cross-database reference is not supported` |
-| internal/query/bind/declaration.go:977 | `cross-database reference is not supported` |
+| internal/query/bind/declaration.go:1010 | `cross-database reference is not supported` |
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
 | internal/query/bind/declaration_constraint.go:30 | `NOT NULL constraint does not support NOT VALID` |
 | internal/query/bind/declaration_constraint.go:34 | `constraint does not support NOT VALID` |
@@ -696,9 +696,9 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
 | internal/query/bind/definition_declaration.go:307 | `support function arguments must be inferred from the declaration` |
 | internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
-| internal/query/bind/function.go:214 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/function.go:536 | `routine dependency version changed` |
-| internal/query/bind/function.go:541 | `routine semantic definition encoding is unavailable` |
+| internal/query/bind/function.go:217 | `ordered-set aggregates cannot be used as window functions` |
+| internal/query/bind/function.go:542 | `routine dependency is no longer available` |
+| internal/query/bind/function.go:547 | `routine semantic definition encoding is unavailable` |
 | internal/query/bind/function_arguments.go:268 | `function defaults cannot contain subqueries` |
 | internal/query/bind/function_window.go:123 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/function_window.go:126 | `aggregate ORDER BY is not implemented for window functions` |
@@ -707,7 +707,13 @@ No resolved catalog objects.
 | internal/query/bind/function_window.go:409 | `` |
 | internal/query/bind/function_window.go:413 | `` |
 | internal/query/bind/function_window.go:417 | `` |
-| internal/query/bind/index.go:71 | `cross-database reference is not supported` |
+| internal/query/bind/index.go:133 | `access method "gin" does not support unique indexes` |
+| internal/query/bind/index.go:136 | `GIN indexes on multiple columns are not supported` |
+| internal/query/bind/index.go:139 | `access method "gin" does not support included columns` |
+| internal/query/bind/index.go:159 | `GIN indexes on expressions are not supported` |
+| internal/query/bind/index.go:162 | `access method "gin" does not support ordering options` |
+| internal/query/bind/index.go:165 | `access method "gin" does not support explicit collations` |
+| internal/query/bind/index.go:72 | `cross-database reference is not supported` |
 | internal/query/bind/index_expression.go:345 | `domain CHECK type identity changed` |
 | internal/query/bind/index_expression.go:348 | `row expression relation identity changed` |
 | internal/query/bind/index_expression.go:402 | `index expression dependency resolution changed` |
@@ -719,10 +725,10 @@ No resolved catalog objects.
 | internal/query/bind/index_expression_encoding.go:82 | `index expression uses a different timezone data revision` |
 | internal/query/bind/indirection.go:14 | `row expansion via * is not supported here` |
 | internal/query/bind/native_rows.go:247 | `could not determine row type for set-returning function` |
-| internal/query/bind/object_declaration.go:226 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/object_declaration.go:381 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/ordinary_alter.go:558 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/ordinary_alter.go:616 | `statistics target can only be set for an index expression` |
+| internal/query/bind/object_declaration.go:251 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/object_declaration.go:409 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/ordinary_alter.go:593 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/ordinary_alter.go:667 | `statistics target can only be set for an index expression` |
 | internal/query/bind/ordinary_reindex.go:220 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
 | internal/query/bind/partition_alter.go:174 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
 | internal/query/bind/partition_alter.go:185 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
@@ -737,8 +743,8 @@ No resolved catalog objects.
 | internal/query/bind/project_set.go:46 | `` |
 | internal/query/bind/project_set.go:49 | `set-returning functions are not allowed in this context` |
 | internal/query/bind/relation.go:165 | `` |
-| internal/query/bind/relation.go:198 | `view dependency version changed` |
-| internal/query/bind/routine.go:96 | `routine body dependency changed during binding` |
+| internal/query/bind/relation.go:198 | `view dependency is no longer available` |
+| internal/query/bind/routine.go:104 | `routine body dependency changed during binding` |
 | internal/query/bind/routine_default_reference.go:115 | `routine default requires its catalog snapshot` |
 | internal/query/bind/routine_default_reference.go:122 | `routine default dependency is not public` |
 | internal/query/bind/routine_default_reference.go:130 | `routine default relation identity changed` |
@@ -778,11 +784,11 @@ No resolved catalog objects.
 | internal/query/bind/type_declaration.go:260 | `only shell CREATE TYPE declarations are supported` |
 | internal/query/bind/type_declaration.go:370 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:575 | `domain constraints cannot be DEFERRABLE` |
-| internal/query/bind/utility.go:365 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/utility.go:659 | `cannot update a non-updatable view column` |
-| internal/query/bind/utility.go:92 | `cross-database reference is not supported` |
+| internal/query/bind/utility.go:385 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility.go:700 | `cannot update a non-updatable view column` |
+| internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:310 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility_merge.go:330 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
 | internal/query/builtin/date_fields.go:130 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:296 | `model.Error{Code: "0A000"}` |
@@ -796,6 +802,7 @@ No resolved catalog objects.
 | internal/query/session/named_execute.go:340 | `model.Error{Code: "0A000"}` |
 | internal/query/session/prepare.go:111 | `model.Error{Code: "0A000"}` |
 | internal/query/session/prepare.go:113 | `model.Error{Code: "0A000"}` |
-| internal/query/session/sequence_runtime.go:129 | `model.Error{Code: "0A000"}` |
+| internal/query/session/sequence_runtime.go:194 | `model.Error{Code: "0A000"}` |
 | internal/query/session/settings_values.go:207 | `model.Error{Code: "0A000"}` |
+| pgwire/conn.go:412 | `model.Error{Code: "0A000"}` |
 

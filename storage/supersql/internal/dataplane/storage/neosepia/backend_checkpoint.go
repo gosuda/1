@@ -61,7 +61,7 @@ func (backend *Backend) captureCheckpoint(ctx context.Context, spec storage.Snap
 			err = errors.Join(err, handle.Close())
 		}
 	}()
-	builder := &checkpointBuilder{handle: handle, limits: backend.limits, extras: backend.extras, used: uint64(unsafe.Sizeof(checkpointHandle{})) + 1024}
+	builder := &checkpointBuilder{handle: handle, limits: backend.limits, extras: backend.extras, used: uint64(unsafe.Sizeof(checkpointHandle{})) + 1024, cipher: backend.cipher}
 	if err := builder.reserve(0); err != nil {
 		return nil, err
 	}

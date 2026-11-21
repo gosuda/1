@@ -145,10 +145,51 @@ func (b *binder) columnCollation(n *zpgparse.CollateClause, typ model.TypeLayout
 	}
 	var info builtin.CollationInfo
 	found := false
+	collName := parts[len(parts)-1]
 	for _, schema := range b.functionPath(parts) {
 		if schema == "pg_catalog" {
-			info, found = builtin.LookupCollationName(parts[len(parts)-1])
-			break
+			if c, ok := builtin.LookupCollationName(collName); ok {
+				info = c
+				found = true
+				break
+			}
+			if c, ok := builtin.LookupICUCollationName(collName); ok {
+				info = builtin.CollationInfo{
+					ID:            c.ID,
+					Name:          c.Name,
+					Provider:      'i',
+					Encoding:      -1,
+					Deterministic: c.Deterministic,
+				}
+				found = true
+				break
+			}
+			continue
+		}
+		if b.catalog != nil {
+			schemaDesc, err := b.catalog.Resolve(b.ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: schema})
+			if err != nil {
+				if isMissingObject(err) {
+					continue
+				}
+				return 0, err
+			}
+			collDesc, err := b.catalog.Resolve(b.ctx, model.NamespaceName{
+				Parent: schemaDesc.Descriptor.ID(),
+				Kind:   model.ObjectCollation,
+				Name:   collName,
+			})
+			if err != nil {
+				if isMissingObject(err) {
+					continue
+				}
+				return 0, err
+			}
+			if !b.collatable(typ.Type) {
+				return 0, bindError("42804", "collations are not supported by this type", pos)
+			}
+			b.dependency(collDesc.Descriptor, 0)
+			return model.CollationID(collDesc.Descriptor.ID()), nil
 		}
 	}
 	if !found {

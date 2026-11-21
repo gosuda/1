@@ -42,6 +42,8 @@ func compilePrimitive(signature Signature, op primitiveOp, options ResolveOption
 		return compileContextOnly(signature)
 	case opAdvisory:
 		return compileAdvisory(signature)
+	case opNotify:
+		return compileNotify(signature)
 	case opFullText:
 		return compileFullText(signature)
 	case opRegexp:
@@ -240,7 +242,7 @@ func compilePrimitive(signature Signature, op primitiveOp, options ResolveOption
 		return compileNumeric(signature, op)
 	}
 	if signature.Result == 1042 || signature.Result == 1043 || signature.Arguments[0] == 1042 || signature.Arguments[0] == 1043 {
-		return compileCharacter(signature, op)
+		return compileCharacter(signature, op, options)
 	}
 	if op == opCast {
 		return compileCast(signature)
@@ -253,7 +255,7 @@ func compilePrimitive(signature Signature, op primitiveOp, options ResolveOption
 	}
 	first := signature.Arguments[0]
 	if first == 25 || first == 17 {
-		return compileText(signature, op)
+		return compileText(signature, op, options)
 	}
 	if isFloat(first) {
 		return func(_ context.Context, args []model.Value, callBudget CallBudget) (model.Value, error) {

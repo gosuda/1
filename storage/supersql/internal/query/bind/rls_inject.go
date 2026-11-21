@@ -94,10 +94,12 @@ func (b *binder) applyScanRLS(scan relation, descriptor, namespace *model.Descri
 	// so any tables referenced inside policy subqueries use SELECT policies.
 	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
 	savedMergeUpdate, savedMergeDelete := b.rlsMergeHasUpdate, b.rlsMergeHasDelete
-	b.rlsTargetID, b.rlsTargetCommand, b.rlsMergeHasUpdate, b.rlsMergeHasDelete = 0, "", false, false
+	savedDMLTargetID := b.dmlTargetID
+	b.rlsTargetID, b.rlsTargetCommand, b.rlsMergeHasUpdate, b.rlsMergeHasDelete, b.dmlTargetID = 0, "", false, false, 0
 	defer func() {
 		b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
 		b.rlsMergeHasUpdate, b.rlsMergeHasDelete = savedMergeUpdate, savedMergeDelete
+		b.dmlTargetID = savedDMLTargetID
 	}()
 
 	var combined expression

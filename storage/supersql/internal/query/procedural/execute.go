@@ -109,7 +109,7 @@ func (p *Program) executeResolved(ctx context.Context, arguments []model.Value, 
 		return SQLResult{}, err
 	}
 	result := p.resolvedResult(signature)
-	return executor.RunRoutine(ctx, RoutineInvocation{Procedure: p.procedure, Atomic: p.atomic, SecurityDefiner: p.securityDefiner, Result: result, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
+	return executor.RunRoutine(ctx, RoutineInvocation{Procedure: p.procedure, Atomic: p.atomic, SecurityDefiner: p.securityDefiner, OwnerName: p.ownerName, Result: result, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
 		return p.executeWithSink(invocation, arguments, executor, nil, nil, signature)
 	})
 }
@@ -157,7 +157,7 @@ func (p *Program) executeRowsResolved(ctx context.Context, arguments []model.Val
 		}
 		return emit(row)
 	}
-	_, err = executor.RunRoutine(ctx, RoutineInvocation{Procedure: p.procedure, Atomic: p.atomic, SecurityDefiner: p.securityDefiner, Result: result, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
+	_, err = executor.RunRoutine(ctx, RoutineInvocation{Procedure: p.procedure, Atomic: p.atomic, SecurityDefiner: p.securityDefiner, OwnerName: p.ownerName, Result: result, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
 		return p.executeWithSink(invocation, arguments, executor, nil, validated, signature)
 	})
 	return err
@@ -287,7 +287,7 @@ func (p *Program) ExecuteTrigger(ctx context.Context, trigger TriggerContext) (*
 	if err != nil {
 		return nil, false, err
 	}
-	result, err := executor.RunRoutine(ctx, RoutineInvocation{Atomic: p.atomic, SecurityDefiner: p.securityDefiner, Result: trigger.Layout, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
+	result, err := executor.RunRoutine(ctx, RoutineInvocation{Atomic: p.atomic, SecurityDefiner: p.securityDefiner, OwnerName: p.ownerName, Result: trigger.Layout, Settings: p.settings}, func(invocation context.Context) (SQLResult, error) {
 		return p.execute(invocation, nil, executor, &trigger)
 	})
 	if err != nil {

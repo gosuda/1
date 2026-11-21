@@ -113,7 +113,7 @@ func (executor *routineExecutor) buildCapabilityFrame(ctx context.Context, view 
 	if err != nil {
 		return nil, err
 	}
-	sequences, err := NewSequenceRuntime(snapshot, configured.Sequence)
+	sequences, err := NewAuthorizedSequenceRuntime(snapshot, configured.Sequence, executor.transactions.settings.CurrentRole)
 	if err != nil {
 		return nil, err
 	}

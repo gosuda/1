@@ -470,7 +470,7 @@ var catalogDiscoveryKinds = [...]model.ObjectKind{
 	model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView,
 	model.ObjectMaterializedView, model.ObjectRoutine, model.ObjectType, model.ObjectCompositeRelation,
 	model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectTextSearchTemplate,
-	model.ObjectCast, model.ObjectOperator,
+	model.ObjectCast, model.ObjectOperator, model.ObjectCollation,
 }
 
 func (executor *routineExecutor) installDefinitions(ctx context.Context, definitions []procedural.Definition) error {

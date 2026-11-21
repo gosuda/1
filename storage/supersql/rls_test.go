@@ -64,7 +64,8 @@ func TestMultiTenantGUCAndRowLevelSecurity(t *testing.T) {
 
 	mustExec(`CREATE ROLE tenant_user`)
 	mustExec(`CREATE ROLE bypass_admin BYPASSRLS`)
-	requireErrCode(`GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_docs TO tenant_user`, "0A000")
+	mustExec(`GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_docs TO tenant_user`)
+	mustExec(`GRANT SELECT ON tenant_docs TO bypass_admin`)
 	mustExec(`ALTER TABLE tenant_docs ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY tenant_isolation ON tenant_docs
 		FOR ALL TO tenant_user
@@ -236,6 +237,7 @@ func TestRLSProductionCompleteness(t *testing.T) {
 	mustExec(`DROP TABLE ephemeral_docs`)
 	mustExec(`CREATE TABLE ephemeral_docs (id bigint PRIMARY KEY, tenant_id text NOT NULL)`)
 	mustExec(`INSERT INTO ephemeral_docs VALUES (1, 'tenant_b')`)
+	mustExec(`GRANT SELECT ON ephemeral_docs TO app_user`)
 	mustExec(`SET ROLE app_user`)
 	out := mustExec(`SELECT count(*) FROM ephemeral_docs`)
 	if out.Rows[0][0].IntVal != 1 {
@@ -247,6 +249,7 @@ func TestRLSProductionCompleteness(t *testing.T) {
 	// 2. ALTER TABLE ... RENAME TO ... migrates RLS configuration and policies.
 	mustExec(`CREATE TABLE org_secrets (id bigint PRIMARY KEY, tenant_id text NOT NULL, secret text NOT NULL)`)
 	mustExec(`INSERT INTO org_secrets VALUES (1, 't1', 's1'), (2, 't2', 's2')`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE, DELETE ON org_secrets TO app_user`)
 	mustExec(`ALTER TABLE org_secrets ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY org_isolation ON org_secrets
 		FOR ALL TO app_user
@@ -265,6 +268,7 @@ func TestRLSProductionCompleteness(t *testing.T) {
 	mustExec(`RESET ROLE`)
 	mustExec(`CREATE TABLE public_projects (id bigint PRIMARY KEY, secret_id bigint NOT NULL)`)
 	mustExec(`INSERT INTO public_projects VALUES (10, 1), (20, 2)`)
+	mustExec(`GRANT SELECT ON public_projects TO app_user`)
 
 	mustExec(`SET ROLE app_user`)
 	mustExec(`SET app.tenant_id = 't1'`)
@@ -352,9 +356,10 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 		USING (tenant_id = current_setting('app.tenant_id', true))
 		WITH CHECK (tenant_id = current_setting('app.tenant_id', true))`)
 
-	// S3: Object-level GRANT/REVOKE is rejected with 0A000 instead of silently succeeding.
-	requireErrCode(`GRANT SELECT ON rls_items TO tenant_role`, "0A000")
-	requireErrCode(`REVOKE SELECT ON rls_items FROM tenant_role`, "0A000")
+	// S3: Object-level GRANT/REVOKE works and enforces real ACL privileges.
+	mustExec(`GRANT SELECT, INSERT, UPDATE, DELETE ON rls_items TO tenant_role`)
+	mustExec(`GRANT SELECT ON public_lookup TO tenant_role`)
+	mustExec(`GRANT CREATE ON SCHEMA public TO tenant_role`)
 
 	// S2: Role membership and privilege checks.
 	mustExec(`GRANT tenant_role TO worker_role`)
@@ -512,6 +517,7 @@ func TestRLSOuterJoinSemantics(t *testing.T) {
 	mustExec(`CREATE TABLE oj_lookup (id bigint PRIMARY KEY)`)
 	mustExec(`INSERT INTO oj_lookup VALUES (1), (2), (3)`)
 	mustExec(`CREATE ROLE oj_tenant`)
+	mustExec(`GRANT SELECT ON oj_items, oj_lookup TO oj_tenant`)
 	mustExec(`ALTER TABLE oj_items ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY oj_pol ON oj_items FOR ALL TO PUBLIC USING (tenant_id = current_setting('app.tenant_id', true))`)
 	mustExec(`SET ROLE oj_tenant`)
@@ -580,6 +586,7 @@ func TestRLSTransactionalCatalogAndBackup(t *testing.T) {
 	mustExec(`CREATE TABLE tx_docs (id bigint PRIMARY KEY, tenant_id text NOT NULL)`)
 	mustExec(`INSERT INTO tx_docs VALUES (1, 't1'), (2, 't2')`)
 	mustExec(`CREATE ROLE tx_user`)
+	mustExec(`GRANT SELECT ON tx_docs TO tx_user`)
 	mustExec(`ALTER TABLE tx_docs ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY committed_pol ON tx_docs FOR ALL TO tx_user USING (tenant_id = 't1')`)
 
@@ -815,6 +822,7 @@ func TestNativeRLSPenetrationMatrix(t *testing.T) {
 	mustExec(`INSERT INTO secret VALUES (1, 't1', 't1-secret-1'), (2, 't2', 't2-secret-2'), (3, 't1', 't1-secret-3')`)
 	mustExec(`ALTER TABLE secret ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY secret_tenant_pol ON secret FOR ALL TO pen_tenant USING (tenant_id = current_setting('app.tenant_id', true)) WITH CHECK (tenant_id = current_setting('app.tenant_id', true))`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE, DELETE ON secret TO pen_tenant`)
 	mustExec(`CREATE STATISTICS secret_ext_stats (ndistinct, dependencies, mcv) ON tenant_id, payload FROM secret`)
 	mustExec(`ANALYZE secret`)
 
@@ -825,6 +833,10 @@ func TestNativeRLSPenetrationMatrix(t *testing.T) {
 	mustExec(`CREATE VIEW v_invoker WITH (security_invoker = true) AS SELECT id, tenant_id, payload FROM secret`)
 	mustExec(`CREATE SCHEMA s2`)
 	mustExec(`CREATE FUNCTION trig_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE, DELETE ON leak, scratch TO pen_tenant`)
+	mustExec(`GRANT SELECT ON v_definer, v_invoker TO pen_tenant`)
+	mustExec(`GRANT USAGE ON SCHEMA s2 TO pen_tenant`)
+	mustExec(`GRANT CREATE ON SCHEMA public TO pen_tenant`)
 
 	// Verify superuser sees pg_stats and pg_statistic_ext_data rows for secret before switching role.
 	out := mustExec(`SELECT count(*) FROM pg_stats WHERE tablename = 'secret'`)
@@ -946,6 +958,7 @@ func TestNativeRLSPenetrationMatrix(t *testing.T) {
 	mustExec(`CREATE POLICY sel_all ON upsert_branch FOR SELECT TO pen_tenant USING (true)`)
 	mustExec(`CREATE POLICY ins_pos ON upsert_branch FOR INSERT TO pen_tenant WITH CHECK (col > 0)`)
 	mustExec(`CREATE POLICY upd_lt10 ON upsert_branch FOR UPDATE TO pen_tenant USING (true) WITH CHECK (col < 10)`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE ON upsert_branch TO pen_tenant`)
 
 	mustExec(`SET ROLE pen_tenant`)
 	// New row with col=20: satisfies INSERT (20 > 0) even though it violates UPDATE (20 < 10).

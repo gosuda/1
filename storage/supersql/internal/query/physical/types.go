@@ -159,6 +159,17 @@ type LookupScanSpec struct {
 	BaseProjection []model.ColumnID
 }
 
+type GINScanSpec struct {
+	Enabled    bool
+	IndexName  string
+	TableName  string
+	OpClass    string
+	Column     model.ColumnID
+	Layout     model.TypeLayout
+	OperatorID model.OperatorID
+	QueryExpr  ScalarRef
+}
+
 type ScanSpec struct {
 	Source    storage.ObjectRef
 	ColumnMap []ScanColumn
@@ -172,6 +183,7 @@ type ScanSpec struct {
 	Estimate           storage.ScanEstimate
 	AppliedLimit       storage.ScanLimit
 	Lookup             LookupScanSpec
+	GIN                GINScanSpec
 }
 
 type NullEquality uint8

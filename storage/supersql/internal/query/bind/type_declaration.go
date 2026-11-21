@@ -1424,6 +1424,9 @@ func bindDropTypes(ctx context.Context, statement *zpgparse.DropStmt, snapshot C
 			}
 			return nil, err
 		}
+		if err := b.requireTableOwner(descriptor, 0); err != nil {
+			return nil, err
+		}
 		spec, err := descriptor.SpecWithin(ctx, options.Descriptors)
 		if err != nil {
 			return nil, err

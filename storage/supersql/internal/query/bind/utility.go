@@ -10,6 +10,7 @@ import (
 
 type mutationTarget struct {
 	descriptor          *model.Descriptor
+	namespace           *model.Descriptor
 	table               *model.TableMetadata
 	qualifier           relationQualifier
 	view                bool
@@ -93,6 +94,7 @@ func (b *binder) modificationTarget(n *zpgparse.RangeVar) (mutationTarget, error
 	}
 	position := int(n.Location) + 1
 	var d *model.Descriptor
+	var ns *model.Descriptor
 	namespace := ""
 	resolveSchema := func(schema string) (bool, error) {
 		if _, logical, err := b.catalogRange(schema, n.Relname, position); err != nil {
@@ -110,7 +112,7 @@ func (b *binder) modificationTarget(n *zpgparse.RangeVar) (mutationTarget, error
 		if descriptor.Kind() == model.ObjectMaterializedView && b.options.MaterializedViewTarget == 0 {
 			return false, nil
 		}
-		d, namespace = descriptor, parent.Name().Name
+		d, ns, namespace = descriptor, parent, parent.Name().Name
 		return true, nil
 	}
 	if n.Schemaname != "" {
@@ -193,7 +195,7 @@ func (b *binder) modificationTarget(n *zpgparse.RangeVar) (mutationTarget, error
 	if n.Alias != nil {
 		qualifier = relationQualifier{name: n.Alias.Aliasname}
 	}
-	return mutationTarget{descriptor: d, table: table, qualifier: qualifier, view: view}, nil
+	return mutationTarget{descriptor: d, namespace: ns, table: table, qualifier: qualifier, view: view}, nil
 }
 func (b *binder) modification(s *scope, target mutationTarget, input relation, kind ir.ModifyKind, assignments []ir.Binding, updated []model.ColumnID, clause *zpgparse.ReturningClause, conflict *zpgparse.OnConflictClause) (relation, error) {
 	d := target.executionDescriptor
@@ -270,6 +272,24 @@ func (b *binder) insert(n *zpgparse.InsertStmt, s *scope) (relation, error) {
 	}
 	target, err := b.modificationTarget(n.Relation)
 	if err != nil {
+		return relation{}, err
+	}
+	pos := int(n.Relation.Location) + 1
+	if err := b.checkSchemaUsage(target.namespace, pos); err != nil {
+		return relation{}, err
+	}
+	required := model.PrivilegeInsert
+	if n.OnConflictClause != nil {
+		if n.OnConflictClause.Action == zpgparse.OnConflictAction_ONCONFLICT_UPDATE {
+			required |= model.PrivilegeUpdate | model.PrivilegeSelect
+		} else if n.OnConflictClause.Infer != nil && n.OnConflictClause.Infer.WhereClause != nil {
+			required |= model.PrivilegeSelect
+		}
+	}
+	if n.ReturningClause != nil {
+		required |= model.PrivilegeSelect
+	}
+	if err := b.checkObjectPrivilege(target.descriptor, required, pos); err != nil {
 		return relation{}, err
 	}
 	d, table := target.descriptor, target.table
@@ -527,6 +547,24 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 	if err != nil {
 		return relation{}, err
 	}
+	pos := int(n.Relation.Location) + 1
+	if err := b.checkSchemaUsage(target.namespace, pos); err != nil {
+		return relation{}, err
+	}
+	required := model.PrivilegeUpdate
+	if n.WhereClause != nil || n.ReturningClause != nil {
+		required |= model.PrivilegeSelect
+	} else {
+		for _, item := range n.TargetList {
+			if rt := item.GetResTarget(); rt != nil && astContainsColumnRef(rt.Val) {
+				required |= model.PrivilegeSelect
+				break
+			}
+		}
+	}
+	if err := b.checkObjectPrivilege(target.descriptor, required, pos); err != nil {
+		return relation{}, err
+	}
 	target, err = b.prepareMutationTarget(target, []string{"update"})
 	if err != nil {
 		return relation{}, err
@@ -536,14 +574,17 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 		b.mutationProvenance = target.executionDescriptor.ID()
 	}
 	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	savedDMLTargetID := b.dmlTargetID
 	if target.executionDescriptor != nil {
 		b.rlsTargetID = target.executionDescriptor.ID()
 	} else {
 		b.rlsTargetID = target.descriptor.ID()
 	}
 	b.rlsTargetCommand = "UPDATE"
+	b.dmlTargetID = target.descriptor.ID()
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
 	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
+	b.dmlTargetID = savedDMLTargetID
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return input, err
@@ -878,6 +919,17 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 	if err != nil {
 		return relation{}, err
 	}
+	pos := int(n.Relation.Location) + 1
+	if err := b.checkSchemaUsage(target.namespace, pos); err != nil {
+		return relation{}, err
+	}
+	required := model.PrivilegeDelete
+	if n.WhereClause != nil || n.ReturningClause != nil {
+		required |= model.PrivilegeSelect
+	}
+	if err := b.checkObjectPrivilege(target.descriptor, required, pos); err != nil {
+		return relation{}, err
+	}
 	target, err = b.prepareMutationTarget(target, []string{"delete"})
 	if err != nil {
 		return relation{}, err
@@ -887,14 +939,17 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 		b.mutationProvenance = target.executionDescriptor.ID()
 	}
 	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	savedDMLTargetID := b.dmlTargetID
 	if target.executionDescriptor != nil {
 		b.rlsTargetID = target.executionDescriptor.ID()
 	} else {
 		b.rlsTargetID = target.descriptor.ID()
 	}
 	b.rlsTargetCommand = "DELETE"
+	b.dmlTargetID = target.descriptor.ID()
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
 	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
+	b.dmlTargetID = savedDMLTargetID
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return input, err

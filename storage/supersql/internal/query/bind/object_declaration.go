@@ -75,6 +75,12 @@ func BindObjectCommand(ctx context.Context, node *zpgparse.Node, snapshot Catalo
 	case *zpgparse.Node_GrantRoleStmt:
 		command, err := bindGrantRole(ctx, statement.GrantRoleStmt, snapshot, options)
 		return command, true, err
+	case *zpgparse.Node_GrantStmt:
+		command, err := bindGrantStatement(ctx, statement.GrantStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_AlterOwnerStmt:
+		command, err := bindAlterOwner(ctx, statement.AlterOwnerStmt, snapshot, options)
+		return command, true, err
 	case *zpgparse.Node_CreatePolicyStmt:
 		command, err := bindCreatePolicy(ctx, statement.CreatePolicyStmt, snapshot, options)
 		return command, true, err
@@ -107,7 +113,17 @@ func BindObjectCommand(ctx context.Context, node *zpgparse.Node, snapshot Catalo
 	case *zpgparse.Node_AlterFunctionStmt:
 		command, err := bindAlterRoutine(ctx, statement.AlterFunctionStmt, snapshot, options)
 		return command, true, err
+	case *zpgparse.Node_DefineStmt:
+		if statement.DefineStmt != nil && statement.DefineStmt.Kind == zpgparse.ObjectType_OBJECT_COLLATION {
+			command, err := bindCreateCollation(ctx, statement.DefineStmt, snapshot, options)
+			return command, true, err
+		}
+		return nil, false, nil
 	case *zpgparse.Node_DropStmt:
+		if statement.DropStmt.RemoveType == zpgparse.ObjectType_OBJECT_COLLATION {
+			command, err := bindDropCollation(ctx, statement.DropStmt, snapshot, options)
+			return command, true, err
+		}
 		if statement.DropStmt.RemoveType == zpgparse.ObjectType_OBJECT_POLICY {
 			command, err := bindDropPolicy(ctx, statement.DropStmt, snapshot, options)
 			return command, true, err
@@ -211,7 +227,16 @@ func bindCreateView(ctx context.Context, statement *zpgparse.ViewStmt, snapshot 
 		return nil, bindError("42P07", "relation already exists", int(statement.View.Location)+1)
 	}
 	if existing == nil {
+		if statement.View.Relpersistence != "t" {
+			if err := b.checkSchemaCreate(parent, int(statement.View.Location)+1); err != nil {
+				return nil, err
+			}
+		}
 		if err := implicitRelationTypeNamesAvailable(ctx, snapshot, parent.ID(), name); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := b.requireTableOwner(existing, int(statement.View.Location)+1); err != nil {
 			return nil, err
 		}
 	}
@@ -284,6 +309,9 @@ func bindCreateView(ctx context.Context, statement *zpgparse.ViewStmt, snapshot 
 		if spec.View == nil || spec.View.RowType == 0 {
 			return nil, model.ErrInvalidDescriptor
 		}
+		metadata.Owner = spec.View.Owner
+		metadata.OwnerName = spec.View.OwnerName
+		metadata.ACL = slices.Clone(spec.View.ACL)
 		if err := replacementViewColumns(spec.View.Columns, metadata.Columns); err != nil {
 			return nil, err
 		}
@@ -438,6 +466,11 @@ func bindCreateTableAs(ctx context.Context, statement *zpgparse.CreateTableAsStm
 			return &BoundObjectCommand{tag: createTableAsTag(statement.Objtype), dependencies: b.dependencies, warnings: []model.Error{{Code: "42P07", Message: "relation already exists, skipping"}}}, nil
 		}
 		return nil, bindError("42P07", "relation already exists", int(into.Rel.Location)+1)
+	}
+	if into.Rel.Relpersistence != "t" {
+		if err := b.checkSchemaCreate(parent, int(into.Rel.Location)+1); err != nil {
+			return nil, err
+		}
 	}
 	if err := implicitRelationTypeNamesAvailable(ctx, snapshot, parent.ID(), name); err != nil {
 		return nil, err

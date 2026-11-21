@@ -67,6 +67,19 @@ func (w *jsonWriter) scan(scan physical.ScanSpec) {
 	w.fixed(scan.Estimate)
 	w.raw(`,"Lookup":`)
 	w.lookup(scan.Lookup)
+	if scan.GIN.Enabled {
+		w.raw(`,"GIN":{"Index Name":`)
+		w.text(scan.GIN.IndexName)
+		w.raw(`,"Relation Name":`)
+		w.text(scan.GIN.TableName)
+		w.raw(`,"OpClass":`)
+		w.text(scan.GIN.OpClass)
+		w.raw(`,"Column":`)
+		w.fixed(scan.GIN.Column)
+		w.raw(`,"Operator":`)
+		w.fixed(scan.GIN.OperatorID)
+		w.raw("}")
+	}
 	w.raw("}")
 }
 

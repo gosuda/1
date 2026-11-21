@@ -162,7 +162,12 @@ func BindCreateSequence(ctx context.Context, statement *zpgparse.CreateSeqStmt, 
 	if persistence == "" {
 		persistence = "p"
 	}
-	d := &BoundSequenceDefinition{limits: options.Descriptors, draft: model.DescriptorSpec{Name: model.NamespaceName{Parent: parent.ID(), Kind: model.ObjectSequence, Name: r.Relname}, Version: 1, State: model.StatePublic, Physical: options.Physical, Sequence: &model.SequenceMetadata{Owner: options.Owner, Type: b.primitive(20).Type, Increment: 1, Cache: 1, Persistence: persistence}}}
+	if persistence != "t" {
+		if err := b.checkSchemaCreate(parent, int(r.Location)+1); err != nil {
+			return nil, err
+		}
+	}
+	d := &BoundSequenceDefinition{limits: options.Descriptors, draft: model.DescriptorSpec{Name: model.NamespaceName{Parent: parent.ID(), Kind: model.ObjectSequence, Name: r.Relname}, Version: 1, State: model.StatePublic, Physical: options.Physical, Sequence: &model.SequenceMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Type: b.primitive(20).Type, Increment: 1, Cache: 1, Persistence: persistence}}}
 	if err := b.sequenceOptions(d, statement.Options); err != nil {
 		return nil, err
 	}

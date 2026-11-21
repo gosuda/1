@@ -52,7 +52,7 @@ func inspectDatabaseDirectory(ctx context.Context, path string) (err error) {
 		}
 		for _, entry := range entries {
 			switch entry.Name() {
-			case ".lock":
+			case ".lock", encryptionMetaName:
 				if !entry.Type().IsRegular() {
 					return ErrIncompatibleFormat
 				}

@@ -24,6 +24,7 @@ func IsRoleOrPolicyCommand(node *zpgparse.Node) bool {
 	}
 	switch s := node.Node.(type) {
 	case *zpgparse.Node_CreateRoleStmt, *zpgparse.Node_AlterRoleStmt, *zpgparse.Node_DropRoleStmt, *zpgparse.Node_GrantRoleStmt,
+		*zpgparse.Node_GrantStmt, *zpgparse.Node_AlterOwnerStmt,
 		*zpgparse.Node_CreatePolicyStmt, *zpgparse.Node_AlterPolicyStmt:
 		return true
 	case *zpgparse.Node_DropStmt:

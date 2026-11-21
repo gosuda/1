@@ -30,6 +30,7 @@ const (
 	ObjectCast
 	ObjectOperator
 	ObjectRole
+	ObjectCollation
 )
 
 // SignatureBearing reports whether the catalog namespace key includes an
@@ -257,6 +258,43 @@ const (
 	PartitionDetachPending
 )
 
+type PrivilegeMask uint32
+
+const (
+	PrivilegeSelect PrivilegeMask = 1 << iota
+	PrivilegeInsert
+	PrivilegeUpdate
+	PrivilegeDelete
+	PrivilegeTruncate
+	PrivilegeReferences
+	PrivilegeTrigger
+	PrivilegeUsage
+	PrivilegeCreate
+	PrivilegeExecute
+
+	PrivilegeAllTable    = PrivilegeSelect | PrivilegeInsert | PrivilegeUpdate | PrivilegeDelete | PrivilegeTruncate | PrivilegeReferences | PrivilegeTrigger
+	PrivilegeAllSequence = PrivilegeUsage | PrivilegeSelect | PrivilegeUpdate
+	PrivilegeAllSchema   = PrivilegeUsage | PrivilegeCreate
+	PrivilegeAllRoutine  = PrivilegeExecute
+)
+
+// PrivilegeGrant records one object-level GRANT entry persisted in MVCC catalog metadata.
+// Grantee is a normalized lowercase role name or "public" for PUBLIC.
+type PrivilegeGrant struct {
+	Grantee     string
+	Privileges  PrivilegeMask
+	GrantOption PrivilegeMask `json:",omitempty"`
+	Grantor     string        `json:",omitempty"`
+}
+
+type CollationMetadata struct {
+	Owner         OID
+	OwnerName     string `json:",omitempty"`
+	Provider      byte   // 'i' (icu), 'b' (builtin), 'c' (libc)
+	Locale        string
+	Deterministic bool
+}
+
 type RoleMetadata struct {
 	Superuser bool
 	BypassRLS bool
@@ -276,7 +314,8 @@ type PolicyDescriptor struct {
 
 type TableMetadata struct {
 	Owner     OID
-	OwnerName string `json:",omitempty"` // optional role name (empty means default superuser owner)
+	OwnerName string           `json:",omitempty"` // optional role name (empty means default superuser owner)
+	ACL       []PrivilegeGrant `json:",omitempty"`
 	// ColumnIDHighWatermark includes removed and reserved IDs. It never decreases.
 	ColumnIDHighWatermark ColumnID
 	Columns               []ColumnDescriptor
@@ -304,11 +343,14 @@ type TableMetadata struct {
 }
 type SchemaMetadata struct {
 	Owner     OID
-	OwnerName string `json:",omitempty"` // optional role name (empty means default superuser owner)
+	OwnerName string           `json:",omitempty"` // optional role name (empty means default superuser owner)
+	ACL       []PrivilegeGrant `json:",omitempty"`
 }
 type IndexMetadata struct {
 	Owner               OID
 	Table               ObjectID
+	Method              string `json:",omitempty"` // "" or "btree", or "gin"
+	OpClass             string `json:",omitempty"` // optional GIN opclass (e.g. "jsonb_ops", "jsonb_path_ops")
 	Keys                []KeyElement
 	Include             []ColumnID
 	Predicate           *ExpressionDefinition
@@ -325,6 +367,7 @@ type IndexMetadata struct {
 	NotLive  bool
 }
 
+func (m IndexMetadata) IsGIN() bool { return m.Method == "gin" }
 func (m IndexMetadata) Valid() bool { return !m.Invalid }
 func (m IndexMetadata) Ready() bool { return !m.NotReady }
 func (m IndexMetadata) Live() bool  { return !m.NotLive }
@@ -333,7 +376,9 @@ func (m IndexMetadata) WriteMaintained() bool {
 }
 
 type SequenceMetadata struct {
-	Owner OID
+	Owner     OID
+	OwnerName string           `json:",omitempty"`
+	ACL       []PrivilegeGrant `json:",omitempty"`
 	// Identity survives RESTART; Incarnation selects the current allocation state.
 	Identity, Incarnation             uint64
 	Type                              Type
@@ -342,6 +387,24 @@ type SequenceMetadata struct {
 	OwnerTable                        ObjectID
 	OwnerColumn                       ColumnID
 	Persistence                       string
+}
+
+func (s SequenceMetadata) Equal(other SequenceMetadata) bool {
+	return s.Owner == other.Owner &&
+		s.OwnerName == other.OwnerName &&
+		slices.Equal(s.ACL, other.ACL) &&
+		s.Identity == other.Identity &&
+		s.Incarnation == other.Incarnation &&
+		s.Type == other.Type &&
+		s.Start == other.Start &&
+		s.Increment == other.Increment &&
+		s.Min == other.Min &&
+		s.Max == other.Max &&
+		s.Cache == other.Cache &&
+		s.Cycle == other.Cycle &&
+		s.OwnerTable == other.OwnerTable &&
+		s.OwnerColumn == other.OwnerColumn &&
+		s.Persistence == other.Persistence
 }
 
 // ViewMutationColumn maps one view output to its immediate base-relation
@@ -361,7 +424,8 @@ type ViewMutationMetadata struct {
 
 type ViewMetadata struct {
 	Owner           OID
-	OwnerName       string `json:",omitempty"` // optional role name (empty means default superuser owner)
+	OwnerName       string           `json:",omitempty"` // optional role name (empty means default superuser owner)
+	ACL             []PrivilegeGrant `json:",omitempty"`
 	Columns         []ColumnDescriptor
 	Query           ExpressionDefinition
 	Definition      string
@@ -397,6 +461,8 @@ type RoutineMetadata struct {
 	Settings        []RoutineSetting
 	Result          TypeLayout
 	Owner           OID
+	OwnerName       string           `json:",omitempty"`
+	ACL             []PrivilegeGrant `json:",omitempty"`
 	LanguageOID     OID
 	Body            ExpressionDefinition
 	Language        string
@@ -518,7 +584,8 @@ type DescriptorSpec struct {
 	Cast                    *CastMetadata
 	Operator                *OperatorMetadata
 	Aggregate               *AggregateMetadata
-	Role                    *RoleMetadata `json:",omitempty"`
+	Role                    *RoleMetadata      `json:",omitempty"`
+	Collation               *CollationMetadata `json:",omitempty"`
 }
 
 // Limits bound each owned descriptor, including nested type/default payloads.
@@ -689,6 +756,86 @@ func (d *Descriptor) Role() (RoleMetadata, bool) {
 		return RoleMetadata{}, false
 	}
 	return *d.spec.Role, true
+}
+
+// Collation returns immutable metadata borrowed from the descriptor.
+func (d *Descriptor) Collation() (CollationMetadata, bool) {
+	if d == nil || d.spec.Collation == nil {
+		return CollationMetadata{}, false
+	}
+	return *d.spec.Collation, true
+}
+
+// Schema returns immutable metadata borrowed from the descriptor.
+func (d *Descriptor) Schema() (SchemaMetadata, bool) {
+	if d == nil || d.spec.Schema == nil {
+		return SchemaMetadata{}, false
+	}
+	return *d.spec.Schema, true
+}
+
+// ACL returns a borrowed slice of object-level privilege grants, if any.
+func (d *Descriptor) ACL() []PrivilegeGrant {
+	if d == nil {
+		return nil
+	}
+	switch d.spec.Name.Kind {
+	case ObjectSchema:
+		if d.spec.Schema != nil {
+			return d.spec.Schema.ACL
+		}
+	case ObjectTable, ObjectMaterializedView:
+		if d.spec.Table != nil {
+			return d.spec.Table.ACL
+		}
+	case ObjectView:
+		if d.spec.View != nil {
+			return d.spec.View.ACL
+		}
+	case ObjectSequence:
+		if d.spec.Sequence != nil {
+			return d.spec.Sequence.ACL
+		}
+	case ObjectRoutine:
+		if d.spec.Routine != nil {
+			return d.spec.Routine.ACL
+		}
+	}
+	return nil
+}
+
+// OwnerName returns the normalized role name owning the object ("" means default superuser).
+func (d *Descriptor) OwnerName() string {
+	if d == nil {
+		return ""
+	}
+	switch d.spec.Name.Kind {
+	case ObjectSchema:
+		if d.spec.Schema != nil {
+			return d.spec.Schema.OwnerName
+		}
+	case ObjectTable, ObjectMaterializedView:
+		if d.spec.Table != nil {
+			return d.spec.Table.OwnerName
+		}
+	case ObjectView:
+		if d.spec.View != nil {
+			return d.spec.View.OwnerName
+		}
+	case ObjectSequence:
+		if d.spec.Sequence != nil {
+			return d.spec.Sequence.OwnerName
+		}
+	case ObjectRoutine:
+		if d.spec.Routine != nil {
+			return d.spec.Routine.OwnerName
+		}
+	case ObjectCollation:
+		if d.spec.Collation != nil {
+			return d.spec.Collation.OwnerName
+		}
+	}
+	return ""
 }
 
 // Spec returns a bounded, deeply owned editable copy.
@@ -932,6 +1079,15 @@ func (c *descriptorCopier) triggers(in []TriggerDescriptor) []TriggerDescriptor 
 	}
 	return out
 }
+func (c *descriptorCopier) acl(in []PrivilegeGrant) []PrivilegeGrant {
+	out := descriptorSlice(c, in)
+	for i := range out {
+		out[i].Grantee = c.text(out[i].Grantee)
+		out[i].Grantor = c.text(out[i].Grantor)
+	}
+	return out
+}
+
 func (c *descriptorCopier) policies(in []PolicyDescriptor) []PolicyDescriptor {
 	out := descriptorSlice(c, in)
 	for i := range out {
@@ -1000,11 +1156,13 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	if in.Schema != nil && c.charge(uint64(unsafe.Sizeof(*in.Schema))) {
 		x := *in.Schema
 		x.OwnerName = c.text(x.OwnerName)
+		x.ACL = c.acl(x.ACL)
 		out.Schema = &x
 	}
 	if in.Table != nil && c.charge(uint64(unsafe.Sizeof(*in.Table))) {
 		x := *in.Table
 		x.OwnerName = c.text(x.OwnerName)
+		x.ACL = c.acl(x.ACL)
 		x.Columns = c.columns(x.Columns)
 		x.TypedColumns = descriptorSlice(c, x.TypedColumns)
 		x.PrimaryKey = c.keys(x.PrimaryKey)
@@ -1035,6 +1193,8 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Index != nil && c.charge(uint64(unsafe.Sizeof(*in.Index))) {
 		x := *in.Index
+		x.Method = c.text(x.Method)
+		x.OpClass = c.text(x.OpClass)
 		x.Keys = c.keys(x.Keys)
 		x.Include = descriptorSlice(c, x.Include)
 		x.Predicate = c.expression(x.Predicate)
@@ -1061,12 +1221,15 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Sequence != nil && c.charge(uint64(unsafe.Sizeof(*in.Sequence))) {
 		x := *in.Sequence
+		x.OwnerName = c.text(x.OwnerName)
+		x.ACL = c.acl(x.ACL)
 		x.Persistence = c.text(x.Persistence)
 		out.Sequence = &x
 	}
 	if in.View != nil && c.charge(uint64(unsafe.Sizeof(*in.View))) {
 		x := *in.View
 		x.OwnerName = c.text(x.OwnerName)
+		x.ACL = c.acl(x.ACL)
 		x.Columns = c.columns(x.Columns)
 		x.Definition = c.text(x.Definition)
 		x.Persistence = c.text(x.Persistence)
@@ -1090,6 +1253,8 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Routine != nil && c.charge(uint64(unsafe.Sizeof(*in.Routine))) {
 		x := *in.Routine
+		x.OwnerName = c.text(x.OwnerName)
+		x.ACL = c.acl(x.ACL)
 		x.Parameters = descriptorSlice(c, x.Parameters)
 		for i := range x.Parameters {
 			p := &x.Parameters[i]
@@ -1205,6 +1370,12 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 			x.MemberOf[i] = c.text(x.MemberOf[i])
 		}
 		out.Role = &x
+	}
+	if in.Collation != nil && c.charge(uint64(unsafe.Sizeof(*in.Collation))) {
+		x := *in.Collation
+		x.OwnerName = c.text(x.OwnerName)
+		x.Locale = c.text(x.Locale)
+		out.Collation = &x
 	}
 	if c.err != nil {
 		return DescriptorSpec{}, c.err

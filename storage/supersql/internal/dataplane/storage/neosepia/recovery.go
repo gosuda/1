@@ -15,8 +15,10 @@ import (
 )
 
 type recoveryLimits struct {
-	Batch    storage.BatchDecodeLimits
-	MaxFiles uint64
+	Batch       storage.BatchDecodeLimits
+	MaxFiles    uint64
+	cipher      *storageCipher
+	maxCommitTS model.Timestamp
 }
 
 type recoveredPosition struct {
@@ -40,19 +42,27 @@ func recoverCommits(ctx context.Context, root *os.Root, after recoveredPosition,
 	}
 	slices.Sort(positions)
 	recovered := after
-	for _, position := range positions {
+	var truncated []uint64
+	for idx, position := range positions {
 		if err := ctx.Err(); err != nil {
 			return after, err
 		}
 		if recovered.LogPosition == math.MaxUint64 || position != recovered.LogPosition+1 {
 			return after, storage.ErrCorruptStorage
 		}
-		record, err := openCommit(ctx, root, position, limits.Batch)
+		record, err := openCommitWithCipher(ctx, root, position, limits.Batch, limits.cipher)
 		if err != nil {
 			return after, err
 		}
 		if record.Result.CommitTS <= recovered.CommitTS {
 			return after, errors.Join(storage.ErrCorruptStorage, record.Close())
+		}
+		if limits.maxCommitTS > 0 && record.Result.CommitTS > limits.maxCommitTS {
+			if closeErr := record.Close(); closeErr != nil {
+				return after, closeErr
+			}
+			truncated = positions[idx:]
+			break
 		}
 		visitErr := visit(record)
 		next := recoveredPosition{LogPosition: position, CommitTS: record.Result.CommitTS}
@@ -60,6 +70,14 @@ func recoverCommits(ctx context.Context, root *os.Root, after recoveredPosition,
 			return after, err
 		}
 		recovered = next
+	}
+	for _, position := range truncated {
+		if err := ctx.Err(); err != nil {
+			return after, err
+		}
+		if err := root.Remove(commitName(position)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return after, err
+		}
 	}
 	for _, position := range pending {
 		if err := ctx.Err(); err != nil {

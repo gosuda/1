@@ -37,7 +37,8 @@ func OrdinaryObjectAlter(statement *zpgparse.AlterTableStmt) bool {
 				zpgparse.AlterTableType_AT_EnableRowSecurity,
 				zpgparse.AlterTableType_AT_DisableRowSecurity,
 				zpgparse.AlterTableType_AT_ForceRowSecurity,
-				zpgparse.AlterTableType_AT_NoForceRowSecurity:
+				zpgparse.AlterTableType_AT_NoForceRowSecurity,
+				zpgparse.AlterTableType_AT_ChangeOwner:
 			default:
 				return false
 			}
@@ -46,7 +47,11 @@ func OrdinaryObjectAlter(statement *zpgparse.AlterTableStmt) bool {
 				return false
 			}
 		case zpgparse.ObjectType_OBJECT_VIEW:
-			if command.Subtype != zpgparse.AlterTableType_AT_SetRelOptions && command.Subtype != zpgparse.AlterTableType_AT_ResetRelOptions && command.Subtype != zpgparse.AlterTableType_AT_ReplaceRelOptions {
+			if command.Subtype != zpgparse.AlterTableType_AT_SetRelOptions && command.Subtype != zpgparse.AlterTableType_AT_ResetRelOptions && command.Subtype != zpgparse.AlterTableType_AT_ReplaceRelOptions && command.Subtype != zpgparse.AlterTableType_AT_ChangeOwner {
+				return false
+			}
+		case zpgparse.ObjectType_OBJECT_MATVIEW, zpgparse.ObjectType_OBJECT_SEQUENCE:
+			if command.Subtype != zpgparse.AlterTableType_AT_ChangeOwner {
 				return false
 			}
 		default:
@@ -475,11 +480,15 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 		kinds = []model.ObjectKind{model.ObjectIndex}
 	case zpgparse.ObjectType_OBJECT_VIEW:
 		kinds = []model.ObjectKind{model.ObjectView}
+	case zpgparse.ObjectType_OBJECT_MATVIEW:
+		kinds = []model.ObjectKind{model.ObjectMaterializedView}
+	case zpgparse.ObjectType_OBJECT_SEQUENCE:
+		kinds = []model.ObjectKind{model.ObjectSequence}
 	}
 	base, _, err := b.resolve(parts, kinds, "42P01", int(statement.Relation.Location)+1)
 	if err != nil {
 		if statement.MissingOk && isMissingObject(err) {
-			return &BoundObjectCommand{tag: "ALTER " + strings.TrimPrefix(statement.Objtype.String(), "OBJECT_"), warnings: []model.Error{{Code: "42P01", Message: "relation does not exist, skipping"}}}, nil
+			return &BoundObjectCommand{tag: objectCommandTag("ALTER", statement.Objtype), warnings: []model.Error{{Code: "42P01", Message: "relation does not exist, skipping"}}}, nil
 		}
 		return nil, err
 	}
@@ -539,12 +548,38 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 				spec.Table.ForceRowSecurity = true
 			case zpgparse.AlterTableType_AT_NoForceRowSecurity:
 				spec.Table.ForceRowSecurity = false
+			case zpgparse.AlterTableType_AT_ChangeOwner:
+				newOID, newName, err := b.validateNewOwner(command.Newowner, base, int(statement.Relation.Location)+1)
+				if err != nil {
+					return nil, err
+				}
+				if newOID != 0 {
+					spec.Table.Owner = newOID
+				}
+				spec.Table.OwnerName = newName
+				if spec.View != nil {
+					if newOID != 0 {
+						spec.View.Owner = newOID
+					}
+					spec.View.OwnerName = newName
+				}
 			}
 		} else if spec.Index != nil {
 			if err := bindSetStatistics(&spec, command, true); err != nil {
 				return nil, err
 			}
 		} else if spec.View != nil {
+			if command.Subtype == zpgparse.AlterTableType_AT_ChangeOwner {
+				newOID, newName, err := b.validateNewOwner(command.Newowner, base, int(statement.Relation.Location)+1)
+				if err != nil {
+					return nil, err
+				}
+				if newOID != 0 {
+					spec.View.Owner = newOID
+				}
+				spec.View.OwnerName = newName
+				continue
+			}
 			reset := command.Subtype == zpgparse.AlterTableType_AT_ResetRelOptions
 			if command.Subtype == zpgparse.AlterTableType_AT_ReplaceRelOptions {
 				spec.View.CheckOption = ""
@@ -557,6 +592,18 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 			if spec.View.CheckOption != "" && (spec.View.Automatic == nil || len(spec.View.Automatic.Columns) == 0) {
 				return nil, bindError("0A000", "WITH CHECK OPTION is supported only on automatically updatable views", viewOptionPosition(command.Def, "check_option", statement.Relation.Location))
 			}
+		} else if spec.Sequence != nil {
+			if command.Subtype != zpgparse.AlterTableType_AT_ChangeOwner {
+				return nil, model.ErrInvalidDescriptor
+			}
+			newOID, newName, err := b.validateNewOwner(command.Newowner, base, int(statement.Relation.Location)+1)
+			if err != nil {
+				return nil, err
+			}
+			if newOID != 0 {
+				spec.Sequence.Owner = newOID
+			}
+			spec.Sequence.OwnerName = newName
 		} else {
 			return nil, model.ErrInvalidDescriptor
 		}
@@ -582,6 +629,10 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 		tag = "ALTER INDEX"
 	case zpgparse.ObjectType_OBJECT_VIEW:
 		tag = "ALTER VIEW"
+	case zpgparse.ObjectType_OBJECT_MATVIEW:
+		tag = "ALTER MATERIALIZED VIEW"
+	case zpgparse.ObjectType_OBJECT_SEQUENCE:
+		tag = "ALTER SEQUENCE"
 	}
 	updates := []ObjectMutation{{Base: base, Next: next}}
 	if typedAlter {

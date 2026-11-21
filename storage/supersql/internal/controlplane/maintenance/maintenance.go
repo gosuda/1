@@ -73,14 +73,18 @@ type CheckpointVerifier interface {
 }
 
 type BackupOptions struct {
-	Destination string
-	Limits      Limits
+	Destination   string
+	Limits        Limits
+	EncryptionKey []byte
 }
 
 type RestoreOptions struct {
-	Destination string
-	Limits      Limits
-	Verifier    CheckpointVerifier
+	Destination       string
+	Limits            Limits
+	Verifier          CheckpointVerifier
+	EncryptionKey     []byte
+	LiveEncryptionKey []byte
+	WALArchiveKey     []byte
 }
 
 func nilDependency(value any) bool {

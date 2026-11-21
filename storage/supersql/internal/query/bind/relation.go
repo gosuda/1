@@ -194,8 +194,8 @@ func (b *binder) view(d *model.Descriptor, view *model.ViewMetadata, alias *zpgp
 		if err != nil {
 			return relation{}, err
 		}
-		if p.Descriptor.Version() != dep.Version {
-			return relation{}, bindError("0A000", "view dependency version changed", pos)
+		if p.Descriptor == nil || p.Descriptor.State() != model.StatePublic {
+			return relation{}, bindError("0A000", "view dependency is no longer available", pos)
 		}
 		b.dependency(p.Descriptor, dep.Column)
 	}

@@ -339,6 +339,23 @@ func (v *indexValidator) pointRow(ctx context.Context, target storage.ObjectRef,
 }
 
 func (v *indexValidator) checkBase(ctx context.Context, row *model.Row) error {
+	if v.plan.IsGIN() {
+		entries, err := v.plan.Entries(ctx, row)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			stored, err := v.pointRow(ctx, v.plan.target, entry.Key, v.indexIDs, v.plan.layout.Columns)
+			if err != nil {
+				return err
+			}
+			if err := v.compare(ctx, &stored, entry); err != nil {
+				return err
+			}
+			v.expected++
+		}
+		return nil
+	}
 	entry, err := v.plan.Entry(ctx, row)
 	if err != nil || entry == nil {
 		return err
@@ -362,6 +379,18 @@ func (v *indexValidator) checkIndex(ctx context.Context, row *model.Row) error {
 	base, err := v.pointRow(ctx, v.base, owner.BytesVal, v.baseIDs, v.plan.baseColumns)
 	if err != nil {
 		return err
+	}
+	if v.plan.IsGIN() {
+		entries, err := v.plan.Entries(ctx, &base)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if bytes.Equal(entry.Key, row.Key) {
+				return v.compare(ctx, row, entry)
+			}
+		}
+		return errIndexValidationCorrupt
 	}
 	entry, err := v.plan.Entry(ctx, &base)
 	if err != nil {

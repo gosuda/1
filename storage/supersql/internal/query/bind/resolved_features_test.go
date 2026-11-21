@@ -21,7 +21,7 @@ func TestResolvedFunctionExclusionsPreserveOverloads(t *testing.T) {
 		{"jsonb_contains", 3802, ""},
 		{"xpath", 25, bind.XML},
 		{"pg_read_file", 25, bind.ServerIO},
-		{"pg_notify", 25, bind.Notifications},
+		{"pg_notify", 25, ""},
 		{"pg_advisory_lock", 20, ""},
 		{"pg_cancel_backend", 23, bind.ServerObservability},
 	}

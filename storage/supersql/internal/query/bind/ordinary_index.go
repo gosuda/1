@@ -154,6 +154,9 @@ func bindDropIndexes(ctx context.Context, statement *zpgparse.DropStmt, snapshot
 			}
 			return nil, err
 		}
+		if err := b.requireTableOwner(index, 0); err != nil {
+			return nil, err
+		}
 		if seen[index.ID()] {
 			continue
 		}

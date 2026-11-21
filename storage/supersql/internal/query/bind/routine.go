@@ -67,6 +67,9 @@ func BindCreateRoutine(ctx context.Context, statement *zpgparse.CreateFunctionSt
 		if !statement.Replace {
 			return nil, bindError("42723", "routine already exists", 0)
 		}
+		if err := b.requireTableOwner(existing, 0); err != nil {
+			return nil, err
+		}
 		spec, err := existing.Spec(ctx)
 		if err != nil {
 			return nil, err
@@ -75,9 +78,14 @@ func BindCreateRoutine(ctx context.Context, statement *zpgparse.CreateFunctionSt
 			return nil, bindError("42P13", "cannot change routine kind or return type with CREATE OR REPLACE", 0)
 		}
 		metadata.Owner = spec.Routine.Owner
+		metadata.OwnerName = spec.Routine.OwnerName
+		metadata.ACL = slices.Clone(spec.Routine.ACL)
 		id, oid, version = existing.ID(), existing.OID(), existing.Version()+1
 		b.dependency(existing, 0)
 	} else {
+		if err := b.checkSchemaCreate(schema, 0); err != nil {
+			return nil, err
+		}
 		id, oid, err = options.Declaration.Identities.AllocateDeclarationIdentity(ctx)
 		if err != nil {
 			return nil, err
@@ -132,7 +140,16 @@ func resolveRoutineSchema(ctx context.Context, snapshot CatalogSnapshot, path []
 }
 
 func bindRoutineMetadata(ctx context.Context, b *binder, statement *zpgparse.CreateFunctionStmt, snapshot CatalogSnapshot, options CreateRoutineOptions) (model.RoutineMetadata, error) {
-	metadata := model.RoutineMetadata{Procedure: statement.IsProcedure, Owner: options.Declaration.Owner, Volatility: "volatile", Parallel: "unsafe", Cost: 100, Atomic: statement.SqlBody != nil}
+	metadata := model.RoutineMetadata{
+		Procedure:  statement.IsProcedure,
+		Owner:      options.Declaration.Owner,
+		OwnerName:  normalizeOwnerName(options.Declaration.Bind.CurrentRole),
+		ACL:        []model.PrivilegeGrant{{Grantee: "public", Privileges: model.PrivilegeExecute}},
+		Volatility: "volatile",
+		Parallel:   "unsafe",
+		Cost:       100,
+		Atomic:     statement.SqlBody != nil,
+	}
 	defaultSeen := false
 	for _, node := range statement.Parameters {
 		parameter := node.GetFunctionParameter()
@@ -255,9 +272,7 @@ func bindRoutineOptions(ctx context.Context, b *binder, snapshot CatalogSnapshot
 		case "strict":
 			metadata.Strict = option.Arg.GetBoolean().GetBoolval()
 		case "security":
-			if option.Arg.GetBoolean().GetBoolval() {
-				return unsupported(Authorization, int(option.Location)+1)
-			}
+			metadata.SecurityDefiner = option.Arg.GetBoolean().GetBoolval()
 		case "as":
 			if list := option.Arg.GetList(); list != nil {
 				if len(list.Items) > 0 && list.Items[0].GetString_() != nil {

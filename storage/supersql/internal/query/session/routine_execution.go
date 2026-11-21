@@ -219,6 +219,16 @@ func (executor *routineExecutor) RunRoutine(ctx context.Context, invocation proc
 			executor.routineDepth--
 			executor.controlAllowed = previousAllowed
 		}()
+		if invocation.SecurityDefiner {
+			executor.transactions.settingMu.Lock()
+			prevCurrent, prevRetained := executor.transactions.settings.pushSecurityDefinerRole(invocation.OwnerName)
+			executor.transactions.settingMu.Unlock()
+			defer func() {
+				executor.transactions.settingMu.Lock()
+				executor.transactions.settings.popSecurityDefinerRole(prevCurrent, prevRetained)
+				executor.transactions.settingMu.Unlock()
+			}()
+		}
 		if len(invocation.Settings) != 0 {
 			beforeCurrent, beforeRetained := executor.settingSnapshot()
 			defer func() {
@@ -757,6 +767,8 @@ func (executor *routineExecutor) RunSubtransaction(ctx context.Context, run func
 	deferredMark := len(executor.transactions.deferredTriggers)
 	deferredConstraintMark := len(executor.transactions.deferredConstraints)
 	deferredConstraintBytes := executor.transactions.deferredConstraintBytes
+	notifyMark := len(executor.transactions.pendingNotifications)
+	listenMark := len(executor.transactions.pendingListenOps)
 	beforeCurrent, beforeRetained := executor.settingSnapshot()
 	beforeDefinitions := append([]procedural.Definition(nil), executor.definitions...)
 	previousAllowed := executor.controlAllowed
@@ -787,6 +799,14 @@ func (executor *routineExecutor) RunSubtransaction(ctx context.Context, run func
 		clear(executor.transactions.deferredConstraints[deferredConstraintMark:])
 		executor.transactions.deferredConstraints = executor.transactions.deferredConstraints[:deferredConstraintMark]
 		executor.transactions.deferredConstraintBytes = deferredConstraintBytes
+	}
+	if err != nil && notifyMark <= len(executor.transactions.pendingNotifications) {
+		clear(executor.transactions.pendingNotifications[notifyMark:])
+		executor.transactions.pendingNotifications = executor.transactions.pendingNotifications[:notifyMark]
+	}
+	if err != nil && listenMark <= len(executor.transactions.pendingListenOps) {
+		clear(executor.transactions.pendingListenOps[listenMark:])
+		executor.transactions.pendingListenOps = executor.transactions.pendingListenOps[:listenMark]
 	}
 	if err != nil {
 		err = errors.Join(err, executor.transactions.rollbackAdvisoryStatement(advisoryMark))

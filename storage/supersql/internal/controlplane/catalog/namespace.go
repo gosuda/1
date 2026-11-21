@@ -89,7 +89,7 @@ func (s *Store) namespaceScanSpan(ctx context.Context, parent model.ObjectID, ki
 	// The accepted range must cover every real ObjectKind. Aggregates are
 	// ObjectRoutine (pg_proc namespace) and triggers are nested metadata, so
 	// neither is a standalone namespace kind.
-	if kind < model.ObjectSchema || kind > model.ObjectRole {
+	if kind < model.ObjectSchema || kind > model.ObjectCollation {
 		return storage.KeySpan{}, model.ErrInvalidDescriptor
 	}
 	const metadataBytes = uint64(unsafe.Sizeof(storage.KeyColumn{})) + uint64(unsafe.Sizeof(storage.KeySpan{})) + 2*uint64(unsafe.Sizeof(model.Value{})) + 18

@@ -41,7 +41,7 @@ func (check *checkpointVerification) verifyDecision(ctx context.Context, commits
 	if err := check.consume("runs/"+runManifestName(position), nil); err != nil {
 		return recoveredPosition{}, err
 	}
-	record, err := openCommit(ctx, commits, position, check.limits.recovery().Batch)
+	record, err := openCommitWithCipher(ctx, commits, position, check.limits.recovery().Batch, check.cipher)
 	if err != nil {
 		return recoveredPosition{}, err
 	}
@@ -159,7 +159,7 @@ func (check *checkpointVerification) verifyCoalescedDecisions(ctx context.Contex
 		if err := check.consume("commits/"+commitName(pos), nil); err != nil {
 			return recoveredPosition{}, err
 		}
-		record, err := openCommit(ctx, commits, pos, check.limits.recovery().Batch)
+		record, err := openCommitWithCipher(ctx, commits, pos, check.limits.recovery().Batch, check.cipher)
 		if err != nil {
 			return recoveredPosition{}, err
 		}

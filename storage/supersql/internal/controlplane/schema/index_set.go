@@ -228,6 +228,9 @@ func (b *indexBinding) expand(ctx context.Context, transaction txn.MutationAppli
 	if b.plan.State() == model.StateAbsent {
 		return nil
 	}
+	if b.plan.IsGIN() {
+		return b.expandGIN(ctx, transaction, old, current, entryBytes)
+	}
 	previous, err := b.plan.Entry(ctx, old)
 	if err != nil {
 		return err
@@ -328,6 +331,77 @@ func (b *indexBinding) expand(ctx context.Context, transaction txn.MutationAppli
 		return nil
 	}
 	return transaction.ApplyMutations(ctx, mutations[:count])
+}
+
+func (b *indexBinding) expandGIN(ctx context.Context, transaction txn.MutationApplier, old, current *model.Row, entryBytes uint64) error {
+	prevEntries, err := b.plan.Entries(ctx, old)
+	if err != nil {
+		return err
+	}
+	var nextEntries []*IndexEntry
+	switch b.plan.State() {
+	case model.StateDeleteOnly, model.StateDropDeleteOnly:
+	case model.StateWriteOnly, model.StatePublic, model.StateDropWriteOnly:
+		nextEntries, err = b.plan.Entries(ctx, current)
+		if err != nil {
+			return err
+		}
+	default:
+		return errIndexSetDescriptor
+	}
+	if len(prevEntries) == 0 && len(nextEntries) == 0 {
+		return nil
+	}
+	nextByKey := make(map[string]*IndexEntry, len(nextEntries))
+	for _, entry := range nextEntries {
+		nextByKey[string(entry.Key)] = entry
+	}
+	prevByKey := make(map[string]struct{}, len(prevEntries))
+	mutations := make([]storage.Mutation, 0, len(prevEntries)+len(nextEntries))
+	for _, entry := range prevEntries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		k := string(entry.Key)
+		prevByKey[k] = struct{}{}
+		if _, kept := nextByKey[k]; kept {
+			continue
+		}
+		owner, err := b.readOwner(ctx, transaction, entry.Key, entryBytes)
+		if err != nil {
+			return err
+		}
+		if owner != nil {
+			if !bytes.Equal(owner, old.Key) {
+				return errIndexOwnerCorrupt
+			}
+			mutations = append(mutations, storage.Mutation{Op: storage.MutationDelete, Target: b.target, Key: entry.Key})
+		}
+	}
+	for _, entry := range nextEntries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, kept := prevByKey[string(entry.Key)]; kept {
+			continue
+		}
+		owner, err := b.readOwner(ctx, transaction, entry.Key, entryBytes)
+		if err != nil {
+			return err
+		}
+		op := storage.MutationInsert
+		if owner != nil {
+			if !bytes.Equal(owner, current.Key) {
+				return errIndexOwnerCorrupt
+			}
+			op = storage.MutationUpdate
+		}
+		mutations = append(mutations, indexEntryMutation(b.target, op, entry))
+	}
+	if len(mutations) == 0 {
+		return nil
+	}
+	return transaction.ApplyMutations(ctx, mutations)
 }
 
 func indexEntryMutation(target storage.ObjectRef, op storage.MutationOp, entry *IndexEntry) storage.Mutation {

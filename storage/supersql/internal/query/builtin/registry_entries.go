@@ -159,6 +159,7 @@ const (
 	opRegexp
 	opFullText
 	opAdvisory
+	opNotify
 	opNativeScalar
 	opContextOnly
 )
@@ -233,6 +234,8 @@ func primitiveOperation(id model.FunctionID) primitiveOp {
 	case 2880, 2881, 2882, 2883, 2884, 2885, 2886, 2887, 2888, 2889, 2890, 2891, 2892,
 		3089, 3090, 3091, 3092, 3093, 3094, 3095, 3096:
 		return opAdvisory
+	case 3036:
+		return opNotify
 	case 3319, 3320, 3321, 3323, 3326, 3327,
 		3610, 3611, 3612, 3613, 3616, 3617, 3618, 3619, 3620, 3621, 3622, 3623, 3624, 3625,
 		3634, 3635, 3638, 3639, 3640, 3641,

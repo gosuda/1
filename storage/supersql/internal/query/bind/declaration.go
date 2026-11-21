@@ -113,16 +113,40 @@ func BindCreateSchema(ctx context.Context, statement *zpgparse.CreateSchemaStmt,
 	if err != nil {
 		return nil, err
 	}
-	if statement.Authrole != nil {
-		return nil, missing("CREATE SCHEMA AUTHORIZATION", 0)
-	}
 	if len(statement.SchemaElts) != 0 {
 		return nil, missing("CREATE SCHEMA embedded declarations", 0)
 	}
-	if err := declarationName(statement.Schemaname); err != nil {
+	schemaName := statement.Schemaname
+	ownerOID := options.Owner
+	ownerName := normalizeOwnerName(options.Bind.CurrentRole)
+	if statement.Authrole != nil {
+		authRole, err := roleSpecName(&zpgparse.Node{Node: &zpgparse.Node_RoleSpec{RoleSpec: statement.Authrole}}, options.Bind.CurrentRole, options.Bind.SessionUser)
+		if err != nil {
+			return nil, err
+		}
+		roles, err := b.cachedRoles()
+		if err != nil {
+			return nil, err
+		}
+		resolvedOID, err := b.validateRoleExists(roles, authRole, 0)
+		if err != nil {
+			return nil, err
+		}
+		if !roleIsSuperuser(roles, options.Bind.CurrentRole) && !roleIsMemberOf(roles, options.Bind.CurrentRole, authRole) {
+			return nil, bindError("42501", "must be member of role \""+authRole+"\"", 0)
+		}
+		if resolvedOID != 0 {
+			ownerOID = resolvedOID
+		}
+		ownerName = normalizeOwnerName(authRole)
+		if schemaName == "" {
+			schemaName = authRole
+		}
+	}
+	if err := declarationName(schemaName); err != nil {
 		return nil, err
 	}
-	name := model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Schemaname}
+	name := model.NamespaceName{Kind: model.ObjectSchema, Name: schemaName}
 	existing, err := snapshot.Resolve(ctx, name)
 	if err == nil {
 		if !statement.IfNotExists {
@@ -138,11 +162,15 @@ func BindCreateSchema(ctx context.Context, statement *zpgparse.CreateSchemaStmt,
 	if err != nil {
 		return nil, err
 	}
-	d, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: id, OID: oid, Name: name, Version: 1, State: model.StatePublic, Schema: &model.SchemaMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole)}}, options.Descriptors)
+	schemaMeta := &model.SchemaMetadata{Owner: ownerOID, OwnerName: ownerName}
+	if schemaName == "public" {
+		schemaMeta.ACL = []model.PrivilegeGrant{{Grantee: "public", Privileges: model.PrivilegeUsage}}
+	}
+	d, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: id, OID: oid, Name: name, Version: 1, State: model.StatePublic, Schema: schemaMeta}, options.Descriptors)
 	if err != nil {
 		return nil, err
 	}
-	return &BoundDeclaration{descriptors: []*model.Descriptor{d}}, ctx.Err()
+	return &BoundDeclaration{descriptors: []*model.Descriptor{d}, dependencies: slices.Clone(b.dependencies)}, ctx.Err()
 }
 
 type tableConstraint struct {
@@ -202,6 +230,11 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 		}
 		b.dependency(existing, 0)
 		return &BoundDeclaration{existing: existing, dependencies: b.dependencies, warnings: []model.Error{{Code: "42P07", Message: "relation already exists, skipping"}}}, ctx.Err()
+	}
+	if statement.Relation.Relpersistence != "t" {
+		if err := b.checkSchemaCreate(parent, int(r.Location)+1); err != nil {
+			return nil, err
+		}
 	}
 	if len(statement.TableElts) > options.Descriptors.MaxItems {
 		return nil, model.ErrDescriptorLimit

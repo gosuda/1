@@ -27,6 +27,10 @@ func CreateBackup(ctx context.Context, source Checkpointer, request storage.Chec
 	if err := validateSnapshot(request.Snapshot); err != nil {
 		return result, err
 	}
+	cipher, err := newBackupCipher(options.EncryptionKey)
+	if err != nil {
+		return result, err
+	}
 	stage, err := newStagedTree(ctx, options.Destination)
 	if err != nil {
 		return result, err
@@ -61,6 +65,10 @@ func CreateBackup(ctx context.Context, source Checkpointer, request storage.Chec
 		return result, ErrInvalid
 	}
 	scratch := make([]byte, int(options.Limits.CopyBufferBytes))
+	var encryptedSizes map[string]uint64
+	if cipher != nil {
+		encryptedSizes = make(map[string]uint64, len(manifest.Files))
+	}
 	for _, file := range manifest.Files {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -75,8 +83,16 @@ func CreateBackup(ctx context.Context, source Checkpointer, request storage.Chec
 		if nilDependency(stream) {
 			return result, ErrInvalid
 		}
-		if err := copyFile(ctx, stage.root, file, stream, scratch); err != nil {
-			return result, err
+		if cipher != nil {
+			encSize, copyErr := copyFileEncrypted(ctx, stage.root, file, stream, cipher)
+			if copyErr != nil {
+				return result, copyErr
+			}
+			encryptedSizes[file.Name] = encSize
+		} else {
+			if err := copyFile(ctx, stage.root, file, stream, scratch); err != nil {
+				return result, err
+			}
 		}
 	}
 	closeErr := handle.Close()
@@ -84,8 +100,21 @@ func CreateBackup(ctx context.Context, source Checkpointer, request storage.Chec
 	if closeErr != nil {
 		return result, closeErr
 	}
-	if err := createEnvelope(ctx, stage.root, manifest, size, scratch); err != nil {
-		return result, err
+	if cipher != nil {
+		if _, err := writeJSONEnvelope(ctx, stage.root, backupEnvelopeSpec{
+			Kind:           backupKindFull,
+			Encrypted:      true,
+			KeyFingerprint: cipher.fingerprintHex(),
+			Manifest:       manifest,
+			ChangedFiles:   manifest.Files,
+			EncryptedSizes: encryptedSizes,
+		}, options.Limits); err != nil {
+			return result, err
+		}
+	} else {
+		if err := createEnvelope(ctx, stage.root, manifest, size, scratch); err != nil {
+			return result, err
+		}
 	}
 	if err := stage.publish(ctx); err != nil {
 		return result, err
@@ -108,6 +137,10 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options RestoreOpt
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
+	cipher, err := newBackupCipher(options.EncryptionKey)
+	if err != nil {
+		return result, err
+	}
 	root, err := openBackupRoot(backupDir)
 	if err != nil {
 		return result, err
@@ -121,10 +154,19 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options RestoreOpt
 		}
 	}()
 	scratch := make([]byte, int(options.Limits.CopyBufferBytes))
-	manifest, err := loadEnvelope(ctx, root, options.Limits, scratch)
+	loaded, err := loadAnyEnvelope(ctx, root, options.Limits, scratch)
 	if err != nil {
 		return result, err
 	}
+	if loaded.Kind != backupKindFull {
+		return result, fmt.Errorf("backup %q is %q, not a full checkpoint: %w", backupDir, loaded.Kind, ErrInvalid)
+	}
+	if loaded.Encrypted {
+		if cipher == nil || !cipher.matchesFingerprintHex(loaded.KeyFingerprint) {
+			return result, ErrInvalidEncryptionKey
+		}
+	}
+	manifest := loaded.Manifest
 	if err := inspectBackup(ctx, root, manifest); err != nil {
 		return result, err
 	}
@@ -137,12 +179,26 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options RestoreOpt
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		stream, err := openBackupFile(root, file)
-		if err != nil {
-			return result, fmt.Errorf("open backup file %q: %w", file.Name, err)
-		}
-		if err := copyFile(ctx, stage.root, file, stream, scratch); err != nil {
-			return result, err
+		if loaded.Encrypted {
+			encSize, ok := loaded.EncryptedSizes[file.Name]
+			if !ok {
+				return result, ErrCorrupt
+			}
+			stream, err := openBackupFileWithSize(root, file.Name, encSize)
+			if err != nil {
+				return result, fmt.Errorf("open backup file %q: %w", file.Name, err)
+			}
+			if err := copyFileDecrypted(ctx, stage.root, file, stream, cipher); err != nil {
+				return result, err
+			}
+		} else {
+			stream, err := openBackupFile(root, file)
+			if err != nil {
+				return result, fmt.Errorf("open backup file %q: %w", file.Name, err)
+			}
+			if err := copyFile(ctx, stage.root, file, stream, scratch); err != nil {
+				return result, err
+			}
 		}
 	}
 	closeErr := root.Close()

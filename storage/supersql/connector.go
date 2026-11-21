@@ -1436,8 +1436,8 @@ func (rows *queryRows) driverValue(index int, value model.Value) (driver.Value, 
 		return value.IntVal != 0, nil // bool
 	case 17:
 		return value.BytesVal, nil // bytea
-	case 18, 19, 25, 705, 1042, 1043:
-		return value.StrVal, nil // char, name, text, unknown, bpchar, varchar
+	case 18, 19, 25, 705, 1042, 1043, 2278:
+		return value.StrVal, nil // char, name, text, unknown, bpchar, varchar, void
 	case 20, 21, 23, 26:
 		return value.IntVal, nil // int8, int2, int4, oid
 	case 700, 701:

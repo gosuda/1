@@ -51,6 +51,7 @@ func NewResolver(ctx context.Context, definitions []Definition, fallback expr.Re
 		}
 		program.settings = slices.Clone(definition.Metadata.Settings)
 		program.securityDefiner = definition.Metadata.SecurityDefiner
+		program.ownerName = definition.Metadata.OwnerName
 		program.routineOID = model.OID(definition.ID)
 		program.routineName = definition.Name
 		plan := routinePlan{metadata: definition.Metadata, program: program}

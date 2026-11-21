@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
@@ -50,6 +51,10 @@ type outcome struct {
 	// builtins are the resolve options the producing statement planned with;
 	// value rendering resolves declared-typed columns through them.
 	builtins builtin.ResolveOptions
+
+	planningDuration time.Duration
+	spillBytes       uint64
+	streamedRows     uint64
 }
 
 // exec runs every statement in sql through the embedded session and reports the
@@ -68,8 +73,10 @@ func (database *Catalog) execIn(ctx context.Context, scope *sessionScope, sql st
 	if err := database.checkOpen(); err != nil {
 		return outcome{}, err
 	}
+	parseStarted := time.Now()
 	parsed, err := scope.txns.Parse(ctx, sql, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
+		database.observeQuery(ctx, QueryEvent{SQL: sql, Duration: time.Since(parseStarted), Err: wrapError(err)})
 		return outcome{}, err
 	}
 	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) == 0 {
@@ -77,7 +84,11 @@ func (database *Catalog) execIn(ctx context.Context, scope *sessionScope, sql st
 	}
 	var out outcome
 	for index := range parsed.ParseResult.Stmts {
-		if out, err = database.execStatement(ctx, scope, parsed, index, nil, maxRows, nil, nil); err != nil {
+		stmtCtx := ctx
+		if database.needsQueryEvent() {
+			stmtCtx = withRawSQL(ctx, statementSQLSlice(sql, parsed.ParseResult.Stmts[index]))
+		}
+		if out, err = database.execStatement(stmtCtx, scope, parsed, index, nil, maxRows, nil, nil); err != nil {
 			return out, err
 		}
 	}
@@ -129,14 +140,20 @@ func (database *Catalog) copyIn(ctx context.Context, scope *sessionScope, statem
 	if err := database.checkOpen(); err != nil {
 		return outcome{}, err
 	}
+	parseStarted := time.Now()
 	parsed, err := scope.txns.Parse(ctx, statement, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
+		database.observeQuery(ctx, QueryEvent{SQL: statement, Duration: time.Since(parseStarted), Err: wrapError(err)})
 		return outcome{}, err
 	}
 	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) != 1 {
 		return outcome{}, &model.Error{Code: "22023", Message: "COPY accepts exactly one statement"}
 	}
-	return database.execStatement(ctx, scope, parsed, 0, nil, 0, nil, streams)
+	stmtCtx := ctx
+	if database.needsQueryEvent() {
+		stmtCtx = withRawSQL(ctx, statement)
+	}
+	return database.execStatement(stmtCtx, scope, parsed, 0, nil, 0, nil, streams)
 }
 
 // rowSource is the pull-side row contract both session portals and historical
@@ -174,8 +191,61 @@ func isSessionDDLStatement(raw *zpgparse.RawStmt) bool {
 // everything else to RunStatement with the full command configuration. A nil
 // stream materializes rows into the outcome; a non-nil stream receives the
 // result columns and callback-scoped row source instead.
-func (database *Catalog) execStatement(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, parameters []expr.ParameterValue, maxRows int, stream rowStream, streams *qcopy.Streams) (_ outcome, err error) {
+func (database *Catalog) execStatement(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, parameters []expr.ParameterValue, maxRows int, stream rowStream, streams *qcopy.Streams) (out outcome, err error) {
+	started := time.Now()
 	statement := parsed.ParseResult.Stmts[index]
+	var hitsBefore, missesBefore uint64
+	var hasCache bool
+	var scanObs *queryScanObserver
+	if database.needsQueryEvent() {
+		hitsBefore, missesBefore, hasCache = database.blockCacheStats()
+		scanObs = &queryScanObserver{}
+		ctx = storage.WithScanObserver(ctx, scanObs)
+	}
+	defer func() {
+		duration := time.Since(started)
+		var sharedHit, sharedRead uint64
+		if hasCache {
+			hitsAfter, missesAfter, _ := database.blockCacheStats()
+			if hitsAfter >= hitsBefore {
+				sharedHit = hitsAfter - hitsBefore
+			}
+			if missesAfter >= missesBefore {
+				sharedRead = missesAfter - missesBefore
+			}
+		}
+		if scanObs != nil {
+			if blocks := scanObs.blocksRead.Load(); blocks > sharedRead {
+				sharedRead = blocks
+			}
+		}
+		rowsAffected := out.RowsAffected
+		if rowsAffected == 0 {
+			if out.streamedRows > 0 {
+				rowsAffected = out.streamedRows
+			} else if len(out.Rows) > 0 {
+				rowsAffected = uint64(len(out.Rows))
+			}
+		}
+		var eventSQL string
+		if database.needsQueryEvent() {
+			eventSQL = resolveEventSQL(ctx, statement, out.Tag)
+		}
+		database.observeQuery(ctx, QueryEvent{
+			SQL:              eventSQL,
+			Duration:         duration,
+			PlanningDuration: out.planningDuration,
+			RowsAffected:     rowsAffected,
+			SharedHitBlocks:  sharedHit,
+			SharedReadBlocks: sharedRead,
+			SpillBytes:       out.spillBytes,
+			Err:              wrapError(err),
+		})
+		if err == nil {
+			database.recordStatementMutations(ctx, scope, statement, out)
+		}
+	}()
+
 	builtins := scope.builtins()
 	systemTime := scope.systemTimeOptions(builtins)
 	selection, err := session.ResolveSystemTime(ctx, parsed, index, nil, systemTime)
@@ -200,20 +270,25 @@ func (database *Catalog) execStatement(ctx context.Context, scope *sessionScope,
 		// implicit latest reads and every write are rejected before planning.
 		return outcome{}, &model.Error{Code: "0A000", Message: "historical read-only database requires AS OF SYSTEM TIME"}
 	}
-	out, err := database.runStatementCore(ctx, scope, parsed, index, statement, parameters, maxRows, stream, streams)
+	out, err = database.runStatementCore(ctx, scope, parsed, index, statement, parameters, maxRows, stream, streams)
 	if isSessionDDLStatement(statement) {
 		scope.ddlSeq.Add(1)
 	}
 	return out, err
 }
 
-func (database *Catalog) runStatementCore(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, statement *zpgparse.RawStmt, parameters []expr.ParameterValue, maxRows int, stream rowStream, streams *qcopy.Streams) (_ outcome, err error) {
+func (database *Catalog) runStatementCore(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, statement *zpgparse.RawStmt, parameters []expr.ParameterValue, maxRows int, stream rowStream, streams *qcopy.Streams) (out outcome, err error) {
 	builtins := scope.builtins()
 	query, err := database.newStatementQuery(ctx)
 	if err != nil {
 		return outcome{}, err
 	}
-	defer func() { err = errors.Join(err, query.Close()) }()
+	defer func() {
+		if usage := query.Usage(); usage.Spill.Peak > 0 {
+			out.spillBytes = uint64(usage.Spill.Peak)
+		}
+		err = errors.Join(err, query.Close())
+	}()
 	environment := database.executionEnvironment(query, builtins)
 	environment.Parameters = parameters
 	execution := session.PreparedExecution{
@@ -237,7 +312,7 @@ func (database *Catalog) runStatementCore(ctx context.Context, scope *sessionSco
 	}
 	execution.Schema = schemaExecution
 	execution.Copy = streams
-	out := outcome{Rows: make([][]model.Value, 0)}
+	out = outcome{Rows: make([][]model.Value, 0)}
 	var consume func(context.Context, *session.Prepared, *session.Rows) error
 	if streams == nil {
 		consume = func(statementCtx context.Context, prepared *session.Prepared, rows *session.Rows) error {
@@ -246,9 +321,14 @@ func (database *Catalog) runStatementCore(ctx context.Context, scope *sessionSco
 			if prepared != nil {
 				columns = prepared.Columns()
 				statementBuiltins = prepared.Builtin()
+				out.planningDuration = prepared.PlanningDuration()
 			}
 			if stream != nil {
-				return stream(statementCtx, columns, statementBuiltins, rows)
+				var source rowSource = rows
+				if database.needsQueryEvent() {
+					source = countingRowSource{source: rows, rows: &out.streamedRows}
+				}
+				return stream(statementCtx, columns, statementBuiltins, source)
 			}
 			out.builtins = statementBuiltins
 			for _, col := range columns {
@@ -270,13 +350,74 @@ func (database *Catalog) runStatementCore(ctx context.Context, scope *sessionSco
 
 // runPreparedCore executes a previously bound and planned *session.Prepared
 // directly through RunPrepared, skipping repeated binding and planning.
-func (database *Catalog) runPreparedCore(ctx context.Context, scope *sessionScope, prepared *session.Prepared, parameters []expr.ParameterValue, maxRows int, stream rowStream) (_ outcome, err error) {
+func (database *Catalog) runPreparedCore(ctx context.Context, scope *sessionScope, prepared *session.Prepared, parameters []expr.ParameterValue, maxRows int, stream rowStream) (out outcome, err error) {
+	started := time.Now()
+	var hitsBefore, missesBefore uint64
+	var hasCache bool
+	var scanObs *queryScanObserver
+	if database.needsQueryEvent() {
+		hitsBefore, missesBefore, hasCache = database.blockCacheStats()
+		scanObs = &queryScanObserver{}
+		ctx = storage.WithScanObserver(ctx, scanObs)
+	}
+	defer func() {
+		duration := time.Since(started)
+		var sharedHit, sharedRead uint64
+		if hasCache {
+			hitsAfter, missesAfter, _ := database.blockCacheStats()
+			if hitsAfter >= hitsBefore {
+				sharedHit = hitsAfter - hitsBefore
+			}
+			if missesAfter >= missesBefore {
+				sharedRead = missesAfter - missesBefore
+			}
+		}
+		if scanObs != nil {
+			if blocks := scanObs.blocksRead.Load(); blocks > sharedRead {
+				sharedRead = blocks
+			}
+		}
+		rowsAffected := out.RowsAffected
+		if rowsAffected == 0 {
+			if out.streamedRows > 0 {
+				rowsAffected = out.streamedRows
+			} else if len(out.Rows) > 0 {
+				rowsAffected = uint64(len(out.Rows))
+			}
+		}
+		var eventSQL string
+		if database.needsQueryEvent() {
+			fallback := out.Tag
+			if fallback == "" {
+				fallback = "PREPARED"
+			}
+			eventSQL = resolveEventSQL(ctx, nil, fallback)
+		}
+		database.observeQuery(ctx, QueryEvent{
+			SQL:              eventSQL,
+			Duration:         duration,
+			RowsAffected:     rowsAffected,
+			SharedHitBlocks:  sharedHit,
+			SharedReadBlocks: sharedRead,
+			SpillBytes:       out.spillBytes,
+			Err:              wrapError(err),
+		})
+		if err == nil && out.RowsAffected > 0 {
+			database.recordPreparedMutations(ctx, prepared, out.RowsAffected)
+		}
+	}()
+
 	builtins := scope.builtins()
 	query, err := database.newStatementQuery(ctx)
 	if err != nil {
 		return outcome{}, err
 	}
-	defer func() { err = errors.Join(err, query.Close()) }()
+	defer func() {
+		if usage := query.Usage(); usage.Spill.Peak > 0 {
+			out.spillBytes = uint64(usage.Spill.Peak)
+		}
+		err = errors.Join(err, query.Close())
+	}()
 	environment := database.executionEnvironment(query, builtins)
 	environment.BorrowQuery = true
 	environment.Parameters = parameters
@@ -287,12 +428,16 @@ func (database *Catalog) runPreparedCore(ctx context.Context, scope *sessionScop
 		TypeRuntime: scope.typeRuntimeOptions(builtins),
 		Routines:    scope.routineExecutionOptions(builtins),
 	}
-	out := outcome{Rows: make([][]model.Value, 0)}
+	out = outcome{Rows: make([][]model.Value, 0)}
 	consume := func(statementCtx context.Context, rows *session.Rows) error {
 		columns := prepared.Columns()
 		statementBuiltins := prepared.Builtin()
 		if stream != nil {
-			return stream(statementCtx, columns, statementBuiltins, rows)
+			var source rowSource = rows
+			if database.needsQueryEvent() {
+				source = countingRowSource{source: rows, rows: &out.streamedRows}
+			}
+			return stream(statementCtx, columns, statementBuiltins, source)
 		}
 		out.builtins = statementBuiltins
 		for _, col := range columns {
@@ -334,7 +479,7 @@ func declaredParameterLayouts(parameters []expr.ParameterValue) []model.TypeLayo
 
 // execHistorical runs one relation-level AS OF SYSTEM TIME statement over a
 // retained fixed snapshot without a live transaction or fresh certification.
-func (database *Catalog) execHistorical(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, builtins builtin.ResolveOptions, parameters []expr.ParameterValue, maxRows int, stream rowStream) (_ outcome, err error) {
+func (database *Catalog) execHistorical(ctx context.Context, scope *sessionScope, parsed *zpgparse.ExtendedParseResult, index int, builtins builtin.ResolveOptions, parameters []expr.ParameterValue, maxRows int, stream rowStream) (out outcome, err error) {
 	historical, err := session.PrepareHistorical(ctx, parsed, index, parameters, session.HistoricalOptions{
 		Snapshots:  database.manager,
 		Catalog:    database.catalog,
@@ -352,21 +497,31 @@ func (database *Catalog) execHistorical(ctx context.Context, scope *sessionScope
 	if err != nil {
 		return outcome{}, err
 	}
-	defer func() { err = errors.Join(err, query.Close()) }()
+	defer func() {
+		if usage := query.Usage(); usage.Spill.Peak > 0 {
+			out.spillBytes = uint64(usage.Spill.Peak)
+		}
+		err = errors.Join(err, query.Close())
+	}()
 	portal, err := historical.Open(ctx, database.executionEnvironment(query, builtins))
 	if err != nil {
 		return outcome{}, err
 	}
 	defer func() { err = errors.Join(err, portal.Close()) }()
-	out := outcome{Rows: make([][]model.Value, 0)}
+	out = outcome{Rows: make([][]model.Value, 0)}
 	var columns []bind.ResultColumn
 	statementBuiltins := builtins
 	if prepared := historical.Prepared(); prepared != nil {
 		columns = prepared.Columns()
 		statementBuiltins = prepared.Builtin()
+		out.planningDuration = prepared.PlanningDuration()
 	}
 	if stream != nil {
-		return out, stream(ctx, columns, statementBuiltins, portal)
+		var source rowSource = portal
+		if database.needsQueryEvent() {
+			source = countingRowSource{source: portal, rows: &out.streamedRows}
+		}
+		return out, stream(ctx, columns, statementBuiltins, source)
 	}
 	out.builtins = statementBuiltins
 	for _, col := range columns {
@@ -454,7 +609,7 @@ func (database *Catalog) newStatementQuery(ctx context.Context) (*runtime.Query,
 func (database *Catalog) executionEnvironment(query *runtime.Query, builtins builtin.ResolveOptions) exec.Environment {
 	exprLimits := expr.DefaultLimits()
 	exprLimits.MaxOutputBytes = 32 << 20
-	return exec.Environment{
+	env := exec.Environment{
 		Query: query, Keys: database.keys, Builtin: builtins, Catalog: database.source,
 		MutationTargets: newStackMutationTargets{descriptors: database.currentDescriptors(), policies: database.policies},
 		Limits: exec.Limits{
@@ -483,4 +638,8 @@ func (database *Catalog) executionEnvironment(query *runtime.Query, builtins bui
 			Seen:          exdistinctset.Options{MemoryBytes: 4 << 20, WorkBytes: 16 << 20, MaxKeyBytes: 64 << 10, MaxKeys: 1 << 24, MaxLevels: 16},
 		},
 	}
+	if provider, ok := any(database.backend).(exec.BufferCacheStatsProvider); ok {
+		env.BufferCacheStats = provider
+	}
+	return env
 }

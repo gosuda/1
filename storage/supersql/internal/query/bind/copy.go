@@ -37,8 +37,19 @@ func (b *binder) copyFrom(statement *zpgparse.CopyStmt, s *scope) (relation, err
 	if err != nil {
 		return relation{}, err
 	}
+	pos := int(statement.Relation.Location) + 1
+	if err := b.checkSchemaUsage(target.namespace, pos); err != nil {
+		return relation{}, err
+	}
+	required := model.PrivilegeInsert
+	if statement.WhereClause != nil {
+		required |= model.PrivilegeSelect
+	}
+	if err := b.checkObjectPrivilege(target.descriptor, required, pos); err != nil {
+		return relation{}, err
+	}
 	if target.view {
-		return relation{}, bindError("42809", "cannot copy to view", int(statement.Relation.Location)+1)
+		return relation{}, bindError("42809", "cannot copy to view", pos)
 	}
 	all := publicColumns(target.table)
 	insertable := make([]model.ColumnDescriptor, 0, len(all))

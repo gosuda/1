@@ -72,6 +72,7 @@ func (database *Catalog) sessionConfig(settings *session.Settings, sequences *se
 			MetadataBytes: 16 << 20, PlanningCostUnitsPerSecond: 1e6,
 		},
 		Advisory: session.AdvisoryLockConfig{Manager: database.advisory, SessionID: id},
+		Notify:   session.NotifyConfig{Hub: database.hub, SessionID: id},
 	}
 }
 

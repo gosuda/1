@@ -16,18 +16,19 @@ SuperSQL is an embedded, single-process relational database written in pure Go (
 
 | Layer | Package Path | Core Types & Entry Points | Responsibility |
 | :--- | :--- | :--- | :--- |
-| **Root Driver API** | `.` | `Open()`, `OpenConnector()`, `Connector`, `Catalog`, `CompactionConfig`, `*supersql.Error` | `database/sql` connector (`sql.OpenDB`), direct catalog execution, hot backup/restore, and structured SQLSTATE errors |
-| **Cleanroom `pgx` API** | `pgx/` | `OpenPool()`, `OpenPoolWithConfig()`, `Pool`, `Conn`, `Tx`, `Batch`, `NamedArgs`, `*PgError` | In-process `pgx/v5`-compatible pool, transactions, implicit-tx batching, `pgtype` wrappers, hooks, and generic row collectors |
+| **Root Driver API** | `.` | `Open()`, `OpenConnector()`, `Connector`, `Catalog`, `CompactionConfig`, `QueryObserver`, `DatabaseMetrics`, `Subscription`, `RestorePITR()`, `*supersql.Error` | `database/sql` connector (`sql.OpenDB`), direct catalog execution, hot/incremental/encrypted backup & PITR, observability hooks, in-process pub/sub, and structured SQLSTATE errors |
+| **Cleanroom `pgx` API** | `pgx/` | `OpenPool()`, `OpenPoolWithConfig()`, `Pool`, `Conn`, `Tx`, `Batch`, `NamedArgs`, `Notification`, `*PgError` | In-process `pgx/v5`-compatible pool, transactions, implicit-tx batching, `WaitForNotification`, `pgtype` wrappers, hooks, and generic row collectors |
+| **PG Wire Listener** | `pgwire/` | `NewServer()`, `NewServerFromCatalog()`, `Server`, `Config`, `Notification` | Optional pure-Go PostgreSQL v3.0 TCP wire protocol server (Simple/Extended Query, binary/text codecs, TLS, auth, `CancelRequest`, async `'A'` `NotificationResponse`) |
 | **Clock & Time** | `clock/`, `clock/local/`, `clock/gstime/` | `Clock`, `localclock.New()`, `ReadFence`, `Epoch`, `Provider` | Certified monotonic clock contract, standalone single-process local clock (`clock/local`), and GSTime synchronization provider |
-| **Model & Columnar** | `internal/model/`, `internal/columnar/` | `DataType`, `Value`, `ObjectRef`, `Batch`, `Vector` | Object identifiers, SQL type layouts, columnar vectors, null bitmaps, and batch budgets |
+| **Model & Columnar** | `internal/model/`, `internal/columnar/` | `DataType`, `Value`, `ObjectRef`, `PrivilegeGrant`, `CollationMetadata`, `Batch`, `Vector` | Object identifiers, SQL type layouts, ACL/collation/GIN descriptors, columnar vectors, null bitmaps, and batch budgets |
 | **SQL Parser & AST** | `internal/zpgparse/` | `Parse()`, `Split()`, `Fingerprint()`, `Deparse()` | Pure-Go PostgreSQL 18 lexer, parser, AST, and deparser (generated via Ragel + `goyacc`) |
-| **Controlplane** | `internal/controlplane/` | `Catalog`, `Namespace`, `SchemaJob`, `Statistics`, `RetentionCoordinator` | Versioned MVCC catalog descriptors, online index/schema jobs, table statistics, and history retention |
-| **Transactions** | `internal/dataplane/txn/` | `Manager`, `Transaction`, `lockRegistry`, `WaitGraph`, `Overlay` | Strict 2PL / PCC concurrency control, sharded lock table, deadlock detection, spill-backed overlays, and commit sequencing |
-| **Storage Backend** | `internal/dataplane/storage/neosepia/` | `Backend`, `paxBlock`, `sstWriter`, `runSet`, `memtable` | PAX v2 SSTables, Bloom filters, zone maps, TOAST blobs, WAL group commit, active/inactive compaction, and crash recovery |
-| **Query Session** | `internal/query/session/` | `Transactions`, `Settings`, `Prepared`, `CatalogAccess` | Session settings (GUC), prepared statements, plan cache, cursors, roles, and `AS OF SYSTEM TIME` routing |
-| **Query Binder** | `internal/query/bind/` | `Binder`, `Scope`, `BoundStatement` | Name and type resolution, catalog dependency declarations, RLS policy expansion, and constraint checks |
-| **Query Optimizer** | `internal/query/opt/` | `Memo`, `Optimizer`, `PhysicalPlan`, `span` | Cascades cost-based optimizer, join reordering, index span extraction, sort elimination, and predicate pushdown |
-| **Query Execution** | `internal/query/exec/` | `Pipeline`, `BatchCursor`, `HashJoin`, `TopK`, `Expr` | Vectorized operators (`BatchRows=1024`), expression VM, window/aggregate spill engines, and ~3,400 built-in functions |
+| **Controlplane** | `internal/controlplane/` | `Catalog`, `Namespace`, `SchemaJob`, `IndexPlan`, `Statistics`, `RetentionCoordinator`, `Maintenance` | Versioned MVCC catalog descriptors, B-tree & GIN index lifecycle/backfill, statistics, retention, incremental backups, and PITR |
+| **Transactions & Pub/Sub** | `internal/dataplane/txn/`, `internal/dataplane/notify/` | `Manager`, `Transaction`, `lockRegistry`, `WaitGraph`, `Overlay`, `notify.Hub` | Strict 2PL / PCC concurrency control, sharded lock table, deadlock detection, spill-backed overlays, commit sequencing, and bounded in-process `LISTEN`/`NOTIFY` fanout |
+| **Storage Backend** | `internal/dataplane/storage/neosepia/` | `Backend`, `paxBlock`, `sstWriter`, `runSet`, `memtable` | PAX v2 SSTables, Bloom filters, zone maps, TOAST blobs, WAL group commit & archiving, optional `NSE1` AES-256-GCM chunked encryption, dual-tier compaction, and crash recovery |
+| **Query Session** | `internal/query/session/` | `Transactions`, `Settings`, `Prepared`, `CatalogAccess`, `NotifyConfig` | Session settings (GUC), prepared statements, plan cache, cursors, roles, `SECURITY DEFINER` role switching, transactional `LISTEN`/`NOTIFY`, and `AS OF SYSTEM TIME` routing |
+| **Query Binder** | `internal/query/bind/` | `Binder`, `Scope`, `BoundStatement`, `CheckObjectPrivilege` | Name/type/collation resolution, catalog dependency declarations, object-level `GRANT`/`REVOKE` enforcement, RLS policy expansion, and constraint checks |
+| **Query Optimizer** | `internal/query/opt/` | `Memo`, `Optimizer`, `PhysicalPlan`, `span`, `GINAccess` | Cascades cost-based optimizer, join reordering, B-tree span & GIN predicate extraction, sort elimination, and predicate pushdown |
+| **Query Execution** | `internal/query/exec/` | `Pipeline`, `BatchCursor`, `GINScan`, `HashJoin`, `TopK`, `Expr`, `BufferStats` | Vectorized operators (`BatchRows=1024`), GIN posting scans with residual recheck, `EXPLAIN (ANALYZE, BUFFERS)` instrumentation, spill engines, pure-Go ICU collations, and ~3,400 built-in functions |
 
 ---
 
@@ -43,16 +44,17 @@ See [`docs/reference/storage-format.md`](reference/storage-format.md) for exact 
 <Data Directory>/
 ├── database.state                       # Published state (NSDB0002): magic, generation, log position, fence, lease horizon, clock scales
 ├── database.state.pending               # Staging file for atomic state replacement; removed on recovery
+├── encryption.meta                      # Present when AES-256-GCM at-rest encryption is enabled (key fingerprint, never raw key)
 ├── fence.secret                         # HMAC-SHA256 secret for ReadFence verification, created atomically on first open
 ├── tmp/                                 # Spill directory for query operators, transaction overlays, and compaction buffers
-├── commits/<020d>.wal                   # Immutable redo WAL segment per committed log position (group-committed)
+├── commits/<020d>.wal                   # Immutable redo WAL segment per committed log position (group-committed; optionally NSE1-encrypted)
 ├── commits/.<020d>.pending              # Staging file for an in-flight WAL segment
 ├── runs/<020d>.runs                     # Incremental single or coalesced run manifest (NSRUNS01 / NSRUNS02)
-├── runs/<020d>-<8hex>.sst               # PAX v2 SSTable run file (NSSST004) with Bloom filters, zone maps, and TOAST blobs
+├── runs/<020d>-<8hex>.sst               # PAX v2 SSTable run file (NSSST004; optionally NSE1-encrypted) with Bloom filters, zone maps, and TOAST blobs
 ├── runs/base-<020d>.runs                # Base manifest (NSBASE04) with pruned transaction horizon produced by maintenance
 ├── runs/.base.pending                   # Staging file for a base manifest rewrite
 ├── .lock                                # Process-exclusive directory lock held while open
-└── .checkpoint-<hex>/                   # Hard-linked consistent snapshot directory for hot backups
+└── .checkpoint-<hex>/                   # Hard-linked consistent snapshot directory for hot/incremental backups
 ```
 
 ### 2.2 64 KB PAX v2 Block Layout & TOAST (`NSSST004`)
@@ -79,10 +81,11 @@ Key `NSSST004` storage features:
 - **`inactiveTier`**: Stores superseded historical versions grouped by time window using multi-writer streaming compaction. Once the retention watermark advances past a window's upper bound, the entire inactive file is unlinked in $O(1)$ time.
 - **Base Manifest Pruning (`NSBASE04`)**: Maintenance rewrites `runs/base-<pos>.runs`, pruning retired transaction records below the compacted frontier and keeping an $O(1)$ covered-fence index.
 
-### 2.5 Crash Recovery & Hot Checkpoints
+### 2.5 Crash Recovery, At-Rest Encryption, Incremental Backups & PITR
 
 - **No-Steal Redo Recovery**: Uncommitted writes live only in transaction-private overlays and never touch SSTs. On startup, `neosepia.Open` validates `database.state` (`NSDB0002`), verifies the persisted `ReadFence` and lease horizon (`ClosedTS`), replays any committed `commits/<pos>.wal` segments newer than the run manifest, discards `.pending` staging files, and fails fast (`storage.ErrCorruptStorage`) on any CRC32 mismatch or ordering violation.
-- **Streaming Hot Backups**: `Backup` / `RestoreCheckpoint` use hard-linked `.checkpoint-<hex>/` snapshots and streaming copies to avoid holding full snapshots in memory.
+- **Pure-Go AES-256-GCM Encryption (`NSE1`)**: When `OpenOptions.EncryptionKey` (32 bytes) is configured, WAL segments, newly written SST runs, and backups are transparently wrapped in authenticated 64 KiB `NSE1` AES-256-GCM chunks bound with chunk-index AAD; `encryption.meta` verifies key fingerprints on reopen without persisting raw key material. Unencrypted databases remain byte-for-byte compatible.
+- **Hot, Incremental & PITR Backups**: `Catalog.Backup` / `CreateHotBackupWithOptions` produce full consistent snapshots (optionally encrypted); `CreateIncrementalBackup` records only SST runs and WAL segments added since a base manifest (`incremental.json`); `WALArchiveDir` / `EnableWALArchive` continuously archive committed WAL segments; and `RestorePITR` / `RestorePITRFromChain` replay archived WAL segments up to a target timestamp or log position.
 
 ---
 
@@ -98,22 +101,23 @@ Key `NSSST004` storage features:
 - **Serializable Isolation**: SuperSQL enforces serializable isolation via strict pessimistic concurrency control (PCC / Strict 2PL) over certified MVCC snapshots. By default (`supersql.compat_isolation = 'on'`), weaker requested isolation levels automatically escalate to `SERIALIZABLE`; setting `supersql.compat_isolation = 'off'` rejects non-serializable requests with `0A000`.
 - **`AS OF SYSTEM TIME <timestamptz>`**: Historical read-only queries execute against a pinned MVCC snapshot verified by a `ReadFence` without acquiring write locks.
 
-### 3.2 Locking, Savepoints & Deadlock Detection
+### 3.2 Locking, Savepoints, Deadlock Detection & Transactional `LISTEN`/`NOTIFY`
 
 - **Sharded `lockRegistry`**: Key-span locks, row locks (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, `NOWAIT`, `SKIP LOCKED`), and advisory locks are partitioned across a sharded lock registry to reduce contention under high concurrency.
 - **Shared $O(V + E)$ `WaitGraph`**: Transaction locks and session advisory locks share one wait-for graph that detects deadlocks across mixed lock types in $O(V + E)$ time and aborts a victim with SQLSTATE `40P01`.
 - **Strict 2PL Savepoints & Non-Bricking Statement Rollback**: `ROLLBACK TO SAVEPOINT` and statement-level errors revert only uncommitted overlay mutations while retaining Strict 2PL locks until transaction end, ensuring a failed statement inside an explicit `BEGIN` block does not brick subsequent rollback or savepoint recovery.
 - **Spill-Backed Write Overlays**: Transaction write buffers (`Overlay`) track mutations in memory up to their configured byte budget and spill automatically to `tmp/` for large bulk transactions.
-- **Atomic Commit Publish**: `Manager.submit` publishes committed state atomically so readers never observe torn transaction visibility.
+- **Atomic Commit Publish & `notify.Hub`**: `Manager.submit` publishes committed state atomically so readers never observe torn visibility. Pending `NOTIFY` / `pg_notify()` events are staged per transaction (with savepoint truncation support), discarded on `ROLLBACK`, deduplicated per commit batch, and fanned out non-blockingly through `notify.Hub` to bounded per-session ring queues consumed by `Catalog.Subscribe`, `pgx.Conn.WaitForNotification`, and `pgwire` `'A'` push frames.
 
 ---
 
-## 4. Controlplane & Background Maintenance
+## 4. Controlplane, Auto-`ANALYZE` & Observability
 
-- **Versioned MVCC Catalog (`internal/controlplane/catalog/`)**: Tables, indexes, views, sequences, functions, domains, enums, composite types, roles, ownership metadata, and RLS policies are stored as versioned catalog descriptors inside NeoSepia itself. DDL operations participate in full MVCC transactions and are included automatically in hot backups.
+- **Versioned MVCC Catalog (`internal/controlplane/catalog/`)**: Tables, B-tree and GIN indexes, views, sequences, functions, domains, enums, composite types, collations, roles, ownership metadata, ACL grants, and RLS policies are stored as versioned catalog descriptors inside NeoSepia itself. DDL operations participate in full MVCC transactions and are included automatically in backups.
 - **Per-Session Sequence State**: Sequence `nextval`/`currval`/`lastval` tracking is isolated per session while durable sequence advances persist transactionally.
-- **Schema & Online Index Jobs (`internal/controlplane/schema/`)**: Background index backfills are driven by an event-signaled `IndexJobScheduler` (`Wake()` with exponential backoff) and a `JobStore` that prunes terminal job records to bound catalog growth.
-- **Statistics (`internal/controlplane/statistics/`)**: `ANALYZE` collects row counts, NDV, null fractions, and MCV/histogram summaries persisted in the statistics store and consumed directly by the optimizer.
+- **Schema & Online Index Jobs (`internal/controlplane/schema/`)**: Background index backfills (both B-tree and GIN posting lists) are driven by an event-signaled `IndexJobScheduler` (`Wake()` with exponential backoff) and a `JobStore` that prunes terminal job records to bound catalog growth.
+- **Statistics & Background Auto-`ANALYZE` (`internal/controlplane/statistics/`, `maintenance.go`, `observability.go`)**: `ANALYZE` collects row counts, NDV, null fractions, and MCV/histogram summaries consumed by the optimizer. A thread-safe mutation tracker triggers background Auto-`ANALYZE` once modified rows exceed `AutoAnalyzeMinRows + AutoAnalyzeScaleFactor * liveRows` (default `50 + 0.2 * liveRows`, configurable via `MaintenanceConfig`), or on demand via `Catalog.RunAutoAnalyze(ctx)`.
+- **Observability Hooks & Live Metrics**: `OpenOptions.Observer` and `OnSlowQuery` emit structured `QueryEvent` records (`SQL`, `Duration`, `PlanningDuration`, `RowsAffected`, `SharedHitBlocks`, `SharedReadBlocks`, `SpillBytes`, `Err`), and `Catalog.Metrics(ctx)` exposes live counters, cache hit/miss rates, WAL/run backlog, and Auto-`ANALYZE` run totals.
 - **Retention Coordinator (`internal/controlplane/retention/`)**: Tracks active snapshot pins and advances the storage history floor safely (closing snapshot readers before triggering storage collection) so `inactiveTier` files can be reclaimed.
 
 ---
@@ -122,25 +126,29 @@ Key `NSSST004` storage features:
 
 ![Query Processing Pipeline](assets/query-pipeline.svg)
 
-### 5.1 Parsing & Binding (`internal/zpgparse`, `internal/query/bind`)
+### 5.1 Parsing, Binding, RBAC & Native RLS (`internal/zpgparse`, `internal/query/bind`)
 
 - **Pure-Go PostgreSQL 18 Parser**: `internal/zpgparse` implements a complete Ragel + `goyacc` PostgreSQL 18 grammar, statement splitter, query fingerprinter, and AST deparser with zero CGo (`libpg_query` is not linked).
-- **Binder & Native RLS**: `bind` resolves identifiers, types, implicit casts, constraints, and declared catalog dependencies. When Row-Level Security is enabled on a target relation, the binder injects `PERMISSIVE`/`RESTRICTIVE` `USING` predicates wrapped in a `SecurityBarrier` (preventing leaky-operator pushdown bypasses) and attaches per-branch `WITH CHECK` enforcement for `INSERT`, `UPDATE`, and `MERGE`.
+- **Object-Level RBAC & `SECURITY DEFINER`**: The binder enforces schema `USAGE`/`CREATE` and object-level `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`/`EXECUTE` ACLs (respecting ownership, `PUBLIC`, and transitive role memberships; superusers bypass). `SECURITY DEFINER` routines execute under their owner's role with unconditional `defer` restoration of the caller's role.
+- **Native RLS**: When Row-Level Security is enabled on a target relation, the binder injects `PERMISSIVE`/`RESTRICTIVE` `USING` predicates wrapped in a `SecurityBarrier` (preventing leaky-operator pushdown bypasses) and attaches per-branch `WITH CHECK` enforcement for `INSERT`, `UPDATE`, and `MERGE`.
+- **Pure-Go ICU Collations**: Predefined ICU collations (`"en-US-x-icu"`, `"ko-KR-x-icu"`, `"ja-JP-x-icu"`, `-u-ks-level2`, `-u-kn-true`, etc.) and catalog-defined `CREATE COLLATION` descriptors are resolved in the binder and executed via pooled `golang.org/x/text/collate` collators with UCA sort-key encoding for indexes and `ORDER BY`.
 
 ### 5.2 Cascades Cost-Based Optimizer (`internal/query/opt`)
 
-- **Span Extraction**: Extracts tight index bounds for built-in types, `UUID`, `VARCHAR`/`BPCHAR`, `NUMERIC`, user-defined domains and enums, `LIKE 'prefix%'`, `= ANY($1)`, and parameterized (`$1`) predicates. User-defined domain/enum spans are encoded through the session's declared-type `KeyEncoder` so secondary indexes and primary keys prune directly in NeoSepia.
-- **Statistics-Driven Costing & Join Reordering**: Wires persisted `ANALYZE` statistics into Cascades cardinality estimation, supports join key commutation, pushes filters through joins (respecting `SecurityBarrier` boundaries), and reorders joins beneath `Aggregate`, `Limit`, `Distinct`, `Window`, and `SetOp`.
+- **B-tree Span Extraction & GIN Index Planning**: Extracts tight B-tree index bounds for built-in types, `UUID`, `VARCHAR`/`BPCHAR`, `NUMERIC`, user-defined domains and enums, `LIKE 'prefix%'`, `= ANY($1)`, and parameterized (`$1`) predicates. Recognizes GIN-indexable predicates (`jsonb` `@>`/`?`/`?|`/`?&`, arrays `@>`/`&&`, `tsvector` `@@`) and emits `GIN Index Scan` plans over posting lists `(token, base_pk)` with full residual recheck.
+- **Statistics-Driven Costing & Join Reordering**: Wires persisted `ANALYZE` / Auto-`ANALYZE` statistics into Cascades cardinality estimation, supports join key commutation, pushes filters through joins (respecting `SecurityBarrier` boundaries), and reorders joins beneath `Aggregate`, `Limit`, `Distinct`, `Window`, and `SetOp`.
 - **Order Exploitation**: Recognizes reverse index scans (`ScanReverse`) and eliminates redundant `Sort` operators when an access path already satisfies the required `ORDER BY`.
 - **Plan Caching**: Prepared and repeated statements reuse cached physical plans validated against catalog descriptor versions and RLS/role context.
 
-### 5.3 Vectorized Execution Engine (`internal/query/exec`)
+### 5.3 Vectorized Execution Engine & `EXPLAIN (ANALYZE, BUFFERS)` (`internal/query/exec`, `internal/query/explain`)
 
 - **Columnar Vectorization**: Operators exchange 1,024-row (`BatchRows = 1024`) columnar batches (`internal/columnar`) with reusable builders and expression VM registers to minimize per-row allocations.
+- **GIN Posting Scans**: Evaluates the query expression once at scan open, prefix-scans posting entries for extracted tokens, intersects (`RequireAll`) or unions candidate primary keys, fetches visible MVCC base rows, and rechecks the full `WHERE` predicate (falling back safely to a sequential scan when a query produces no selective tokens).
 - **External Spill Operators**:
   - **Recursive Partitioned `HashJoin`**: Spills skewed or oversized build/probe partitions recursively to `tmp/`.
   - **Bounded-$K$ Heap `TopK`**: `ORDER BY ... LIMIT K` maintains a bounded heap instead of sorting the full input.
   - **External Merge `Sort`, `Aggregate` (`DISTINCT`/`ORDER BY`/Grouping Sets), `Window`, and `SetOp`**: Respect `work_mem` bidirectionally and spill intermediate partitions to `tmp/` while keeping `OutputMemory` batches sized for large TOAST values.
+- **`EXPLAIN (ANALYZE, BUFFERS)`**: Instruments shared block cache hits/reads and temp spill read/write 8 KiB blocks across TEXT, JSON, YAML, and XML formats.
 - **Built-in Catalog & PL/pgSQL**: Provides ~3,400 PostgreSQL built-in functions/operators, RE2 linear-time regular expressions, and a cancellable PL/pgSQL runtime (including interruptible loops).
 
 ---

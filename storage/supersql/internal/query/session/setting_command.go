@@ -149,6 +149,9 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 		tag = "SET"
 	}
 	result := ExecutionResult{Tag: tag}
+	if transactions.settings.InSecurityDefiner() {
+		return result, settingError("0A000", `cannot set parameter "role" within security-definer function`)
+	}
 	if command.Action == bind.ResetRole || strings.TrimSpace(command.Target) == "" {
 		if err := transactions.settings.ResetRole(ctx, command.Local); err != nil {
 			return result, err
@@ -237,6 +240,10 @@ func (transactions *Transactions) executeSetting(ctx context.Context, command bi
 		result.Tag = "RESET"
 		changed, err = settings.Reset(ctx, command.Name, scope)
 	case bind.ResetAllSettings:
+		if transactions.settings.InSecurityDefiner() {
+			err = settingError("0A000", `cannot set parameter "role" within security-definer function`)
+			break
+		}
 		result.Tag = "RESET"
 		err = settings.ResetAll(ctx)
 	case bind.ShowSetting:

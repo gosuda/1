@@ -38,13 +38,43 @@ type NodeObservation struct {
 	Storage     StorageObservation
 }
 
+// bufferBlockBytes is the logical block size (8 KiB) used to convert spill byte
+// counts into PostgreSQL-compatible temporary buffer block counts.
+const bufferBlockBytes uint64 = 8192
+
+func bytesToBufferBlocks(bytes uint64) uint64 {
+	if bytes == 0 {
+		return 0
+	}
+	return (bytes + bufferBlockBytes - 1) / bufferBlockBytes
+}
+
+// BufferStats reports buffer/block cache and temporary spill I/O statistics
+// accumulated during a single query execution.
+type BufferStats struct {
+	SharedHitBlocks   uint64
+	SharedReadBlocks  uint64
+	TempReadBlocks    uint64
+	TempWrittenBlocks uint64
+	TempReadBytes     uint64
+	TempWrittenBytes  uint64
+}
+
+// BufferCacheStatsProvider is an optional interface implemented by storage
+// backends, snapshot readers, or environment hooks to report cumulative block
+// cache hit and miss counts for per-query delta calculation.
+type BufferCacheStatsProvider interface {
+	BlockCacheStats() (hits, misses uint64)
+}
+
 // Observation is an immutable execution-wide measurement snapshot.
 type Observation struct {
-	Nodes           []NodeObservation
-	ExecutionNanos  uint64
-	LockWaitNanos   MeasuredCount
-	Resources       runtime.QueryUsage
-	ResourcesKnown  bool
+	Nodes          []NodeObservation
+	ExecutionNanos uint64
+	LockWaitNanos  MeasuredCount
+	Resources      runtime.QueryUsage
+	ResourcesKnown bool
+	Buffers        BufferStats
 }
 
 type measuredCounter struct {
@@ -65,10 +95,10 @@ func (c *measuredCounter) snapshot() MeasuredCount {
 }
 
 type nodeCounters struct {
-	rows, batches, loops                          atomic.Uint64
-	nanos                                         measuredCounter
-	readBytes, decodedBytes                       measuredCounter
-	blocksRead, blocksPruned, rangesPruned        measuredCounter
+	rows, batches, loops                   atomic.Uint64
+	nanos                                  measuredCounter
+	readBytes, decodedBytes                measuredCounter
+	blocksRead, blocksPruned, rangesPruned measuredCounter
 }
 
 func (n *nodeCounters) ObserveScan(observation storage.ScanObservation) {
@@ -82,15 +112,20 @@ func (n *nodeCounters) ObserveScan(observation storage.ScanObservation) {
 // Instrumentation is owned by one execution invocation. It can be attached as
 // both an executor observer and a lock-wait observer.
 type Instrumentation struct {
-	mu             sync.Mutex
-	nodes          []nodeCounters
-	started        time.Time
-	executionNanos uint64
-	finished       bool
-	usage          runtime.QueryUsage
-	usageKnown     bool
-	lockWaitNanos  atomic.Uint64
-	timing         bool
+	mu               sync.Mutex
+	nodes            []nodeCounters
+	started          time.Time
+	executionNanos   uint64
+	finished         bool
+	usage            runtime.QueryUsage
+	usageKnown       bool
+	buffersProvider  BufferCacheStatsProvider
+	cacheHitsStart   uint64
+	cacheMissesStart uint64
+	cacheTracked     bool
+	buffers          BufferStats
+	lockWaitNanos    atomic.Uint64
+	timing           bool
 }
 
 // NewInstrumentation enables per-invocation counters. When timing is false,
@@ -115,6 +150,21 @@ func (i *Instrumentation) bind(plan *physical.Plan) error {
 	return nil
 }
 
+func (i *Instrumentation) beginBuffers(provider BufferCacheStatsProvider) {
+	if i == nil || provider == nil {
+		return
+	}
+	hits, misses := provider.BlockCacheStats()
+	i.mu.Lock()
+	if !i.cacheTracked {
+		i.buffersProvider = provider
+		i.cacheHitsStart = hits
+		i.cacheMissesStart = misses
+		i.cacheTracked = true
+	}
+	i.mu.Unlock()
+}
+
 func (i *Instrumentation) ObserveLockWait(wait time.Duration) {
 	if i == nil || wait <= 0 {
 		return
@@ -130,6 +180,15 @@ func (i *Instrumentation) observeUsage(usage runtime.QueryUsage) {
 	if !i.usageKnown {
 		i.usage = usage
 		i.usageKnown = true
+		if usage.Spill.Peak > 0 {
+			written := uint64(usage.Spill.Peak)
+			i.buffers.TempWrittenBytes = written
+			i.buffers.TempWrittenBlocks = bytesToBufferBlocks(written)
+			if usage.PeakReaders > 0 {
+				i.buffers.TempReadBytes = written
+				i.buffers.TempReadBlocks = bytesToBufferBlocks(written)
+			}
+		}
 	}
 	i.mu.Unlock()
 }
@@ -143,6 +202,15 @@ func (i *Instrumentation) finish() {
 		i.finished = true
 		if !i.started.IsZero() {
 			i.executionNanos = uint64(time.Since(i.started))
+		}
+		if i.cacheTracked && i.buffersProvider != nil {
+			hitsEnd, missesEnd := i.buffersProvider.BlockCacheStats()
+			if hitsEnd >= i.cacheHitsStart {
+				i.buffers.SharedHitBlocks = hitsEnd - i.cacheHitsStart
+			}
+			if missesEnd >= i.cacheMissesStart {
+				i.buffers.SharedReadBlocks = missesEnd - i.cacheMissesStart
+			}
 		}
 	}
 	i.mu.Unlock()
@@ -158,13 +226,19 @@ func (i *Instrumentation) Snapshot() Observation {
 		LockWaitNanos:  MeasuredCount{Value: i.lockWaitNanos.Load(), Known: true},
 		Resources:      i.usage,
 		ResourcesKnown: i.usageKnown,
+		Buffers:        i.buffers,
 	}
 	nodes := i.nodes
 	result.Nodes = make([]NodeObservation, max(0, len(nodes)-1))
 
 	i.mu.Unlock()
+	var scanBlocksRead uint64
 	for index := 1; index < len(nodes); index++ {
 		counters := &nodes[index]
+		blocksRead := counters.blocksRead.snapshot()
+		if blocksRead.Known {
+			scanBlocksRead += blocksRead.Value
+		}
 		result.Nodes[index-1] = NodeObservation{
 			Node:        physical.NodeID(index),
 			Rows:        counters.rows.Load(),
@@ -174,11 +248,14 @@ func (i *Instrumentation) Snapshot() Observation {
 			Storage: StorageObservation{
 				ReadBytes:    counters.readBytes.snapshot(),
 				DecodedBytes: counters.decodedBytes.snapshot(),
-				BlocksRead:   counters.blocksRead.snapshot(),
+				BlocksRead:   blocksRead,
 				BlocksPruned: counters.blocksPruned.snapshot(),
 				RangesPruned: counters.rangesPruned.snapshot(),
 			},
 		}
+	}
+	if result.Buffers.SharedReadBlocks < scanBlocksRead {
+		result.Buffers.SharedReadBlocks = scanBlocksRead
 	}
 	return result
 }

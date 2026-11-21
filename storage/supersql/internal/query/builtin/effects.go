@@ -53,7 +53,7 @@ func ScalarMayErrorWithCollation(id model.FunctionID, collation, defaultCollatio
 		if effective == 100 {
 			effective = defaultCollation
 		}
-		return effective != 950 && effective != 951
+		return !IsSupportedCollation(effective, nil)
 	}
 	return true
 }

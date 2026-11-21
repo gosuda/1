@@ -165,7 +165,14 @@ func (d *Descriptor) WithTableRLS(enabled, force bool, policies []PolicyDescript
 // WithTableOwner returns a validated successor table descriptor with updated
 // owner identity at Version+1.
 func (d *Descriptor) WithTableOwner(owner OID, ownerName string) (*Descriptor, error) {
-	if d == nil || d.spec.Table == nil || d.spec.Version == ^uint64(0) {
+	return d.WithOwner(owner, ownerName)
+}
+
+// WithOwner returns a validated successor descriptor with updated owner
+// identity at Version+1 for schema, table, view, materialized view, sequence,
+// routine, or collation objects.
+func (d *Descriptor) WithOwner(owner OID, ownerName string) (*Descriptor, error) {
+	if d == nil || d.spec.Version == ^uint64(0) {
 		return nil, ErrInvalidDescriptor
 	}
 	spec, err := d.Spec(context.Background())
@@ -173,10 +180,124 @@ func (d *Descriptor) WithTableOwner(owner OID, ownerName string) (*Descriptor, e
 		return nil, err
 	}
 	spec.Version++
-	if owner != 0 {
-		spec.Table.Owner = owner
+	switch d.spec.Name.Kind {
+	case ObjectSchema:
+		if spec.Schema == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Schema.Owner = owner
+		}
+		spec.Schema.OwnerName = ownerName
+	case ObjectTable, ObjectMaterializedView:
+		if spec.Table == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Table.Owner = owner
+		}
+		spec.Table.OwnerName = ownerName
+		if spec.View != nil {
+			if owner != 0 {
+				spec.View.Owner = owner
+			}
+			spec.View.OwnerName = ownerName
+		}
+	case ObjectView:
+		if spec.View == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.View.Owner = owner
+		}
+		spec.View.OwnerName = ownerName
+	case ObjectSequence:
+		if spec.Sequence == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Sequence.Owner = owner
+		}
+		spec.Sequence.OwnerName = ownerName
+	case ObjectRoutine:
+		if spec.Routine == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Routine.Owner = owner
+		}
+		spec.Routine.OwnerName = ownerName
+	case ObjectCollation:
+		if spec.Collation == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Collation.Owner = owner
+		}
+		spec.Collation.OwnerName = ownerName
+	default:
+		return nil, ErrInvalidDescriptor
 	}
-	spec.Table.OwnerName = ownerName
+	return NewDescriptor(context.Background(), spec, d.limits)
+}
+
+// WithACL returns a validated successor descriptor with updated ACL grants at Version+1.
+func (d *Descriptor) WithACL(acl []PrivilegeGrant) (*Descriptor, error) {
+	if d == nil || d.spec.Version == ^uint64(0) {
+		return nil, ErrInvalidDescriptor
+	}
+	spec, err := d.Spec(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	spec.Version++
+	switch d.spec.Name.Kind {
+	case ObjectSchema:
+		if spec.Schema == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		spec.Schema.ACL = acl
+	case ObjectTable, ObjectMaterializedView:
+		if spec.Table == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		spec.Table.ACL = acl
+		if spec.View != nil {
+			spec.View.ACL = acl
+		}
+	case ObjectView:
+		if spec.View == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		spec.View.ACL = acl
+	case ObjectSequence:
+		if spec.Sequence == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		spec.Sequence.ACL = acl
+	case ObjectRoutine:
+		if spec.Routine == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		spec.Routine.ACL = acl
+	default:
+		return nil, ErrInvalidDescriptor
+	}
+	return NewDescriptor(context.Background(), spec, d.limits)
+}
+
+// WithRoutineSecurityDefiner returns a validated successor routine descriptor
+// with updated SecurityDefiner flag at Version+1.
+func (d *Descriptor) WithRoutineSecurityDefiner(definer bool) (*Descriptor, error) {
+	if d == nil || d.spec.Routine == nil || d.spec.Version == ^uint64(0) {
+		return nil, ErrInvalidDescriptor
+	}
+	spec, err := d.Spec(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	spec.Version++
+	spec.Routine.SecurityDefiner = definer
 	return NewDescriptor(context.Background(), spec, d.limits)
 }
 func equalRangeTypeMetadata(a, b *RangeTypeMetadata) bool {

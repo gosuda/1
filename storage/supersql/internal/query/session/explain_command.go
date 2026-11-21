@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -129,6 +130,7 @@ func (invocation *explainInvocation) publish(ctx context.Context, prepared *Prep
 		Verbose:         invocation.command.Options.Verbose,
 		Costs:           invocation.command.Options.Costs,
 		Summary:         invocation.command.Options.Summary,
+		Buffers:         invocation.command.Options.Buffers,
 		SerializedBytes: invocation.serializedBytes,
 	}
 	if invocation.instrumentation != nil {
@@ -213,4 +215,12 @@ func runExplainAnalysis(ctx context.Context, prepared *Prepared, portal *exec.Po
 		affectedRows = &affected
 	}
 	return affected, invocation.publish(ctx, prepared, affectedRows)
+}
+
+// PlanningDuration reports the measured optimizer/planning duration for p.
+func (p *Prepared) PlanningDuration() time.Duration {
+	if p == nil {
+		return 0
+	}
+	return p.planningDuration
 }

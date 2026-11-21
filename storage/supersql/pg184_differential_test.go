@@ -396,13 +396,15 @@ var diffScript = []diffStep{
 	{sql: `SELEC bogus`, query: true},
 	{sql: `INSERT INTO diff_dom VALUES (2, -1)`},
 	{sql: `SELECT m::text FROM diff_enum WHERE m = 'happy'`, query: true},
+	// Newly supported parity steps: both PG 18.4 and SuperSQL execute them cleanly.
+	{sql: `GRANT SELECT ON diff_t TO PUBLIC`},
+	{sql: `LISTEN diff_chan`},
+	{sql: `UNLISTEN diff_chan`},
 	// Exclusion contract: embedded must reject with 0A000; the reference result
 	// is recorded, never mapped onto it.
 	{sql: `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`, oursCode: "0A000"},
 	{sql: `BEGIN ISOLATION LEVEL REPEATABLE READ`, oursCode: "0A000"},
-	{sql: `GRANT SELECT ON diff_t TO PUBLIC`, oursCode: "0A000"},
 	{sql: `VACUUM diff_t`, oursCode: "0A000"},
-	{sql: `LISTEN diff_chan`, oursCode: "0A000"},
 	{sql: `CREATE EXTENSION hstore`, oursCode: "0A000"},
 	{sql: `SELECT xmin FROM diff_t`, query: true, oursCode: "0A000"},
 	{sql: `PREPARE TRANSACTION 'diff_xact'`, oursCode: "0A000"},

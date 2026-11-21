@@ -276,6 +276,9 @@ func bindAlterRoutine(ctx context.Context, statement *zpgparse.AlterFunctionStmt
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil || spec.Routine == nil {
 		return nil, errors.Join(err, model.ErrInvalidDescriptor)
@@ -293,10 +296,7 @@ func bindAlterRoutine(ctx context.Context, statement *zpgparse.AlterFunctionStmt
 		case "strict":
 			metadata.Strict = option.Arg.GetBoolean().GetBoolval()
 		case "security":
-			if option.Arg.GetBoolean().GetBoolval() {
-				return nil, unsupported(Authorization, int(option.Location)+1)
-			}
-			metadata.SecurityDefiner = false
+			metadata.SecurityDefiner = option.Arg.GetBoolean().GetBoolval()
 		case "leakproof":
 			if option.Arg.GetBoolean().GetBoolval() {
 				return nil, unsupported(Authorization, int(option.Location)+1)

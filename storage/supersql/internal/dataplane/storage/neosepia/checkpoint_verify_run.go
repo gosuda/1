@@ -41,7 +41,9 @@ func (check *checkpointVerification) verifyRun(ctx context.Context, root *os.Roo
 	if err != nil {
 		return err
 	}
-	run, err := openSST(ctx, file, check.limits.preparation().File)
+	sstLim := check.limits.preparation().File
+	sstLim.cipher = check.cipher
+	run, err := openSST(ctx, file, sstLim)
 	if err != nil {
 		return errors.Join(err, file.Close())
 	}

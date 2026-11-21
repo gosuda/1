@@ -89,7 +89,7 @@ func (d *BoundDeclaration) FinalizeSequences(ctx context.Context, snapshot Catal
 			}
 			identityMismatch := descriptor.OID() != expected.OID() || descriptor.Name() != expected.Name()
 			versionMismatch := descriptor.Version() != expected.Version() || descriptor.State() != expected.State()
-			allocationMismatch := actualSpec.Physical != expectedSpec.Physical || *actualSpec.Sequence != *expectedSpec.Sequence
+			allocationMismatch := actualSpec.Physical != expectedSpec.Physical || !actualSpec.Sequence.Equal(*expectedSpec.Sequence)
 			if identityMismatch || versionMismatch || allocationMismatch || !slices.Equal(actualSpec.Dependencies, expectedSpec.Dependencies) {
 				return nil, bindError("22023", "owned sequence does not match its reserved declaration", 0)
 			}
@@ -212,9 +212,10 @@ func (s *declarationState) ownedSequences(spec model.DescriptorSpec, serials map
 		if err != nil {
 			return nil, nil, err
 		}
-		configuration := &model.SequenceMetadata{Owner: s.options.Owner, Type: column.Layout.Type, Increment: 1, Cache: 1, OwnerTable: spec.ID, OwnerColumn: column.ID}
+		configuration := &model.SequenceMetadata{Owner: s.options.Owner, OwnerName: normalizeOwnerName(s.options.Bind.CurrentRole), Type: column.Layout.Type, Increment: 1, Cache: 1, OwnerTable: spec.ID, OwnerColumn: column.ID}
 		if spec.Table != nil {
 			configuration.Persistence = spec.Table.Persistence
+			configuration.OwnerName = spec.Table.OwnerName
 		}
 		sequence := &BoundSequenceDefinition{limits: s.options.Descriptors, draft: model.DescriptorSpec{ID: id, OID: oid, Name: model.NamespaceName{Parent: s.parent, Kind: model.ObjectSequence, Name: name}, Version: 1, State: model.StatePublic, Physical: s.options.Physical, Sequence: configuration}}
 		if err := s.b.sequenceOptions(sequence, options); err != nil {

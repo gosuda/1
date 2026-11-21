@@ -30,6 +30,7 @@ type ExplainOptions struct {
 	Verbose     bool
 	Costs       bool
 	Settings    bool
+	Buffers     bool
 	Timing      bool
 	Summary     bool
 	GenericPlan bool
@@ -51,10 +52,10 @@ func bindExplain(statement *zpgparse.ExplainStmt, textLayout ResultColumn) (Expl
 	}
 	seen := make(map[string]bool, len(statement.Options))
 	timingSet, summarySet, serializeSet := false, false, false
-	// buffers, wal and memory parse like every other option but are rejected
-	// after the option-consistency checks: the embedded profile has no server
+	// wal and memory parse like every other option but are rejected after the
+	// option-consistency checks: the embedded profile has no server
 	// instrumentation to report them from.
-	buffers, wal, memory := false, false, false
+	wal, memory := false, false
 	for _, node := range statement.Options {
 		option := node.GetDefElem()
 		if option == nil || option.Defnamespace != "" || option.Defaction != zpgparse.DefElemAction_DEFELEM_UNSPEC {
@@ -77,7 +78,7 @@ func bindExplain(statement *zpgparse.ExplainStmt, textLayout ResultColumn) (Expl
 		case "settings":
 			command.Options.Settings, err = explainBooleanOption(option)
 		case "buffers":
-			buffers, err = explainBooleanOption(option)
+			command.Options.Buffers, err = explainBooleanOption(option)
 		case "wal":
 			wal, err = explainBooleanOption(option)
 		case "timing":
@@ -111,9 +112,6 @@ func bindExplain(statement *zpgparse.ExplainStmt, textLayout ResultColumn) (Expl
 	if command.Options.Timing && !command.Options.Analyze {
 		return command, nil, bindError("22023", "EXPLAIN TIMING requires ANALYZE", 0)
 	}
-	if buffers && !command.Options.Analyze {
-		return command, nil, bindError("22023", "EXPLAIN BUFFERS requires ANALYZE", 0)
-	}
 	if wal && !command.Options.Analyze {
 		return command, nil, bindError("22023", "EXPLAIN WAL requires ANALYZE", 0)
 	}
@@ -123,7 +121,7 @@ func bindExplain(statement *zpgparse.ExplainStmt, textLayout ResultColumn) (Expl
 	if command.Options.GenericPlan && command.Options.Analyze {
 		return command, nil, bindError("22023", "EXPLAIN GENERIC_PLAN cannot be used with ANALYZE", 0)
 	}
-	if buffers || wal || memory {
+	if wal || memory {
 		return command, nil, unsupported(ServerObservability, 0)
 	}
 	command.Query = proto.Clone(statement.Query).(*zpgparse.Node)

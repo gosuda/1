@@ -9,7 +9,82 @@ import (
 
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 )
+
+// Entries returns all index entries produced by a single base row. For B-tree
+// indexes this yields zero or one entry; for GIN indexes it yields one posting
+// entry per distinct extracted token (zero for NULL or empty documents).
+func (p *IndexPlan) Entries(ctx context.Context, row *model.Row) ([]*IndexEntry, error) {
+	if p == nil {
+		return nil, invalidIndexPlan()
+	}
+	if !p.isGIN {
+		entry, err := p.Entry(ctx, row)
+		if err != nil || entry == nil {
+			return nil, err
+		}
+		return []*IndexEntry{entry}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if row == nil || row.Deleted {
+		return nil, nil
+	}
+	if err := p.validateRow(ctx, row); err != nil {
+		return nil, err
+	}
+	if p.predicate != nil {
+		predicate, err := p.predicate.Evaluate(ctx, row.Values, model.ExpressionRuntime{})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := model.ValueBytes(ctx, predicate, p.limits.EntryBytes); err != nil {
+			return nil, indexPlanLimitError(err)
+		}
+		column := storage.ColumnLayout{Type: model.Type{ID: 16, Modifier: -1, Storage: model.TypeBoolean}, Nullable: true}
+		if err := validateIndexPlanValue(ctx, predicate, column); err != nil {
+			return nil, err
+		}
+		if predicate.IsNull || predicate.IntVal == 0 {
+			return nil, ctx.Err()
+		}
+	}
+	val := row.Values[p.ginColumn]
+	if val.IsNull {
+		return nil, nil
+	}
+	tokens, err := builtin.ExtractGINDocumentTokens(ctx, p.ginLayout, val, p.opClass, p.encoder, p.limits.EntryBytes)
+	if err != nil {
+		return nil, err
+	}
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	ownerKey := bytes.Clone(row.Key)
+	entries := make([]*IndexEntry, 0, len(tokens))
+	for _, tok := range tokens {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tokCopy := bytes.Clone(tok)
+		values := []model.Value{model.BytesVal(tokCopy), model.BytesVal(ownerKey), model.BytesVal(ownerKey)}
+		encodedKey, err := p.encoder.EncodePrefix(ctx, p.keyLayout, values[:2], p.limits.EntryBytes)
+		if err != nil {
+			return nil, err
+		}
+		if len(encodedKey) == 0 {
+			return nil, &IndexKeyImplementationError{Cause: storage.ErrInvalidEncoding}
+		}
+		entries = append(entries, &IndexEntry{
+			Key:       encodedKey,
+			ColumnIDs: []model.ColumnID{1, 2, 3},
+			Values:    values,
+		})
+	}
+	return entries, ctx.Err()
+}
 
 // Entry borrows a complete base row in increasing ColumnID order. No entry is
 // published on failure or cancellation, and neither row nor plan is modified.

@@ -11,6 +11,9 @@ import (
 // ValidateBuiltinFunction is called only after resolution identifies a builtin.
 // User-defined functions with the same name are not subject to this inventory.
 func ValidateBuiltinFunction(id model.FunctionID, position int) error {
+	if id == 3035 || id == 3036 {
+		return nil
+	}
 	if feature := builtinFunctionFeature(id); feature != "" {
 		return unsupported(feature, position)
 	}
@@ -25,6 +28,9 @@ func ValidateBuiltinType(id model.TypeID, position int) error {
 }
 
 func ValidateBuiltinCollation(id model.CollationID, position int) error {
+	if id == 963 || id == 6411 {
+		return nil
+	}
 	if feature := builtinCollationFeature(id); feature != "" {
 		return unsupported(feature, position)
 	}

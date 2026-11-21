@@ -16,6 +16,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	controlstats "github.com/gosuda/supersql-alpha/internal/controlplane/statistics"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/notify"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage/neosepia"
@@ -53,6 +54,7 @@ type Catalog struct {
 	retention   *schema.RetentionCoordinator
 	scheduler   *schema.IndexJobScheduler
 	advisory    *locks.AdvisoryLockManager
+	hub         *notify.Hub
 	native      *session.NativeCatalog
 	// declaredTypes shares declared-type metadata between sessions that read the
 	// same committed catalog content, which the policy provider's key encoder
@@ -84,6 +86,15 @@ type Catalog struct {
 	maintenanceStarted bool
 	maintenanceLast    atomic.Pointer[error]
 
+	observer           QueryObserver
+	slowQueryThreshold time.Duration
+	onSlowQuery        func(context.Context, QueryEvent)
+	observing          atomic.Bool
+	queriesTotal       atomic.Uint64
+	queriesFailed      atomic.Uint64
+	slowQueriesTotal   atomic.Uint64
+	autoAnalyze        *autoAnalyzeTracker
+
 	mu       sync.Mutex
 	closed   bool
 	closeErr error
@@ -108,6 +119,9 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 	if options.HistoryRetention < 0 {
 		return nil, wrapError(&model.Error{Code: "22023", Message: "invalid history retention duration"})
 	}
+	if options.SlowQueryThreshold < 0 {
+		return nil, wrapError(&model.Error{Code: "22023", Message: "invalid slow query threshold"})
+	}
 	maintenance, err := normalizedMaintenance(options.Maintenance)
 	if err != nil {
 		return nil, wrapError(err)
@@ -129,6 +143,9 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 		Directory: options.Directory, Scale: options.Clock.Scale(), KeyEncoder: keys,
 		FenceVerifier: authority, Limits: storageLimits,
 		ExtraCheckpointFiles: []string{nativeFenceSecretFile},
+		EncryptionKey:        options.EncryptionKey,
+		WALArchiveDir:        options.WALArchiveDir,
+		WALArchiveKey:        options.WALArchiveKey,
 	})
 	if err != nil {
 		return nil, openFormatError(options.Directory, err)
@@ -151,6 +168,10 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 		transactionSpillBytes:  options.TransactionSpillBytes,
 		maxTransactions:        options.MaxTransactions,
 		maxOperations:          options.MaxOperations,
+		observer:               options.Observer,
+		slowQueryThreshold:     options.SlowQueryThreshold,
+		onSlowQuery:            options.OnSlowQuery,
+		autoAnalyze:            newAutoAnalyzeTracker(),
 	}
 	database.workerCtx, database.workerStop = context.WithCancel(context.Background())
 	database.schedulerErr = make(chan error, 1)
@@ -158,6 +179,13 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 	if err := database.compose(ctx); err != nil {
 		return nil, wrapError(errors.Join(err, database.closeAll()))
 	}
+	// Enable user query observation only after compose succeeds so internal
+	// bootstrap DDL is never counted or delivered to user observers, without
+	// mutating hook fields after background goroutines have started.
+	database.queriesTotal.Store(0)
+	database.queriesFailed.Store(0)
+	database.slowQueriesTotal.Store(0)
+	database.observing.Store(true)
 	return database, nil
 }
 
@@ -349,6 +377,7 @@ func (database *Catalog) compose(ctx context.Context) error {
 	if database.advisory, err = locks.NewAdvisoryLockManagerWithLimits(advisoryLimits); err != nil {
 		return err
 	}
+	database.hub = notify.NewHub(0)
 	embeddedSequences, err := session.NewSequenceSession(session.SequenceSessionOptions{
 		Allocations: database.service, MaxSequences: 256,
 	})
@@ -467,6 +496,9 @@ func (database *Catalog) closeAll() error {
 		err = errors.Join(err, database.embedded.close())
 	} else if database.txns != nil {
 		err = errors.Join(err, database.txns.Close())
+	}
+	if database.hub != nil {
+		database.hub.Close()
 	}
 	if database.service != nil {
 		err = errors.Join(err, database.service.Close(background))

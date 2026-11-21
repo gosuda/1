@@ -77,16 +77,18 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options OpenOption
 		return nil, err
 	}
 	_, err = maintenance.RestoreCheckpoint(ctx, backupDir, maintenance.RestoreOptions{
-		Destination: options.Directory,
-		Limits:      backupLimits,
+		Destination:       options.Directory,
+		Limits:            backupLimits,
+		LiveEncryptionKey: options.EncryptionKey,
 		Verifier: neosepia.CheckpointVerifier{
 			FenceVerifier: authority,
 			Limits:        mergeCompactionConfig(options.Compaction),
 			ExtraFiles:    []string{nativeFenceSecretFile},
+			EncryptionKey: options.EncryptionKey,
 		},
 	})
 	if err != nil {
-		return nil, restoreError(err)
+		return nil, backupError(err)
 	}
 	return Open(ctx, options)
 }

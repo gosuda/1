@@ -146,6 +146,9 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 	// Prepared and named paths wrap their own contexts; re-wrapping there with the
 	// same value is harmless.
 	ctx = txn.WithLockTimeout(ctx, transactions.settings.Resources().LockTimeout)
+	if result, handled, err := transactions.runNotifyCommand(ctx, statement, options); handled {
+		return result, err
+	}
 	if result, handled, err := transactions.runStatisticsCommand(ctx, statement, options); handled {
 		return result, err
 	}

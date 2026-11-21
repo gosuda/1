@@ -39,6 +39,10 @@ type stagedGroupCommit struct {
 // any error. If err != nil and linked > 0, segments [0:linked] may be durable
 // on disk (so callers must resolve or treat as indeterminate).
 func writeCommitGroup(ctx context.Context, root *os.Root, items []stagedGroupCommit, maxBytes uint64) (int, error) {
+	return writeCommitGroupWithCipher(ctx, root, items, maxBytes, nil)
+}
+
+func writeCommitGroupWithCipher(ctx context.Context, root *os.Root, items []stagedGroupCommit, maxBytes uint64, c *storageCipher) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -75,7 +79,7 @@ func writeCommitGroup(ctx context.Context, root *os.Root, items []stagedGroupCom
 			cleanupPrepared(0)
 			return 0, err
 		}
-		if err := writePendingCommitBody(ctx, file, item.position, item.req.batch, item.req.validated.identity, maxBytes); err != nil {
+		if err := writePendingCommitBodyWithCipher(ctx, file, item.position, item.req.batch, item.req.validated.identity, maxBytes, c); err != nil {
 			_ = file.Close()
 			_ = root.Remove(pending)
 			cleanupPrepared(0)
@@ -111,6 +115,20 @@ func writeCommitGroup(ctx context.Context, root *os.Root, items []stagedGroupCom
 		return linked, errors.Join(storage.ErrCommitIndeterminate, err)
 	}
 	return linked, nil
+}
+
+func writePendingCommitBodyWithCipher(ctx context.Context, file *os.File, position uint64, batch storage.MutationBatch, identity [32]byte, maxBytes uint64, c *storageCipher) error {
+	if c == nil {
+		return writePendingCommitBody(ctx, file, position, batch, identity, maxBytes)
+	}
+	ew, err := newEncryptStreamWriter(file, c)
+	if err != nil {
+		return err
+	}
+	if err := writeCommitFrames(ctx, ew, position, batch, identity, maxBytes, nil); err != nil {
+		return err
+	}
+	return ew.Close()
 }
 
 func writePendingCommitBody(ctx context.Context, file *os.File, position uint64, batch storage.MutationBatch, identity [32]byte, maxBytes uint64) error {

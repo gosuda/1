@@ -131,6 +131,14 @@ func (b *binder) scanOccurrence(position int) (model.ScanOccurrence, error) {
 }
 
 func (b *binder) descriptorRelation(descriptor, namespace *model.Descriptor, node *zpgparse.RangeVar, scope *scope, position int) (relation, error) {
+	if err := b.checkSchemaUsage(namespace, position); err != nil {
+		return relation{}, err
+	}
+	if descriptor.ID() != b.dmlTargetID {
+		if err := b.checkObjectPrivilege(descriptor, model.PrivilegeSelect, position); err != nil {
+			return relation{}, err
+		}
+	}
 	pushed := slices.Clone(b.rangeRowLocks[node])
 	delete(b.rangeRowLocks, node)
 	spec, err := b.descriptorSpec(descriptor)

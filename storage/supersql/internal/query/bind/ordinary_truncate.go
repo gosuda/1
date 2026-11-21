@@ -48,8 +48,13 @@ func BindTruncateTransactional(ctx context.Context, statement *zpgparse.Truncate
 		if relation.Schemaname != "" {
 			parts = []string{relation.Schemaname, relation.Relname}
 		}
-		root, _, err := b.resolve(parts, []model.ObjectKind{model.ObjectTable}, "42P01", position)
+		root, parentSchema, err := resolveNamespaceObject(ctx, snapshot, b.options.SearchPath, parts, []model.ObjectKind{model.ObjectTable}, "42P01", position)
 		if err != nil {
+			return nil, err
+		}
+		b.dependency(parentSchema, 0)
+		b.dependency(root, 0)
+		if err := b.checkSchemaUsage(parentSchema, position); err != nil {
 			return nil, err
 		}
 		metadata, ok := root.Table()
@@ -90,7 +95,7 @@ func BindTruncateTransactional(ctx context.Context, statement *zpgparse.Truncate
 		if table == nil || table.Kind() != model.ObjectTable || table.State() != model.StatePublic {
 			return nil, model.ErrInvalidDescriptor
 		}
-		if err := b.requireTableOwner(table, 0); err != nil {
+		if err := b.checkObjectPrivilege(table, model.PrivilegeTruncate, 0); err != nil {
 			return nil, err
 		}
 		targets[table.ID()] = true

@@ -1,6 +1,7 @@
 package neosepia
 
 import (
+	"context"
 	"errors"
 	"math"
 
@@ -23,6 +24,10 @@ type Config struct {
 	FenceVerifier        storage.FenceVerifier
 	Limits               Limits
 	ExtraCheckpointFiles []string
+	EncryptionKey        []byte
+	WALArchiveDir        string
+	WALArchiveKey        []byte
+	WALArchiveHook       func(context.Context, WALArchiveEntry) error
 }
 
 type Limits struct {

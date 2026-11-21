@@ -21,7 +21,7 @@ func resolveMutationRuns(ctx context.Context, directory *databaseDirectory, deci
 	if directory == nil || directory.commits == nil || directory.runs == nil {
 		return storage.CommitResolution{}, nil, storage.ErrClosed
 	}
-	record, err := openCommit(ctx, directory.commits, decision.Position, batchLimits)
+	record, err := openCommitWithCipher(ctx, directory.commits, decision.Position, batchLimits, limits.File.cipher)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := ctx.Err(); err != nil {
 			return storage.CommitResolution{}, nil, err

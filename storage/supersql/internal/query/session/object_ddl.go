@@ -404,7 +404,7 @@ func qualifyEmbeddedSchemaObject(schema string, node *zpgparse.Node) error {
 	case node.GetViewStmt() != nil:
 		relation = node.GetViewStmt().View
 	case node.GetGrantStmt() != nil:
-		return settingError("0A000", "authorization statements are not supported")
+		return nil
 	default:
 		return settingError("42601", "invalid CREATE SCHEMA element")
 	}
@@ -633,9 +633,14 @@ func isObjectCommand(node *zpgparse.Node) bool {
 		return bind.HierarchyAlter(statement.AlterTableStmt) || bind.OrdinaryObjectAlter(statement.AlterTableStmt) || bind.IdentityDeclarationAlter(statement.AlterTableStmt) || bind.TransactionalGenerationAlter(statement.AlterTableStmt) || bind.SchemaJobAlter(statement.AlterTableStmt) || bind.TriggerStateAlter(statement.AlterTableStmt)
 	case *zpgparse.Node_ReindexStmt:
 		return statement.ReindexStmt != nil
+	case *zpgparse.Node_DefineStmt:
+		return statement.DefineStmt != nil && statement.DefineStmt.Kind == zpgparse.ObjectType_OBJECT_COLLATION
 	case *zpgparse.Node_DropStmt:
 		if statement.DropStmt == nil || statement.DropStmt.Concurrent {
 			return false
+		}
+		if statement.DropStmt.RemoveType == zpgparse.ObjectType_OBJECT_COLLATION {
+			return true
 		}
 		if bind.TextSearchLifecycleKind(node) {
 			return true

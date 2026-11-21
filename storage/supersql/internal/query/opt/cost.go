@@ -248,18 +248,28 @@ func (o *optimizer) cost(e *expression) {
 				versionWork = statistic.table.VersionChainWork
 			}
 		}
-		c.CPURows = scanRows
-		c.CPUBatches = max(math.Ceil(scanRows/1024), blocks)
-		c.DecodeBytes = max(n.Scan.Estimate.DecodeBytes, scanRows*rowBytes)
-		c.VersionMerge = max(n.Scan.Estimate.VisibilityChecks, scanRows*versionWork)
-		if n.Algorithm != physical.TableScan {
-			c.IndexProbes = max(n.Scan.Estimate.IndexProbes, 1)
-			if scanRows == 0 {
-				c.IndexProbes = 0
+		if n.Scan.GIN.Enabled {
+			ginRows := max(1.0, scanRows*0.05)
+			c.CPURows = ginRows
+			c.CPUBatches = max(0.1, math.Ceil(ginRows/1024)*0.1)
+			c.DecodeBytes = ginRows * rowBytes * 0.25
+			c.VersionMerge = ginRows * versionWork * 0.1
+			c.IndexProbes = 0.05
+			c.Startup = 0
+		} else {
+			c.CPURows = scanRows
+			c.CPUBatches = max(math.Ceil(scanRows/1024), blocks)
+			c.DecodeBytes = max(n.Scan.Estimate.DecodeBytes, scanRows*rowBytes)
+			c.VersionMerge = max(n.Scan.Estimate.VisibilityChecks, scanRows*versionWork)
+			if n.Algorithm != physical.TableScan {
+				c.IndexProbes = max(n.Scan.Estimate.IndexProbes, 1)
+				if scanRows == 0 {
+					c.IndexProbes = 0
+				}
 			}
-		}
-		if scanRows > 0 {
-			c.Startup = blocks
+			if scanRows > 0 {
+				c.Startup = blocks
+			}
 		}
 	case physical.GenerateSeries, physical.GenerateSubscripts, physical.Unnest:
 		c.Startup = float64(len(n.Expressions))

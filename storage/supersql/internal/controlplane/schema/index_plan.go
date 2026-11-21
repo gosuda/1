@@ -13,6 +13,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 )
 
 // Descriptor snapshots and retained plan metadata are admitted separately against
@@ -99,6 +100,11 @@ type IndexPlan struct {
 	encoder             storage.KeyEncoder
 	limits              IndexLimits
 	metadata            uint64
+	isGIN               bool
+	opClass             string
+	ginColumn           int
+	ginColumnID         model.ColumnID
+	ginLayout           model.TypeLayout
 }
 
 func NewIndexPlan(ctx context.Context, table, index *model.Descriptor, encoder storage.KeyEncoder, expressions IndexExpressions, limits IndexLimits) (*IndexPlan, error) {
@@ -269,6 +275,9 @@ func (p *IndexPlan) bindBase(ctx context.Context, table *model.TableMetadata, bu
 }
 
 func (p *IndexPlan) bindIndex(ctx context.Context, metadata *model.IndexMetadata, expressions IndexExpressions, budget *indexPlanBudget) error {
+	if metadata.IsGIN() {
+		return p.bindGINIndex(ctx, metadata, expressions, budget)
+	}
 	count := len(metadata.Keys) + 2 + len(metadata.Include)
 	for _, allocation := range [...]struct{ count, size uint64 }{
 		{uint64(count), uint64(unsafe.Sizeof(storage.ColumnLayout{}))},
@@ -348,6 +357,74 @@ func (p *IndexPlan) bindIndex(ctx context.Context, metadata *model.IndexMetadata
 		column.ID = model.ColumnID(len(metadata.Keys) + 3 + i)
 		p.layout.Columns[int(column.ID)-1] = column
 		p.includes[i] = slot
+	}
+	if metadata.Predicate != nil {
+		program, err := p.compile(ctx, expressions, metadata.Predicate, model.TypeLayout{Type: model.Type{ID: 16, Modifier: -1, Storage: model.TypeBoolean}})
+		if err != nil {
+			return err
+		}
+		p.predicate = program
+	}
+	return nil
+}
+
+func (p *IndexPlan) bindGINIndex(ctx context.Context, metadata *model.IndexMetadata, expressions IndexExpressions, budget *indexPlanBudget) error {
+	if metadata.Unique || metadata.DeferredUnique || len(metadata.Keys) != 1 || len(metadata.Include) != 0 {
+		return invalidIndexPlan()
+	}
+	key := metadata.Keys[0]
+	if key.Expression != nil || key.Column == 0 {
+		return invalidIndexPlan()
+	}
+	slot, ok := p.baseColumn(key.Column)
+	if !ok {
+		return invalidIndexPlan()
+	}
+	baseCol := p.baseColumns[slot]
+	colLayout := model.TypeLayout{Type: baseCol.Type, Children: baseCol.Children}
+	resolvedOpClass, ok := builtin.GINSupportedType(colLayout, metadata.OpClass)
+	if !ok {
+		return invalidIndexPlan()
+	}
+	ownedLayout, used, err := model.CopyPhysicalTypeLayout(ctx, colLayout, budget.limit-budget.used)
+	if err != nil {
+		return indexPlanLimitError(err)
+	}
+	budget.used += used
+	if err := budget.add(1, uint64(len(resolvedOpClass))); err != nil {
+		return err
+	}
+	// Physical GIN posting layout: (col1: token bytea, col2: basePK bytea, col3: owner bytea)
+	// with composite key (col1, col2) so prefix scans on token are exact and ordered by basePK.
+	const colCount = 3
+	const keyCount = 2
+	for _, allocation := range [...]struct{ count, size uint64 }{
+		{colCount, uint64(unsafe.Sizeof(storage.ColumnLayout{}))},
+		{keyCount, uint64(unsafe.Sizeof(storage.KeyColumn{}))},
+		{1, uint64(unsafe.Sizeof(indexPlanKey{}))},
+	} {
+		if err := budget.add(allocation.count, allocation.size); err != nil {
+			return err
+		}
+	}
+	bytea := model.Type{ID: 17, Modifier: -1, Storage: model.TypeBytes}
+	p.isGIN = true
+	p.opClass = resolvedOpClass
+	p.ginColumn = slot
+	p.ginColumnID = key.Column
+	p.ginLayout = ownedLayout
+	p.keys = []indexPlanKey{{column: slot}}
+	p.layout = storage.ObjectLayout{
+		Target: p.target,
+		Columns: []storage.ColumnLayout{
+			{ID: 1, Type: bytea},
+			{ID: 2, Type: bytea},
+			{ID: 3, Type: bytea},
+		},
+	}
+	p.keyLayout = []storage.KeyColumn{
+		{ColumnID: 1, Type: bytea},
+		{ColumnID: 2, Type: bytea},
 	}
 	if metadata.Predicate != nil {
 		program, err := p.compile(ctx, expressions, metadata.Predicate, model.TypeLayout{Type: model.Type{ID: 16, Modifier: -1, Storage: model.TypeBoolean}})
@@ -460,6 +537,10 @@ func (p *IndexPlan) Table() (model.ObjectID, uint64) { return p.tableID, p.table
 func (p *IndexPlan) State() model.SchemaState        { return p.state }
 func (p *IndexPlan) Valid() bool                     { return p.valid }
 func (p *IndexPlan) WriteMaintained() bool           { return p.writeMaintained }
+func (p *IndexPlan) IsGIN() bool                     { return p.isGIN }
+func (p *IndexPlan) OpClass() string                 { return p.opClass }
+func (p *IndexPlan) GINColumn() model.ColumnID       { return p.ginColumnID }
+func (p *IndexPlan) GINLayout() model.TypeLayout     { return p.ginLayout }
 func (p *IndexPlan) OwnerColumn() model.ColumnID     { return model.ColumnID(len(p.keys) + 2) }
 func (p *IndexPlan) KeyLayout() []storage.KeyColumn {
 	layout, _, err := storage.CopyKeyLayout(context.Background(), p.keyLayout, p.metadata)

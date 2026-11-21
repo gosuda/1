@@ -808,7 +808,7 @@ func (s *Store) TypeCascadeScanDependencies(ctx context.Context, snapshot *Catal
 // typeCascadeKinds is the per-schema namespace kind inventory the cascade walk
 // scans. It is shared by the population pre-pass and the walk so both count the
 // same rows.
-var typeCascadeKinds = []model.ObjectKind{model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectRoutine, model.ObjectType, model.ObjectCompositeRelation, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectTextSearchTemplate, model.ObjectCast, model.ObjectOperator}
+var typeCascadeKinds = []model.ObjectKind{model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectRoutine, model.ObjectType, model.ObjectCompositeRelation, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectTextSearchTemplate, model.ObjectCast, model.ObjectOperator, model.ObjectCollation}
 
 // typeCascadePopulation counts, without retaining, the namespace rows the
 // cascade walk will visit: the schema rows plus every child row under each

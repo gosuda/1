@@ -18,14 +18,6 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	if err != nil {
 		return relation{}, err
 	}
-	target, err = b.prepareMutationTarget(target, mergeMutationEvents(n.MergeWhenClauses))
-	if err != nil {
-		return relation{}, err
-	}
-	previousProvenance := b.mutationProvenance
-	if target.automatic() {
-		b.mutationProvenance = target.executionDescriptor.ID()
-	}
 	mergeHasInsert, mergeHasUpdate, mergeHasDelete := false, false, false
 	for _, whenNode := range n.MergeWhenClauses {
 		if clause := whenNode.GetMergeWhenClause(); clause != nil {
@@ -39,8 +31,34 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 			}
 		}
 	}
+	pos := int(n.Relation.Location) + 1
+	if err := b.checkSchemaUsage(target.namespace, pos); err != nil {
+		return relation{}, err
+	}
+	required := model.PrivilegeSelect
+	if mergeHasInsert {
+		required |= model.PrivilegeInsert
+	}
+	if mergeHasUpdate {
+		required |= model.PrivilegeUpdate
+	}
+	if mergeHasDelete {
+		required |= model.PrivilegeDelete
+	}
+	if err := b.checkObjectPrivilege(target.descriptor, required, pos); err != nil {
+		return relation{}, err
+	}
+	target, err = b.prepareMutationTarget(target, mergeMutationEvents(n.MergeWhenClauses))
+	if err != nil {
+		return relation{}, err
+	}
+	previousProvenance := b.mutationProvenance
+	if target.automatic() {
+		b.mutationProvenance = target.executionDescriptor.ID()
+	}
 	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
 	savedMergeUpdate, savedMergeDelete := b.rlsMergeHasUpdate, b.rlsMergeHasDelete
+	savedDMLTargetID := b.dmlTargetID
 	if target.executionDescriptor != nil {
 		b.rlsTargetID = target.executionDescriptor.ID()
 	} else {
@@ -48,9 +66,11 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	}
 	b.rlsTargetCommand = "MERGE"
 	b.rlsMergeHasUpdate, b.rlsMergeHasDelete = mergeHasUpdate, mergeHasDelete
+	b.dmlTargetID = target.descriptor.ID()
 	left, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
 	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
 	b.rlsMergeHasUpdate, b.rlsMergeHasDelete = savedMergeUpdate, savedMergeDelete
+	b.dmlTargetID = savedDMLTargetID
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return relation{}, err

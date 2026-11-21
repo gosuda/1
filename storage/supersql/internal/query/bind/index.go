@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
@@ -84,6 +85,9 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 	if table.Kind() != model.ObjectTable && table.Kind() != model.ObjectMaterializedView {
 		return nil, bindError("42809", "cannot create an index on this relation", int(rangeVar.Location)+1)
 	}
+	if err := b.requireTableOwner(table, int(rangeVar.Location)+1); err != nil {
+		return nil, err
+	}
 	spec, err := table.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -123,7 +127,22 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 	if spec.Table.Owner == 0 {
 		return nil, model.ErrInvalidDescriptor
 	}
+	isGIN := strings.EqualFold(strings.TrimSpace(statement.AccessMethod), "gin")
+	if isGIN {
+		if statement.Unique || statement.NullsNotDistinct {
+			return nil, bindError("0A000", "access method \"gin\" does not support unique indexes", 0)
+		}
+		if len(statement.IndexParams) != 1 {
+			return nil, bindError("0A000", "GIN indexes on multiple columns are not supported", 0)
+		}
+		if len(statement.IndexIncludingParams) != 0 {
+			return nil, bindError("0A000", "access method \"gin\" does not support included columns", 0)
+		}
+	}
 	metadata := &model.IndexMetadata{Owner: spec.Table.Owner, Table: table.ID(), Unique: statement.Unique, NullsNotDistinct: statement.NullsNotDistinct}
+	if isGIN {
+		metadata.Method = "gin"
+	}
 	if statement.Concurrent {
 		metadata.Invalid = true
 		metadata.NotReady = true
@@ -134,6 +153,56 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 		elem := raw.GetIndexElem()
 		if elem == nil || (elem.Name == "") == (elem.Expr == nil) || elem.Indexcolname != "" {
 			return nil, bindError("42601", "invalid index key", 0)
+		}
+		if isGIN {
+			if elem.Expr != nil || elem.Name == "" {
+				return nil, bindError("0A000", "GIN indexes on expressions are not supported", 0)
+			}
+			if elem.Ordering != zpgparse.SortByDir_SORTBY_DEFAULT || elem.NullsOrdering != zpgparse.SortByNulls_SORTBY_NULLS_DEFAULT {
+				return nil, bindError("0A000", "access method \"gin\" does not support ordering options", 0)
+			}
+			if len(elem.Collation) != 0 {
+				return nil, bindError("0A000", "access method \"gin\" does not support explicit collations", 0)
+			}
+			col, err := publicIndexColumn(spec.Table.Columns, elem.Name)
+			if err != nil {
+				return nil, err
+			}
+			var requestedOpClass string
+			if len(elem.Opclass) != 0 {
+				parts, nameErr := names(elem.Opclass)
+				if nameErr != nil {
+					return nil, nameErr
+				}
+				switch len(parts) {
+				case 1:
+					requestedOpClass = parts[0]
+				case 2:
+					if !strings.EqualFold(parts[0], "pg_catalog") {
+						return nil, bindError("42704", "operator class does not exist for access method \"gin\"", 0)
+					}
+					requestedOpClass = parts[1]
+				default:
+					return nil, bindError("42704", "operator class does not exist for access method \"gin\"", 0)
+				}
+			}
+			resolvedOpClass, ok := builtin.GINSupportedType(col.Layout, requestedOpClass)
+			if !ok {
+				if requestedOpClass != "" {
+					return nil, bindError("42804", "operator class \""+requestedOpClass+"\" does not accept data type for access method \"gin\"", 0)
+				}
+				return nil, bindError("42704", "data type has no default operator class for access method \"gin\"", 0)
+			}
+			metadata.OpClass = resolvedOpClass
+			dependencies = appendIndexDependency(dependencies, model.Dependency{Object: table.ID(), Version: table.Version(), Column: col.ID})
+			key := model.KeyElement{
+				Column:    col.ID,
+				Type:      col.Layout.Type,
+				Children:  col.Layout.Children,
+				Collation: col.Layout.Type.Collation,
+			}
+			metadata.Keys = append(metadata.Keys, key)
+			continue
 		}
 		key := model.KeyElement{}
 		switch elem.Ordering {

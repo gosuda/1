@@ -31,6 +31,13 @@ func (node Node) HasLookupReadSpan() bool {
 	return node.plan.nodes[node.id-1].Scan.Lookup.Enabled
 }
 
+func (node Node) HasGINScan() bool {
+	if node.plan == nil || node.id == 0 || uint64(node.id) > uint64(len(node.plan.nodes)) {
+		return false
+	}
+	return node.plan.nodes[node.id-1].Scan.GIN.Enabled
+}
+
 func (node Node) ReadTargets() (source, target storage.ObjectRef) {
 	if !node.HasReadSpan() {
 		return storage.ObjectRef{}, storage.ObjectRef{}

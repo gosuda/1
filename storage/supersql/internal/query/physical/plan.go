@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
@@ -365,6 +366,20 @@ func (b *copier) node(source NodeSpec) (NodeSpec, error) {
 	}
 	if n.Scan.Lookup.BaseProjection, err = ownSlice(b, source.Scan.Lookup.BaseProjection, false); err != nil {
 		return NodeSpec{}, err
+	}
+	if source.Scan.GIN.Enabled {
+		if err := b.charge(uint64(len(source.Scan.GIN.IndexName))+uint64(len(source.Scan.GIN.TableName))+uint64(len(source.Scan.GIN.OpClass)), 1); err != nil {
+			return NodeSpec{}, err
+		}
+		n.Scan.GIN.IndexName = strings.Clone(source.Scan.GIN.IndexName)
+		n.Scan.GIN.TableName = strings.Clone(source.Scan.GIN.TableName)
+		n.Scan.GIN.OpClass = strings.Clone(source.Scan.GIN.OpClass)
+		ownedLayout, used, err := model.CopyPhysicalTypeLayout(b.ctx, source.Scan.GIN.Layout, b.limits.MaxBytes-b.used)
+		if err != nil {
+			return NodeSpec{}, err
+		}
+		b.used += used
+		n.Scan.GIN.Layout = ownedLayout
 	}
 	if n.Catalog.Columns, err = ownSlice(b, source.Catalog.Columns, false); err != nil {
 		return NodeSpec{}, err

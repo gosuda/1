@@ -134,9 +134,15 @@ func recoverPublishedRuns(ctx context.Context, directory *databaseDirectory, sta
 			return recoveredRuns{}, err
 		}
 	}
-	manifests, err := discoverRunManifests(ctx, directory.runs, base.Position)
-	if err != nil {
-		return recoveredRuns{}, err
+	if limits.Log.maxCommitTS > 0 && base.Generation != 0 && base.CommitTS > limits.Log.maxCommitTS {
+		return recoveredRuns{}, storage.ErrInvalidMutation
+	}
+	var manifests map[uint64]runManifestSpan
+	if limits.Log.maxCommitTS == 0 {
+		manifests, err = discoverRunManifests(ctx, directory.runs, base.Position)
+		if err != nil {
+			return recoveredRuns{}, err
+		}
 	}
 	identities := base.Transactions
 	position := recoveredPosition{LogPosition: base.Position, CommitTS: base.CommitTS}

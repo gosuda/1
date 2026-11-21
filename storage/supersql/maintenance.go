@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"math"
 	"time"
 
 	"github.com/gosuda/supersql-alpha/clock"
@@ -33,6 +34,16 @@ type MaintenanceConfig struct {
 	// MaxRetiredTargets caps the retired objects one pass collects. Zero selects
 	// DefaultMaxRetiredTargets.
 	MaxRetiredTargets uint64
+	// AutoAnalyzeDisabled stops background maintenance from automatically
+	// running ANALYZE on mutated tables.
+	AutoAnalyzeDisabled bool
+	// AutoAnalyzeMinRows is the base mutation count required before auto-ANALYZE
+	// triggers on a table. Zero selects DefaultAutoAnalyzeMinRows.
+	AutoAnalyzeMinRows uint64
+	// AutoAnalyzeScaleFactor scales the auto-ANALYZE trigger threshold by the
+	// table's last analyzed live row count. Zero selects
+	// DefaultAutoAnalyzeScaleFactor; negative values are rejected by Open.
+	AutoAnalyzeScaleFactor float64
 }
 
 const (
@@ -48,6 +59,12 @@ const (
 	DefaultRunThreshold = 64
 	// DefaultMaxRetiredTargets caps the retired objects one pass collects.
 	DefaultMaxRetiredTargets = 1024
+	// DefaultAutoAnalyzeMinRows is the default base mutation count that triggers
+	// automatic ANALYZE on a table.
+	DefaultAutoAnalyzeMinRows uint64 = 50
+	// DefaultAutoAnalyzeScaleFactor is the default fraction of live rows added
+	// to AutoAnalyzeMinRows before automatic ANALYZE triggers.
+	DefaultAutoAnalyzeScaleFactor = 0.2
 )
 
 // errMaintenanceOptions rejects a probe period Open cannot honor. It mirrors the
@@ -60,10 +77,17 @@ func normalizedMaintenance(config MaintenanceConfig) (MaintenanceConfig, error) 
 	if config.Interval < 0 || (config.Interval > 0 && config.Interval < MinMaintenanceInterval) {
 		return MaintenanceConfig{}, errMaintenanceOptions
 	}
+	if config.AutoAnalyzeScaleFactor < 0 || math.IsNaN(config.AutoAnalyzeScaleFactor) || math.IsInf(config.AutoAnalyzeScaleFactor, 0) {
+		return MaintenanceConfig{}, errMaintenanceOptions
+	}
 	config.Interval = cmp.Or(config.Interval, DefaultMaintenanceInterval)
 	config.WALThreshold = cmp.Or(config.WALThreshold, DefaultWALThreshold)
 	config.RunThreshold = cmp.Or(config.RunThreshold, DefaultRunThreshold)
 	config.MaxRetiredTargets = cmp.Or(config.MaxRetiredTargets, DefaultMaxRetiredTargets)
+	config.AutoAnalyzeMinRows = cmp.Or(config.AutoAnalyzeMinRows, DefaultAutoAnalyzeMinRows)
+	if config.AutoAnalyzeScaleFactor == 0 {
+		config.AutoAnalyzeScaleFactor = DefaultAutoAnalyzeScaleFactor
+	}
 	return config, nil
 }
 
@@ -114,6 +138,9 @@ func (database *Catalog) maintenanceLoop(ctx context.Context) error {
 func (database *Catalog) maintainOnce(ctx context.Context) error {
 	wal, runs, err := database.backend.MaintenanceBacklog(ctx)
 	if err != nil {
+		return err
+	}
+	if err := database.runAutoAnalyzeIfEnabled(ctx); err != nil {
 		return err
 	}
 	uncompacted := min(runs, database.backend.UncompactedRunFiles())

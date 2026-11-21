@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/gosuda/supersql-alpha/clock"
@@ -49,6 +50,8 @@ type Backend struct {
 	groupMu            sync.Mutex
 	groupQueue         []*groupCommitReq
 	groupActive        bool
+	cipher             *storageCipher
+	archiver           *walArchiver
 }
 
 type pendingCommit struct {
@@ -71,7 +74,11 @@ type State struct {
 var _ storage.Backend = (*Backend)(nil)
 var _ storage.Maintenance = (*Backend)(nil)
 
-func Open(ctx context.Context, config Config) (_ *Backend, err error) {
+func Open(ctx context.Context, config Config) (*Backend, error) {
+	return openBackend(ctx, config, 0)
+}
+
+func openBackend(ctx context.Context, config Config, maxCommitTS model.Timestamp) (_ *Backend, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -84,7 +91,23 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 	if err := config.Limits.validate(); err != nil {
 		return nil, err
 	}
-	extras, err := validateCheckpointExtras(config.ExtraCheckpointFiles)
+	dbCipher, err := newStorageCipher(config.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	archiveCipher, err := newStorageCipher(config.WALArchiveKey)
+	if err != nil {
+		return nil, err
+	}
+	archiver, err := newWALArchiver(config.WALArchiveDir, dbCipher, archiveCipher, config.WALArchiveHook)
+	if err != nil {
+		return nil, err
+	}
+	extraNames := config.ExtraCheckpointFiles
+	if dbCipher != nil && !slices.Contains(extraNames, encryptionMetaName) {
+		extraNames = append(slices.Clone(extraNames), encryptionMetaName)
+	}
+	extras, err := validateCheckpointExtras(extraNames)
 	if err != nil {
 		return nil, err
 	}
@@ -105,6 +128,7 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 	backend := &Backend{
 		directory: directory, limits: config.Limits, verifier: config.FenceVerifier, encoder: config.KeyEncoder, extras: extras,
 		maintenanceCtx: maintenanceCtx, maintenanceCancel: maintenanceCancel, maintenanceGate: make(chan struct{}, 1), closeDone: make(chan struct{}),
+		cipher: dbCipher, archiver: archiver,
 	}
 	defer func() {
 		if err != nil {
@@ -115,16 +139,30 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 		return nil, err
 	}
 	state, err := readDatabaseState(ctx, directory.root, config.Limits.MetadataBytes)
-	if errors.Is(err, os.ErrNotExist) {
+	freshDB := errors.Is(err, os.ErrNotExist)
+	if !freshDB && err != nil {
+		return nil, err
+	}
+	hasEncMeta, err := verifyDirectoryEncryption(directory.root, dbCipher, !freshDB)
+	if err != nil {
+		return nil, err
+	}
+	if freshDB {
 		if !suppliedScale {
 			return nil, ErrInvalidConfig
+		}
+		if dbCipher != nil && !hasEncMeta {
+			if err := writeEncryptionMeta(directory.root, dbCipher); err != nil {
+				return nil, err
+			}
 		}
 		state = databaseState{Generation: 1, Scales: []scaleVersion{{Scale: copyClockScale(config.Scale)}}}
 		if _, err := writeDatabaseState(ctx, directory.root, state, config.Limits.MetadataBytes, nil); err != nil {
 			return nil, err
 		}
-	} else if err != nil {
-		return nil, err
+	}
+	if maxCommitTS > 0 && state.Closed.ClosedTS > maxCommitTS {
+		return nil, storage.ErrInvalidMutation
 	}
 	if state.Closed.ClosedTS != 0 {
 		if err := backend.verifier.VerifyReadFence(ctx, state.Closed); err != nil {
@@ -134,8 +172,10 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 	backend.state = state
 	backend.durableClosed = state.Closed
 	backend.persistedHorizon = max(state.Closed.ClosedTS, state.ClosedHorizon)
+	recLimits := backend.recoveryLimits()
+	recLimits.maxCommitTS = maxCommitTS
 	recovered, err := recoverPublishedRuns(ctx, directory, state, runRecoveryLimits{
-		Log: config.Limits.recovery(), Preparation: config.Limits.preparation(), Resident: config.Limits.resident(),
+		Log: recLimits, Preparation: backend.preparationLimits(), Resident: config.Limits.resident(),
 		StagingBytes: config.Limits.ResidentBytes, IdentityBytes: config.Limits.IdentityBytes,
 	}, func(record *storedCommit) error {
 		if err := validateRecordState(record, state); err != nil {
@@ -261,7 +301,7 @@ func (backend *Backend) flushMemtableLocked(ctx context.Context, maxPos uint64) 
 	if backend.memtable.empty() {
 		return nil
 	}
-	return backend.memtable.flushToRuns(ctx, backend.directory.runs, backend.runs, backend.limits, maxPos)
+	return backend.memtable.flushToRuns(ctx, backend.directory.runs, backend.runs, backend.limits, backend.cipher, maxPos)
 }
 
 func (backend *Backend) closedTimestamp() model.Timestamp {

@@ -122,10 +122,27 @@ accounts, err := pgx.CollectRows(rows, pgx.RowToStructByName[Account])
 ```
 
 Included `pgx` capabilities:
-- `Pool`, `PoolConfig` (`BeforeConnect`, `AfterConnect`, `BeforeAcquire`, `AfterRelease` hooks), `PoolConn`, `Conn` (`Prepare`, `Deallocate`, `DeallocateAll`), `Tx` (nested `tx.Begin` via `SAVEPOINT`, `DeferrableMode`), `BeginFunc` / `BeginTxFunc`
+- `Pool`, `PoolConfig` (`BeforeConnect`, `AfterConnect`, `BeforeAcquire`, `AfterRelease` hooks), `PoolConn`, `Conn` (`Prepare`, `Deallocate`, `DeallocateAll`, `WaitForNotification`), `Tx` (nested `tx.Begin` via `SAVEPOINT`, `DeferrableMode`), `BeginFunc` / `BeginTxFunc`
 - `*pgx.PgError` (matching `pgconn.PgError` fields and unwrapping to `*supersql.Error`) and `FieldDescription` with PostgreSQL type OIDs
 - `NamedArgs` (`@param`), Go slices (including nullable `[]*T` / `[]pgx.Text`, multi-dimensional `[][]T`, `[]float32`, `[]int8`), UUID (`[16]byte`), JSONB (`map[string]any`, `json.RawMessage`), and nullable `pgtype` wrappers (`Text`, `Int2`, `Int4`, `Int8`, `Float4`, `Float8`, `Bool`, `UUID`, `Numeric`, `Timestamp`, `Timestamptz`, `Date`, `JSONB`)
 - Transactional `Batch` / `SendBatch`, `CopyFrom` (`CopyFromRows`, `CopyFromSlice`), and generic collectors (`CollectRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`, `RowToStructByName`, `RowToStructByPos`, `RowToMap`, etc.)
+
+### Optional PostgreSQL Wire Protocol Listener (`pgwire`)
+
+When you want to inspect or query an embedded SuperSQL database with `psql`, GUI clients (DBeaver, DataGrip), or ecosystem drivers (`jackc/pgx/v5`, GORM, Ent, Bun, `sqlc`), attach an opt-in PostgreSQL v3.0 TCP listener over an existing `*supersql.Catalog` or `*supersql.Connector`:
+
+```go
+srv, err := pgwire.NewServerFromCatalog(db, pgwire.Config{
+	Password: "dev-password", // or AuthFunc / TLSConfig
+})
+if err != nil {
+	return err
+}
+defer srv.Close()
+go srv.ListenAndServe(ctx, "127.0.0.1:5432")
+```
+
+Supports Simple & Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`PortalSuspended`), text & binary parameter/result codecs, `CancelRequest`, TLS (`SSLRequest`), authentication callbacks, `MaxConnections`, and asynchronous `'A'` `NotificationResponse` delivery for `LISTEN`/`NOTIFY`.
 
 ---
 
@@ -133,24 +150,28 @@ Included `pgx` capabilities:
 
 - **Queries (DQL)**: `UNION`/`INTERSECT`/`EXCEPT`, `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`LATERAL` joins, `WITH` / `WITH RECURSIVE` CTEs, window functions, `GROUPING SETS`/`ROLLUP`/`CUBE`, correlated subqueries, row locking (`FOR UPDATE` / `FOR SHARE` / `NOWAIT` / `SKIP LOCKED`), and time-travel queries (`AS OF SYSTEM TIME <timestamptz>`).
 - **Mutations (DML)**: Multi-row `INSERT`, `INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`, `UPDATE ... FROM`, `DELETE ... USING`, `MERGE INTO`, `RETURNING`, and streaming `COPY ... FROM STDIN` / `TO STDOUT`.
-- **Schema & Procedural (DDL / PL/pgSQL)**: Composite primary/unique/foreign keys, `CHECK` constraints, secondary/partial/`INCLUDE` covering indexes, views, materialized views, sequences, domains, enums, composite types, ranges, triggers, functions, procedures, and `DO $$ ... $$` blocks in SQL and `PL/pgSQL`.
-- **Multi-Tenant Security & Session GUC**:
+- **Indexes (B-tree & GIN)**: Composite primary/unique/foreign keys, `CHECK` constraints, secondary/partial/`INCLUDE` covering B-tree indexes, and **GIN inverted indexes** (`USING gin`) for `jsonb` (`jsonb_ops`, `jsonb_path_ops`: `@>`, `?`, `?|`, `?&`), arrays (`array_ops`: `@>`, `&&`), and full-text search `tsvector` (`tsvector_ops`: `@@`).
+- **Schema, Procedural & Pure-Go ICU Collations**: Views, materialized views, sequences, domains, enums, composite types, ranges, triggers, functions, procedures, `DO $$ ... $$` blocks in SQL and `PL/pgSQL`, and **pure-Go ICU/locale collations** (`"en-US-x-icu"`, `"ko-KR-x-icu"`, `"ja-JP-x-icu"`, case-insensitive `-u-ks-level2`, numeric `-u-kn-true`, plus `CREATE / DROP COLLATION`).
+- **Multi-Tenant Security, RBAC & Session GUC**:
+  - **Object-Level Privileges & Ownership**: `GRANT` / `REVOKE` (`WITH GRANT OPTION`, `ALL TABLES/SEQUENCES/FUNCTIONS IN SCHEMA`, `PUBLIC`), `ALTER TABLE/VIEW/SEQUENCE/SCHEMA/FUNCTION ... OWNER TO`, `CREATE SCHEMA ... AUTHORIZATION`, and `SECURITY DEFINER` routines with safe caller-role restoration.
   - **Native MVCC Row-Level Security (RLS)**: `ENABLE / DISABLE / FORCE ROW LEVEL SECURITY` and `CREATE / ALTER / DROP POLICY` (`PERMISSIVE` / `RESTRICTIVE`, `USING`, `WITH CHECK`), persisted transactionally in catalog descriptors and exposed via `pg_policies` and `pg_roles`.
   - **Roles & Session Settings**: `CREATE / ALTER / DROP ROLE [BYPASSRLS | SUPERUSER]`, `GRANT / REVOKE <role>`, `SET [LOCAL] ROLE`, and custom qualified GUCs (`SET [LOCAL] app.tenant_id = '...'`, `current_setting`, `set_config`).
   - **Serializable by Default**: Weaker isolation requests escalate automatically to `SERIALIZABLE` (`SET supersql.compat_isolation = 'off'` switches to strict `0A000` rejection).
-- **Hot Backups**: Consistent online snapshot backups via `Catalog.Backup` / `RestoreCheckpoint` (including catalog descriptors, roles, and RLS policies).
+- **In-Process `LISTEN` / `NOTIFY`**: Transactional `LISTEN`, `NOTIFY`, `UNLISTEN` (including savepoint rollback suppression and commit-only fanout), `pg_notify()`, `pg_listening_channels()`, Go-native `Catalog.Subscribe(...)`, `pgx.Conn.WaitForNotification`, and `pgwire` `'A'` push frames.
+- **Auto-`ANALYZE` & Observability**: Background Auto-`ANALYZE` triggered by per-table mutation thresholds (`MaintenanceConfig`), `EXPLAIN (ANALYZE, BUFFERS)` (TEXT/JSON/YAML/XML), `OpenOptions.Observer` / `OnSlowQuery`, and live `Catalog.Metrics(ctx)`.
+- **Encrypted & Incremental Backups, WAL Archiving & PITR**: Online hot backups (`Catalog.Backup`), incremental backup chains (`CreateIncrementalBackup` / `RestoreIncremental`), continuous WAL archiving (`OpenOptions.WALArchiveDir` / `EnableWALArchive`), Point-in-Time Recovery (`RestorePITR` / `RestorePITRFromChain`), and optional pure-Go AES-256-GCM at-rest & backup encryption (`OpenOptions.EncryptionKey` / `BackupOptions.EncryptionKey`).
 - **Safe Regex (RE2)**: Regular expression operators use Go's RE2 engine (linear-time evaluation; backreferences and lookarounds are rejected).
 
 ---
 
 ## Intentional Departures & Known Limitations
 
-SuperSQL omits server-only and heap-specific PostgreSQL features; every excluded feature fails deterministically with SQLSTATE `0A000` (see [`docs/reference/sql-compatibility.md`](docs/reference/sql-compatibility.md)):
+SuperSQL omits cluster-wide and heap-specific PostgreSQL features; every excluded feature fails deterministically with SQLSTATE `0A000` (see [`docs/reference/sql-compatibility.md`](docs/reference/sql-compatibility.md)):
 
-- **No network server**: Embedded single-process engine holding `.lock` on the data directory; no wire-protocol listener or `pg_hba.conf`.
-- **No heap maintenance commands**: `VACUUM`, `FREEZE`, `CLUSTER`, `ctid`, and `xmin` are rejected (`0A000`); background compaction and retention run automatically inside NeoSepia.
+- **Embedded single-process storage**: The storage directory is owned exclusively by one process (`.lock`); multi-node clustering, `pg_hba.conf`, and `CREATE DATABASE` / `TABLESPACE` are excluded (use the optional `pgwire` package when external TCP clients need to connect to the host process).
+- **No heap maintenance commands**: `VACUUM`, `FREEZE`, `CLUSTER`, `ctid`, and `xmin` are rejected (`0A000`); background compaction, Auto-`ANALYZE`, and retention run automatically inside NeoSepia.
 - **No host filesystem / C extensions / XML**: `pg_read_file`, server-side `COPY FROM '/path'` or `PROGRAM`, C extensions, untrusted languages, and XML functions are excluded.
-- **Ordered index access only**: Primary storage uses PAX v2 SSTables with Bloom filters and zone maps; secondary indexes use ordered key runs (`GIN`, `GiST`, `SP-GiST`, `BRIN` are excluded).
+- **Supported index access methods**: Primary storage uses PAX v2 SSTables with Bloom filters and zone maps; secondary indexes support ordered **B-tree** runs and **GIN** inverted posting lists (`GiST`, `SP-GiST`, `BRIN`, and `Hash` are excluded with `0A000`).
 - **Catalog lock serialization across uncommitted DDL**: Statements in transaction blocks and writes acquire shared locks on catalog collections until transaction end, so uncommitted DDL or an idle open transaction can block concurrent DDL in another session. Autocommit reads run as snapshot reads without waiting. Bound wait times with `SET lock_timeout` (`55P03`), `SET statement_timeout` (`57014`), `SET idle_in_transaction_session_timeout` (`25P03`), or Go context deadlines.
 - **RE2 regex & `%TYPE` superset**: Regular expressions use RE2 rather than Tcl ARE; PL/pgSQL `%TYPE` in routine signatures is supported as a superset of upstream `libpg_query`.
 

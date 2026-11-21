@@ -119,8 +119,10 @@ type optimizer struct {
 	exhausted   bool
 	searchStart time.Time
 	access      []scanAccess
-	predicates  []ir.ScalarID
-	predicateSlots [][]model.SlotID
+	predicates        []ir.ScalarID
+	predicateSlots    [][]model.SlotID
+	ginPredicates     []ir.ScalarID
+	ginPredicateSlots [][]model.SlotID
 	producers   []*expression
 	lockedOccurrences []model.ScanOccurrence
 }
@@ -178,6 +180,8 @@ func optimize(ctx context.Context, graph *ir.Graph, options Options, reorder boo
 	o.access = allocate[scanAccess](&o, uint64(graph.RelCount())+1)
 	o.predicates = allocate[ir.ScalarID](&o, uint64(graph.RelCount())+1)
 	o.predicateSlots = allocate[[]model.SlotID](&o, uint64(graph.RelCount())+1)
+	o.ginPredicates = allocate[ir.ScalarID](&o, uint64(graph.RelCount())+1)
+	o.ginPredicateSlots = allocate[[]model.SlotID](&o, uint64(graph.RelCount())+1)
 	o.producers = allocate[*expression](&o, uint64(graph.CTECount())+1)
 	o.collectLockedOccurrences()
 	o.inventory()

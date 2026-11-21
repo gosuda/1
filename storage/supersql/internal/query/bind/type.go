@@ -126,6 +126,10 @@ func (b *binder) primitive(id model.TypeID) model.TypeLayout {
 		typ.Storage = model.TypeBytes
 	case 18, 19, 25, 194, 705, 1042, 1043, 2275:
 		typ.Storage = model.TypeString
+	case 2278:
+		if !b.options.allowPseudoTypes {
+			typ.Storage = model.TypeString
+		}
 	case 1700:
 		typ.Storage = model.TypeNumeric
 	case 1082, 1083, 1114, 1184:

@@ -45,13 +45,41 @@ func TestBindExplainAnalyzeSerializationDefaults(t *testing.T) {
 	}
 }
 
+func TestBindExplainBuffersOption(t *testing.T) {
+	for _, tc := range []struct {
+		sql     string
+		analyze bool
+		buffers bool
+		format  bind.ExplainFormat
+	}{
+		{`EXPLAIN (ANALYZE, BUFFERS) SELECT 1`, true, true, bind.ExplainText},
+		{`EXPLAIN (ANALYZE, BUFFERS true, FORMAT JSON) SELECT 1`, true, true, bind.ExplainJSON},
+		{`EXPLAIN (BUFFERS, FORMAT JSON) SELECT 1`, false, true, bind.ExplainJSON},
+		{`EXPLAIN (BUFFERS) SELECT 1`, false, true, bind.ExplainText},
+		{`EXPLAIN (ANALYZE, BUFFERS false) SELECT 1`, true, false, bind.ExplainText},
+		{`EXPLAIN (ANALYZE) SELECT 1`, true, false, bind.ExplainText},
+	} {
+		parsed, err := zpgparse.Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		bound, err := bind.BindCommand(t.Context(), parsed.Stmts[0], bindingOptions(tc.sql))
+		if err != nil {
+			t.Fatalf("%s: unexpected bind error: %v", tc.sql, err)
+		}
+		options := bound.Command().(bind.ExplainCommand).Options
+		if options.Analyze != tc.analyze || options.Buffers != tc.buffers || options.Format != tc.format {
+			t.Fatalf("%s: options=%+v, want analyze=%v buffers=%v format=%v", tc.sql, options, tc.analyze, tc.buffers, tc.format)
+		}
+	}
+}
+
 // TestBindExplainRejectsObservabilitySections pins the embedded-profile decision
-// for EXPLAIN BUFFERS/WAL/MEMORY: they parse, the ANALYZE consistency checks run
+// for EXPLAIN WAL/MEMORY: they parse, the ANALYZE consistency checks run
 // first, and an otherwise valid statement is rejected with 0A000
 // server_observability instead of silently dropping the section.
 func TestBindExplainRejectsObservabilitySections(t *testing.T) {
 	for _, sql := range []string{
-		`EXPLAIN (ANALYZE, BUFFERS) SELECT 1`,
 		`EXPLAIN (ANALYZE, WAL) SELECT 1`,
 		`EXPLAIN (MEMORY) SELECT 1`,
 		`EXPLAIN (ANALYZE, MEMORY) SELECT 1`,
@@ -71,20 +99,9 @@ func TestBindExplainRejectsObservabilitySections(t *testing.T) {
 		}
 	}
 
-	// Without ANALYZE the option-consistency check still reports 22023 first.
-	parsed, err := zpgparse.Parse(`EXPLAIN (BUFFERS) SELECT 1`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = bind.BindCommand(t.Context(), parsed.Stmts[0], bindingOptions(`EXPLAIN (BUFFERS) SELECT 1`)); err != nil {
-		requireCode(t, err, "22023")
-	} else {
-		t.Fatal("EXPLAIN (BUFFERS) without ANALYZE bound")
-	}
-
 	// An explicit false selects nothing, so the statement binds.
 	sql := `EXPLAIN (ANALYZE, BUFFERS false, WAL false, MEMORY false) SELECT 1`
-	parsed, err = zpgparse.Parse(sql)
+	parsed, err := zpgparse.Parse(sql)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +113,6 @@ func TestBindExplainRejectsObservabilitySections(t *testing.T) {
 func TestBindExplainRejectsExecutionOnlyOptionsWithoutAnalyze(t *testing.T) {
 	for _, sql := range []string{
 		`EXPLAIN (TIMING true) SELECT 1`,
-		`EXPLAIN (BUFFERS true) SELECT 1`,
 		`EXPLAIN (WAL true) SELECT 1`,
 		`EXPLAIN (SERIALIZE TEXT) SELECT 1`,
 		`EXPLAIN (ANALYZE, GENERIC_PLAN) SELECT 1`,

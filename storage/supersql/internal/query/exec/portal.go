@@ -65,9 +65,10 @@ type Environment struct {
 	// failure. BorrowQuery retains the caller's query instead, leaving the
 	// lifetime with whoever created it, which is required when the caller
 	// reuses one query across statements.
-	Query           *runtime.Query
-	BorrowQuery     bool
-	Instrumentation *Instrumentation
+	Query            *runtime.Query
+	BorrowQuery      bool
+	Instrumentation  *Instrumentation
+	BufferCacheStats BufferCacheStatsProvider
 	// Reader supplies this invocation's snapshot. It is owned by default: the
 	// portal closes it when releasing. BorrowReader retains the caller's reader
 	// instead, leaving its lifetime with whoever opened it, which is required
@@ -156,6 +157,13 @@ func Open(ctx context.Context, graph *fragment.FragmentGraph, env Environment) (
 		if err = env.Instrumentation.bind(graph.Plan()); err != nil {
 			return nil, err
 		}
+		provider := env.BufferCacheStats
+		if provider == nil {
+			if readerProvider, ok := env.Reader.(BufferCacheStatsProvider); ok {
+				provider = readerProvider
+			}
+		}
+		env.Instrumentation.beginBuffers(provider)
 	}
 	if err = preflight(graph, env); err != nil {
 		return nil, fmt.Errorf("execution preflight: %w", err)

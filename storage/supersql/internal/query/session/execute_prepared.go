@@ -238,6 +238,7 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 	}
 	constrainEnvironment(&options.Environment, resources.EffectiveWorkMemoryBytes, resources.EffectiveTempFileBytes)
 	operation = txn.WithLockTimeout(operation, resources.LockTimeout)
+	operation = builtin.WithNotifyRuntime(operation, transactions.notifyRuntime())
 	automatic := !transactions.active
 	if automatic {
 		if err = transactions.begin(operation, TransactionStart{Historical: execution.timestamp(), ImplicitReadOnly: execution.readOnlyHint}); err != nil {
@@ -272,6 +273,7 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 	deferredMark := len(transactions.deferredTriggers)
 	deferredConstraintMark := len(transactions.deferredConstraints)
 	deferredConstraintBytes := transactions.deferredConstraintBytes
+	notifyMark := len(transactions.pendingNotifications)
 	invocationGeneration := transactions.generation
 	defer func() {
 		if !completed {
@@ -309,6 +311,10 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 		clear(transactions.deferredConstraints[deferredConstraintMark:])
 		transactions.deferredConstraints = transactions.deferredConstraints[:deferredConstraintMark]
 		transactions.deferredConstraintBytes = deferredConstraintBytes
+	}
+	if err != nil && transactions.generation == invocationGeneration && notifyMark <= len(transactions.pendingNotifications) {
+		clear(transactions.pendingNotifications[notifyMark:])
+		transactions.pendingNotifications = transactions.pendingNotifications[:notifyMark]
 	}
 	completed = true
 	if err != nil {

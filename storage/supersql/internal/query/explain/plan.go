@@ -30,15 +30,16 @@ type Setting struct {
 }
 
 type Options struct {
-	Limits        Limits
-	Planning      *Planning
-	Analysis      *exec.Observation
-	AffectedRows  *uint64
-	SettingValues []Setting
-	Verbose       bool
-	Costs         bool
-	Summary       bool
-	Serialization string
+	Limits          Limits
+	Planning        *Planning
+	Analysis        *exec.Observation
+	AffectedRows    *uint64
+	SettingValues   []Setting
+	Verbose         bool
+	Costs           bool
+	Summary         bool
+	Buffers         bool
+	Serialization   string
 	SerializedBytes *uint64
 }
 
@@ -84,6 +85,17 @@ func WriteJSON(ctx context.Context, output io.Writer, graph *fragment.FragmentGr
 			w.fixed(usage.PeakReaders)
 			w.raw("}")
 		}
+	}
+	if options.Buffers {
+		buffers := explainBuffers(options.Analysis)
+		w.raw(`,"Shared Hit Blocks":`)
+		w.fixed(buffers.SharedHitBlocks)
+		w.raw(`,"Shared Read Blocks":`)
+		w.fixed(buffers.SharedReadBlocks)
+		w.raw(`,"Temp Read Blocks":`)
+		w.fixed(buffers.TempReadBlocks)
+		w.raw(`,"Temp Written Blocks":`)
+		w.fixed(buffers.TempWrittenBlocks)
 	}
 	if options.Serialization != "" {
 		w.raw(`,"Serialization":`)
@@ -150,7 +162,7 @@ func (w *jsonWriter) node(graph *fragment.FragmentGraph, id physical.NodeID, nod
 	w.raw(`{"Node ID":`)
 	w.fixed(id)
 	w.raw(`,"Algorithm":`)
-	w.text(algorithmName(node.Algorithm))
+	w.text(nodeAlgorithmName(node))
 	w.raw(`,"Logical":`)
 	w.fixed(node.Logical)
 	w.raw(`,"Effects":`)
@@ -279,6 +291,16 @@ func distributionName(kind physical.DistributionKind) string {
 	default:
 		return "Unknown"
 	}
+}
+
+func nodeAlgorithmName(node physical.NodeSpec) string {
+	if node.Algorithm == physical.SecondaryScan && node.Scan.GIN.Enabled {
+		if node.Scan.GIN.IndexName != "" && node.Scan.GIN.TableName != "" {
+			return "GIN Index Scan using " + node.Scan.GIN.IndexName + " on " + node.Scan.GIN.TableName
+		}
+		return "GIN Index Scan"
+	}
+	return algorithmName(node.Algorithm)
 }
 
 func algorithmName(algorithm physical.Algorithm) string {

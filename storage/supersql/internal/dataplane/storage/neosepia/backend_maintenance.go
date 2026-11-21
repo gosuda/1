@@ -193,7 +193,7 @@ func (backend *Backend) runMaintenance(ctx context.Context, requested *storage.O
 	if err != nil {
 		return err
 	}
-	preparation := backend.limits.preparation()
+	preparation := backend.preparationLimits()
 	preparation.File.MaxBytes = min(preparation.File.MaxBytes, compactionFileBytes)
 	prepared, err := newCompactedRuns(backend.directory.runs, fileID, preparation)
 	if err != nil {
@@ -462,7 +462,7 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 	if err := writeRunBase(ctx, backend.directory.runs, base, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles); err != nil {
 		return false, err
 	}
-	opened, err := backend.runs.openReplacementFiles(ctx, backend.directory.runs, descriptors, fragments, backend.limits.preparation().File, backend.limits.ResidentBytes)
+	opened, err := backend.runs.openReplacementFiles(ctx, backend.directory.runs, descriptors, fragments, backend.preparationLimits().File, backend.limits.ResidentBytes)
 	if err != nil {
 		return false, errors.Join(err, backend.removeUnpublishedBase(generation))
 	}
@@ -568,6 +568,11 @@ func (backend *Backend) cleanupSupersededRunMetadata(ctx context.Context, base r
 			return err
 		}
 	}
+	if backend.archiver != nil {
+		if err := backend.archiver.archiveBeforeRetire(ctx, backend.directory.commits, base.Position, backend.limits.recovery().Batch); err != nil {
+			return err
+		}
+	}
 	return retireCoveredWAL(ctx, backend.directory.commits, base.Position)
 }
 
@@ -578,6 +583,11 @@ func (backend *Backend) retireRecoveredWAL(ctx context.Context) error {
 	base, err := loadRunBase(ctx, backend.directory.runs, backend.state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles)
 	if err != nil {
 		return err
+	}
+	if backend.archiver != nil {
+		if err := backend.archiver.archiveBeforeRetire(ctx, backend.directory.commits, base.Position, backend.limits.recovery().Batch); err != nil {
+			return err
+		}
 	}
 	return retireCoveredWAL(ctx, backend.directory.commits, base.Position)
 }

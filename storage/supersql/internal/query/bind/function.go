@@ -68,6 +68,9 @@ func (b *binder) invokeResult(s *scope, sig builtin.Signature, op model.Operator
 	if err := ValidateBuiltinFunction(sig.ID, pos); err != nil {
 		return expression{}, err
 	}
+	if result.Type.ID == 2278 && result.Type.Storage == model.TypeAny {
+		result.Type.Storage = model.TypeString
+	}
 	if result.Type.Storage == model.TypeAny {
 		return expression{}, missing("physical layout for resolved function result", pos)
 	}
@@ -521,8 +524,11 @@ func (b *binder) userRoutine(schema, name string, call callArguments, s *scope, 
 	}
 	b.dependency(namespace.Descriptor, 0)
 	b.dependency(selected, 0)
-	if metadata.SecurityDefiner {
-		return expression{}, false, unsupported(Authorization, pos)
+	if err := b.checkSchemaUsage(namespace.Descriptor, pos); err != nil {
+		return expression{}, false, err
+	}
+	if err := b.checkObjectPrivilege(selected, model.PrivilegeExecute, pos); err != nil {
+		return expression{}, false, err
 	}
 	if metadata.Language != "sql" && metadata.Language != "plpgsql" {
 		return expression{}, false, unsupported(ExternalCode, pos)
@@ -532,8 +538,8 @@ func (b *binder) userRoutine(schema, name string, call callArguments, s *scope, 
 		if err != nil {
 			return expression{}, false, err
 		}
-		if published.Descriptor.Version() != dep.Version {
-			return expression{}, false, bindError("0A000", "routine dependency version changed", pos)
+		if published.Descriptor == nil || published.Descriptor.State() != model.StatePublic {
+			return expression{}, false, bindError("0A000", "routine dependency is no longer available", pos)
 		}
 		b.dependency(published.Descriptor, dep.Column)
 	}

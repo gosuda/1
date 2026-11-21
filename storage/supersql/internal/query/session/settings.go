@@ -72,10 +72,11 @@ type SettingResult struct {
 // transaction outcomes. Errors leave settings unchanged; transaction abort
 // handling belongs to that orchestrator.
 type Settings struct {
-	mu       sync.RWMutex
-	resolver SettingResolver
-	limits   SettingLimits
-	state    settingState
+	mu                   sync.RWMutex
+	resolver             SettingResolver
+	limits               SettingLimits
+	state                settingState
+	securityDefinerDepth int
 }
 
 type settingState struct {
@@ -221,6 +222,44 @@ func (s *Settings) ResetRole(ctx context.Context, local bool) error {
 		s.state.retainedRole = ""
 	}
 	return nil
+}
+
+// pushSecurityDefinerRole temporarily switches the active role to ownerName
+// for a SECURITY DEFINER routine invocation and returns the previous raw role
+// fields so popSecurityDefinerRole restores them unconditionally on exit.
+func (s *Settings) pushSecurityDefinerRole(ownerName string) (prevCurrent, prevRetained string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prevCurrent, prevRetained = s.state.currentRole, s.state.retainedRole
+	s.securityDefinerDepth++
+	normalized := strings.ToLower(strings.TrimSpace(ownerName))
+	if normalized == "" || normalized == "embedded" || normalized == "supersql" || normalized == "postgres" {
+		s.state.currentRole = "supersql"
+	} else {
+		s.state.currentRole = strings.Clone(normalized)
+	}
+	return prevCurrent, prevRetained
+}
+
+func (s *Settings) popSecurityDefinerRole(prevCurrent, prevRetained string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.securityDefinerDepth > 0 {
+		s.securityDefinerDepth--
+	}
+	s.state.currentRole = prevCurrent
+	s.state.retainedRole = prevRetained
+}
+
+// InSecurityDefiner reports whether execution is currently inside one or more
+// SECURITY DEFINER routine frames.
+func (s *Settings) InSecurityDefiner() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.securityDefinerDepth > 0
 }
 
 // SetSessionUser updates the protected session_user identity and resets the

@@ -158,7 +158,7 @@ func (backend *Backend) resolveMetadata(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		files, err := openBaseFiles(ctx, backend.directory.runs, base.Files, backend.limits.preparation().File, backend.limits.ResidentBytes)
+		files, err := openBaseFiles(ctx, backend.directory.runs, base.Files, backend.preparationLimits().File, backend.limits.ResidentBytes)
 		if err != nil {
 			return err
 		}

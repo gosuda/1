@@ -20,7 +20,7 @@ docs/reference by internal/tools/docgen.
 
 ## Constants
 
-### `DefaultMaintenanceInterval, MinMaintenanceInterval, DefaultWALThreshold, DefaultRunThreshold, DefaultMaxRetiredTargets`
+### `DefaultMaintenanceInterval, MinMaintenanceInterval, DefaultWALThreshold, DefaultRunThreshold, DefaultMaxRetiredTargets, DefaultAutoAnalyzeMinRows, DefaultAutoAnalyzeScaleFactor`
 
 ```go
 const (
@@ -36,6 +36,12 @@ const (
 	DefaultRunThreshold	= 64
 	// DefaultMaxRetiredTargets caps the retired objects one pass collects.
 	DefaultMaxRetiredTargets	= 1024
+	// DefaultAutoAnalyzeMinRows is the default base mutation count that triggers
+	// automatic ANALYZE on a table.
+	DefaultAutoAnalyzeMinRows	uint64	= 50
+	// DefaultAutoAnalyzeScaleFactor is the default fraction of live rows added
+	// to AutoAnalyzeMinRows before automatic ANALYZE triggers.
+	DefaultAutoAnalyzeScaleFactor	= 0.2
 )
 ```
 
@@ -70,7 +76,33 @@ fails verification.
 var ErrCorruptBackup = errors.New("corrupted backup manifest or file checksum mismatch")
 ```
 
+### `ErrInvalidEncryptionKey`
+
+ErrInvalidEncryptionKey reports a missing, malformed, or mismatched 32-byte
+AES-256-GCM encryption key during encrypted backup, restore, or WAL archiving.
+
+
+```go
+// ErrInvalidEncryptionKey reports a missing, malformed, or mismatched 32-byte
+// AES-256-GCM encryption key during encrypted backup, restore, or WAL archiving.
+var ErrInvalidEncryptionKey = errors.New("supersql: invalid or missing encryption key")
+```
+
 ## Functions
+
+### `func RestorePITR(ctx context.Context, baseBackupDir string, walArchiveDir string, targetTS clock.Instant, options PITRRestoreOptions) (*Catalog, PITRResult, error)`
+
+RestorePITR restores baseBackupDir into options.Open.Directory, replays every
+contiguous archived WAL segment from walArchiveDir with commitTS <= targetTS,
+and opens the recovered database strictly at or before targetTS.
+
+
+### `func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir string, targetTS clock.Instant, options PITRRestoreOptions) (*Catalog, PITRResult, error)`
+
+RestorePITRFromChain restores an incremental backup chain into
+options.Open.Directory, replays contiguous archived WAL segments from
+walArchiveDir with commitTS <= targetTS, and opens the recovered database.
+
 
 ### `func SQLState(err error) string`
 
@@ -79,6 +111,23 @@ engine, or the empty string when the error has no SQLSTATE.
 
 
 ## Types
+
+### `type BackupOptions`
+
+BackupOptions configures full hot checkpoint backups created by
+Catalog.CreateHotBackupWithOptions.
+
+
+```go
+// BackupOptions configures full hot checkpoint backups created by
+// Catalog.CreateHotBackupWithOptions.
+type BackupOptions struct {
+	// EncryptionKey optionally enables pure-Go AES-256-GCM at-rest encryption
+	// for every file written to the backup directory. When non-empty, it must
+	// be exactly 32 bytes.
+	EncryptionKey []byte
+}
+```
 
 ### `type Catalog`
 
@@ -114,6 +163,22 @@ restored frontier, while HistoricalReadOnly serves retained snapshots without
 a synchronized clock.
 
 
+#### `func RestoreEncryptedCheckpoint(ctx context.Context, backupDir string, encryptionKey []byte, options OpenOptions) (*Catalog, error)`
+
+RestoreEncryptedCheckpoint restores an encrypted (or unencrypted) full
+checkpoint backup from backupDir into options.Directory, verifies the
+encryption key fingerprint, file checksums, and certified read fence, then
+opens the restored database under Open's readiness rules.
+
+
+#### `func RestoreIncremental(ctx context.Context, chainDirs []string, options IncrementalRestoreOptions) (*Catalog, error)`
+
+RestoreIncremental validates a full-plus-incremental backup chain
+[baseDir, inc1Dir, ...], verifies parent lineage, decryption keys, checksums,
+and certified read fence, reconstructs the database at options.Open.Directory,
+and opens it.
+
+
 #### `func (database *Catalog) Close() error`
 
 Close releases the session, allocator, transaction manager, backend and
@@ -146,9 +211,32 @@ it at a destination. Historical-only databases re-publish their persisted
 closed frontier.
 
 
+#### `func (database *Catalog) CreateHotBackupWithOptions(ctx context.Context, targetDir string, options BackupOptions) error`
+
+CreateHotBackupWithOptions captures one certified closed snapshot into
+targetDir, optionally encrypting every backed-up file with AES-256-GCM when
+options.EncryptionKey is provided.
+
+
+#### `func (database *Catalog) CreateIncrementalBackup(ctx context.Context, baseBackupDir string, options IncrementalBackupOptions) (IncrementalBackupInfo, error)`
+
+CreateIncrementalBackup captures one certified closed snapshot relative to
+baseBackupDir (a full backup or an earlier incremental backup) into
+options.Destination, copying only newly created or modified files and
+recording unchanged files as inherited references.
+
+
 #### `func (database *Catalog) Directory() string`
 
 Directory reports the database directory this instance was opened on.
+
+
+#### `func (database *Catalog) EnableWALArchive(ctx context.Context, archiveDir string, encryptionKey []byte) error`
+
+EnableWALArchive enables atomic WAL segment archiving on an open database.
+Every existing unretired WAL segment and every subsequent durable commit WAL
+segment is atomically copied to archiveDir (encrypted with AES-256-GCM when
+encryptionKey is non-empty) before WAL retirement can unlink it.
 
 
 #### `func (database *Catalog) MaintenanceError() error`
@@ -157,6 +245,33 @@ MaintenanceError reports the most recent background maintenance failure, or
 nil when every pass since Open succeeded. The loop exits on a fatal failure
 and delivers it to Close; a long-running host observes the same error here
 without closing the database.
+
+
+#### `func (database *Catalog) Metrics(ctx context.Context) DatabaseMetrics`
+
+Metrics returns a live snapshot of query, auto-ANALYZE, storage backlog, and
+block-cache counters for the database.
+
+
+#### `func (database *Catalog) Notify(channel, payload string) error`
+
+Notify publishes a notification directly to all listeners on channel.
+It validates PostgreSQL channel (<= 63 bytes, non-empty) and payload
+(<= 8000 bytes) limits.
+
+
+#### `func (database *Catalog) RunAutoAnalyze(ctx context.Context) (int, error)`
+
+RunAutoAnalyze executes ANALYZE on every table whose accumulated mutations
+have reached the configured auto-ANALYZE threshold, resetting each analyzed
+table's pending mutation counter. It returns the number of tables analyzed.
+
+
+#### `func (database *Catalog) Subscribe(channels ...string) *Subscription`
+
+Subscribe registers an in-process Go listener on one or more PostgreSQL
+LISTEN/NOTIFY channels. Channel names are normalized case-insensitively like
+unquoted SQL identifiers.
 
 
 ### `type CompactionConfig`
@@ -340,6 +455,29 @@ type CopyResult struct {
 }
 ```
 
+### `type DatabaseMetrics`
+
+DatabaseMetrics is a point-in-time snapshot of query, maintenance, storage,
+and block-cache counters for an opened Catalog.
+
+
+```go
+// DatabaseMetrics is a point-in-time snapshot of query, maintenance, storage,
+// and block-cache counters for an opened Catalog.
+type DatabaseMetrics struct {
+	QueriesTotal		uint64
+	QueriesFailed		uint64
+	SlowQueriesTotal	uint64
+	AutoAnalyzeRuns		uint64
+	WALSegments		uint64
+	LiveRunFiles		uint64
+	UncompactedRunFiles	uint64
+	BlockCacheHits		uint64
+	BlockCacheMisses	uint64
+	BlockCacheEntries	uint64
+}
+```
+
 ### `type Driver`
 
 Driver cannot construct a connection by itself: a certified clock is not
@@ -404,6 +542,63 @@ diagnostic.
 Unwrap returns the underlying cause error, if any.
 
 
+### `type IncrementalBackupInfo`
+
+IncrementalBackupInfo summarizes one published incremental backup artifact.
+
+
+```go
+// IncrementalBackupInfo summarizes one published incremental backup artifact.
+type IncrementalBackupInfo struct {
+	BackupID		string
+	ParentBackupID		string
+	BaseSnapshotTS		clock.Instant
+	SnapshotTS		clock.Instant
+	Encrypted		bool
+	KeyFingerprint		string
+	ChangedFileCount	int
+	InheritedFileCount	int
+	ChangedFiles		[]string
+	InheritedFiles		[]string
+}
+```
+
+### `type IncrementalBackupOptions`
+
+IncrementalBackupOptions configures an incremental checkpoint backup created
+by Catalog.CreateIncrementalBackup.
+
+
+```go
+// IncrementalBackupOptions configures an incremental checkpoint backup created
+// by Catalog.CreateIncrementalBackup.
+type IncrementalBackupOptions struct {
+	// Destination is the target directory for the incremental backup artifact.
+	// It must be missing or empty with an existing parent directory.
+	Destination	string
+	// EncryptionKey optionally enables pure-Go AES-256-GCM encryption for all
+	// changed files copied into Destination. When non-empty, it must be 32 bytes.
+	EncryptionKey	[]byte
+}
+```
+
+### `type IncrementalRestoreOptions`
+
+IncrementalRestoreOptions configures RestoreIncremental.
+
+
+```go
+// IncrementalRestoreOptions configures RestoreIncremental.
+type IncrementalRestoreOptions struct {
+	// Open supplies the destination directory, clock, compaction limits, and
+	// readiness policy used to open the reconstructed database.
+	Open	OpenOptions
+	// EncryptionKey provides the 32-byte AES-256-GCM key required whenever any
+	// hop in the backup chain is encrypted.
+	EncryptionKey	[]byte
+}
+```
+
 ### `type MaintenanceConfig`
 
 MaintenanceConfig bounds the background maintenance loop started by Open.
@@ -431,6 +626,31 @@ type MaintenanceConfig struct {
 	// MaxRetiredTargets caps the retired objects one pass collects. Zero selects
 	// DefaultMaxRetiredTargets.
 	MaxRetiredTargets	uint64
+	// AutoAnalyzeDisabled stops background maintenance from automatically
+	// running ANALYZE on mutated tables.
+	AutoAnalyzeDisabled	bool
+	// AutoAnalyzeMinRows is the base mutation count required before auto-ANALYZE
+	// triggers on a table. Zero selects DefaultAutoAnalyzeMinRows.
+	AutoAnalyzeMinRows	uint64
+	// AutoAnalyzeScaleFactor scales the auto-ANALYZE trigger threshold by the
+	// table's last analyzed live row count. Zero selects
+	// DefaultAutoAnalyzeScaleFactor; negative values are rejected by Open.
+	AutoAnalyzeScaleFactor	float64
+}
+```
+
+### `type Notification`
+
+Notification represents a committed PostgreSQL LISTEN/NOTIFY event.
+
+
+```go
+// Notification represents a committed PostgreSQL LISTEN/NOTIFY event.
+type Notification struct {
+	Channel		string
+	Payload		string
+	PID		uint64
+	Timestamp	time.Time
 }
 ```
 
@@ -476,8 +696,149 @@ type OpenOptions struct {
 	MaxTransactions	int
 	// MaxOperations overrides the maximum concurrent snapshot/read operations (default 64).
 	MaxOperations	int
+	// Observer receives one QueryEvent after each completed SQL statement.
+	// Nil disables per-query observer notifications.
+	Observer	QueryObserver
+	// SlowQueryThreshold marks statements whose duration meets or exceeds this
+	// value as slow queries. Zero disables slow-query tracking; negative values
+	// are rejected by Open.
+	SlowQueryThreshold	time.Duration
+	// OnSlowQuery is invoked when a statement's duration meets or exceeds
+	// SlowQueryThreshold. Nil disables the callback while still incrementing
+	// DatabaseMetrics.SlowQueriesTotal when SlowQueryThreshold > 0.
+	OnSlowQuery	func(context.Context, QueryEvent)
+	// EncryptionKey enables optional pure-Go AES-256-GCM at-rest encryption for
+	// newly written SST runs, WAL files, and encrypted backups when set to a
+	// 32-byte key. Nil disables at-rest encryption.
+	EncryptionKey	[]byte
+	// WALArchiveDir enables continuous WAL segment archiving into the given
+	// directory for Point-in-Time Recovery (PITR). Empty disables WAL archiving.
+	WALArchiveDir	string
+	// WALArchiveKey optionally encrypts archived WAL segments with a 32-byte
+	// AES-256-GCM key when WALArchiveDir is set.
+	WALArchiveKey	[]byte
 }
 ```
+
+### `type PITRRestoreOptions`
+
+PITRRestoreOptions configures Point-in-Time Recovery via RestorePITR and
+RestorePITRFromChain.
+
+
+```go
+// PITRRestoreOptions configures Point-in-Time Recovery via RestorePITR and
+// RestorePITRFromChain.
+type PITRRestoreOptions struct {
+	// Open supplies the destination directory, clock, compaction limits, and
+	// readiness policy used to open the recovered database.
+	Open	OpenOptions
+	// EncryptionKey provides the 32-byte AES-256-GCM key required when the base
+	// backup (or chain) is encrypted.
+	EncryptionKey	[]byte
+	// WALArchiveKey optionally specifies a separate 32-byte AES-256-GCM key for
+	// encrypted WAL archive segments; when empty, EncryptionKey is used.
+	WALArchiveKey	[]byte
+}
+```
+
+### `type PITRResult`
+
+PITRResult summarizes one completed Point-in-Time Recovery restore.
+
+
+```go
+// PITRResult summarizes one completed Point-in-Time Recovery restore.
+type PITRResult struct {
+	BaseLogPosition		uint64
+	BaseSnapshotTS		clock.Instant
+	TargetTS		clock.Instant
+	RecoveredLogPosition	uint64
+	RecoveredCommitTS	clock.Instant
+	ReplayedSegments	uint64
+}
+```
+
+### `type QueryEvent`
+
+QueryEvent carries per-statement execution metrics delivered to a
+QueryObserver or OnSlowQuery callback after statement completion.
+
+
+```go
+// QueryEvent carries per-statement execution metrics delivered to a
+// QueryObserver or OnSlowQuery callback after statement completion.
+type QueryEvent struct {
+	SQL			string
+	Duration		time.Duration
+	PlanningDuration	time.Duration
+	RowsAffected		uint64
+	SharedHitBlocks		uint64
+	SharedReadBlocks	uint64
+	SpillBytes		uint64
+	Err			error
+}
+```
+
+### `type QueryObserver`
+
+QueryObserver receives one QueryEvent for each completed SQL statement.
+Implementations must be safe for concurrent invocation across sessions.
+
+
+```go
+// QueryObserver receives one QueryEvent for each completed SQL statement.
+// Implementations must be safe for concurrent invocation across sessions.
+type QueryObserver interface {
+	OnQuery(ctx context.Context, event QueryEvent)
+}
+```
+
+### `type QueryObserverFunc`
+
+QueryObserverFunc adapts an ordinary function to QueryObserver.
+
+
+```go
+// QueryObserverFunc adapts an ordinary function to QueryObserver.
+type QueryObserverFunc func(ctx context.Context, event QueryEvent)
+```
+
+#### `func (fn QueryObserverFunc) OnQuery(ctx context.Context, event QueryEvent)`
+
+OnQuery invokes fn(ctx, event).
+
+
+### `type Subscription`
+
+Subscription delivers committed notifications for one or more channels
+directly to in-process Go callers. Call Close when done to release resources.
+
+
+```go
+// Subscription delivers committed notifications for one or more channels
+// directly to in-process Go callers. Call Close when done to release resources.
+type Subscription struct {
+	// contains filtered or unexported fields
+}
+```
+
+#### `func (s *Subscription) C() <-chan Notification`
+
+C returns a receive-only channel of committed notifications. The channel
+closes after Close is called.
+
+
+#### `func (s *Subscription) Close()`
+
+Close unsubscribes from all channels and stops background delivery.
+
+
+#### `func (s *Subscription) Wait(ctx context.Context) (Notification, error)`
+
+Wait blocks until the next notification arrives, ctx is canceled, or the
+subscription is closed.
+
 
 ### `type UpgradeRequired`
 

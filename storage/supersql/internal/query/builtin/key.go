@@ -30,18 +30,19 @@ func (e *MissingKeyImplementationError) MissingKeyImplementation() bool { return
 type KeyEncoder struct {
 	defaultCollation       model.CollationID
 	types                  TypeResolver
+	collations             CollationResolver
 	informationSchemaTypes InformationSchemaTypeResolver
 }
 
 var _ storage.KeyEncoder = (*KeyEncoder)(nil)
 
-// NewKeyEncoder accepts default (0 or 100), C (950), or POSIX (951).
+// NewKeyEncoder accepts default (0 or 100), C (950), POSIX (951), or supported ICU collations.
 func NewKeyEncoder(defaultCollation model.CollationID) (*KeyEncoder, error) {
 	if defaultCollation == 0 || defaultCollation == 100 {
 		defaultCollation = 950
 	}
-	if defaultCollation != 950 && defaultCollation != 951 {
-		return nil, sqlError("42P22", "SQL keys require C or POSIX collation")
+	if !IsSupportedCollation(defaultCollation, nil) {
+		return nil, sqlError("42P22", "SQL keys require a supported collation")
 	}
 	return &KeyEncoder{defaultCollation: defaultCollation}, nil
 }
@@ -53,6 +54,9 @@ func (e *KeyEncoder) WithTypes(types TypeResolver) *KeyEncoder {
 	}
 	copy := *e
 	copy.types = types
+	if cr, ok := types.(CollationResolver); ok {
+		copy.collations = cr
+	}
 	return &copy
 }
 
@@ -63,6 +67,7 @@ func (e *KeyEncoder) WithResolveOptions(options ResolveOptions) *KeyEncoder {
 	}
 	copy := *e
 	copy.types = options.Types
+	copy.collations = effectiveCollationResolver(options)
 	copy.informationSchemaTypes = options.InformationSchemaTypes
 	return &copy
 }
@@ -202,10 +207,20 @@ func (e *KeyEncoder) validateKeyType(typ model.Type) error {
 	if collation == 100 {
 		collation = cmp.Or(e.defaultCollation, model.CollationID(950))
 	}
-	if collation != 950 && collation != 951 {
-		return sqlError("42P22", "SQL text key requires a resolved C or POSIX collation")
+	if !IsSupportedCollation(collation, e.collations) {
+		return sqlError("42P22", "SQL text key requires a supported collation")
 	}
 	return nil
+}
+
+func (e *KeyEncoder) resolveKeyCollation(coll model.CollationID) model.CollationID {
+	if coll == 100 {
+		if e != nil && e.defaultCollation != 0 {
+			return e.defaultCollation
+		}
+		return 950
+	}
+	return coll
 }
 
 func keyTextLength(ctx context.Context, typ model.Type, text string) (int, error) {
@@ -224,6 +239,10 @@ func keyTextLength(ctx context.Context, typ model.Type, text string) (int, error
 }
 
 func keyFieldSize(ctx context.Context, typ model.Type, value *model.Value, budget uint64) (uint64, error) {
+	return (*KeyEncoder)(nil).keyFieldSize(ctx, typ, value, budget)
+}
+
+func (e *KeyEncoder) keyFieldSize(ctx context.Context, typ model.Type, value *model.Value, budget uint64) (uint64, error) {
 	if value.Type != typ.Storage {
 		return 0, sqlError("42804", "SQL key value storage does not match its type")
 	}
@@ -301,15 +320,39 @@ func keyFieldSize(ctx context.Context, typ model.Type, value *model.Value, budge
 			if err != nil {
 				return 0, err
 			}
+			if _, err := textCharacters(ctx, value.StrVal[:length]); err != nil {
+				return 0, err
+			}
+			coll := e.resolveKeyCollation(typ.Collation)
+			if coll != 0 && !IsBinaryCollation(coll) {
+				var resolver CollationResolver
+				if e != nil {
+					resolver = e.collations
+				}
+				sortKey, spec, err := CollationSortKey(coll, resolver, value.StrVal[:length])
+				if err != nil {
+					return 0, err
+				}
+				size += uint64(len(sortKey)) + 2
+				for _, b := range sortKey {
+					if b == 0 {
+						size++
+					}
+				}
+				if spec.Deterministic {
+					size += uint64(length) + 2
+				}
+				if size > budget {
+					return 0, columnar.ErrBatchBudget
+				}
+				return size, nil
+			}
 		}
 		size += uint64(length) + 2
 		if size > budget {
 			return 0, columnar.ErrBatchBudget
 		}
 		if typ.Storage == model.TypeString {
-			if _, err := textCharacters(ctx, value.StrVal[:length]); err != nil {
-				return 0, err
-			}
 			return size, nil
 		}
 		for i, b := range value.BytesVal {
@@ -333,6 +376,10 @@ func keyFieldSize(ctx context.Context, typ model.Type, value *model.Value, budge
 }
 
 func appendKeyValue(ctx context.Context, key []byte, column *storage.KeyColumn, value *model.Value) ([]byte, error) {
+	return (*KeyEncoder)(nil).appendKeyValue(ctx, key, column, value)
+}
+
+func (e *KeyEncoder) appendKeyValue(ctx context.Context, key []byte, column *storage.KeyColumn, value *model.Value) ([]byte, error) {
 	mask := byte(0)
 	if column.Descending {
 		mask = 0xff
@@ -370,6 +417,35 @@ func appendKeyValue(ctx context.Context, key []byte, column *storage.KeyColumn, 
 			length, err = keyTextLength(ctx, column.Type, value.StrVal)
 			if err != nil {
 				return nil, err
+			}
+			coll := e.resolveKeyCollation(column.Type.Collation)
+			if coll != 0 && !IsBinaryCollation(coll) {
+				var resolver CollationResolver
+				if e != nil {
+					resolver = e.collations
+				}
+				sortKey, spec, err := CollationSortKey(coll, resolver, value.StrVal[:length])
+				if err != nil {
+					return nil, err
+				}
+				for _, b := range sortKey {
+					key = append(key, b^mask)
+					if b == 0 {
+						key = append(key, 0xff^mask)
+					}
+				}
+				key = append(key, mask, mask)
+				if spec.Deterministic {
+					for i := range length {
+						b := value.StrVal[i]
+						key = append(key, b^mask)
+						if b == 0 {
+							key = append(key, 0xff^mask)
+						}
+					}
+					key = append(key, mask, mask)
+				}
+				return key, nil
 			}
 		}
 		for i := range length {

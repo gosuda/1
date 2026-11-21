@@ -150,6 +150,7 @@ type Program struct {
 	procedure       bool
 	atomic          bool
 	securityDefiner bool
+	ownerName       string
 	returnsSet      bool
 	result          model.TypeLayout
 	settings        []model.RoutineSetting

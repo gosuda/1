@@ -31,7 +31,8 @@ func compileBtreeComparison(signature Signature, options ResolveOptions) scalarK
 		if collation == 100 {
 			collation = options.DefaultCollation
 		}
-		indeterminate := collation != 950 && collation != 951
+		collations := effectiveCollationResolver(options)
+		indeterminate := !IsSupportedCollation(collation, collations)
 		op := opCmp
 		switch signature.ID {
 		case 62, 240, 247:
@@ -57,7 +58,7 @@ func compileBtreeComparison(signature Signature, options ResolveOptions) scalarK
 			if _, err := textCharacters(ctx, args[1].StrVal); err != nil {
 				return model.Value{}, err
 			}
-			order, err := compareText(ctx, args[0].StrVal, args[1].StrVal)
+			order, err := CompareCollationText(ctx, collation, collations, args[0].StrVal, args[1].StrVal)
 			if err != nil {
 				return model.Value{}, err
 			}

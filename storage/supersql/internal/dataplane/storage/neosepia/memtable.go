@@ -691,7 +691,7 @@ func encodeMemEntriesBlock(ctx context.Context, layout storage.ObjectLayout, ent
 // flushToRuns writes commits [firstPos .. maxPos] from the memtable into
 // coalesced NSSST004 PAX SST files and a run manifest (NSRUNS01 if single
 // commit, NSRUNS02 if multiple), admits them into runs, and trims the memtable.
-func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runSet, limits Limits, maxPos uint64) (err error) {
+func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runSet, limits Limits, c *storageCipher, maxPos uint64) (err error) {
 	if m.empty() {
 		return nil
 	}
@@ -707,6 +707,7 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 	isPartial := flushCount < len(m.commits)
 
 	prepLimits := limits.preparation()
+	prepLimits.File.cipher = c
 	prepared := &preparedRuns{root: runsRoot, metadataBytes: uint64(unsafe.Sizeof(preparedRuns{}))}
 	defer func() {
 		if err != nil {

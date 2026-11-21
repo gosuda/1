@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -134,8 +135,20 @@ func (f *indexOwnerLookupFactory) Open(ctx context.Context, left []model.Value) 
 	if decodeBytes == 0 {
 		return nil, errors.Join(columnar.ErrBatchBudget, probe.Close())
 	}
-	values, err := f.decoder.DecodeKey(ctx, f.scan.Request.KeyLayout, left[f.owner].BytesVal, decodeBytes)
+	ownerKey := left[f.owner].BytesVal
+	values, err := f.decoder.DecodeKey(ctx, f.scan.Request.KeyLayout, ownerKey, decodeBytes)
 	if err != nil {
+		if errors.Is(err, storage.ErrInvalidEncoding) {
+			// Primary keys with non-deterministic ICU collations encode lossy UCA
+			// sort keys and cannot be decoded back to SQL text; probe the base
+			// table directly by the exact encoded owner key bytes instead.
+			direct, directErr := f.openDirectOwnerLookup(ctx, ownerKey, limit-fixed)
+			if directErr != nil {
+				return nil, errors.Join(directErr, probe.Close())
+			}
+			probe.cursor = direct
+			return probe, nil
+		}
 		return nil, errors.Join(err, probe.Close())
 	}
 	prefix := storage.KeySpan{Lower: storage.KeyBound{Values: values, Inclusive: true}, Upper: storage.KeyBound{Values: values, Inclusive: true}}
@@ -157,6 +170,106 @@ func (f *indexOwnerLookupFactory) Open(ctx context.Context, left []model.Value) 
 	cursor := &scanCursor{reader: f.env.Reader, spec: spec, decision: decision, maxBytes: limit, releasePlan: true, ignoreOrdering: true}
 	probe.cursor = &exactRowCursor{cursor: cursor}
 	return probe, nil
+}
+
+func (f *indexOwnerLookupFactory) openDirectOwnerLookup(ctx context.Context, ownerKey []byte, maxBytes uint64) (storage.BatchCursor, error) {
+	if len(f.scan.Request.Spans) > 0 {
+		matched, err := f.ownerKeyInSpans(ctx, ownerKey, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			return nil, ErrCapability
+		}
+	}
+	layouts := make([]model.TypeLayout, len(f.scan.Projection))
+	for i, colID := range f.scan.Projection {
+		layout, ok := lookupColumnLayout(f.scan.Request.Layout, colID)
+		if !ok {
+			return nil, ErrCapability
+		}
+		layouts[i] = layout
+	}
+	return &directOwnerRowCursor{
+		env:     f.env,
+		req:     storage.ReadRequest{Target: f.scan.Request.Target, Key: bytes.Clone(ownerKey), Layout: f.scan.Request.Layout, ColumnIDs: f.scan.Projection},
+		layouts: layouts,
+	}, nil
+}
+
+func (f *indexOwnerLookupFactory) ownerKeyInSpans(ctx context.Context, ownerKey []byte, maxBytes uint64) (bool, error) {
+	for _, span := range f.scan.Request.Spans {
+		if !span.Lower.Unbounded {
+			lower, err := f.env.Keys.EncodePrefix(ctx, f.scan.Request.KeyLayout, span.Lower.Values, maxBytes)
+			if err != nil {
+				return false, err
+			}
+			cmp := bytes.Compare(ownerKey, lower)
+			if cmp < 0 || (cmp == 0 && !span.Lower.Inclusive) {
+				continue
+			}
+		}
+		if !span.Upper.Unbounded {
+			upper, err := f.env.Keys.EncodePrefix(ctx, f.scan.Request.KeyLayout, span.Upper.Values, maxBytes)
+			if err != nil {
+				return false, err
+			}
+			cmp := bytes.Compare(ownerKey, upper)
+			if cmp > 0 || (cmp == 0 && !span.Upper.Inclusive) {
+				continue
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+type directOwnerRowCursor struct {
+	env     *Environment
+	req     storage.ReadRequest
+	layouts []model.TypeLayout
+	output  *columnar.Builder
+	done    bool
+}
+
+func (c *directOwnerRowCursor) Next(ctx context.Context, out *columnar.Batch) error {
+	if c.done {
+		out.Reset()
+		return io.EOF
+	}
+	c.done = true
+	row, err := c.env.Reader.Get(ctx, c.req)
+	if err != nil {
+		if errors.Is(err, storage.ErrRowNotFound) {
+			return ErrCapability
+		}
+		return err
+	}
+	if row.Deleted || len(row.Values) != len(c.layouts) {
+		return ErrCapability
+	}
+	if c.output == nil {
+		c.output, err = builder(c.env, c.layouts)
+		if err != nil {
+			return err
+		}
+	} else {
+		c.output.Reset()
+	}
+	if err := c.output.Append(ctx, row.Values); err != nil {
+		return err
+	}
+	return c.output.Publish(out)
+}
+
+func (c *directOwnerRowCursor) Close() error {
+	c.done = true
+	if c.output != nil {
+		err := c.output.Close()
+		c.output = nil
+		return err
+	}
+	return nil
 }
 
 type exactRowCursor struct {
@@ -210,7 +323,7 @@ type lookupFactory struct {
 
 func (c *invocation) lookup(node physical.NodeSpec, children []storage.BatchCursor, options exjoin.Options) (storage.BatchCursor, error) {
 	right := &c.prepared.nodes[node.Children[1]]
-	if right.node.Algorithm != physical.PrimaryKeyScan && right.node.Algorithm != physical.SecondaryScan {
+	if (right.node.Algorithm != physical.PrimaryKeyScan && right.node.Algorithm != physical.SecondaryScan) || right.node.Scan.GIN.Enabled {
 		return nil, ErrCapability
 	}
 	spec := right.node.Scan

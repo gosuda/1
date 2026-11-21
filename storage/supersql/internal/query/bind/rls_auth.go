@@ -248,24 +248,23 @@ func (b *binder) requireTableOwner(table *model.Descriptor, position int) error 
 	if roleIsSuperuser(roles, b.options.CurrentRole) {
 		return nil
 	}
-	ownerName := ""
-	switch table.Kind() {
-	case model.ObjectTable, model.ObjectMaterializedView:
-		if meta, ok := table.Table(); ok {
-			ownerName = meta.OwnerName
+	ownerName := table.OwnerName()
+	if table.Kind() == model.ObjectIndex {
+		meta, ok := table.Index()
+		if !ok || meta.Table == 0 {
+			return bindError("42501", fmt.Sprintf("must be owner of %s %s", ownerObjectKindLabel(table.Kind()), table.Name().Name), position)
 		}
-	case model.ObjectView:
-		if meta, ok := table.View(); ok {
-			ownerName = meta.OwnerName
+		parent, err := b.catalog.Descriptor(b.ctx, meta.Table)
+		if err != nil || parent.Descriptor == nil {
+			if err != nil {
+				return err
+			}
+			return bindError("42501", fmt.Sprintf("must be owner of %s %s", ownerObjectKindLabel(table.Kind()), table.Name().Name), position)
 		}
-	case model.ObjectSchema:
-		if spec, err := table.Spec(b.ctx); err == nil && spec.Schema != nil {
-			ownerName = spec.Schema.OwnerName
-		}
-	default:
-		return nil
+		b.dependency(parent.Descriptor, 0)
+		ownerName = parent.Descriptor.OwnerName()
 	}
-	if roleIsOwner(roles, b.options.CurrentRole, ownerName) {
+	if ownerName != "" && roleIsOwner(roles, b.options.CurrentRole, ownerName) {
 		return nil
 	}
 	return bindError("42501", fmt.Sprintf("must be owner of %s %s", ownerObjectKindLabel(table.Kind()), table.Name().Name), position)
@@ -279,8 +278,18 @@ func ownerObjectKindLabel(kind model.ObjectKind) string {
 		return "view"
 	case model.ObjectMaterializedView:
 		return "materialized view"
+	case model.ObjectIndex:
+		return "index"
+	case model.ObjectSequence:
+		return "sequence"
 	case model.ObjectSchema:
 		return "schema"
+	case model.ObjectRoutine:
+		return "function"
+	case model.ObjectCollation:
+		return "collation"
+	case model.ObjectType:
+		return "type"
 	default:
 		return "relation"
 	}

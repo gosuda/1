@@ -20,8 +20,11 @@ func compileScalarHash(signature Signature, options ResolveOptions) scalarKernel
 	if collation == 100 {
 		collation = options.DefaultCollation
 	}
+	collations := effectiveCollationResolver(options)
 	collationInfo, collationKnown := LookupCollation(collation)
-	deterministic := collationKnown && collation != 100 && collationInfo.Deterministic
+	icuSpec, icuKnown := LookupICUCollation(collation, collations)
+	deterministic := (collationKnown && collation != 100 && collationInfo.Deterministic) || (icuKnown && icuSpec.Deterministic)
+	nondeterministicICU := icuKnown && !icuSpec.Deterministic
 	return func(ctx context.Context, args []model.Value, _ CallBudget) (model.Value, error) {
 		if err := ctx.Err(); err != nil {
 			return model.Value{}, err
@@ -72,8 +75,9 @@ func compileScalarHash(signature Signature, options ResolveOptions) scalarKernel
 					}
 					start = end
 				}
+				hash, err = pgHashStringExtended(ctx, text, seed)
 			} else {
-				if !deterministic {
+				if !deterministic && !nondeterministicICU {
 					return model.Value{}, sqlError("42P22", "string hashing requires a resolved deterministic collation")
 				}
 				if signature.Arguments[0] == 1042 {
@@ -82,8 +86,16 @@ func compileScalarHash(signature Signature, options ResolveOptions) scalarKernel
 						return model.Value{}, err
 					}
 				}
+				if nondeterministicICU {
+					sortKey, _, sortErr := CollationSortKey(collation, collations, text)
+					if sortErr != nil {
+						return model.Value{}, sortErr
+					}
+					hash, err = pgHashBytesExtended(ctx, sortKey, seed)
+				} else {
+					hash, err = pgHashStringExtended(ctx, text, seed)
+				}
 			}
-			hash, err = pgHashStringExtended(ctx, text, seed)
 		}
 		if err != nil {
 			return model.Value{}, err

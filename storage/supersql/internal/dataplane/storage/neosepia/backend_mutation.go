@@ -192,10 +192,20 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 	commitsRoot := backend.directory.commits
 	walBytes := backend.limits.WALBytes
 	rowBytes := backend.limits.RowBytes
+	dbCipher := backend.cipher
+	archiver := backend.archiver
 	backend.mu.Unlock()
 
 	// Write & fsync all staged WAL segments with ONE single directory sync!
-	linked, walErr := writeCommitGroup(context.Background(), commitsRoot, staged, walBytes)
+	linked, walErr := writeCommitGroupWithCipher(context.Background(), commitsRoot, staged, walBytes, dbCipher)
+	if walErr == nil && archiver != nil {
+		for _, item := range staged {
+			if archErr := archiver.archiveCommit(context.Background(), commitsRoot, item.position, item.result.CommitTS); archErr != nil {
+				walErr = errors.Join(storage.ErrCommitIndeterminate, archErr)
+				break
+			}
+		}
+	}
 
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
@@ -306,9 +316,16 @@ func (backend *Backend) commitOneMemtable(ctx context.Context, batch storage.Mut
 	commitsRoot := backend.directory.commits
 	walBytes := backend.limits.WALBytes
 	commitFault := backend.commitFault
+	dbCipher := backend.cipher
+	archiver := backend.archiver
 	backend.mu.Unlock()
 
-	walRes, err := writeCommit(ctx, commitsRoot, position, batch, validated.identity, walBytes, commitFault)
+	walRes, err := writeCommitWithCipher(ctx, commitsRoot, position, batch, validated.identity, walBytes, commitFault, dbCipher)
+	if err == nil && archiver != nil {
+		if archErr := archiver.archiveCommit(ctx, commitsRoot, position, batch.CommitTS); archErr != nil {
+			err = errors.Join(storage.ErrCommitIndeterminate, archErr)
+		}
+	}
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	if err != nil && !errors.Is(err, storage.ErrCommitIndeterminate) {
@@ -444,12 +461,18 @@ func (backend *Backend) applyMutationDirect(ctx context.Context, batch storage.M
 	}
 	directory := backend.directory
 	runs := backend.runs
-	preparation := backend.limits.preparation()
+	preparation := backend.preparationLimits()
 	walBytes := backend.limits.WALBytes
 	publicationBytes := backend.limits.PublicationBytes
 	commitFault := backend.commitFault
+	archiver := backend.archiver
 	backend.mu.Unlock()
 	submitted, err := commitMutationRuns(ctx, directory, runs, position, validated, preparation, walBytes, publicationBytes, commitFault)
+	if err == nil && archiver != nil {
+		if archErr := archiver.archiveCommit(ctx, directory.commits, position, batch.CommitTS); archErr != nil {
+			err = errors.Join(storage.ErrCommitIndeterminate, archErr)
+		}
+	}
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	if err != nil && !errors.Is(err, storage.ErrCommitIndeterminate) {
@@ -521,7 +544,7 @@ func (backend *Backend) ResolveCommit(ctx context.Context, id model.TxnID) (stor
 		// LogPosition order from the head of the pending chain.
 		for backend.pending != nil && backend.pending.admission == nil {
 			head := backend.pending
-			record, err := openCommit(ctx, backend.directory.commits, head.decision.Position, backend.limits.recovery().Batch)
+			record, err := openCommitWithCipher(ctx, backend.directory.commits, head.decision.Position, backend.limits.recovery().Batch, backend.cipher)
 			if errors.Is(err, os.ErrNotExist) {
 				if err := ctx.Err(); err != nil {
 					return storage.CommitResolution{}, err
@@ -561,7 +584,7 @@ func (backend *Backend) ResolveCommit(ctx context.Context, id model.TxnID) (stor
 		}
 		return storage.CommitResolution{State: storage.CommitNotCommitted}, nil
 	}
-	resolution, _, err := resolveMutationRuns(ctx, backend.directory, backend.pending.decision, backend.limits.preparation(), backend.limits.recovery().Batch)
+	resolution, _, err := resolveMutationRuns(ctx, backend.directory, backend.pending.decision, backend.preparationLimits(), backend.limits.recovery().Batch)
 	if err != nil {
 		return resolution, err
 	}

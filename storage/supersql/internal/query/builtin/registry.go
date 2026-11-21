@@ -41,15 +41,18 @@ type ResolveOptions struct {
 	DateOrder                  DateOrder
 	TimeZone                   TimeZoneContext
 	Types                      TypeResolver
+	Collations                 CollationResolver
 	InformationSchemaFunctions InformationSchemaFunctionResolver
 	InformationSchemaTypes     InformationSchemaTypeResolver
 }
 
 func (options ResolveOptions) SameSemantics(other ResolveOptions) bool {
 	leftTypes, rightTypes := options.Types, other.Types
+	leftCollations, rightCollations := effectiveCollationResolver(options), effectiveCollationResolver(other)
 	leftInformationTypes, rightInformationTypes := options.InformationSchemaTypes, other.InformationSchemaTypes
 	leftFunctions, rightFunctions := options.InformationSchemaFunctions, other.InformationSchemaFunctions
 	options.Types, other.Types = nil, nil
+	options.Collations, other.Collations = nil, nil
 	options.InformationSchemaTypes, other.InformationSchemaTypes = nil, nil
 	options.InformationSchemaFunctions, other.InformationSchemaFunctions = nil, nil
 	if options != other {
@@ -60,6 +63,13 @@ func (options ResolveOptions) SameSemantics(other ResolveOptions) bool {
 			return false
 		}
 	} else if leftTypes.SemanticFingerprint() != rightTypes.SemanticFingerprint() {
+		return false
+	}
+	if leftCollations == nil || rightCollations == nil {
+		if leftCollations != nil || rightCollations != nil {
+			return false
+		}
+	} else if leftCollations.CollationFingerprint() != rightCollations.CollationFingerprint() {
 		return false
 	}
 	if leftInformationTypes == nil || rightInformationTypes == nil {
@@ -203,7 +213,7 @@ func Resolve(id model.FunctionID, options ResolveOptions) (Callable, error) {
 	}
 	callable := Callable{
 		signature: signature, resultStorage: primitiveStorage(signature.Result), kernel: kernel,
-		indeterminateText: (signature.Arguments[0] == 25 || signature.Arguments[0] == 1042) && isComparison(op) && collation != 950 && collation != 951,
+		indeterminateText: (signature.Arguments[0] == 25 || signature.Arguments[0] == 1042) && isComparison(op) && !IsSupportedCollation(collation, effectiveCollationResolver(options)),
 		metadataBytes:     metadataBytes,
 	}
 	for i := range signature.ArgumentCount {

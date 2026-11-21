@@ -25,9 +25,11 @@ func TestCollationNameResolution(t *testing.T) {
 		{`public.ucs_basic`, 0, "42704"},
 		{`missing_collation`, 0, "42704"},
 		{`pg_catalog.ucs_basic`, 0, "0A000"},
-		{`pg_catalog.unicode`, 0, "0A000"},
+		{`pg_catalog.unicode`, 963, ""},
 		{`pg_catalog.pg_c_utf8`, 0, "0A000"},
-		{`pg_catalog.pg_unicode_fast`, 0, "0A000"},
+		{`pg_catalog.pg_unicode_fast`, 6411, ""},
+		{`"en-US-x-icu"`, builtin.CollationEnUSICU, ""},
+		{`"ko-KR-x-icu"`, builtin.CollationKoKRICU, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			statement, err := bindSQL(t, `SELECT 'x' COLLATE `+tc.name, nil, nil)

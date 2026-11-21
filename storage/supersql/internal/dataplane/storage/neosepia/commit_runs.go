@@ -43,7 +43,7 @@ func commitMutationRuns(ctx context.Context, directory *databaseDirectory, set *
 	if err != nil {
 		return committedRuns{}, errors.Join(err, prepared.Close())
 	}
-	result, err := writeCommit(ctx, directory.commits, position, batch, identity, maxWALBytes, fault)
+	result, err := writeCommitWithCipher(ctx, directory.commits, position, batch, identity, maxWALBytes, fault, limits.File.cipher)
 	if err != nil && !errors.Is(err, storage.ErrCommitIndeterminate) {
 		return committedRuns{}, errors.Join(err, admission.Close(), prepared.Close())
 	}

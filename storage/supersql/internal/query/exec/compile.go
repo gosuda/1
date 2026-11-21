@@ -55,7 +55,11 @@ func preflight(graph *fragment.FragmentGraph, env Environment) error {
 			if env.Reader == nil {
 				return gap("snapshot reader required")
 			}
-			if node.HasLookupReadSpan() {
+			if node.HasGINScan() {
+				if env.Keys == nil {
+					return gap("GIN scan requires SQL key encoder")
+				}
+			} else if node.HasLookupReadSpan() {
 				if _, ok := env.Keys.(storage.KeyDecoder); !ok {
 					return gap("secondary lookup key decoder required")
 				}
@@ -626,6 +630,9 @@ func (c *invocation) node(id physical.NodeID, node physical.NodeSpec, layouts []
 		return v, nil
 	case physical.TableScan, physical.PrimaryKeyScan, physical.SecondaryScan:
 		if c.preparing {
+			if node.Scan.GIN.Enabled {
+				return nil, c.ginScanPrepare(node)
+			}
 			if !node.Scan.Residual.Empty() {
 				if _, _, err := c.residual(node); err != nil {
 					return nil, err

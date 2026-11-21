@@ -7,6 +7,11 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 func compileContextOnly(signature Signature) scalarKernel {
+	if signature.ID == 2298 || signature.ID == 2299 {
+		return func(context.Context, []model.Value, CallBudget) (model.Value, error) {
+			return model.StringVal(""), nil
+		}
+	}
 	if kernel := compileSQLCallableSupport(signature); kernel != nil {
 		return kernel
 	}

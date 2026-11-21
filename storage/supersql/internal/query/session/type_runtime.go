@@ -343,7 +343,11 @@ func buildDeclaredTypeRuntime(ctx context.Context, snapshot *catalog.CatalogSnap
 	}
 	options.Expressions.Functions = routines
 	compiler := &declaredTypeCompiler{snapshot: snapshot, options: options}
-	return builtin.NewDeclaredTypeResolver(ctx, definitions, compiler, options.Descriptors)
+	resolver, err := builtin.NewDeclaredTypeResolver(ctx, definitions, compiler, options.Descriptors)
+	if err != nil {
+		return nil, err
+	}
+	return wrapWithCatalogCollations(ctx, snapshot, options.Descriptors, resolver)
 }
 
 // discoverDeclaredRoutines walks the routine descriptors reachable from the type

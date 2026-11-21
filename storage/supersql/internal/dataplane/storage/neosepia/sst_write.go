@@ -36,6 +36,7 @@ type sstLimits struct {
 	MaxBytes      uint64
 	MaxIndexBytes uint64
 	MaxBlocks     uint32
+	cipher        *storageCipher
 }
 
 type sstEntry struct {
@@ -70,6 +71,34 @@ type sstWriter struct {
 	level         uint8
 	historyUntil  model.Timestamp
 	timeWindow    uint64
+	enc           *sstEncWriter
+}
+
+func (w *sstWriter) writerAt() io.WriterAt {
+	if w.enc != nil {
+		return w.enc
+	}
+	return w.file
+}
+
+func (w *sstWriter) maxPlainBytes() uint64 {
+	if w.enc == nil {
+		return w.limits.MaxBytes
+	}
+	if w.limits.MaxBytes <= encryptionHeaderSize+encryptionChunkOverhead {
+		return 0
+	}
+	// Reserve enough room for the NSE1 header and per-chunk 20-byte framing
+	// overhead so the finalized encrypted file never exceeds w.limits.MaxBytes.
+	body := w.limits.MaxBytes - encryptionHeaderSize
+	encChunk := uint64(encryptionDefaultChunk + encryptionChunkOverhead)
+	full := body / encChunk
+	rem := body % encChunk
+	plain := full * encryptionDefaultChunk
+	if rem > encryptionChunkOverhead {
+		plain += rem - encryptionChunkOverhead
+	}
+	return plain
 }
 
 // The caller owns the empty file and publishes it only after Finish succeeds.
@@ -87,6 +116,13 @@ func newSSTWriter(file *os.File, target storage.ObjectRef, limits sstLimits) (*s
 	if !info.Mode().IsRegular() || info.Size() != 0 {
 		return nil, storage.ErrInvalidTarget
 	}
+	var enc *sstEncWriter
+	if limits.cipher != nil {
+		enc, err = newSSTEncWriter(file, limits.cipher)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &sstWriter{
 		file:   file,
 		target: target,
@@ -94,6 +130,7 @@ func newSSTWriter(file *os.File, target storage.ObjectRef, limits sstLimits) (*s
 		offset: sstHeaderSize,
 		bloom:  newBloomBuilder(limits.MaxIndexBytes),
 		budget: encBudget{limit: limits.MaxIndexBytes},
+		enc:    enc,
 	}, nil
 }
 
@@ -184,13 +221,14 @@ func (w *sstWriter) AppendWithBlobs(ctx context.Context, data []byte, blobs []to
 		zoneIndexExtra = uint64(len(w.zones))*sstZoneEntrySize + uint64(len(w.zoneBytes))
 	}
 	indexSize := baseIndexSize + zoneIndexExtra
+	maxPlain := w.maxPlainBytes()
 	payloadBytes := uint64(len(data))
-	if payloadBytes > w.limits.MaxBytes-blobDiskBytes {
+	if payloadBytes > maxPlain-blobDiskBytes {
 		w.zoneBytes = w.zoneBytes[:zonePoolMark]
 		return columnar.ErrBatchBudget
 	}
 	payloadBytes += blobDiskBytes
-	if indexSize > w.limits.MaxIndexBytes || payloadBytes > w.limits.MaxBytes-w.offset || indexSize > w.limits.MaxBytes-w.offset-payloadBytes {
+	if indexSize > w.limits.MaxIndexBytes || w.offset > maxPlain || payloadBytes > maxPlain-w.offset || indexSize > maxPlain-w.offset-payloadBytes {
 		w.zoneBytes = w.zoneBytes[:zonePoolMark]
 		return columnar.ErrBatchBudget
 	}
@@ -256,7 +294,8 @@ func (w *sstWriter) AppendWithBlobs(ctx context.Context, data []byte, blobs []to
 			return err
 		}
 	}
-	n, writeErr := w.file.WriteAt(data, int64(w.offset))
+	targetWriter := w.writerAt()
+	n, writeErr := targetWriter.WriteAt(data, int64(w.offset))
 	if writeErr != nil {
 		w.failure = writeErr
 		return writeErr
@@ -273,7 +312,7 @@ func (w *sstWriter) AppendWithBlobs(ctx context.Context, data []byte, blobs []to
 			return err
 		}
 		if len(b.data) > 0 {
-			written, bErr := w.file.WriteAt(b.data, int64(nextOffset))
+			written, bErr := targetWriter.WriteAt(b.data, int64(nextOffset))
 			if bErr != nil {
 				w.failure = bErr
 				return bErr
@@ -285,7 +324,7 @@ func (w *sstWriter) AppendWithBlobs(ctx context.Context, data []byte, blobs []to
 		}
 		padded := aligned8(uint64(len(b.data)))
 		if pad := padded - uint64(len(b.data)); pad > 0 {
-			written, pErr := w.file.WriteAt(zeroPad[:pad], int64(nextOffset+uint64(len(b.data))))
+			written, pErr := targetWriter.WriteAt(zeroPad[:pad], int64(nextOffset+uint64(len(b.data))))
 			if pErr != nil {
 				w.failure = pErr
 				return pErr
@@ -377,9 +416,10 @@ func (w *sstWriter) Finish(ctx context.Context) error {
 		uint64(len(w.zones))*sstZoneEntrySize +
 		uint64(len(w.keys)) +
 		uint64(len(w.zoneBytes))
+	maxPlain := w.maxPlainBytes()
 	var maxBloom uint64
-	if baseIndexLen < w.limits.MaxIndexBytes && baseIndexLen < w.limits.MaxBytes-w.offset {
-		maxBloom = min(w.limits.MaxIndexBytes-baseIndexLen, w.limits.MaxBytes-w.offset-baseIndexLen)
+	if baseIndexLen < w.limits.MaxIndexBytes && w.offset <= maxPlain && baseIndexLen < maxPlain-w.offset {
+		maxBloom = min(w.limits.MaxIndexBytes-baseIndexLen, maxPlain-w.offset-baseIndexLen)
 		// Also leave room for sstCore/sstFile overhead on open.
 		overhead := uint64(unsafe.Sizeof(sstFile{})) + uint64(unsafe.Sizeof(sstCore{}))
 		if maxBloom > overhead {
@@ -391,7 +431,8 @@ func (w *sstWriter) Finish(ctx context.Context) error {
 	bloomBits, bloomProbes := w.bloom.finish(maxBloom)
 	indexLength := baseIndexLen + uint64(len(bloomBits))
 
-	output := io.NewOffsetWriter(w.file, int64(w.offset))
+	targetWriter := w.writerAt()
+	output := io.NewOffsetWriter(targetWriter, int64(w.offset))
 	hash := sha256.New()
 	writer := io.MultiWriter(output, hash)
 	var prefix [sstIndexHeaderSizeV4]byte
@@ -478,12 +519,17 @@ func (w *sstWriter) Finish(ctx context.Context) error {
 	binary.LittleEndian.PutUint64(header[64:], uint64(w.historyUntil))
 	binary.LittleEndian.PutUint64(header[72:], w.timeWindow)
 	binary.LittleEndian.PutUint32(header[56:], paxChecksum(header[:]))
-	n, err := w.file.WriteAt(header[:], 0)
+	n, err := targetWriter.WriteAt(header[:], 0)
 	if err != nil {
 		return err
 	}
 	if n != len(header) {
 		return io.ErrShortWrite
+	}
+	if w.enc != nil {
+		if err := w.enc.Finish(); err != nil {
+			return err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err

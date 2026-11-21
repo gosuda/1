@@ -156,6 +156,9 @@ func (p *Plan) validateScan(n NodeSpec, logical ir.Rel) error {
 	if err := validateLookupScan(s, n.Algorithm); err != nil {
 		return err
 	}
+	if err := p.validateGINScan(n, s); err != nil {
+		return err
+	}
 	unsafeLimit := !r.SafeLimit.Enabled || s.AppliedLimit.Count != r.SafeLimit.Count || !s.Residual.Empty() || s.LimitOwner == 0
 	if s.AppliedLimit.Enabled && unsafeLimit {
 		return invalid("unsafe storage limit")
@@ -336,7 +339,41 @@ func layoutMatches(g *ir.Graph, id ir.LayoutID, layout model.TypeLayout) bool {
 	return true
 }
 
+func (p *Plan) validateGINScan(n NodeSpec, s ScanSpec) error {
+	g := s.GIN
+	if !g.Enabled {
+		if !emptyGINScan(g) {
+			return invalid("disabled GIN scan carries metadata")
+		}
+		return nil
+	}
+	if n.Algorithm != SecondaryScan || !s.Lookup.Enabled {
+		return invalid("GIN scan requires a secondary lookup scan")
+	}
+	if g.Column == 0 || g.OpClass == "" || g.OperatorID == 0 || g.QueryExpr.Scalar == 0 {
+		return invalid("incomplete GIN scan metadata")
+	}
+	if len(n.Delivered.Ordering) != 0 {
+		return invalid("GIN scan cannot deliver key ordering")
+	}
+	if err := g.Layout.Validate(); err != nil {
+		return err
+	}
+	graph, ok := p.Graph(g.QueryExpr.Graph)
+	if !ok {
+		return invalid("GIN query expression graph missing")
+	}
+	if _, ok := graph.Scalar(g.QueryExpr.Scalar); !ok {
+		return invalid("GIN query expression scalar missing")
+	}
+	return nil
+}
+
+func emptyGINScan(g GINScanSpec) bool {
+	return !g.Enabled && g.IndexName == "" && g.TableName == "" && g.OpClass == "" && g.Column == 0 && g.Layout.Type == (model.Type{}) && len(g.Layout.Children) == 0 && g.OperatorID == 0 && g.QueryExpr == (ScalarRef{})
+}
+
 func emptyScan(s ScanSpec) bool {
 	r := s.Request
-	return s.Source == (storage.ObjectRef{}) && len(s.ColumnMap) == 0 && s.CapabilityEpoch == 0 && s.LimitOwner == 0 && r.Target == (storage.ObjectRef{}) && r.Occurrence == 0 && r.IndexID == 0 && len(r.Layout) == 0 && len(r.KeyLayout) == 0 && len(r.ColumnIDs) == 0 && len(r.Spans) == 0 && r.Direction == storage.ScanForward && r.Predicate.Empty() && r.SafeLimit == (storage.ScanLimit{}) && s.Accepted.Empty() && s.Residual.Empty() && len(s.Projection) == 0 && len(s.Ordering) == 0 && s.Estimate == (storage.ScanEstimate{}) && s.AppliedLimit == (storage.ScanLimit{}) && emptyLookupScan(s.Lookup)
+	return s.Source == (storage.ObjectRef{}) && len(s.ColumnMap) == 0 && s.CapabilityEpoch == 0 && s.LimitOwner == 0 && r.Target == (storage.ObjectRef{}) && r.Occurrence == 0 && r.IndexID == 0 && len(r.Layout) == 0 && len(r.KeyLayout) == 0 && len(r.ColumnIDs) == 0 && len(r.Spans) == 0 && r.Direction == storage.ScanForward && r.Predicate.Empty() && r.SafeLimit == (storage.ScanLimit{}) && s.Accepted.Empty() && s.Residual.Empty() && len(s.Projection) == 0 && len(s.Ordering) == 0 && s.Estimate == (storage.ScanEstimate{}) && s.AppliedLimit == (storage.ScanLimit{}) && emptyLookupScan(s.Lookup) && emptyGINScan(s.GIN)
 }

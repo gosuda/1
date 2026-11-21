@@ -11,7 +11,7 @@ func ValidateNamespaceName(n NamespaceName) error {
 	if !utf8.ValidString(n.Name) || !utf8.ValidString(n.Signature) {
 		return ErrInvalidDescriptor
 	}
-	if n.Kind < ObjectSchema || n.Kind > ObjectRole || n.Name == "" || strings.IndexByte(n.Name, 0) >= 0 || strings.IndexByte(n.Signature, 0) >= 0 {
+	if n.Kind < ObjectSchema || n.Kind > ObjectCollation || n.Name == "" || strings.IndexByte(n.Name, 0) >= 0 || strings.IndexByte(n.Signature, 0) >= 0 {
 		return ErrInvalidDescriptor
 	}
 	if !n.Kind.SignatureBearing() && n.Signature != "" {
@@ -308,7 +308,7 @@ func validateDescriptor(d DescriptorSpec) error {
 		}
 	}
 	count := 0
-	for _, present := range []bool{d.Schema != nil, d.Table != nil, d.Index != nil, d.Sequence != nil, d.View != nil, d.Routine != nil, d.Type != nil, d.CompositeRelation != nil, d.TextSearchTemplate != nil, d.TextSearchDictionary != nil, d.TextSearchConfiguration != nil, d.Cast != nil, d.Operator != nil, d.Aggregate != nil, d.Role != nil} {
+	for _, present := range []bool{d.Schema != nil, d.Table != nil, d.Index != nil, d.Sequence != nil, d.View != nil, d.Routine != nil, d.Type != nil, d.CompositeRelation != nil, d.TextSearchTemplate != nil, d.TextSearchDictionary != nil, d.TextSearchConfiguration != nil, d.Cast != nil, d.Operator != nil, d.Aggregate != nil, d.Role != nil, d.Collation != nil} {
 		if present {
 			count++
 		}
@@ -336,6 +336,7 @@ func validateDescriptor(d DescriptorSpec) error {
 		if d.Schema.OwnerName != "" && (!validDescriptorText(d.Schema.OwnerName) || d.Schema.OwnerName != strings.ToLower(d.Schema.OwnerName)) {
 			return ErrInvalidDescriptor
 		}
+		return validateACL(d.Schema.ACL)
 	case ObjectTable:
 		return validateTableMetadata(d.Table, d.ID)
 	case ObjectIndex:
@@ -397,6 +398,47 @@ func validateDescriptor(d DescriptorSpec) error {
 		return validateOperatorMetadata(d.Operator)
 	case ObjectRole:
 		return validateRoleMetadata(d.Name.Name, d.Role)
+	case ObjectCollation:
+		return validateCollationMetadata(d.Collation)
+	default:
+		return ErrInvalidDescriptor
+	}
+}
+
+func validateACL(acl []PrivilegeGrant) error {
+	type aclKey struct {
+		grantee string
+		grantor string
+	}
+	seen := make(map[aclKey]struct{}, len(acl))
+	for _, g := range acl {
+		if g.Grantee == "" || !validDescriptorText(g.Grantee) || g.Grantee != strings.ToLower(g.Grantee) {
+			return ErrInvalidDescriptor
+		}
+		if g.Grantor != "" && (!validDescriptorText(g.Grantor) || g.Grantor != strings.ToLower(g.Grantor)) {
+			return ErrInvalidDescriptor
+		}
+		if g.Privileges == 0 || (g.GrantOption&^g.Privileges) != 0 {
+			return ErrInvalidDescriptor
+		}
+		key := aclKey{grantee: g.Grantee, grantor: g.Grantor}
+		if _, dup := seen[key]; dup {
+			return ErrInvalidDescriptor
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func validateCollationMetadata(c *CollationMetadata) error {
+	if c == nil || c.Owner == 0 || c.Locale == "" || !validDescriptorText(c.Locale) {
+		return ErrInvalidDescriptor
+	}
+	if c.OwnerName != "" && (!validDescriptorText(c.OwnerName) || c.OwnerName != strings.ToLower(c.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
+	switch c.Provider {
+	case 'i', 'b', 'c':
 	default:
 		return ErrInvalidDescriptor
 	}
@@ -774,6 +816,9 @@ func validateViewMetadata(view *ViewMetadata, materialized bool) error {
 	if view.OwnerName != "" && (!validDescriptorText(view.OwnerName) || view.OwnerName != strings.ToLower(view.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
+	if err := validateACL(view.ACL); err != nil {
+		return err
+	}
 	if view.CheckOption != "" && view.CheckOption != "local" && view.CheckOption != "cascaded" {
 		return ErrInvalidDescriptor
 	}
@@ -814,6 +859,9 @@ func validateTableMetadata(t *TableMetadata, tableID ObjectID) error {
 	}
 	if t.OwnerName != "" && (!validDescriptorText(t.OwnerName) || t.OwnerName != strings.ToLower(t.OwnerName)) {
 		return ErrInvalidDescriptor
+	}
+	if err := validateACL(t.ACL); err != nil {
+		return err
 	}
 	if t.Persistence != "" && t.Persistence != "p" && t.Persistence != "t" {
 		return ErrInvalidDescriptor
@@ -1189,6 +1237,15 @@ func validateIndexMetadata(id ObjectID, index *IndexMetadata) error {
 	if index == nil || index.Table == 0 || len(index.Keys) == 0 || index.DeferredUnique && !index.Unique {
 		return ErrInvalidDescriptor
 	}
+	if index.Method != "" && index.Method != "btree" && index.Method != "gin" {
+		return ErrInvalidDescriptor
+	}
+	if index.Method == "gin" && (index.Unique || index.DeferredUnique) {
+		return ErrInvalidDescriptor
+	}
+	if index.OpClass != "" && !validDescriptorText(index.OpClass) {
+		return ErrInvalidDescriptor
+	}
 	if index.ParentIndex == id || index.ParentIndex == index.Table {
 		return ErrInvalidDescriptor
 	}
@@ -1240,6 +1297,12 @@ func validateSequenceMetadata(s *SequenceMetadata) error {
 	if s == nil || s.Identity == 0 || s.Incarnation == 0 {
 		return ErrInvalidDescriptor
 	}
+	if s.OwnerName != "" && (!validDescriptorText(s.OwnerName) || s.OwnerName != strings.ToLower(s.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
+	if err := validateACL(s.ACL); err != nil {
+		return err
+	}
 	if s.Persistence != "" && s.Persistence != "p" && s.Persistence != "t" {
 		return ErrInvalidDescriptor
 	}
@@ -1266,8 +1329,14 @@ func ValidateSequenceConfiguration(s SequenceMetadata) error {
 }
 
 func validateRoutineMetadata(routine *RoutineMetadata) error {
-	if routine == nil || routine.Owner == 0 || routine.LanguageOID == 0 || routine.SecurityDefiner {
+	if routine == nil || routine.Owner == 0 || routine.LanguageOID == 0 {
 		return ErrInvalidDescriptor
+	}
+	if routine.OwnerName != "" && (!validDescriptorText(routine.OwnerName) || routine.OwnerName != strings.ToLower(routine.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
+	if err := validateACL(routine.ACL); err != nil {
+		return err
 	}
 	validLanguage := routine.Language == "internal" && routine.LanguageOID == 12 ||
 		routine.Language == "c" && routine.LanguageOID == 13 ||

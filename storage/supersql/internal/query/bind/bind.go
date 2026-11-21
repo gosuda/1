@@ -346,6 +346,7 @@ type binder struct {
 	rlsTargetCommand    string
 	rlsMergeHasUpdate   bool
 	rlsMergeHasDelete   bool
+	dmlTargetID         model.ObjectID
 }
 
 func bindError(code, message string, position int) error {

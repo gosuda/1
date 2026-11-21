@@ -26,6 +26,7 @@ type CheckpointVerifier struct {
 	FenceVerifier storage.FenceVerifier
 	Limits        Limits
 	ExtraFiles    []string
+	EncryptionKey []byte
 }
 
 type checkpointVerification struct {
@@ -37,6 +38,7 @@ type checkpointVerification struct {
 	prunedPosition uint64
 	transactions   ordered.Tree[recoveryTxnID, transactionRecord]
 	layouts        ordered.Tree[checkpointTarget, [32]byte]
+	cipher         *storageCipher
 }
 
 func (verifier CheckpointVerifier) VerifyCheckpoint(ctx context.Context, root *os.Root, manifest storage.CheckpointManifest) (err error) {
@@ -56,11 +58,23 @@ func (verifier CheckpointVerifier) VerifyCheckpoint(ctx context.Context, root *o
 	if root == nil {
 		return storage.ErrClosed
 	}
-	extras, err := validateCheckpointExtras(verifier.ExtraFiles)
+	dbCipher, err := newStorageCipher(verifier.EncryptionKey)
 	if err != nil {
 		return err
 	}
-	check := checkpointVerification{limits: limits, manifest: manifest, extras: extras}
+	hasEncMeta, err := verifyDirectoryEncryption(root, dbCipher, true)
+	if err != nil {
+		return err
+	}
+	extraNames := verifier.ExtraFiles
+	if hasEncMeta && !slices.Contains(extraNames, encryptionMetaName) {
+		extraNames = append(slices.Clone(extraNames), encryptionMetaName)
+	}
+	extras, err := validateCheckpointExtras(extraNames)
+	if err != nil {
+		return err
+	}
+	check := checkpointVerification{limits: limits, manifest: manifest, extras: extras, cipher: dbCipher}
 	if err := check.validateManifest(ctx); err != nil {
 		return err
 	}

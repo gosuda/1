@@ -47,7 +47,7 @@ func (o *optimizer) inventory() {
 	}
 	for id := ir.RelID(1); id <= ir.RelID(o.graph.RelCount()) && o.step(1); id++ {
 		r, _ := o.graph.Rel(id)
-		if r.Kind != ir.Filter || r.SecurityBarrier || r.Effects.Volatility != ir.Immutable || r.Effects.MayError {
+		if r.Kind != ir.Filter || r.SecurityBarrier {
 			continue
 		}
 		child, _ := o.graph.Input(id, 0)
@@ -61,7 +61,12 @@ func (o *optimizer) inventory() {
 		for i := range outputs {
 			outputs[i], _ = o.graph.Output(id, uint32(i))
 		}
-		o.propagateScanPredicate(child, r.Predicate, outputs, parents, 0)
+		if r.Effects.Volatility == ir.Immutable && !r.Effects.MayError {
+			o.propagateScanPredicate(child, r.Predicate, outputs, parents, 0)
+		}
+		if r.Effects.Volatility != ir.Volatile {
+			o.propagateGINPredicate(child, r.Predicate, outputs, parents, 0)
+		}
 	}
 	for id := ir.RelID(1); id <= ir.RelID(o.graph.RelCount()) && o.step(1); id++ {
 		r, _ := o.graph.Rel(id)

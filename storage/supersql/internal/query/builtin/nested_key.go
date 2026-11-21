@@ -92,8 +92,8 @@ func (e *KeyEncoder) validateKeyLayout(ctx context.Context, layout model.TypeLay
 		if err := validateCatalogVectorLayout(layout); err != nil {
 			return err
 		}
-		if layout.Type.Collation != 0 && layout.Type.Collation != 100 && layout.Type.Collation != 950 && layout.Type.Collation != 951 {
-			return sqlError("42P22", "array SQL key requires a resolved C or POSIX collation")
+		if layout.Type.Collation != 0 && layout.Type.Collation != 100 && !IsSupportedCollation(layout.Type.Collation, e.collations) {
+			return sqlError("42P22", "array SQL key requires a supported collation")
 		}
 	} else {
 		if layout.Type.Collation != 0 {
@@ -204,10 +204,10 @@ func (e *KeyEncoder) appendNestedKeyValue(ctx context.Context, key []byte, layou
 			}
 			ranked := model.Int64Val(int64(order))
 			column := storage.KeyColumn{Type: model.Type{ID: 20, Storage: model.TypeInt64, Modifier: -1}, Descending: mask != 0}
-			return appendKeyValue(ctx, key, &column, &ranked)
+			return e.appendKeyValue(ctx, key, &column, &ranked)
 		}
 		column := storage.KeyColumn{Type: layout.Type, Children: layout.Children, Descending: mask != 0}
-		return appendKeyValue(ctx, key, &column, value)
+		return e.appendKeyValue(ctx, key, &column, value)
 	}
 	if layout.Type.ID == 30 {
 		key = appendNestedKeyNumber(key, uint32(len(value.ArrayVal)), mask)
@@ -257,7 +257,7 @@ func (e *KeyEncoder) measureScalar(ctx context.Context, typ model.Type, value *m
 	layout, declared := e.keyLayout(model.TypeLayout{Type: typ})
 	typ = layout.Type
 	if value.Type != typ.Storage || value.IsNull {
-		return keyFieldSize(ctx, typ, value, maximum)
+		return e.keyFieldSize(ctx, typ, value, maximum)
 	}
 	if family, known := e.rangeFamily(typ.ID); known {
 		return rangeKeyFieldSize(ctx, family, typ.ID, *value, maximum)
@@ -290,5 +290,5 @@ func (e *KeyEncoder) measureScalar(ctx context.Context, typ model.Type, value *m
 		prepared.jsonb = append(prepared.jsonb, payload)
 		return uint64(len(payload)) + 1, nil
 	}
-	return keyFieldSize(ctx, typ, value, maximum)
+	return e.keyFieldSize(ctx, typ, value, maximum)
 }

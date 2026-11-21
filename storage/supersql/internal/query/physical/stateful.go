@@ -57,7 +57,7 @@ func (p *Plan) validateJoin(ctx context.Context, n NodeSpec, logical ir.Rel) err
 		if logical.JoinKind != ir.InnerJoin && logical.JoinKind != ir.LeftJoin && logical.JoinKind != ir.SemiJoin && logical.JoinKind != ir.AntiJoin {
 			return invalid("lookup join cannot enumerate unmatched right rows")
 		}
-		if right.Algorithm != PrimaryKeyScan && right.Algorithm != SecondaryScan {
+		if (right.Algorithm != PrimaryKeyScan && right.Algorithm != SecondaryScan) || right.Scan.GIN.Enabled {
 			return invalid("lookup right side must name a real keyed scan")
 		}
 		if n.Join.Lookup != right.Scan.Request.Target || n.Join.LookupIndex != right.Scan.Request.IndexID {

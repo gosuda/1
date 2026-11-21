@@ -19,6 +19,7 @@ type checkpointBuilder struct {
 	limits Limits
 	extras []string
 	used   uint64
+	cipher *storageCipher
 }
 
 // validateCheckpointExtras admits only plain regular-file names at the database
@@ -260,7 +261,7 @@ func (builder *checkpointBuilder) finish(ctx context.Context) (err error) {
 }
 
 func (builder *checkpointBuilder) finishCommit(ctx context.Context, commits, runs *os.Root, position uint64, scratch []byte, seen []bool) (err error) {
-	record, err := openCommit(ctx, commits, position, builder.limits.recovery().Batch)
+	record, err := openCommitWithCipher(ctx, commits, position, builder.limits.recovery().Batch, builder.cipher)
 	if err != nil {
 		return err
 	}
@@ -291,7 +292,7 @@ func (builder *checkpointBuilder) finishCoalescedCommit(ctx context.Context, com
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		record, err := openCommit(ctx, commits, pos, builder.limits.recovery().Batch)
+		record, err := openCommitWithCipher(ctx, commits, pos, builder.limits.recovery().Batch, builder.cipher)
 		if err != nil {
 			return err
 		}

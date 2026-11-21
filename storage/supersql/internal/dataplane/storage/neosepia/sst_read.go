@@ -49,6 +49,7 @@ type sstCore struct {
 	entryBytes   int
 	headerBytes  uint64
 	coreRefs     atomic.Int64
+	enc          *sstEncState
 }
 
 func (c *sstCore) entry(i int) sstEntry {
@@ -109,8 +110,35 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 	if !info.Mode().IsRegular() || info.Size() < 64 || uint64(info.Size()) > limits.MaxBytes {
 		return nil, storage.ErrCorruptStorage
 	}
+	var prefix [4]byte
+	if _, err := file.ReadAt(prefix[:], 0); err != nil {
+		return nil, errors.Join(storage.ErrCorruptStorage, err)
+	}
+	var enc *sstEncState
+	plainSize := uint64(info.Size())
+	readAt := func(p []byte, off int64) (int, error) {
+		if enc != nil {
+			return enc.readAt(file, p, off)
+		}
+		return file.ReadAt(p, off)
+	}
+	if string(prefix[:]) == encryptionMagic {
+		if limits.cipher == nil {
+			return nil, ErrInvalidEncryptionKey
+		}
+		enc, err = newSSTEncState(file, info.Size(), limits.cipher)
+		if err != nil {
+			return nil, err
+		}
+		plainSize = enc.plainSize
+		if plainSize < 64 {
+			return nil, storage.ErrCorruptStorage
+		}
+	} else if limits.cipher != nil {
+		return nil, ErrInvalidEncryptionKey
+	}
 	var header [sstHeaderSize]byte
-	if _, err := file.ReadAt(header[:64], 0); err != nil {
+	if _, err := readAt(header[:64], 0); err != nil {
 		return nil, errors.Join(storage.ErrCorruptStorage, err)
 	}
 	headerBytes := uint64(sstHeaderSize)
@@ -121,7 +149,7 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 	switch magic {
 	case sstMagic:
 		isV4 = true
-		if _, err := file.ReadAt(header[64:], 64); err != nil {
+		if _, err := readAt(header[64:], 64); err != nil {
 			return nil, errors.Join(storage.ErrCorruptStorage, err)
 		}
 		if !sstHeaderValid(header[:]) {
@@ -130,7 +158,7 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 	case sstMagicV3:
 		entryBytes = sstEntrySizeV3
 		indexHeaderSize = sstIndexHeaderSizeV3
-		if _, err := file.ReadAt(header[64:], 64); err != nil {
+		if _, err := readAt(header[64:], 64); err != nil {
 			return nil, errors.Join(storage.ErrCorruptStorage, err)
 		}
 		if !sstHeaderValid(header[:]) {
@@ -155,10 +183,10 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 	}
 	count := uint64(binary.LittleEndian.Uint32(header[36:]))
 	offset, length := binary.LittleEndian.Uint64(header[40:]), binary.LittleEndian.Uint64(header[48:])
-	if count == 0 || count > uint64(limits.MaxBlocks) || offset < headerBytes || offset > uint64(info.Size()) {
+	if count == 0 || count > uint64(limits.MaxBlocks) || offset < headerBytes || offset > plainSize {
 		return nil, storage.ErrCorruptStorage
 	}
-	if length != uint64(info.Size())-offset || length < indexHeaderSize+sstIndexHashSize+count*entryBytes {
+	if length != plainSize-offset || length < indexHeaderSize+sstIndexHashSize+count*entryBytes {
 		return nil, storage.ErrCorruptStorage
 	}
 	overhead := uint64(unsafe.Sizeof(sstFile{}))
@@ -166,7 +194,7 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 		return nil, columnar.ErrBatchBudget
 	}
 	index := make([]byte, length)
-	if _, err := file.ReadAt(index, int64(offset)); err != nil {
+	if _, err := readAt(index, int64(offset)); err != nil {
 		return nil, errors.Join(storage.ErrCorruptStorage, err)
 	}
 	digest := sha256.Sum256(index[:len(index)-sstIndexHashSize])
@@ -262,6 +290,7 @@ func openSST(ctx context.Context, file *os.File, limits sstLimits) (*sstFile, er
 		level:        header[61],
 		historyUntil: model.Timestamp(binary.LittleEndian.Uint64(header[64:])),
 		timeWindow:   binary.LittleEndian.Uint64(header[72:]),
+		enc:          enc,
 	}
 	core.coreRefs.Store(1)
 	if core.historyUntil < 0 || (core.tier == inactiveTier && (core.historyUntil == 0 || core.level != 0)) || (core.tier == activeTier && (core.historyUntil != 0 || core.timeWindow != 0)) {
@@ -337,10 +366,16 @@ func (s *sstFile) readAtLocked(p []byte, off int64) (int, error) {
 			return 0, err
 		}
 		defer core.pool.release(entry)
+		if core.enc != nil {
+			return core.enc.readAt(entry.file, p, off)
+		}
 		return entry.file.ReadAt(p, off)
 	}
 	if core.directFile == nil {
 		return 0, storage.ErrClosed
+	}
+	if core.enc != nil {
+		return core.enc.readAt(core.directFile, p, off)
 	}
 	return core.directFile.ReadAt(p, off)
 }

@@ -148,8 +148,13 @@ func substringBounds(size, start int64, args []model.Value) (int64, int64, error
 	return begin, end, nil
 }
 
-func compileText(signature Signature, op primitiveOp) scalarKernel {
+func compileText(signature Signature, op primitiveOp, options ResolveOptions) scalarKernel {
 	text := signature.Arguments[0] == 25
+	collation := options.Collation
+	if collation == 100 {
+		collation = options.DefaultCollation
+	}
+	collations := effectiveCollationResolver(options)
 	return func(ctx context.Context, args []model.Value, callBudget CallBudget) (model.Value, error) {
 		budget := callBudget.OutputBytes
 		size := int64(len(args[0].BytesVal))
@@ -169,7 +174,7 @@ func compileText(signature Signature, op primitiveOp) scalarKernel {
 			var order int
 			var err error
 			if text {
-				order, err = compareText(ctx, args[0].StrVal, args[1].StrVal)
+				order, err = CompareCollationText(ctx, collation, collations, args[0].StrVal, args[1].StrVal)
 			} else {
 				order, err = compareBytes(ctx, args[0].BytesVal, args[1].BytesVal)
 			}

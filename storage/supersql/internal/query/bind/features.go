@@ -124,8 +124,8 @@ func statementFeature(message protoreflect.Message) FeatureID {
 		*zpgparse.AlterTableMoveAllStmt:
 		return ClusterAdmin
 	case *zpgparse.AlterRoleSetStmt,
-		*zpgparse.GrantStmt, *zpgparse.AlterDefaultPrivilegesStmt,
-		*zpgparse.DropOwnedStmt, *zpgparse.ReassignOwnedStmt, *zpgparse.AlterOwnerStmt,
+		*zpgparse.AlterDefaultPrivilegesStmt,
+		*zpgparse.DropOwnedStmt, *zpgparse.ReassignOwnedStmt,
 		*zpgparse.SecLabelStmt:
 		return Authorization
 	case *zpgparse.CreateExtensionStmt, *zpgparse.AlterExtensionStmt, *zpgparse.AlterExtensionContentsStmt,
@@ -138,8 +138,6 @@ func statementFeature(message protoreflect.Message) FeatureID {
 	case *zpgparse.CreatePublicationStmt, *zpgparse.AlterPublicationStmt, *zpgparse.CreateSubscriptionStmt,
 		*zpgparse.AlterSubscriptionStmt, *zpgparse.DropSubscriptionStmt:
 		return Replication
-	case *zpgparse.ListenStmt, *zpgparse.NotifyStmt, *zpgparse.UnlistenStmt:
-		return Notifications
 	case *zpgparse.XmlExpr, *zpgparse.XmlSerialize, *zpgparse.RangeTableFunc:
 		return XML
 	case *zpgparse.CreateAmStmt, *zpgparse.CreateOpClassStmt, *zpgparse.CreateOpFamilyStmt, *zpgparse.AlterOpFamilyStmt:
@@ -155,10 +153,6 @@ func statementFeature(message protoreflect.Message) FeatureID {
 	case *zpgparse.ReindexStmt:
 		if node.Kind == zpgparse.ReindexObjectType_REINDEX_OBJECT_SCHEMA || node.Kind == zpgparse.ReindexObjectType_REINDEX_OBJECT_SYSTEM || node.Kind == zpgparse.ReindexObjectType_REINDEX_OBJECT_DATABASE {
 			return PhysicalMaintenance
-		}
-	case *zpgparse.CreateSchemaStmt:
-		if node.Authrole != nil {
-			return Authorization
 		}
 	case *zpgparse.CopyStmt:
 		if node.IsProgram || node.Filename != "" {
@@ -199,7 +193,7 @@ func statementFeature(message protoreflect.Message) FeatureID {
 		if node.Iswithoutoverlaps {
 			return AdvancedExclusion
 		}
-		if node.AccessMethod != "" && node.AccessMethod != "btree" {
+		if node.AccessMethod != "" && node.AccessMethod != "btree" && node.AccessMethod != "gin" {
 			return NonBtreeIndexes
 		}
 		if node.TableSpace != "" {
@@ -264,8 +258,14 @@ func statementFeature(message protoreflect.Message) FeatureID {
 			return PreparedTransactions
 		}
 	case *zpgparse.DropStmt:
+		if node.RemoveType == zpgparse.ObjectType_OBJECT_COLLATION {
+			return ""
+		}
 		return objectKindFeature(node.RemoveType)
 	case *zpgparse.DefineStmt:
+		if node.Kind == zpgparse.ObjectType_OBJECT_COLLATION {
+			return ""
+		}
 		if node.Kind == zpgparse.ObjectType_OBJECT_TYPE {
 			if len(node.Definition) == 0 && len(node.Args) == 0 && !node.Replace {
 				return ""
@@ -329,8 +329,6 @@ func objectKindFeature(kind zpgparse.ObjectType) FeatureID {
 
 func alterTableFeature(kind zpgparse.AlterTableType) FeatureID {
 	switch kind {
-	case zpgparse.AlterTableType_AT_ChangeOwner:
-		return Authorization
 	case zpgparse.AlterTableType_AT_SetTableSpace:
 		return ClusterAdmin
 	case zpgparse.AlterTableType_AT_SetStorage, zpgparse.AlterTableType_AT_SetCompression,

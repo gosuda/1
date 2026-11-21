@@ -152,6 +152,8 @@ func (c *invocation) resolveRowSource(id model.FunctionID, arguments []model.Typ
 		return builtin.ResolveFullTextRows(c.portal.ctx, id, arguments, result, options, maximum)
 	case 1686, 2084, 2289, 2510, 2511, 2599, 2856, 3423, 3425, 3427, 6159, 6401:
 		return builtin.ResolveIntrospectionRows(c.portal.ctx, id, arguments, result, options, maximum)
+	case 3035:
+		return builtin.ResolveNotifyRows(c.portal.ctx, id, arguments, result, options, maximum)
 	}
 	resolver, ok := env.Functions.(expr.RowSourceResolver)
 	if !ok {

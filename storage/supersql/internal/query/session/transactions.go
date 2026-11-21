@@ -13,6 +13,7 @@ import (
 
 	"github.com/gosuda/supersql-alpha/clock"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/notify"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/locks"
@@ -39,6 +40,7 @@ type TransactionConfig struct {
 	SequenceDDL  *SequenceDDLConfig
 	NamedObjects SessionNamedObjectOptions
 	Advisory     AdvisoryLockConfig
+	Notify       NotifyConfig
 	// TypeRuntime describes how declared-type runtimes are built for statement
 	// bodies that bind keys outside the prepared-statement path. Nil disables
 	// declared-type key resolution.
@@ -99,6 +101,7 @@ type Transactions struct {
 	settings      *Settings
 	options       txn.TransactionOptions
 	advisory      AdvisoryLockConfig
+	notify        NotifyConfig
 	gate          chan struct{}
 	life          context.Context
 	cancel        context.CancelCauseFunc
@@ -127,6 +130,10 @@ type Transactions struct {
 	deferredConstraints     []deferredRelationalConstraint
 	deferredConstraintMarks []int
 	deferredConstraintBytes uint64
+	pendingNotifications    []notify.PendingNotification
+	notifyMarks             []int
+	pendingListenOps        []pendingListenOp
+	listenMarks             []int
 	constraintModes         constraintModeState
 	constraintSavepoints    []constraintModeState
 	typeRuntime             *DeclaredTypeRuntimeOptions
@@ -188,7 +195,7 @@ func NewTransactions(ctx context.Context, config TransactionConfig) (*Transactio
 		return nil, err
 	}
 	transactions := &Transactions{
-		manager: config.Manager, settings: config.Settings, options: config.Options, advisory: config.Advisory,
+		manager: config.Manager, settings: config.Settings, options: config.Options, advisory: config.Advisory, notify: config.Notify,
 		gate: make(chan struct{}, 1), cleanupDone: make(chan struct{}),
 		sequences:     sequences,
 		named:         named,
@@ -209,6 +216,9 @@ func NewTransactions(ctx context.Context, config TransactionConfig) (*Transactio
 		transactions.closeError = errors.Join(transactions.closeActive(context.WithoutCancel(transactions.life)), transactions.closeNamedObjects())
 		if transactions.advisory.Manager != nil {
 			transactions.advisory.Manager.CloseSession(transactions.advisory.SessionID)
+		}
+		if transactions.notify.Hub != nil {
+			transactions.notify.Hub.CloseSession(transactions.notify.SessionID)
 		}
 	})
 	return transactions, nil
@@ -673,6 +683,7 @@ func (transactions *Transactions) finishSettings(committed bool) error {
 	transactions.chain, transactions.chainModes = false, transactionCharacteristics{}
 	transactions.sequences.finish(committed)
 	err = errors.Join(err, transactions.sequences.clean(context.WithoutCancel(transactions.life)))
+	transactions.finishNotify(committed)
 	return err
 }
 
@@ -730,6 +741,8 @@ func (transactions *Transactions) savepoint(ctx context.Context, name string) er
 	transactions.constraintSavepoints = append(transactions.constraintSavepoints, cloneConstraintModes(transactions.constraintModes))
 	transactions.cursorSavepoints = append(transactions.cursorSavepoints, transactions.named.cursorSerial)
 	transactions.named.temporaryMarks = append(transactions.named.temporaryMarks, len(transactions.named.temporaryChanges))
+	transactions.notifyMarks = append(transactions.notifyMarks, len(transactions.pendingNotifications))
+	transactions.listenMarks = append(transactions.listenMarks, len(transactions.pendingListenOps))
 	if transactions.sequences != nil {
 		transactions.sequences.marks = append(transactions.sequences.marks, len(transactions.sequences.changes))
 	}
@@ -839,6 +852,24 @@ func (transactions *Transactions) rollbackTo(ctx context.Context, name string) e
 	transactions.savepoints = transactions.savepoints[:index+1]
 	clear(transactions.advisoryMarks[index+1:])
 	transactions.advisoryMarks = transactions.advisoryMarks[:index+1]
+	if index < len(transactions.notifyMarks) {
+		mark := transactions.notifyMarks[index]
+		if mark >= 0 && mark <= len(transactions.pendingNotifications) {
+			clear(transactions.pendingNotifications[mark:])
+			transactions.pendingNotifications = transactions.pendingNotifications[:mark]
+		}
+		clear(transactions.notifyMarks[index+1:])
+		transactions.notifyMarks = transactions.notifyMarks[:index+1]
+	}
+	if index < len(transactions.listenMarks) {
+		mark := transactions.listenMarks[index]
+		if mark >= 0 && mark <= len(transactions.pendingListenOps) {
+			clear(transactions.pendingListenOps[mark:])
+			transactions.pendingListenOps = transactions.pendingListenOps[:mark]
+		}
+		clear(transactions.listenMarks[index+1:])
+		transactions.listenMarks = transactions.listenMarks[:index+1]
+	}
 	transactions.failure = nil
 	return cleanupErr
 }
@@ -895,6 +926,14 @@ func (transactions *Transactions) release(ctx context.Context, name string) erro
 	}
 	clear(transactions.named.temporaryMarks[index:])
 	transactions.named.temporaryMarks = transactions.named.temporaryMarks[:index]
+	if index <= len(transactions.notifyMarks) {
+		clear(transactions.notifyMarks[index:])
+		transactions.notifyMarks = transactions.notifyMarks[:index]
+	}
+	if index <= len(transactions.listenMarks) {
+		clear(transactions.listenMarks[index:])
+		transactions.listenMarks = transactions.listenMarks[:index]
+	}
 	if transactions.sequences != nil {
 		transactions.sequences.marks = transactions.sequences.marks[:index]
 	}
@@ -1091,6 +1130,7 @@ func (transactions *Transactions) ResetSessionObjects(ctx context.Context) error
 	if transactions.advisory.Manager != nil {
 		transactions.advisory.Manager.UnlockAllSession(transactions.advisory.SessionID)
 	}
+	transactions.resetNotify()
 	hasTemporary := len(transactions.named.temporary) != 0 || transactions.named.options.DiscardTemporary != nil
 	<-transactions.gate
 	if !hasTemporary {

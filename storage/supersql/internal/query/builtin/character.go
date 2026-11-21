@@ -7,7 +7,12 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
-func compileCharacter(signature Signature, op primitiveOp) scalarKernel {
+func compileCharacter(signature Signature, op primitiveOp, options ResolveOptions) scalarKernel {
+	collation := options.Collation
+	if collation == 100 {
+		collation = options.DefaultCollation
+	}
+	collations := effectiveCollationResolver(options)
 	return func(ctx context.Context, args []model.Value, callBudget CallBudget) (model.Value, error) {
 		budget := callBudget.OutputBytes
 		text := args[0].StrVal
@@ -44,7 +49,7 @@ func compileCharacter(signature Signature, op primitiveOp) scalarKernel {
 		if err != nil {
 			return model.Value{}, err
 		}
-		order, err := compareText(ctx, text, right)
+		order, err := CompareCollationText(ctx, collation, collations, text, right)
 		if err != nil {
 			return model.Value{}, err
 		}
