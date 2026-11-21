@@ -4,7 +4,114 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project is
 pre-1.0: the API is unstable and may change between commits.
 
-## [0.1.0] - Unreleased
+## [Unreleased] — v0.1.0-alpha
+
+Pre-alpha release of `github.com/gosuda/supersql-alpha`: a pure-Go (`CGO_ENABLED=0`)
+embedded PostgreSQL-18-compatible relational engine with NeoSepia PAX v2
+columnar storage, a Cascades statistics-driven optimizer, certified-clock
+MVCC/SSI, and full operational tooling.
+
+### Added
+
+- **Core pre-alpha architecture upgrades**:
+  - **NeoSepia PAX v2 columnar storage**: 64 KiB columnar data blocks with
+    dictionary/RLE/bitpacked encodings, out-of-line TOAST compression for
+    oversized values, per-block Bloom filters, and min/max zone maps for
+    predicate pushdown and block skipping.
+  - **Dual-tier compaction & WAL group commit**: background `activeTier` and
+    `inactiveTier` compaction separating hot reads from retained history, paired
+    with batched WAL group commit (`commits/*.wal`) for low-latency durable
+    writes.
+  - **Sharded lock registry & shared `WaitGraph`**: striped lock management with
+    shared wait-for deadlock detection (`40P01`) across row, relation, and
+    catalog locks.
+  - **Cascades statistics-driven optimizer & external spill operators**:
+    cost-based join ordering, index selection, and selectivity estimation driven
+    by `pg_statistic` histograms/MCVs/NDV, plus disk-backed external spill
+    operators (`Sort`, `HashJoin`, `HashAggregate`, `Window`, `SetOp`) bounded
+    by `work_mem` and `temp_file_limit`.
+  - **Zero-dependency local clock (`clock/local`)**: pure-Go monotonic+wall
+    certified clock provider (`localclock.New()`) for single-node embedded
+    deployments alongside `clock/gstime` for externally synchronized clocks.
+  - **Cleanroom `pgx` package (`pgx`)**: drop-in `pgx/v5` & `pgxpool`-style
+    connection, pool, transaction, batch, `CopyFrom`, and `pgtype` codec API
+    running directly in-process over `supersql.Connector` (compatible with
+    `sqlc`, GORM, Ent, and standard `pgx` codebases).
+
+- **Seven major engine capabilities**:
+  - **GIN inverted indexes (`USING gin`)**: pure-Go inverted posting-list
+    indexes supporting `jsonb` (`@>`, `?`, `?|`, `?&`, `@?`, `@@`), arrays
+    (`@>`, `<@`, `&&`), and full-text `tsvector` (`@@`) accelerated via
+    `GIN Index Scan`.
+  - **Optional PostgreSQL v3.0 TCP wire listener (`pgwire`)**: pure-Go wire
+    protocol server over `supersql.Connector` supporting `SSLRequest`/TLS,
+    `CancelRequest`, trust/password/custom auth, Simple Query Protocol, Extended
+    Query Protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`, text and binary
+    formats), and `NotificationResponse` (`'A'`) async push so `psql` and
+    external PostgreSQL clients can connect directly.
+  - **Object-level access control & routine security**: full `GRANT`/`REVOKE`
+    privileges on databases, schemas, tables, sequences, views, functions, and
+    procedures, `ALTER ... OWNER TO`, and `SECURITY DEFINER` / `SECURITY
+    INVOKER` execution contexts with role enforcement.
+  - **Observability & Auto-`ANALYZE`**: background Auto-`ANALYZE` triggered by
+    per-table mutation thresholds (`MaintenanceConfig.AutoAnalyzeMinRows`,
+    `AutoAnalyzeScaleFactor`, and `Catalog.RunAutoAnalyze`), `EXPLAIN (ANALYZE,
+    BUFFERS)` reporting shared cache hits/reads and spill telemetry, per-query
+    `QueryObserver` / `OnSlowQuery` hooks (`QueryEvent`), and live
+    `Catalog.Metrics(ctx)` (`DatabaseMetrics`) snapshots.
+  - **At-rest encryption, incremental backups, WAL archiving & PITR**: pure-Go
+    AES-256-GCM (`NSE1` 64 KiB authenticated chunks) encryption for live
+    storage (`OpenOptions.EncryptionKey`), hot backups
+    (`CreateHotBackupWithOptions`, `RestoreEncryptedCheckpoint`), incremental
+    backup chains (`CreateIncrementalBackup`, `RestoreIncremental`), continuous
+    WAL archiving (`OpenOptions.WALArchiveDir` / `WALArchiveKey`,
+    `Catalog.EnableWALArchive`), and Point-in-Time Recovery (`RestorePITR`).
+  - **Transactional `LISTEN` / `NOTIFY` / `UNLISTEN` & Go pub/sub**:
+    commit-atomic notification staging and delivery with payload coalescing,
+    in-process Go subscriptions (`Catalog.Subscribe`), `pgx`
+    `Conn.WaitForNotification` / `Pool.WaitForNotification`, and `pgwire`
+    asynchronous `'A'` messages.
+  - **Pure-Go ICU collations & `CREATE/DROP COLLATION`**: Unicode Collation
+    Algorithm (`golang.org/x/text/collate`) integration with locale-aware
+    sorting, comparisons, `COLLATE` expressions, and `CREATE COLLATION` /
+    `DROP COLLATION` catalog persistence.
+
+- **Full-text search & documentation**:
+  - **Built-in Snowball FTS configs & extensible Go `TextSearchAnalyzer` API**:
+    28 pure-Go Snowball stemmer configurations (`english`, `french`, `german`,
+    `spanish`, etc.) with PostgreSQL stopword lists, plus custom analyzer
+    registration via `OpenOptions.TextSearchAnalyzers`,
+    `Catalog.RegisterTextSearchAnalyzer`, `Catalog.UnregisterTextSearchAnalyzer`,
+    and `SimpleTextSearchAnalyzer` (usable with `to_tsvector`, `to_tsquery`,
+    `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`,
+    `jsonb_to_tsvector`, and `GIN` indexes).
+  - **SQL syntax reference & automated doctests**: 8-chapter SQL reference under
+    `docs/sql/` verified end-to-end by `docs_sql_test.go`.
+  - **Operational guides & architecture doc**: Go operational guides under
+    `docs/guides/` (`pgx-and-orms.md`, `backup-encryption-pitr.md`,
+    `observability-tuning.md`, `custom-text-search.md`) and
+    `docs/ARCHITECTURE.md`.
+  - **Multi-package Go API reference**: `internal/tools/docgen` now documents
+    the root `supersql` package alongside public subpackages (`pgx`, `pgwire`,
+    `clock`, `clock/local`, `clock/gstime`) in `docs/reference/api.md` and
+    enforces GoDoc coverage across all public packages.
+
+### Changed
+
+- `EXPLAIN (ANALYZE, BUFFERS)` is now supported and reports real shared block
+  hits/reads and spill statistics (`WAL` and `MEMORY` options remain outside the
+  embedded profile with SQLSTATE `0A000`).
+
+### Fixed
+
+- `SELECT ... FOR UPDATE [SKIP LOCKED | NOWAIT]` now locks selected rows along
+  the full query execution path, honoring `SKIP LOCKED` and returning `55P03`
+  under `NOWAIT` contention.
+- `INSERT` into tables with `GENERATED ALWAYS AS (...) STORED` columns now
+  evaluates and persists generated expressions reliably across single-row,
+  multi-row, and `INSERT ... SELECT` paths.
+
+## [0.1.0-rc0] - Earlier Pre-Alpha Baseline
 
 First private-repo, release-candidate pass over the embedded PostgreSQL-18
 engine (NeoSepia columnar storage + the certified-clock session stack).

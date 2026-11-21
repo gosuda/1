@@ -118,3 +118,20 @@ SELECT hashtext('Alice' COLLATE ci_en) = hashtext('alice' COLLATE ci_en) AS hash
 
 DROP COLLATION IF EXISTS unused_coll;
 ```
+
+---
+
+## 3. Full-Text Search & Custom `TextSearchAnalyzer`
+
+SuperSQL ships with `'simple'` plus all **29 built-in PostgreSQL Snowball language configurations** (`'english'`, `'french'`, `'german'`, `'spanish'`, `'italian'`, `'portuguese'`, `'russian'`, `'dutch'`, `'arabic'`, `'turkish'`, etc.) compiled in pure Go (`CGO_ENABLED=0`).
+
+<!-- doctest -->
+```sql
+SELECT to_tsvector('english', 'The fat rats ran quickly')
+    @@ to_tsquery('english', 'rat & quick') AS matches;
+
+SELECT plainto_tsquery('english', 'embedded databases') AS query;
+```
+
+For languages requiring morphological analysis or custom tokenization (such as Korean, Japanese, CJK bigrams, or domain-specific normalizers), register a Go `supersql.TextSearchAnalyzer` via `OpenOptions.TextSearchAnalyzers` or `Catalog.RegisterTextSearchAnalyzer` — see **[`docs/guides/custom-text-search.md`](../guides/custom-text-search.md)**.
+

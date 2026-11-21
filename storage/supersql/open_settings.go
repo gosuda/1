@@ -11,10 +11,12 @@ import (
 
 // newStackSettings resolves session GUC values that name a session-visible
 // object or locale. The native build pins its time zone database, its single
-// C locale, and the pg_catalog.simple text search configuration, so resolution
-// is a constant-time identity check rather than a catalog read: SettingResolver
-// carries no read view, so a resolver must never depend on the current catalog.
-type newStackSettings struct{}
+// C locale, its built-in text search configurations, and any host-registered
+// custom text search analyzers, so resolution does not require a catalog read
+// view.
+type newStackSettings struct {
+	database *Catalog
+}
 
 // ResolveTimeZone validates a name against the pinned tzcode database. Fixed
 // offsets never reach this method: Settings parses numeric zones itself. The
@@ -38,18 +40,26 @@ func (newStackSettings) ResolveTimeZone(ctx context.Context, name string) (sessi
 	return session.Zone{Name: value}, nil
 }
 
-// ResolveTextSearchConfig accepts only the pinned pg_catalog.simple
-// configuration. User-defined text search configurations live in the catalog and
-// need a read view to verify, which this interface cannot provide; they are
-// rejected rather than accepted without verification.
-func (newStackSettings) ResolveTextSearchConfig(ctx context.Context, name string, _ []string) (string, error) {
+// ResolveTextSearchConfig accepts any host-registered custom text search
+// analyzer or built-in PostgreSQL text search configuration (simple and all
+// embedded Snowball languages).
+func (s newStackSettings) ResolveTextSearchConfig(ctx context.Context, name string, _ []string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if configurationName(name) != "pg_catalog.simple" {
-		return "", &model.Error{Code: "42704", Message: "text search configuration does not exist", Detail: name}
+	parts, err := builtin.ParseQualifiedName(ctx, name, 4096)
+	if err != nil {
+		return "", &model.Error{Code: "42602", Message: "invalid text search configuration name", Detail: name, Cause: err}
 	}
-	return "pg_catalog.simple", nil
+	if len(parts) == 1 && s.database != nil && s.database.textSearchRegistry != nil {
+		if cfg, ok := s.database.textSearchRegistry.LookupByName(parts[0]); ok {
+			return cfg.Name, nil
+		}
+	}
+	if canonical, ok := builtin.HasBuiltinTextSearchConfiguration(name); ok {
+		return canonical, nil
+	}
+	return "", &model.Error{Code: "42704", Message: "text search configuration does not exist", Detail: name}
 }
 
 // ResolveFormatLocale accepts only the C locale, which is the build's sole
@@ -89,14 +99,4 @@ var cFormatLocale = model.FormatLocale{
 	AbbreviatedMonthNames: [12]string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"},
 	DayNames:              [7]string{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"},
 	AbbreviatedDayNames:   [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
-}
-
-// configurationName qualifies an unqualified text search configuration name
-// with pg_catalog, which is always on the search path.
-func configurationName(name string) string {
-	value := strings.ToLower(strings.TrimSpace(name))
-	if strings.ContainsRune(value, '.') {
-		return value
-	}
-	return "pg_catalog." + value
 }

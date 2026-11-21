@@ -22,6 +22,7 @@ type RoutineTransactionCapabilities struct {
 	CatalogRelations     *catalogrel.Registry
 	TextSearchRewrite    TextSearchRewrite
 	TextSearchStatistics TextSearchStatistics
+	CustomTextSearch     CustomTextSearchLookup
 	// BaseFunctions, BaseBuiltin, and BaseKeys are immutable database roots.
 	// They must not capture a transaction snapshot or session operation token.
 	BaseFunctions expr.Resolver
@@ -120,7 +121,7 @@ func (executor *routineExecutor) buildCapabilityFrame(ctx context.Context, view 
 	if executor.transactions.settings.TransactionPolicy().ReadOnly {
 		sequences = readOnlySequences{SequenceRuntime: sequences}
 	}
-	textSearch, err := NewTextSearchRuntime(snapshot, path, configured.PathBytes, configured.TextSearchRewrite, configured.TextSearchStatistics)
+	textSearch, err := NewTextSearchRuntimeWithCustom(snapshot, path, configured.PathBytes, configured.TextSearchRewrite, configured.TextSearchStatistics, configured.CustomTextSearch)
 	if err != nil {
 		return nil, err
 	}

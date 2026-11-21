@@ -15,6 +15,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/exchange"
 	exsort "github.com/gosuda/supersql-alpha/internal/query/exec/sort"
+	"github.com/gosuda/supersql-alpha/internal/query/ir"
 	"github.com/gosuda/supersql-alpha/internal/query/physical"
 )
 
@@ -54,10 +55,49 @@ func (c *invocation) parallelScanEligible(node physical.NodeSpec) bool {
 	return true
 }
 
+func (c *invocation) skipLockedOccurrence(occurrence model.ScanOccurrence) bool {
+	if occurrence == 0 {
+		return false
+	}
+	skip := false
+	for id := physical.NodeID(1); id <= physical.NodeID(c.plan.NodeCount()); id++ {
+		node, ok := c.plan.Node(id)
+		if !ok {
+			continue
+		}
+		meta := node.Metadata()
+		if meta.Algorithm != physical.LockRows {
+			continue
+		}
+		graph, ok := c.plan.Graph(meta.Logical.Graph)
+		if !ok {
+			continue
+		}
+		rel, ok := graph.Rel(meta.Logical.Rel)
+		if !ok || rel.Kind != ir.LockRows {
+			continue
+		}
+		for i := range rel.LockCount() {
+			lock, ok := graph.RowLock(meta.Logical.Rel, i)
+			if !ok || lock.Occurrence != occurrence {
+				continue
+			}
+			switch lock.Wait {
+			case ir.NoWait:
+				return false
+			case ir.SkipLocked:
+				skip = true
+			}
+		}
+	}
+	return skip
+}
+
 func (c *invocation) scanInput(node physical.NodeSpec, decision [32]byte) (_ storage.BatchCursor, err error) {
 	env, spec := &c.portal.env, node.Scan
+	allowAdmitted := c.skipLockedOccurrence(spec.Request.Occurrence)
 	if !c.parallelScanEligible(node) {
-		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: env.Limits.MetadataBytes}, nil
+		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: env.Limits.MetadataBytes, allowAdmitted: allowAdmitted}, nil
 	}
 	groups := min(env.Query.Parallelism(), len(spec.Request.Spans))
 	limit := env.Limits.MetadataBytes
@@ -100,7 +140,7 @@ func (c *invocation) scanInput(node physical.NodeSpec, decision [32]byte) (_ sto
 	if len(spans) < 2 {
 		// Canonicalization is the last eligibility proof, before group creation.
 		claim.Release()
-		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: limit}, nil
+		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: limit, allowAdmitted: allowAdmitted}, nil
 	}
 	groups = min(groups, len(spans))
 	layouts := make([]model.TypeLayout, len(spec.Projection))
@@ -142,7 +182,7 @@ func (c *invocation) scanInput(node physical.NodeSpec, decision [32]byte) (_ sto
 		if err != nil {
 			return nil, err
 		}
-		inputs[i] = &scanCursor{reader: env.Reader, spec: group, decision: decision, maxBytes: limit, releasePlan: true}
+		inputs[i] = &scanCursor{reader: env.Reader, spec: group, decision: decision, maxBytes: limit, releasePlan: true, allowAdmitted: allowAdmitted}
 		start = end
 	}
 	var gathered storage.BatchCursor

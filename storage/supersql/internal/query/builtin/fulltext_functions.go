@@ -68,31 +68,77 @@ func compileFullText(signature Signature) scalarKernel {
 	}
 }
 
-func resolveTextSearchConfiguration(ctx context.Context, explicit *model.Value, budget CallBudget) (model.TextSearchConfiguration,error) {
-	if explicit != nil {
-		oid:=model.OID(explicit.IntVal)
-		if configuration,ok:=builtinTextSearchConfiguration(oid);ok{return configuration,nil}
-		if budget.TextSearch==nil{return model.TextSearchConfiguration{},sqlError("42704","text search configuration does not exist")}
-		return budget.TextSearch.TextSearchConfiguration(ctx,oid)
-	}
-	if budget.Settings==nil{return model.TextSearchConfiguration{},sqlError("55000","default_text_search_config runtime is unavailable")}
-	value,err:=budget.Settings.CurrentSetting(ctx,"default_text_search_config",false);if err!=nil{return model.TextSearchConfiguration{},err}
-	if configuration,ok:=builtinTextSearchConfigurationByName(value.StrVal);ok{return configuration,nil}
-	if budget.TextSearch==nil{return model.TextSearchConfiguration{},sqlError("42704","text search configuration does not exist")}
-	return budget.TextSearch.ResolveTextSearchConfiguration(ctx,value.StrVal)
+func isTextSearchNotFoundError(err error) bool {
+	var state *model.Error
+	return errors.As(err, &state) && state.Code == "42704"
 }
 
-func fullTextRegInput(ctx context.Context, configuration bool, input string, budget CallBudget) (model.Value,error) {
-	text:=strings.TrimSpace(input)
-	if oid,err:=strconv.ParseUint(text,10,32);err==nil{return model.Int64Val(int64(oid)),nil}
-	if configuration {
-		if value,ok:=builtinTextSearchConfigurationByName(text);ok{return model.Int64Val(int64(value.OID)),nil}
-		if budget.TextSearch!=nil { value,err:=budget.TextSearch.ResolveTextSearchConfiguration(ctx,text);if err==nil{return model.Int64Val(int64(value.OID)),nil};return model.Value{},err }
-	} else {
-		if value,ok:=builtinTextSearchDictionaryByName(text);ok{return model.Int64Val(int64(value.OID)),nil}
-		if budget.TextSearch!=nil { value,err:=budget.TextSearch.ResolveTextSearchDictionary(ctx,text);if err==nil{return model.Int64Val(int64(value.OID)),nil};return model.Value{},err }
+func resolveTextSearchConfiguration(ctx context.Context, explicit *model.Value, budget CallBudget) (model.TextSearchConfiguration, error) {
+	if explicit != nil {
+		oid := model.OID(explicit.IntVal)
+		if configuration, ok := builtinTextSearchConfiguration(oid); ok {
+			return configuration, nil
+		}
+		if budget.TextSearch == nil {
+			return model.TextSearchConfiguration{}, sqlError("42704", "text search configuration does not exist")
+		}
+		return budget.TextSearch.TextSearchConfiguration(ctx, oid)
 	}
-	return model.Value{},sqlError("42704","text search object does not exist")
+	if budget.Settings == nil {
+		return model.TextSearchConfiguration{}, sqlError("55000", "default_text_search_config runtime is unavailable")
+	}
+	value, err := budget.Settings.CurrentSetting(ctx, "default_text_search_config", false)
+	if err != nil {
+		return model.TextSearchConfiguration{}, err
+	}
+	if budget.TextSearch != nil {
+		configuration, resolveErr := budget.TextSearch.ResolveTextSearchConfiguration(ctx, value.StrVal)
+		if resolveErr == nil {
+			return configuration, nil
+		}
+		if !isTextSearchNotFoundError(resolveErr) {
+			return model.TextSearchConfiguration{}, resolveErr
+		}
+	}
+	if configuration, ok := builtinTextSearchConfigurationByName(value.StrVal); ok {
+		return configuration, nil
+	}
+	return model.TextSearchConfiguration{}, sqlError("42704", "text search configuration does not exist")
+}
+
+func fullTextRegInput(ctx context.Context, configuration bool, input string, budget CallBudget) (model.Value, error) {
+	text := strings.TrimSpace(input)
+	if oid, err := strconv.ParseUint(text, 10, 32); err == nil {
+		return model.Int64Val(int64(oid)), nil
+	}
+	if configuration {
+		if budget.TextSearch != nil {
+			value, err := budget.TextSearch.ResolveTextSearchConfiguration(ctx, text)
+			if err == nil {
+				return model.Int64Val(int64(value.OID)), nil
+			}
+			if !isTextSearchNotFoundError(err) {
+				return model.Value{}, err
+			}
+		}
+		if value, ok := builtinTextSearchConfigurationByName(text); ok {
+			return model.Int64Val(int64(value.OID)), nil
+		}
+	} else {
+		if budget.TextSearch != nil {
+			value, err := budget.TextSearch.ResolveTextSearchDictionary(ctx, text)
+			if err == nil {
+				return model.Int64Val(int64(value.OID)), nil
+			}
+			if !isTextSearchNotFoundError(err) {
+				return model.Value{}, err
+			}
+		}
+		if value, ok := builtinTextSearchDictionaryByName(text); ok {
+			return model.Int64Val(int64(value.OID)), nil
+		}
+	}
+	return model.Value{}, sqlError("42704", "text search object does not exist")
 }
 
 func fullTextRegOutput(ctx context.Context, configuration bool, oid model.OID, budget CallBudget) (model.Value,error) {

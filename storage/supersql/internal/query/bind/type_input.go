@@ -36,7 +36,7 @@ func (b *binder) inputLiteral(s *scope, e expression, target model.TypeLayout) (
 		return e, err
 	}
 	remaining := maximum - function.OwnedBytes()
-	value, err := function.Call(b.ctx, values[:sig.ArgumentCount], builtin.CallBudget{OutputBytes: int64(remaining), MemoryBytes: remaining, Temporal: b.options.Temporal})
+	value, err := function.Call(b.ctx, values[:sig.ArgumentCount], builtin.CallBudget{OutputBytes: int64(remaining), MemoryBytes: remaining, Temporal: b.options.Temporal, TextSearch: b.options.TextSearch})
 	if err != nil {
 		var sqlErr *model.Error
 		if errors.As(err, &sqlErr) {

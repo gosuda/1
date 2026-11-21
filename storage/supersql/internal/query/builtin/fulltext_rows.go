@@ -300,6 +300,25 @@ func prepareTSDebugRows(ctx context.Context, id model.FunctionID, arguments []mo
 	}
 	rows := make([][]model.Value, len(tokens))
 	for i, token := range tokens {
+		alias, description := tsTokenInfo(token.typ)
+		if configuration.Analyzer != nil {
+			dictionaryValues := []model.Value{}
+			selected := model.NullVal(model.TypeInt64)
+			lexemeValue := model.NullVal(model.TypeArray)
+			if token.typ != 12 && token.typ != 13 && token.typ != 23 {
+				words, lexErr := lexizeCustomText(ctx, configuration.Analyzer, token.text, tsMaxDataBytes)
+				if lexErr != nil {
+					return nil, lexErr
+				}
+				values := make([]model.Value, len(words))
+				for j, word := range words {
+					values[j] = model.StringVal(word.lexeme)
+				}
+				lexemeValue = fullTextArray(values)
+			}
+			rows[i] = []model.Value{model.StringVal(alias), model.StringVal(description), model.StringVal(token.text), fullTextArray(dictionaryValues), selected, lexemeValue}
+			continue
+		}
 		dictionaries := textSearchMapping(configuration, token.typ)
 		dictionaryValues := make([]model.Value, len(dictionaries))
 		for j, dictionary := range dictionaries {
@@ -323,7 +342,6 @@ func prepareTSDebugRows(ctx context.Context, id model.FunctionID, arguments []mo
 			lexemeValue = fullTextArray(values)
 			break
 		}
-		alias, description := tsTokenInfo(token.typ)
 		rows[i] = []model.Value{model.StringVal(alias), model.StringVal(description), model.StringVal(token.text), fullTextArray(dictionaryValues), selected, lexemeValue}
 	}
 	return rows, nil

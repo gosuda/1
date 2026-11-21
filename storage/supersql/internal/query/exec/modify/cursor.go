@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
@@ -50,6 +51,7 @@ type cursor struct {
 	target                   storage.ObjectRef
 	metadata                 uint64
 	columnIDs                []model.ColumnID
+	generatedColumns         []bool
 	tableLayouts             []model.TypeLayout
 	visibleColumns           []int
 	visibleLayouts           []model.TypeLayout
@@ -527,11 +529,13 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		if err := candidate.Close(); err != nil {
 			return err
 		}
-		fullColumns := c.columnIDs
+		fullColumns, updateValues := c.columnIDs, replacement.Values
 		if source != nil {
-			fullColumns = source.columnIDs
+			fullColumns, updateValues = filterNonGeneratedColumns(source.columns, source.columnIDs, updateValues)
+		} else {
+			fullColumns, updateValues = filterNonGeneratedMask(c.generatedColumns, fullColumns, updateValues)
 		}
-		candidate, err = o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: fullColumns, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
+		candidate, err = o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: fullColumns, Values: updateValues, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 		if err != nil {
 			return err
 		}
@@ -620,8 +624,9 @@ func (c *cursor) movePartitionRow(ctx context.Context, frozen []model.Value, sou
 	if err != nil {
 		return err
 	}
+	insertColumns, insertValues := filterNonGeneratedColumns(destination.columns, columnIDs, proposed.Values)
 	rowLimit := c.rowPayloadBytes()
-	candidate, err := o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: destination.target, ColumnIDs: columnIDs, Values: proposed.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
+	candidate, err := o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: destination.target, ColumnIDs: insertColumns, Values: insertValues, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 	if err != nil {
 		return err
 	}
@@ -1240,11 +1245,59 @@ func (c *cursor) Close() error {
 	}
 	c.row, c.keyValues, c.pending, c.lastKey = nil, nil, nil, nil
 	c.returnValues = nil
-	c.columnIDs, c.tableLayouts, c.returnLayouts = nil, nil, nil
+	c.columnIDs, c.generatedColumns, c.tableLayouts, c.returnLayouts = nil, nil, nil, nil
 	c.visibleColumns, c.visibleLayouts, c.oldImage, c.newImage = nil, nil, nil, nil
 	c.keyColumns, c.assignmentColumns = nil, nil
 	c.assignmentInput, c.rlsCheckInput, c.returnInput, c.output = nil, nil, nil, nil
 	c.assignment, c.returning, c.rlsInsertCheck, c.rlsUpdateCheck, c.claim, c.descriptor = nil, nil, nil, nil, nil, nil
 	c.options = Options{}
 	return c.closeErr
+}
+
+// filterNonGeneratedMask omits generated columns from a full-row column/value
+// pair before passing it back to RowNormalizer, which rejects supplied
+// generated columns and recomputes them from the supplied non-generated values.
+func filterNonGeneratedMask(generated []bool, columnIDs []model.ColumnID, values []model.Value) ([]model.ColumnID, []model.Value) {
+	if len(generated) == 0 || len(generated) != len(columnIDs) || len(columnIDs) != len(values) {
+		return columnIDs, values
+	}
+	filteredIDs := make([]model.ColumnID, 0, len(columnIDs))
+	filteredValues := make([]model.Value, 0, len(values))
+	for i, id := range columnIDs {
+		if generated[i] {
+			continue
+		}
+		filteredIDs = append(filteredIDs, id)
+		filteredValues = append(filteredValues, values[i])
+	}
+	return filteredIDs, filteredValues
+}
+
+// filterNonGeneratedColumns omits generated columns of the target descriptor
+// from a mapped column/value pair before invoking RowNormalizer.
+func filterNonGeneratedColumns(columns []model.ColumnDescriptor, columnIDs []model.ColumnID, values []model.Value) ([]model.ColumnID, []model.Value) {
+	if len(columnIDs) != len(values) {
+		return columnIDs, values
+	}
+	hasGenerated := false
+	for _, column := range columns {
+		if column.Generated != nil {
+			hasGenerated = true
+			break
+		}
+	}
+	if !hasGenerated {
+		return columnIDs, values
+	}
+	filteredIDs := make([]model.ColumnID, 0, len(columnIDs))
+	filteredValues := make([]model.Value, 0, len(values))
+	for i, id := range columnIDs {
+		idx := slices.IndexFunc(columns, func(col model.ColumnDescriptor) bool { return col.ID == id })
+		if idx >= 0 && columns[idx].Generated != nil {
+			continue
+		}
+		filteredIDs = append(filteredIDs, id)
+		filteredValues = append(filteredValues, values[i])
+	}
+	return filteredIDs, filteredValues
 }

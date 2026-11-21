@@ -1539,11 +1539,45 @@ func buildProbeArgs(paramOIDs []uint32, stringFallback bool) []driver.NamedValue
 	return args
 }
 
-// runProtectedProbe executes a read-only 0-row SELECT probe to extract exact
-// column metadata. When the connection is inside an active transaction ('T'),
-// it wraps the probe in an internal SAVEPOINT so any probe failure cannot
-// abort the user's transaction.
+type queryDescriber interface {
+	DescribeQuery(ctx context.Context, query string, args []driver.NamedValue) (names []string, oids []uint32, mods []int32, err error)
+}
+
+// runProtectedProbe extracts exact result column metadata for a Describe probe.
+// When the driver connection supports bind-only DescribeQuery, it binds against
+// the catalog snapshot without acquiring data-table locks (so Describe never
+// blocks on or pollutes row locks in concurrent transactions). Otherwise it
+// falls back to a 0-row SELECT probe wrapped in a SAVEPOINT inside active
+// transactions.
 func (c *clientConn) runProtectedProbe(ctx context.Context, probeSQL string, args []driver.NamedValue) ([]columnDesc, error) {
+	if describer, ok := c.driverConn.(queryDescriber); ok {
+		names, oids, mods, err := describer.DescribeQuery(ctx, probeSQL, args)
+		if err != nil {
+			return nil, err
+		}
+		cols := make([]columnDesc, len(names))
+		for i, name := range names {
+			var oid uint32 = oidText
+			var mod int32 = -1
+			if i < len(oids) && oids[i] != 0 {
+				oid = oids[i]
+				if i < len(mods) {
+					mod = mods[i]
+				}
+			}
+			if oid == oidUnknown {
+				oid = oidText
+			}
+			cols[i] = columnDesc{
+				Name:       name,
+				TypeOID:    oid,
+				TypeSize:   typeSize(oid),
+				TypeMod:    mod,
+				FormatCode: formatText,
+			}
+		}
+		return cols, nil
+	}
 	queryer, ok := c.driverConn.(driver.QueryerContext)
 	if !ok {
 		return nil, &wireError{Severity: "ERROR", Code: "XX000", Message: "driver connection does not support QueryContext"}

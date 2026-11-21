@@ -94,6 +94,7 @@ type Catalog struct {
 	queriesFailed      atomic.Uint64
 	slowQueriesTotal   atomic.Uint64
 	autoAnalyze        *autoAnalyzeTracker
+	textSearchRegistry *textSearchAnalyzerRegistry
 
 	mu       sync.Mutex
 	closed   bool
@@ -123,6 +124,10 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 		return nil, wrapError(&model.Error{Code: "22023", Message: "invalid slow query threshold"})
 	}
 	maintenance, err := normalizedMaintenance(options.Maintenance)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	textSearchRegistry, err := newTextSearchAnalyzerRegistryFromOptions(options.TextSearchAnalyzers)
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -172,6 +177,7 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 		slowQueryThreshold:     options.SlowQueryThreshold,
 		onSlowQuery:            options.OnSlowQuery,
 		autoAnalyze:            newAutoAnalyzeTracker(),
+		textSearchRegistry:     textSearchRegistry,
 	}
 	database.workerCtx, database.workerStop = context.WithCancel(context.Background())
 	database.schedulerErr = make(chan error, 1)

@@ -128,7 +128,8 @@ func (scope *sessionScope) routineExecutionOptions(builtins builtin.ResolveOptio
 		Limits:   database.proceduralLimits(),
 		Capabilities: session.RoutineTransactionCapabilities{
 			Sequence: scope.sequences, CatalogRelations: database.native.Registry,
-			BaseFunctions: unresolvedFunctions{}, BaseBuiltin: builtins, BaseKeys: database.keys, PathBytes: 4096,
+			CustomTextSearch: database.textSearchRegistry,
+			BaseFunctions:    unresolvedFunctions{}, BaseBuiltin: builtins, BaseKeys: database.keys, PathBytes: 4096,
 		},
 	}
 }

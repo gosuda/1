@@ -601,7 +601,7 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 	environment.Builtin.InformationSchemaFunctions = prepared.builtins.InformationSchemaFunctions
 	environment.Builtin.InformationSchemaTypes = prepared.builtins.InformationSchemaTypes
 	if len(environment.Parameters) != 0 {
-		reconciled, paramErr := reconcileBoundParameters(ctx, prepared.bound, environment.Parameters, environment.Builtin, environment.Limits)
+		reconciled, paramErr := reconcileBoundParameters(ctx, prepared.bound, environment.Parameters, environment.Builtin, environment.Limits, environment.TextSearch)
 		if paramErr != nil {
 			return 0, paramErr
 		}
@@ -790,7 +790,7 @@ func validatePreparedDependencies(ctx context.Context, prepared *Prepared, store
 // reconcileBoundParameters aligns caller-supplied parameter values with the
 // bound statement's authoritative parameter layouts: NULLs adopt the bound
 // storage tag and text-format values are coerced through the type's input codec.
-func reconcileBoundParameters(ctx context.Context, bound *bind.BoundStatement, parameters []expr.ParameterValue, builtins builtin.ResolveOptions, limits exec.Limits) ([]expr.ParameterValue, error) {
+func reconcileBoundParameters(ctx context.Context, bound *bind.BoundStatement, parameters []expr.ParameterValue, builtins builtin.ResolveOptions, limits exec.Limits, textSearch model.TextSearchRuntime) ([]expr.ParameterValue, error) {
 	if bound == nil || len(parameters) == 0 {
 		return nil, nil
 	}
@@ -819,7 +819,7 @@ func reconcileBoundParameters(ctx context.Context, bound *bind.BoundStatement, p
 				return nil, coerceErr
 			}
 			output := min(limits.Expressions.MaxOutputBytes, uint64(math.MaxInt64))
-			budget := builtin.CallBudget{MemoryBytes: limits.Expressions.MaxStateBytes, OutputBytes: int64(output)}
+			budget := builtin.CallBudget{MemoryBytes: limits.Expressions.MaxStateBytes, OutputBytes: int64(output), TextSearch: textSearch}
 			if value, coerceErr = codec.Input(ctx, []model.Value{value}, budget); coerceErr != nil {
 				return nil, coerceErr
 			}

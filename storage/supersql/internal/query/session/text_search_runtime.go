@@ -21,17 +21,32 @@ type TextSearchCatalog interface {
 type TextSearchRewrite func(context.Context, []byte, string, uint64) ([]byte, error)
 type TextSearchStatistics func(context.Context, string, string, uint64) ([]model.TextSearchStatistic, error)
 
+// CustomTextSearchLookup resolves host-registered custom text search
+// configurations by normalized lowercase name or synthetic OID.
+type CustomTextSearchLookup interface {
+	LookupByName(name string) (model.TextSearchConfiguration, bool)
+	LookupByOID(oid model.OID) (model.TextSearchConfiguration, bool)
+}
+
 type textSearchRuntime struct {
 	catalog    TextSearchCatalog
 	path       []string
 	rewrite    TextSearchRewrite
 	statistics TextSearchStatistics
 	stemmer    model.TextSearchStemmer
+	custom     CustomTextSearchLookup
 }
 
 // NewTextSearchRuntime borrows the pinned invocation catalog and owns the
 // semantic search path used by regconfig and regdictionary.
 func NewTextSearchRuntime(snapshot TextSearchCatalog, path []string, pathBytes uint64, rewrite TextSearchRewrite, statistics TextSearchStatistics) (model.TextSearchRuntime, error) {
+	return NewTextSearchRuntimeWithCustom(snapshot, path, pathBytes, rewrite, statistics, nil)
+}
+
+// NewTextSearchRuntimeWithCustom borrows the pinned invocation catalog, owns
+// the semantic search path used by regconfig and regdictionary, and consults
+// custom for host-registered Go text search analyzers.
+func NewTextSearchRuntimeWithCustom(snapshot TextSearchCatalog, path []string, pathBytes uint64, rewrite TextSearchRewrite, statistics TextSearchStatistics, custom CustomTextSearchLookup) (model.TextSearchRuntime, error) {
 	if historicalNil(snapshot) || pathBytes == 0 {
 		return nil, errPreparedInvocation
 	}
@@ -48,7 +63,7 @@ func NewTextSearchRuntime(snapshot TextSearchCatalog, path []string, pathBytes u
 		remaining -= uint64(len(name))
 		owned[i] = strings.Clone(name)
 	}
-	return &textSearchRuntime{catalog: snapshot, path: owned, rewrite: rewrite, statistics: statistics, stemmer: builtin.NativeTextSearchStemmer{}}, nil
+	return &textSearchRuntime{catalog: snapshot, path: owned, rewrite: rewrite, statistics: statistics, stemmer: builtin.NativeTextSearchStemmer{}, custom: custom}, nil
 }
 
 func (r *textSearchRuntime) resolve(ctx context.Context, text string, kind model.ObjectKind) (*model.Descriptor, error) {
@@ -99,10 +114,7 @@ func textSearchLookupError(err error) error {
 }
 
 func staticRuntimeDictionary(oid model.OID) (model.TextSearchDictionary, bool) {
-	if oid == 3765 {
-		return model.TextSearchDictionary{OID: 3765, Name: "pg_catalog.simple", Kind: model.TextSearchSimpleDictionary, Accept: true}, true
-	}
-	return model.TextSearchDictionary{}, false
+	return builtin.BuiltinTextSearchDictionary(oid)
 }
 
 func (r *textSearchRuntime) dictionaryDescriptor(ctx context.Context, descriptor *model.Descriptor) (model.TextSearchDictionary, error) {
@@ -194,6 +206,17 @@ func (r *textSearchRuntime) configurationDescriptor(ctx context.Context, descrip
 	return configuration, nil
 }
 func (r *textSearchRuntime) ResolveTextSearchConfiguration(ctx context.Context, name string) (model.TextSearchConfiguration, error) {
+	if r.custom != nil {
+		parts, err := builtin.ParseQualifiedName(ctx, name, 1<<20)
+		if err != nil {
+			return model.TextSearchConfiguration{}, err
+		}
+		if len(parts) == 1 {
+			if cfg, ok := r.custom.LookupByName(parts[0]); ok {
+				return cfg, nil
+			}
+		}
+	}
 	descriptor, err := r.resolve(ctx, name, model.ObjectTextSearchConfiguration)
 	if err != nil {
 		return model.TextSearchConfiguration{}, err
@@ -201,6 +224,11 @@ func (r *textSearchRuntime) ResolveTextSearchConfiguration(ctx context.Context, 
 	return r.configurationDescriptor(ctx, descriptor)
 }
 func (r *textSearchRuntime) TextSearchConfiguration(ctx context.Context, oid model.OID) (model.TextSearchConfiguration, error) {
+	if r.custom != nil {
+		if cfg, ok := r.custom.LookupByOID(oid); ok {
+			return cfg, nil
+		}
+	}
 	published, err := r.catalog.ResolveOID(ctx, oid)
 	if err != nil {
 		return model.TextSearchConfiguration{}, textSearchLookupError(err)
@@ -247,6 +275,11 @@ func (r *textSearchRuntime) objectName(ctx context.Context, oid model.OID, kind 
 	return builtin.QuoteQualifiedName(ctx, []string{namespace.Descriptor.Name().Name, name.Name}, maxBytes)
 }
 func (r *textSearchRuntime) TextSearchConfigurationName(ctx context.Context, oid model.OID, maxBytes uint64) (string, error) {
+	if r.custom != nil {
+		if cfg, ok := r.custom.LookupByOID(oid); ok {
+			return builtin.QuoteQualifiedName(ctx, []string{cfg.Name}, maxBytes)
+		}
+	}
 	return r.objectName(ctx, oid, model.ObjectTextSearchConfiguration, maxBytes)
 }
 func (r *textSearchRuntime) TextSearchDictionaryName(ctx context.Context, oid model.OID, maxBytes uint64) (string, error) {

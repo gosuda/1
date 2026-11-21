@@ -39,6 +39,8 @@ func ownHistory(history *gstime.LeapHistory) (*gstime.LeapHistory, error) {
 	return owned, nil
 }
 
+// FromUTC converts a civil UTC timestamp into a continuous SI Instant using
+// the clock's leap-second history.
 func (c *certifiedClock) FromUTC(value time.Time) (clock.Instant, error) {
 	utc := value.UTC()
 	if utc.Year() < 1 || utc.Year() > 9999 {
@@ -76,6 +78,8 @@ func (c *certifiedClock) FromUTC(value time.Time) (clock.Instant, error) {
 	return clock.Instant(instant), nil
 }
 
+// ToUTC projects a continuous SI Instant onto a civil UTC timestamp and
+// reports whether the instant lies inside a positive leap second.
 func (c *certifiedClock) ToUTC(instant clock.Instant) (clock.UTCProjection, error) {
 	if instant < 0 {
 		return clock.UTCProjection{}, clock.ErrClockRange

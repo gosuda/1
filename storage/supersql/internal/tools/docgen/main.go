@@ -112,19 +112,15 @@ type generator struct {
 	fset         *token.FileSet
 	parsed       map[string]*ast.File
 	undocumented map[string]bool
-	// renderedExamples records the examples already shown with a symbol so the
-	// example list stays complete without repeating code.
-	renderedExamples map[string]bool
-	notes            []string
+	notes        []string
 }
 
 func newGenerator(root string) *generator {
 	return &generator{
-		root:             root,
-		fset:             token.NewFileSet(),
-		parsed:           map[string]*ast.File{},
-		undocumented:     map[string]bool{},
-		renderedExamples: map[string]bool{},
+		root:         root,
+		fset:         token.NewFileSet(),
+		parsed:       map[string]*ast.File{},
+		undocumented: map[string]bool{},
 	}
 }
 

@@ -35,13 +35,43 @@ func parseTSHeadlineOptions(text string)(tsHeadlineOptions,error){
 	return options,nil
 }
 
-func textSearchTokenMatches(ctx context.Context,configuration model.TextSearchConfiguration,token tsParsedToken,operands []*tsQueryNode)(bool,error){
-	for _,dictionary:=range textSearchMapping(configuration,token.typ){
-		lexemes,err:=lexizeTextSearch(ctx,dictionary,token.text);if err!=nil{return false,err};if lexemes==nil{continue}
-		for _,lexeme:=range lexemes{value:=&tsQueryNode{kind:tsQueryValue,word:lexeme};for _,operand:=range operands{if operand.prefix&&strings.HasPrefix(value.word,operand.word)||!operand.prefix&&value.word==operand.word{return true,nil}}}
-		return false,nil
+func textSearchTokenMatches(ctx context.Context, configuration model.TextSearchConfiguration, token tsParsedToken, operands []*tsQueryNode) (bool, error) {
+	if configuration.Analyzer != nil {
+		if token.typ == 12 || token.typ == 13 || token.typ == 23 {
+			return false, nil
+		}
+		words, err := lexizeCustomText(ctx, configuration.Analyzer, token.text, tsMaxDataBytes)
+		if err != nil {
+			return false, err
+		}
+		for _, word := range words {
+			for _, operand := range operands {
+				if operand.prefix && strings.HasPrefix(word.lexeme, operand.word) || !operand.prefix && word.lexeme == operand.word {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
 	}
-	return false,nil
+	for _, dictionary := range textSearchMapping(configuration, token.typ) {
+		lexemes, err := lexizeTextSearch(ctx, dictionary, token.text)
+		if err != nil {
+			return false, err
+		}
+		if lexemes == nil {
+			continue
+		}
+		for _, lexeme := range lexemes {
+			value := &tsQueryNode{kind: tsQueryValue, word: lexeme}
+			for _, operand := range operands {
+				if operand.prefix && strings.HasPrefix(value.word, operand.word) || !operand.prefix && value.word == operand.word {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
+	return false, nil
 }
 
 func headlineText(ctx context.Context,configuration model.TextSearchConfiguration,text string,query *tsQueryNode,rawOptions string,budget int64)(string,error){
@@ -87,7 +117,24 @@ func parseTSJSONFlags(ctx context.Context,text string)(tsJSONFlags,error){
 func jsonTSVector(ctx context.Context,configuration model.TextSearchConfiguration,text string,flags tsJSONFlags,budget int64)([]byte,error){
 	document,err:=parseJSONBDocument(ctx,text,int64(tsMaxDataBytes));if err!=nil{return nil,err}
 	lexemes:=make([]tsLexeme,0);base:=0
-	add:=func(value string)error{words,err:=lexizeText(ctx,configuration,value,max(1,min(len(value)+1,tsMaxDataBytes)));if err!=nil{return err};if len(words)==0{return nil};for _,word:=range words{lexemes=append(lexemes,tsLexeme{text:word.lexeme,positions:[]tsPosition{makeTSPosition(min(tsMaxPosition,base+word.position),0)}})};base+=words[len(words)-1].position+1;return nil}
+	add := func(value string) error {
+		words, err := lexizeText(ctx, configuration, value, max(1, min(len(value)+1, tsMaxDataBytes)))
+		if err != nil {
+			return err
+		}
+		if len(words) == 0 {
+			return nil
+		}
+		maxPos := 0
+		for _, word := range words {
+			lexemes = append(lexemes, tsLexeme{text: word.lexeme, positions: []tsPosition{makeTSPosition(min(tsMaxPosition, base+word.position), word.weight)}})
+			if word.position > maxPos {
+				maxPos = word.position
+			}
+		}
+		base += maxPos + 1
+		return nil
+	}
 	for index,node:=range document.nodes{
 		if err:=ctx.Err();err!=nil{return nil,err}
 		if index!=0&&node.key!=""&&flags.keys{if err:=add(node.key);err!=nil{return nil,err}}

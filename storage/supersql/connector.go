@@ -21,6 +21,7 @@ import (
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/bind"
@@ -526,6 +527,53 @@ func (c *connection) QueryContext(ctx context.Context, query string, args []driv
 		return nil, wrapError(err)
 	}
 	return c.queryParsed(ctx, parsed, args)
+}
+
+// DescribeQuery binds a single statement against the session's current catalog
+// snapshot without acquiring data-table locks or executing scans, returning its
+// result column names, PostgreSQL type OIDs, and type modifiers.
+func (c *connection) DescribeQuery(ctx context.Context, query string, args []driver.NamedValue) ([]string, []uint32, []int32, error) {
+	if err := c.check(); err != nil {
+		return nil, nil, nil, err
+	}
+	parsed, err := c.scope.txns.Parse(ctx, query, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
+	if err != nil {
+		return nil, nil, nil, wrapError(err)
+	}
+	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) != 1 {
+		return nil, nil, nil, ErrMissingStatement
+	}
+	parameters, err := driverParameters(args)
+	if err != nil {
+		return nil, nil, nil, wrapError(err)
+	}
+	builtins := c.scope.builtins()
+	execution := session.PreparedExecution{
+		Catalog:     c.database.catalog,
+		Statistics:  ptrTo(c.scope.statisticsCommandOptions(builtins)),
+		TypeRuntime: c.scope.typeRuntimeOptions(builtins),
+		Routines:    c.scope.routineExecutionOptions(builtins),
+	}
+	execution.Environment.Builtin = builtins
+	cols, err := c.scope.txns.DescribeStatement(ctx, parsed.ParseResult.Stmts[0], session.StatementExecution{
+		Execution:  execution,
+		Parameters: declaredParameterLayouts(parameters),
+		Planning: func(ctx context.Context, snapshot *catalog.CatalogSnapshot, reader storage.SnapshotReader) (session.PrepareOptions, error) {
+			return c.scope.prepareOptions(ctx, snapshot, reader, builtins)
+		},
+	})
+	if err != nil {
+		return nil, nil, nil, wrapError(err)
+	}
+	names := make([]string, len(cols))
+	oids := make([]uint32, len(cols))
+	mods := make([]int32, len(cols))
+	for i, col := range cols {
+		names[i] = col.Name
+		oids[i] = uint32(col.Layout.Type.ID)
+		mods[i] = col.Layout.Type.Modifier
+	}
+	return names, oids, mods, nil
 }
 
 // queryParsed streams statements through a per-statement pump. Single-statement

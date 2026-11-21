@@ -168,13 +168,29 @@ type TextSearchMapping struct {
 	Dictionaries []TextSearchDictionary
 }
 
+// TextSearchCustomToken is one normalized lexeme emitted by a user-registered
+// custom text search analyzer. Weight uses PostgreSQL's internal 2-bit encoding
+// (0 = 'D', 1 = 'C', 2 = 'B', 3 = 'A').
+type TextSearchCustomToken struct {
+	Lexeme   string
+	Position uint16
+	Weight   uint8
+}
+
+// TextSearchCustomAnalyzer tokenizes and normalizes input text into lexemes
+// for a user-registered custom text search configuration.
+type TextSearchCustomAnalyzer func(ctx context.Context, input string) ([]TextSearchCustomToken, error)
+
 // TextSearchConfiguration is immutable metadata borrowed from an invocation's
 // pinned catalog snapshot. Parser identifies a native parser implementation.
+// When Analyzer is non-nil, it handles tokenization and lexeme normalization
+// directly in place of the parser and dictionary mappings.
 type TextSearchConfiguration struct {
 	OID      OID
 	Name     string
 	Parser   OID
 	Mappings []TextSearchMapping
+	Analyzer TextSearchCustomAnalyzer
 }
 
 type TextSearchStatistic struct {

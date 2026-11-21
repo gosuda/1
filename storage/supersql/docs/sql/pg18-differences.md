@@ -16,6 +16,7 @@ SuperSQL targets **PostgreSQL 18.4** (`server_version_num = 180004`) as its SQL 
 | **Isolation Auto-Escalation** | `SET supersql.compat_isolation = 'on' \| 'off'` | Default `'on'` transparently escalates `READ COMMITTED` / `REPEATABLE READ` / `READ UNCOMMITTED` requests to `SERIALIZABLE` so ORMs and drivers work out of the box. Set `'off'` for strict `0A000` rejection. |
 | **PL/pgSQL `%TYPE` in Signatures** | `CREATE FUNCTION f(x accounts.balance%TYPE) ...` | Supported directly in function/procedure parameter and return signatures as a superset of upstream `libpg_query`. |
 | **Pure-Go Predefined ICU Collations** | `COLLATE "en-US-x-icu"`, `"ko-KR-x-icu"`, `"en-US-u-ks-level2"`, `"en-US-u-kn-true"` | Works identically across Linux/macOS/Windows with `CGO_ENABLED=0` and zero system `libicu` installation. |
+| **Custom Go `TextSearchAnalyzer`** | `OpenOptions.TextSearchAnalyzers` / `Catalog.RegisterTextSearchAnalyzer` | Registers Go tokenizers/morphological analyzers as PostgreSQL `regconfig` names usable in `to_tsvector`, `to_tsquery`, and GIN `tsvector_ops` indexes (alongside 29 built-in Snowball languages). |
 | **Optional In-Process Wire Listener** | `pgwire.NewServerFromCatalog(db, cfg)` | Exposes an embedded database over PostgreSQL v3.0 TCP without running a separate database cluster. |
 
 ---

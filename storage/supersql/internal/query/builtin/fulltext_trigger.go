@@ -82,13 +82,19 @@ func fullTextTriggerColumn(columns []model.ColumnDescriptor, name string) int {
 
 func fullTextTriggerConfiguration(ctx context.Context, id model.FunctionID, trigger FullTextTriggerContext, budget CallBudget) (model.TextSearchConfiguration, error) {
 	if id == 3752 {
+		if trigger.TextSearch != nil {
+			configuration, err := trigger.TextSearch.ResolveTextSearchConfiguration(ctx, trigger.Arguments[1])
+			if err == nil {
+				return configuration, nil
+			}
+			if !isTextSearchNotFoundError(err) {
+				return model.TextSearchConfiguration{}, err
+			}
+		}
 		if configuration, ok := builtinTextSearchConfigurationByName(trigger.Arguments[1]); ok {
 			return configuration, nil
 		}
-		if trigger.TextSearch == nil {
-			return model.TextSearchConfiguration{}, sqlError("42704", "text search configuration does not exist")
-		}
-		return trigger.TextSearch.ResolveTextSearchConfiguration(ctx, trigger.Arguments[1])
+		return model.TextSearchConfiguration{}, sqlError("42704", "text search configuration does not exist")
 	}
 	column := fullTextTriggerColumn(trigger.Columns, trigger.Arguments[1])
 	if column < 0 || column >= len(trigger.New.Values) || trigger.Columns[column].Layout.Type.ID != 3734 {

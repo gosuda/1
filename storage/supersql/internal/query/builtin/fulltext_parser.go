@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -19,8 +20,9 @@ type tsParsedToken struct {
 }
 
 type tsLexizedToken struct {
-	lexeme  string
+	lexeme   string
 	position int
+	weight   int
 }
 
 const tsTokenTypeCount = 23
@@ -169,7 +171,59 @@ func textSearchMapping(configuration model.TextSearchConfiguration, token uint16
 	return nil
 }
 
+func lexizeCustomText(ctx context.Context, analyzer model.TextSearchCustomAnalyzer, text string, maxTokens int) ([]tsLexizedToken, error) {
+	if !utf8.ValidString(text) {
+		return nil, sqlError("22021", "invalid UTF-8 in text search input")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tokens, err := analyzer(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	out := make([]tsLexizedToken, 0, len(tokens))
+	lastPos := 0
+	for _, token := range tokens {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if token.Lexeme == "" {
+			continue
+		}
+		if !utf8.ValidString(token.Lexeme) {
+			return nil, sqlError("22021", "invalid UTF-8 in text search lexeme")
+		}
+		if len(token.Lexeme) > tsMaxLexemeBytes {
+			return nil, sqlError("54000", "text search lexeme is too long")
+		}
+		pos := int(token.Position)
+		if pos == 0 {
+			pos = lastPos + 1
+		}
+		if pos > tsMaxPosition {
+			pos = tsMaxPosition
+		}
+		lastPos = pos
+		weight := int(token.Weight)
+		if weight > 3 {
+			return nil, sqlError("22023", "unrecognized weight")
+		}
+		out = append(out, tsLexizedToken{lexeme: token.Lexeme, position: pos, weight: weight})
+		if len(out) > maxTokens {
+			return nil, sqlError("54000", "text search token limit exceeded")
+		}
+	}
+	return out, nil
+}
+
 func lexizeText(ctx context.Context, configuration model.TextSearchConfiguration, text string, maxTokens int) ([]tsLexizedToken, error) {
+	if configuration.Analyzer != nil {
+		return lexizeCustomText(ctx, configuration.Analyzer, text, tsMaxDataBytes)
+	}
 	if configuration.Parser != tsDefaultParserOID { return nil, sqlError("0A000", "unsupported native text search parser") }
 	tokens, err := parseDefaultText(ctx, text, maxTokens)
 	if err != nil { return nil, err }
@@ -199,20 +253,64 @@ func toTSVector(ctx context.Context, configuration model.TextSearchConfiguration
 	words, err := lexizeText(ctx, configuration, text, maxTokens)
 	if err != nil { return nil, err }
 	lexemes := make([]tsLexeme, 0, len(words))
-	for _, word := range words { lexemes = append(lexemes, tsLexeme{text: word.lexeme, positions: []tsPosition{makeTSPosition(word.position, 0)}}) }
+	for _, word := range words { lexemes = append(lexemes, tsLexeme{text: word.lexeme, positions: []tsPosition{makeTSPosition(word.position, word.weight)}}) }
 	return encodeTSVector(ctx, normalizeTSVector(lexemes), budget)
+}
+
+func joinTSLexizedTokens(words []tsLexizedToken, phrase bool, weight uint8, prefix bool) *tsQueryNode {
+	if len(words) == 0 {
+		return nil
+	}
+	if len(words) == 1 {
+		return &tsQueryNode{kind: tsQueryValue, word: words[0].lexeme, weight: weight, prefix: prefix}
+	}
+	ordered := words
+	for i := 1; i < len(words); i++ {
+		if words[i].position < words[i-1].position {
+			ordered = slices.Clone(words)
+			slices.SortStableFunc(ordered, func(a, b tsLexizedToken) int {
+				return a.position - b.position
+			})
+			break
+		}
+	}
+	var root *tsQueryNode
+	lastPosition := 0
+	for i := 0; i < len(ordered); {
+		pos := ordered[i].position
+		j := i + 1
+		for j < len(ordered) && ordered[j].position == pos {
+			j++
+		}
+		isLastGroup := j == len(ordered)
+		var groupNode *tsQueryNode
+		for k := i; k < j; k++ {
+			node := &tsQueryNode{
+				kind:   tsQueryValue,
+				word:   ordered[k].lexeme,
+				weight: weight,
+				prefix: prefix && isLastGroup,
+			}
+			groupNode = joinTSQuery(tsQueryOr, 0, groupNode, node)
+		}
+		if root == nil {
+			root = groupNode
+		} else if phrase {
+			delta := min(pos-lastPosition, tsMaxPosition+1)
+			root = joinTSQuery(tsQueryPhrase, uint16(delta), root, groupNode)
+		} else {
+			root = joinTSQuery(tsQueryAnd, 0, root, groupNode)
+		}
+		lastPosition = pos
+		i = j
+	}
+	return root
 }
 
 func plainTSQuery(ctx context.Context, configuration model.TextSearchConfiguration, text string, phrase bool, budget int64) ([]byte, error) {
 	words, err := lexizeText(ctx, configuration, text, max(1, min(len(text)+1, tsMaxDataBytes)))
 	if err != nil { return nil, err }
-	var root *tsQueryNode
-	lastPosition := 0
-	for _, word := range words {
-		node := &tsQueryNode{kind: tsQueryValue, word: word.lexeme}
-		if root == nil { root = node } else if phrase { root = joinTSQuery(tsQueryPhrase, uint16(word.position-lastPosition), root, node) } else { root = joinTSQuery(tsQueryAnd, 0, root, node) }
-		lastPosition = word.position
-	}
+	root := joinTSLexizedTokens(words, phrase, 0, false)
 	return encodeTSQuery(ctx, root, budget)
 }
 
@@ -223,6 +321,11 @@ func morphTSQuery(ctx context.Context, configuration model.TextSearchConfigurati
 	morph = func(node *tsQueryNode) (*tsQueryNode, error) {
 		if node == nil { return nil, nil }
 		if node.kind == tsQueryValue {
+			if configuration.Analyzer != nil {
+				words, err := lexizeCustomText(ctx, configuration.Analyzer, node.word, tsMaxDataBytes)
+				if err != nil { return nil, err }
+				return joinTSLexizedTokens(words, true, node.weight, node.prefix), nil
+			}
 			words, err := lexizeText(ctx, configuration, node.word, max(1, len(node.word)+1))
 			if err != nil { return nil, err }
 			var result *tsQueryNode

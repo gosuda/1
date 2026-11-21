@@ -669,8 +669,8 @@ No resolved catalog objects.
 
 | Location | Message |
 | --- | --- |
-| connector.go:1515 | `model.Error{Code: "0A000"}` |
-| connector.go:334 | `model.Error{Code: "0A000"}` |
+| connector.go:1563 | `model.Error{Code: "0A000"}` |
+| connector.go:335 | `model.Error{Code: "0A000"}` |
 | execution.go:271 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/catalog/type_service.go:1051 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |

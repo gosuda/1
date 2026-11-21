@@ -254,6 +254,11 @@ type OpenOptions struct {
 	// WALArchiveKey optionally encrypts archived WAL segments with a 32-byte
 	// AES-256-GCM key when WALArchiveDir is set.
 	WALArchiveKey []byte
+	// TextSearchAnalyzers pre-registers custom Go text search analyzers keyed
+	// by configuration name (ASCII case-folded to lowercase, 1..63 bytes,
+	// without NUL bytes or dots). Invalid names, duplicate case-folded names,
+	// or nil analyzers are rejected by Open with SQLSTATE 22023.
+	TextSearchAnalyzers map[string]TextSearchAnalyzer
 }
 
 // CopyResult reports the completed command tag and row count of one CopyFrom or

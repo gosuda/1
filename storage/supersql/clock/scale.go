@@ -8,6 +8,7 @@ import (
 	"errors"
 )
 
+// ErrClockScale reports an invalid or incompatible SI scale descriptor or leap-second history.
 var ErrClockScale = errors.New("incompatible SI clock scale or leap history")
 
 // ValidateScale validates the provider-independent GSTL1 persistence contract.

@@ -147,7 +147,7 @@ SELECT sku, qty FROM inventory ORDER BY sku;
 
 ## 4. Row-Level Locking (`FOR UPDATE` / `SKIP LOCKED` / `NOWAIT`)
 
-Row locks participate in SuperSQL's Strict 2PL sharded lock registry and shared `WaitGraph` (deadlocks raise `40P01`, `NOWAIT` contention raises `55P03`). In addition to `FOR UPDATE` / `FOR SHARE` / `NOWAIT` / `SKIP LOCKED`, atomic `UPDATE ... RETURNING` acquires row write locks directly under Serializable isolation:
+Row locks participate in SuperSQL's Strict 2PL sharded lock registry and shared `WaitGraph` (deadlocks raise `40P01`, `NOWAIT` contention raises `55P03`).
 
 <!-- doctest -->
 ```sql
@@ -159,10 +159,8 @@ CREATE TABLE jobs (
 INSERT INTO jobs VALUES (1, 'queued'), (2, 'queued');
 
 BEGIN;
-UPDATE jobs
-SET status = 'running'
-WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1)
-RETURNING id, status;
+SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED;
+UPDATE jobs SET status = 'running' WHERE id = 1;
 COMMIT;
 ```
 

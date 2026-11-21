@@ -45,6 +45,7 @@ func New(service *gstime.ClockService, history *gstime.LeapHistory) (clock.Clock
 	return c, nil
 }
 
+// Read returns a validated certified SI interval from the underlying gstime service.
 func (c *certifiedClock) Read(ctx context.Context) (clock.Reading, error) {
 	if err := c.contextError(ctx); err != nil {
 		return clock.Reading{}, err
@@ -172,6 +173,8 @@ func sampleError(sample gstime.AssuredNow) error {
 	return fmt.Errorf("%w: %w (status %s, reason %s)", category, cause, sample.Status, sample.Reason)
 }
 
+// WaitUntilAfter blocks until a fresh certified reading in epoch proves
+// Earliest > target, or until ctx or the provider lifetime ends.
 func (c *certifiedClock) WaitUntilAfter(ctx context.Context, target clock.Instant, epoch clock.Epoch) error {
 	if target < 0 {
 		return clock.ErrClockRange
@@ -214,6 +217,7 @@ func (c *certifiedClock) WaitUntilAfter(ctx context.Context, target clock.Instan
 	}
 }
 
+// Scale returns an owned copy of the canonical GSTL1 scale descriptor.
 func (c *certifiedClock) Scale() clock.ScaleDescriptor {
 	return clock.ScaleDescriptor{Name: clock.ScaleName, LeapHistoryID: c.history.ID, CanonicalLeapHistory: c.history.CanonicalBytes()}
 }

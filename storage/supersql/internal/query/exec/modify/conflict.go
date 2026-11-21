@@ -282,15 +282,18 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 			return false, err
 		}
 		clear(proposed.Values)
-		target, ids := c.target, c.columnIDs
+		target, ids, vals := c.target, c.columnIDs, replacement.Values
 		if route != nil {
 			target = route.target
 			ids, err = o.Partitions.mapColumns(route, c.columnIDs)
 			if err != nil {
 				return false, err
 			}
+			ids, vals = filterNonGeneratedColumns(route.columns, ids, vals)
+		} else {
+			ids, vals = filterNonGeneratedMask(c.generatedColumns, ids, vals)
 		}
-		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: target, ColumnIDs: ids, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
+		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: target, ColumnIDs: ids, Values: vals, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 		if err != nil {
 			return false, err
 		}

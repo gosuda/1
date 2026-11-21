@@ -370,7 +370,7 @@ func (n *normalizer) fold(source ir.Scalar, args []scalarResult) (model.Value, b
 		return model.Value{}, false
 	}
 	remaining := n.o.MaxBytes - n.bytes
-	value, err := callable.Call(n.ctx, values[:len(args)], builtin.CallBudget{OutputBytes: int64(remaining), MemoryBytes: remaining})
+	value, err := callable.Call(n.ctx, values[:len(args)], builtin.CallBudget{OutputBytes: int64(remaining), MemoryBytes: remaining, TextSearch: n.o.TextSearch})
 	if err != nil {
 		n.foldError(err)
 		return model.Value{}, false

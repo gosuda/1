@@ -278,7 +278,7 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 			}
 			defer func() { err = errors.Join(err, snapshot.Close()) }()
 			if len(options.Execution.Environment.Parameters) != 0 {
-				reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Execution.Environment.Parameters, planning.Normalize.Builtin, options.Execution.Environment.Limits)
+				reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Execution.Environment.Parameters, planning.Normalize.Builtin, options.Execution.Environment.Limits, options.Execution.Environment.TextSearch)
 				if paramErr != nil {
 					return nil, paramErr
 				}
@@ -304,6 +304,57 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 		result.Tag = "COPY"
 	}
 	return result, execErr
+}
+
+// DescribeStatement binds statement against the session's current catalog
+// snapshot (including uncommitted DDL and temporary tables) without acquiring
+// data-table locks, executing the query, or altering transaction failure state.
+func (transactions *Transactions) DescribeStatement(ctx context.Context, statement *zpgparse.RawStmt, options StatementExecution) (columns []bind.ResultColumn, err error) {
+	previous := transactions.statementTypes
+	transactions.statementTypes = nil
+	defer func() { transactions.statementTypes = previous }()
+	if statement == nil || statement.Stmt == nil || options.Execution.Catalog == nil || options.Planning == nil {
+		return nil, errPreparedInvocation
+	}
+	operation, finish, err := transactions.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	automatic := !transactions.active
+	if automatic {
+		if err := transactions.begin(operation, TransactionStart{ImplicitReadOnly: true}); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if transactions.active {
+				err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			}
+		}()
+	} else if err := transactions.ordinary(); err != nil {
+		return nil, err
+	}
+	var deps []txn.ReadDependency
+	if !automatic {
+		deps = catalogLayoutDependencies(options.Execution.Catalog)
+	}
+	view, err := transactions.transaction.ReadView(operation, deps)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, view.Close()) }()
+	builtins := transactions.settings.BuiltinOptions(options.Execution.Environment.Builtin.Collation, options.Execution.Environment.Builtin.DefaultCollation)
+	snapshot, planning, err := transactions.statementPlanning(operation, view, builtins, options)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, snapshot.Close()) }()
+	planning.Bind.Builtin = planning.Normalize.Builtin
+	bound, err := bind.Bind(operation, statement, snapshot, planning.Bind, options.Parameters)
+	if err != nil {
+		return nil, err
+	}
+	return bound.Columns(), nil
 }
 
 func isReadOnlyAutocommitSelect(root *zpgparse.Node) bool {

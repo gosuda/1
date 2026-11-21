@@ -21,10 +21,11 @@ var (
 // scratch allocation, including owned constants; Limits separately bounds the
 // returned graph and Builder storage. All budgets must be positive.
 type Options struct {
-	Limits   ir.Limits
-	MaxWork  uint64
-	MaxBytes uint64
-	Builtin  builtin.ResolveOptions
+	Limits     ir.Limits
+	MaxWork    uint64
+	MaxBytes   uint64
+	Builtin    builtin.ResolveOptions
+	TextSearch model.TextSearchRuntime
 }
 
 type scalarResult struct {

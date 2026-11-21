@@ -39,7 +39,7 @@ type sessionScope struct {
 
 func (database *Catalog) settingsOptions() session.SettingsOptions {
 	return session.SettingsOptions{
-		Resolver: newStackSettings{},
+		Resolver: newStackSettings{database: database},
 		Limits: session.SettingLimits{
 			MaxValueBytes: 4096, MaxSavepoints: 64,
 			WorkMemoryBytes: 128 << 20, MaintenanceMemoryBytes: 128 << 20, TemporaryFileBytes: 1 << 30,
@@ -138,6 +138,7 @@ func (scope *sessionScope) bindOptions(builtins builtin.ResolveOptions) bind.Opt
 	options := bind.Options{
 		SearchPath: scope.settings.SearchPath(), CurrentRole: scope.settings.CurrentRole(), SessionUser: scope.settings.SessionUser(),
 		Collation: defaultCollation, DefaultCollation: defaultCollation, Limits: scope.database.irLimits(), Builtin: builtins,
+		TextSearch: scope.database.customTextSearchRuntime(),
 	}
 	if scope.database.native != nil {
 		options.CatalogRelations = scope.database.native.Registry
@@ -252,9 +253,17 @@ func (a *statisticsProviderAdapter) Lookup(ctx context.Context, target storage.O
 func (scope *sessionScope) prepareOptions(ctx context.Context, snapshot *catalog.CatalogSnapshot, reader storage.SnapshotReader, builtins builtin.ResolveOptions) (session.PrepareOptions, error) {
 	database := scope.database
 	limits := database.irLimits()
+	textSearch := database.customTextSearchRuntime()
+	if snapshot != nil {
+		if runtimeTS, tsErr := session.NewTextSearchRuntimeWithCustom(snapshot, scope.settings.SearchPath(), 4096, nil, nil, database.textSearchRegistry); tsErr == nil {
+			textSearch = runtimeTS
+		}
+	}
+	bindOpts := scope.bindOptions(builtins)
+	bindOpts.TextSearch = textSearch
 	options := session.PrepareOptions{
-		Bind:      scope.bindOptions(builtins),
-		Normalize: normalize.Options{Limits: limits, MaxWork: 1000000, MaxBytes: 16 << 20, Builtin: builtins},
+		Bind:      bindOpts,
+		Normalize: normalize.Options{Limits: limits, MaxWork: 1000000, MaxBytes: 16 << 20, Builtin: builtins, TextSearch: textSearch},
 		Optimize: opt.Options{
 			IR: limits, Plan: physical.Limits{MaxNodes: 1024, MaxOperands: 32768, MaxProperties: 32768, MaxDepth: 128, MaxBytes: 16 << 20},
 			MaxBytes: 256 << 20, MaxWork: 100000000, MaxOutputColumns: 1600, MaxAccessPaths: 64, WorkingMemory: 16 << 20,

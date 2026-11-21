@@ -35,6 +35,8 @@ type Options struct {
 	Builtin builtin.ResolveOptions
 	// Temporal is borrowed only while resolving temporal input literals.
 	Temporal model.TemporalRuntime
+	// TextSearch is borrowed while resolving regconfig/regdictionary literals.
+	TextSearch model.TextSearchRuntime
 	// CatalogRelations is the immutable per-database logical relation registry.
 	CatalogRelations *catalogrel.Registry
 	// MaterializedViewTarget authorizes internal population of exactly one

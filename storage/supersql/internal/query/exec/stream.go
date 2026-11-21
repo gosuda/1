@@ -138,15 +138,15 @@ func (v *valuesCursor) Close() error {
 }
 
 type scanCursor struct {
-	reader      storage.SnapshotReader
-	spec        physical.ScanSpec
-	decision    [32]byte
-	maxBytes    uint64
-	cursor      storage.BatchCursor
-	releasePlan, ignoreOrdering bool
-	issuedPlan    *storage.PushdownPlan
-	closed      bool
-	closeErr    error
+	reader                                     storage.SnapshotReader
+	spec                                       physical.ScanSpec
+	decision                                   [32]byte
+	maxBytes                                   uint64
+	cursor                                     storage.BatchCursor
+	releasePlan, ignoreOrdering, allowAdmitted bool
+	issuedPlan                                 *storage.PushdownPlan
+	closed                                     bool
+	closeErr                                   error
 }
 
 func (s *scanCursor) Next(ctx context.Context, out *columnar.Batch) error {
@@ -168,6 +168,13 @@ func (s *scanCursor) Next(ctx context.Context, out *columnar.Batch) error {
 		decisionPlan := plan
 		if s.ignoreOrdering {
 			decisionPlan.Ordering = nil
+		}
+		if s.allowAdmitted && len(s.spec.Request.Spans) != 0 && len(s.spec.Request.EncodedSpans) == 0 && len(decisionPlan.Request.Spans) == 0 {
+			// ReadViewForRowLocks narrows SKIP LOCKED scan occurrences to
+			// lock-admitted encoded subspans during PlanScan. Verify all other
+			// negotiated scan capabilities against the physical plan decision.
+			decisionPlan.Request.Spans = s.spec.Request.Spans
+			decisionPlan.Request.EncodedSpans = nil
 		}
 		decision, err := scanDecision(ctx, decisionPlan, s.maxBytes)
 		if err != nil {

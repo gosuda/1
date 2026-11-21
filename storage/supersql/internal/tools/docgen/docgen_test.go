@@ -245,6 +245,112 @@ func TestExampleBodySkipsPackageClause(t *testing.T) {
 	}
 }
 
+// TestRenderAPISubpackages proves that optional public subpackages present in
+// the module root are appended to api.md and checked for undocumented exports.
+func TestRenderAPISubpackages(t *testing.T) {
+	root, out := copyFixture(t)
+	subpkgDir := filepath.Join(root, "pgx")
+	if err := os.MkdirAll(subpkgDir, 0o755); err != nil {
+		t.Fatalf("mkdir pgx: %v", err)
+	}
+	documented := `// Package pgx is a synthetic subpackage for testing docgen.
+package pgx
+
+// Version is the synthetic package version.
+const Version = "1.0"
+
+// DefaultTimeout is the synthetic default timeout.
+var DefaultTimeout = 5
+
+// HealthCheck performs a package-level health check.
+func HealthCheck() error { return nil }
+
+// Connect opens a synthetic connection.
+func Connect() *Conn { return &Conn{} }
+
+// Conn represents a synthetic connection.
+type Conn struct{}
+
+// Ping verifies the synthetic connection.
+func (c *Conn) Ping() error { return nil }
+`
+	if err := os.WriteFile(filepath.Join(subpkgDir, "pgx.go"), []byte(documented), 0o644); err != nil {
+		t.Fatalf("write pgx.go: %v", err)
+	}
+	if err := run([]string{"-root", root, "-out", out}, io.Discard); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := run([]string{"-root", root, "-out", out, "-check"}, io.Discard); err != nil {
+		t.Fatalf("check documented subpackage: %v", err)
+	}
+	rendered, err := os.ReadFile(filepath.Join(out, "api.md"))
+	if err != nil {
+		t.Fatalf("read api.md: %v", err)
+	}
+	text := string(rendered)
+	for _, want := range []string{
+		"# `fixture` package reference",
+		"## `pgx` package reference",
+		"Import path `example.com/fixture/pgx`.",
+		"### Package documentation",
+		"### Constants",
+		"### Variables",
+		"### Functions",
+		"#### `func HealthCheck() error`",
+		"### Types",
+		"#### `type Conn`",
+		"##### `func Connect() *Conn`",
+		"##### `func (c *Conn) Ping() error`",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("api.md missing %q", want)
+		}
+	}
+
+	undocumented := "package pgx\n\nfunc UndocumentedSubpkgFunc() {}\n"
+	if err := os.WriteFile(filepath.Join(subpkgDir, "undocumented.go"), []byte(undocumented), 0o644); err != nil {
+		t.Fatalf("write undocumented subpkg file: %v", err)
+	}
+	var output bytes.Buffer
+	err = run([]string{"-root", root, "-out", out, "-check"}, &output)
+	if err == nil {
+		t.Fatal("check accepted an undocumented exported symbol in a subpackage")
+	}
+	if !strings.Contains(output.String(), "pgx: UndocumentedSubpkgFunc") {
+		t.Fatalf("check did not name the undocumented subpackage symbol: %s", output.String())
+	}
+}
+
+// TestRepositoryAPIIncludesPublicSubpackages verifies that rendering api.md
+// over the real module documents every public subpackage with zero undocumented
+// exported symbols in those subpackages.
+func TestRepositoryAPIIncludesPublicSubpackages(t *testing.T) {
+	g := repositoryGenerator(t)
+	rendered, err := renderAPI(g)
+	if err != nil {
+		t.Fatalf("renderAPI: %v", err)
+	}
+	text := string(rendered)
+	modPath := g.modulePath()
+	for _, subpkg := range publicSubpackages {
+		wantHeading := "## `" + subpkg + "` package reference"
+		wantImport := "Import path `" + modPath + "/" + subpkg + "`"
+		if !strings.Contains(text, wantHeading) {
+			t.Errorf("api.md missing subpackage heading %q", wantHeading)
+		}
+		if !strings.Contains(text, wantImport) {
+			t.Errorf("api.md missing subpackage import path %q", wantImport)
+		}
+	}
+	for _, sym := range g.undocumentedSymbols() {
+		for _, subpkg := range publicSubpackages {
+			if strings.HasPrefix(sym, subpkg+": ") {
+				t.Errorf("undocumented exported subpackage symbol: %s", sym)
+			}
+		}
+	}
+}
+
 // copyFixture copies the fixture module into a temporary directory so a test can
 // write into it without touching the checked-in tree. It returns the module root
 // and an output directory beside it.

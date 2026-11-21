@@ -173,6 +173,7 @@ func (ct CommandTag) Empty() bool { return ct.s == "" }
 // TxIsoLevel represents the transaction isolation level.
 type TxIsoLevel string
 
+// Transaction isolation levels supported by TxOptions.
 const (
 	Serializable    TxIsoLevel = "serializable"
 	RepeatableRead  TxIsoLevel = "repeatable read"
@@ -183,6 +184,7 @@ const (
 // TxAccessMode represents the transaction access mode.
 type TxAccessMode string
 
+// Transaction access modes supported by TxOptions.
 const (
 	ReadWrite TxAccessMode = "read write"
 	ReadOnly  TxAccessMode = "read only"
@@ -191,6 +193,7 @@ const (
 // TxDeferrableMode represents the transaction deferrable mode.
 type TxDeferrableMode string
 
+// Transaction deferrable modes supported by TxOptions.
 const (
 	Deferrable    TxDeferrableMode = "deferrable"
 	NotDeferrable TxDeferrableMode = "not deferrable"
@@ -731,9 +734,14 @@ type PoolStat struct {
 	stats sql.DBStats
 }
 
-func (s PoolStat) TotalConns() int32    { return int32(s.stats.OpenConnections) }
+// TotalConns returns the total number of open connections in the pool.
+func (s PoolStat) TotalConns() int32 { return int32(s.stats.OpenConnections) }
+
+// AcquiredConns returns the number of connections currently checked out of the pool.
 func (s PoolStat) AcquiredConns() int32 { return int32(s.stats.InUse) }
-func (s PoolStat) IdleConns() int32     { return int32(s.stats.Idle) }
+
+// IdleConns returns the number of idle connections currently held in the pool.
+func (s PoolStat) IdleConns() int32 { return int32(s.stats.Idle) }
 
 // Pool is a concurrency-safe connection pool compatible with pgxpool.Pool.
 type Pool struct {

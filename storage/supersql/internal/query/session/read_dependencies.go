@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
@@ -195,17 +196,21 @@ func (transactions *Transactions) statementScanDependenciesWithTrial(ctx context
 		// binding catalog set preserves that diagnostic.
 		return dependencies, nil, nil
 	}
-	// Trial-plan to derive narrowed read-lock spans whenever there are no row
-	// locks and either the statement has no parameters or runtime parameter
-	// values are available to specialize spans.
+	// Trial-plan to derive narrowed read-lock spans whenever either the
+	// statement has no parameters or runtime parameter values are available to
+	// specialize spans. Row-locking statements also benefit from narrowed
+	// primary-key spans (so `WHERE id = 1 FOR UPDATE` locks only key 1 rather
+	// than the full table), provided every row-lock policy occurrence remains
+	// represented in the narrowed dependencies.
+	rowLockPolicies := boundRowLockPolicies(bound)
 	hasParams := len(bound.Parameters()) != 0
-	if len(boundRowLockPolicies(bound)) == 0 && (!hasParams || len(options.Environment.Parameters) != 0) {
+	if !hasParams || len(options.Environment.Parameters) != 0 {
 		trial := plan
 		canReuse := trial.ValidateBound == nil
 		trial.ValidateBound = nil
 		paramsReady := true
 		if len(options.Environment.Parameters) != 0 {
-			reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Environment.Parameters, trial.Normalize.Builtin, options.Environment.Limits)
+			reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Environment.Parameters, trial.Normalize.Builtin, options.Environment.Limits, options.Environment.TextSearch)
 			if paramErr != nil {
 				paramsReady = false
 			} else {
@@ -214,7 +219,7 @@ func (transactions *Transactions) statementScanDependenciesWithTrial(ctx context
 		}
 		if paramsReady {
 			if prepared, prepErr := prepareBound(ctx, bound, trial); prepErr == nil && prepared != nil && prepared.graph != nil {
-				if planDeps, _, depErr := prepared.ReadDependencies(ctx, store, maximum); depErr == nil {
+				if planDeps, _, depErr := prepared.ReadDependencies(ctx, store, maximum); depErr == nil && rowLockPoliciesCovered(rowLockPolicies, planDeps) {
 					for _, dependency := range planDeps {
 						if err := add(dependency); err != nil {
 							return nil, nil, err
@@ -561,6 +566,17 @@ func boundRowLockPolicies(bound *bind.BoundStatement) []txn.RowLockPolicy {
 		}
 	}
 	return policies
+}
+
+func rowLockPoliciesCovered(policies []txn.RowLockPolicy, dependencies []txn.ReadDependency) bool {
+	for _, policy := range policies {
+		if !slices.ContainsFunc(dependencies, func(dependency txn.ReadDependency) bool {
+			return dependency.Occurrence == policy.Occurrence
+		}) {
+			return false
+		}
+	}
+	return true
 }
 
 func rowLockWaitRank(wait txn.RowLockWait) uint8 {

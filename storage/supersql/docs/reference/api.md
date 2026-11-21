@@ -260,6 +260,16 @@ It validates PostgreSQL channel (<= 63 bytes, non-empty) and payload
 (<= 8000 bytes) limits.
 
 
+#### `func (database *Catalog) RegisterTextSearchAnalyzer(name string, analyzer TextSearchAnalyzer) error`
+
+RegisterTextSearchAnalyzer registers or replaces a custom Go text search
+configuration under name on this database. Configuration names follow
+PostgreSQL identifier rules (ASCII case-folded to lowercase, non-empty,
+at most 63 bytes, valid UTF-8, without NUL bytes or dots).
+
+Registration is safe for concurrent use alongside active SQL queries.
+
+
 #### `func (database *Catalog) RunAutoAnalyze(ctx context.Context) (int, error)`
 
 RunAutoAnalyze executes ANALYZE on every table whose accumulated mutations
@@ -272,6 +282,14 @@ table's pending mutation counter. It returns the number of tables analyzed.
 Subscribe registers an in-process Go listener on one or more PostgreSQL
 LISTEN/NOTIFY channels. Channel names are normalized case-insensitively like
 unquoted SQL identifiers.
+
+
+#### `func (database *Catalog) UnregisterTextSearchAnalyzer(name string)`
+
+UnregisterTextSearchAnalyzer removes a previously registered custom text
+search configuration by name. Unregistering an unknown name is a no-op.
+
+Unregistration is safe for concurrent use alongside active SQL queries.
 
 
 ### `type CompactionConfig`
@@ -717,6 +735,11 @@ type OpenOptions struct {
 	// WALArchiveKey optionally encrypts archived WAL segments with a 32-byte
 	// AES-256-GCM key when WALArchiveDir is set.
 	WALArchiveKey	[]byte
+	// TextSearchAnalyzers pre-registers custom Go text search analyzers keyed
+	// by configuration name (ASCII case-folded to lowercase, 1..63 bytes,
+	// without NUL bytes or dots). Invalid names, duplicate case-folded names,
+	// or nil analyzers are rejected by Open with SQLSTATE 22023.
+	TextSearchAnalyzers	map[string]TextSearchAnalyzer
 }
 ```
 
@@ -840,6 +863,49 @@ Wait blocks until the next notification arrives, ctx is canceled, or the
 subscription is closed.
 
 
+### `type TextSearchAnalyzer`
+
+TextSearchAnalyzer tokenizes and normalizes input text into lexemes for a
+custom text search configuration (for example, a Korean/Japanese
+morphological analyzer, n-gram tokenizer, or domain-specific stemmer).
+
+
+```go
+// TextSearchAnalyzer tokenizes and normalizes input text into lexemes for a
+// custom text search configuration (for example, a Korean/Japanese
+// morphological analyzer, n-gram tokenizer, or domain-specific stemmer).
+type TextSearchAnalyzer func(ctx context.Context, input string) ([]TextSearchToken, error)
+```
+
+#### `func SimpleTextSearchAnalyzer(fn func(ctx context.Context, input string) ([]string, error)) TextSearchAnalyzer`
+
+SimpleTextSearchAnalyzer adapts a tokenizer returning normalized lexeme
+strings into a TextSearchAnalyzer with sequential 1-based positions and
+default weight 'D'.
+
+
+### `type TextSearchToken`
+
+TextSearchToken is one normalized lexeme emitted by a user-registered
+TextSearchAnalyzer.
+
+
+```go
+// TextSearchToken is one normalized lexeme emitted by a user-registered
+// TextSearchAnalyzer.
+type TextSearchToken struct {
+	// Lexeme is the normalized token text. Empty lexemes are skipped.
+	Lexeme	string
+	// Position is the 1-based token position in the document (clamped to
+	// PostgreSQL's 1..16383 range). A zero value auto-increments sequentially
+	// from the previous token's position.
+	Position	uint16
+	// Weight is the optional PostgreSQL lexeme weight ('A', 'B', 'C', or 'D';
+	// lowercase is accepted). Zero defaults to 'D'.
+	Weight	byte
+}
+```
+
 ### `type UpgradeRequired`
 
 UpgradeRequired reports a directory that holds a legacy database. Open never
@@ -870,4 +936,1724 @@ Unwrap keeps the storage layer's own format verdict reachable.
 ## Examples
 
 1 example asserts output; it is shown with the symbol it documents.
+
+## `pgx` package reference
+
+Import path `github.com/gosuda/supersql-alpha/pgx`.
+
+### Package documentation
+
+Package pgx provides a cleanroom, zero-external-dependency, in-process
+pgx/v5-compatible API over supersql.
+
+
+### Variables
+
+#### `ErrNoRows, ErrTxClosed, ErrTxCommitRollback`
+
+```go
+var (
+	// ErrNoRows occurs when rows are expected but none are returned.
+	ErrNoRows	= sql.ErrNoRows
+
+	// ErrTxClosed occurs when an operation is performed on a closed transaction.
+	ErrTxClosed	= sql.ErrTxDone
+
+	// ErrTxCommitRollback occurs when a commit fails and the transaction is rolled back.
+	ErrTxCommitRollback	= errors.New("pgx: commit unexpectedly resulted in rollback")
+)
+```
+
+### Functions
+
+#### `func AppendRows[T any, S ~[]T](slice S, rows Rows, fn RowToFunc[T]) (S, error)`
+
+AppendRows iterates through rows, calling fn for each row and appending the results to slice.
+
+
+#### `func BeginFunc(ctx context.Context, db interface {
+	Begin(ctx context.Context) (Tx, error)
+}, fn func(Tx) error) (err error)`
+
+BeginFunc begins a transaction on db and executes fn.
+
+
+#### `func BeginTxFunc(ctx context.Context, db interface {
+	BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error)
+}, txOptions TxOptions, fn func(Tx) error) (err error)`
+
+BeginTxFunc begins a transaction with txOptions on db and executes fn.
+
+
+#### `func CollectExactlyOneRow[T any](rows Rows, fn RowToFunc[T]) (T, error)`
+
+CollectExactlyOneRow calls fn for the single row in rows and returns an error if 0 or >1 rows are returned.
+
+
+#### `func CollectOneRow[T any](rows Rows, fn RowToFunc[T]) (T, error)`
+
+CollectOneRow calls fn for the first row in rows and closes rows. Returns ErrNoRows if no rows are present.
+
+
+#### `func CollectRows[T any](rows Rows, fn RowToFunc[T]) ([]T, error)`
+
+CollectRows iterates through rows, calling fn for each row and collecting the results into a slice.
+
+
+#### `func RowTo[T any](row CollectableRow) (T, error)`
+
+RowTo scans a single column row into a value of type T.
+
+
+#### `func RowToAddrOf[T any](row CollectableRow) (*T, error)`
+
+RowToAddrOf scans a single column row into the address of a new value of type T.
+
+
+#### `func RowToAddrOfStructByName[T any](row CollectableRow) (*T, error)`
+
+RowToAddrOfStructByName returns a pointer to a struct of type T scanned by column name.
+
+
+#### `func RowToAddrOfStructByNameLax[T any](row CollectableRow) (*T, error)`
+
+RowToAddrOfStructByNameLax returns a pointer to a struct of type T scanned by column name (lax).
+
+
+#### `func RowToAddrOfStructByPos[T any](row CollectableRow) (*T, error)`
+
+RowToAddrOfStructByPos returns a pointer to a struct of type T scanned by field position.
+
+
+#### `func RowToMap(row CollectableRow) (map[string]any, error)`
+
+RowToMap scans a row into a map[string]any keyed by column name.
+
+
+#### `func RowToStructByName[T any](row CollectableRow) (T, error)`
+
+RowToStructByName scans a row into a struct of type T by matching column names to `db` tags or field names.
+
+
+#### `func RowToStructByNameLax[T any](row CollectableRow) (T, error)`
+
+RowToStructByNameLax scans a row into a struct of type T by name, ignoring extra columns or unmapped fields.
+
+
+#### `func RowToStructByPos[T any](row CollectableRow) (T, error)`
+
+RowToStructByPos scans a row into a struct of type T by field position.
+
+
+### Types
+
+#### `type Batch`
+
+Batch queues multiple queries to be executed sequentially.
+
+
+```go
+// Batch queues multiple queries to be executed sequentially.
+type Batch struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func (b *Batch) Len() int`
+
+Len returns the number of queued queries in the batch.
+
+
+##### `func (b *Batch) Queue(query string, arguments ...any) *QueuedQuery`
+
+Queue adds a query to the batch.
+
+
+#### `type BatchResults`
+
+BatchResults reads the results of a Batch.
+
+
+```go
+// BatchResults reads the results of a Batch.
+type BatchResults interface {
+	Exec() (CommandTag, error)
+	Query() (Rows, error)
+	QueryRow() Row
+	Close() error
+}
+```
+
+#### `type Bool`
+
+Bool represents a nullable PostgreSQL boolean value.
+
+
+```go
+// Bool represents a nullable PostgreSQL boolean value.
+type Bool struct {
+	Bool	bool
+	Valid	bool
+}
+```
+
+##### `func (b *Bool) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (b Bool) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type CollectableRow`
+
+CollectableRow is the subset of Rows methods accessible to a RowToFunc.
+
+
+```go
+// CollectableRow is the subset of Rows methods accessible to a RowToFunc.
+type CollectableRow interface {
+	Scan(dest ...any) error
+	FieldDescriptions() []FieldDescription
+	Values() ([]any, error)
+	RawValues() [][]byte
+}
+```
+
+#### `type CommandTag`
+
+CommandTag is the result tag returned by an Exec command.
+
+
+```go
+// CommandTag is the result tag returned by an Exec command.
+type CommandTag struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func ForEachRow(rows Rows, scans []any, fn func() error) (CommandTag, error)`
+
+ForEachRow iterates over rows, scanning each row into scans and calling fn.
+
+
+##### `func NewCommandTag(s string) CommandTag`
+
+NewCommandTag parses a command tag string.
+
+
+##### `func (ct CommandTag) Delete() bool`
+
+Delete reports whether the command tag is a DELETE tag.
+
+
+##### `func (ct CommandTag) Empty() bool`
+
+Empty reports whether the command tag is empty.
+
+
+##### `func (ct CommandTag) Insert() bool`
+
+Insert reports whether the command tag is an INSERT tag.
+
+
+##### `func (ct CommandTag) RowsAffected() int64`
+
+RowsAffected returns the number of rows affected by the command.
+
+
+##### `func (ct CommandTag) Select() bool`
+
+Select reports whether the command tag is a SELECT tag.
+
+
+##### `func (ct CommandTag) String() string`
+
+String returns the command tag string.
+
+
+##### `func (ct CommandTag) Update() bool`
+
+Update reports whether the command tag is an UPDATE tag.
+
+
+#### `type Conn`
+
+Conn represents a single isolated SQL session compatible with pgx.Conn.
+
+
+```go
+// Conn represents a single isolated SQL session compatible with pgx.Conn.
+type Conn struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func OpenConn(ctx context.Context, opts supersql.OpenOptions) (*Conn, error)`
+
+OpenConn opens a single dedicated session connection over supersql.OpenOptions.
+
+
+##### `func (c *Conn) Begin(ctx context.Context) (Tx, error)`
+
+Begin starts a transaction on this connection.
+
+
+##### `func (c *Conn) BeginFunc(ctx context.Context, fn func(Tx) error) error`
+
+BeginFunc starts a transaction on this connection and runs fn.
+
+
+##### `func (c *Conn) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error)`
+
+BeginTx starts a transaction with TxOptions on this connection.
+
+
+##### `func (c *Conn) Close(ctx context.Context) error`
+
+Close closes the connection.
+
+
+##### `func (c *Conn) CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error)`
+
+CopyFrom performs an atomic bulk insert of rows into tableName.
+
+
+##### `func (c *Conn) Deallocate(ctx context.Context, name string) error`
+
+Deallocate removes a named prepared query from this session.
+
+
+##### `func (c *Conn) DeallocateAll(ctx context.Context) error`
+
+DeallocateAll removes all named prepared queries from this session.
+
+
+##### `func (c *Conn) Exec(ctx context.Context, sqlText string, arguments ...any) (CommandTag, error)`
+
+Exec executes a statement and returns its CommandTag.
+
+
+##### `func (c *Conn) Ping(ctx context.Context) error`
+
+Ping verifies the connection is alive.
+
+
+##### `func (c *Conn) Prepare(ctx context.Context, name, sqlText string) error`
+
+Prepare registers a named prepared query on this session.
+
+
+##### `func (c *Conn) Query(ctx context.Context, sqlText string, args ...any) (Rows, error)`
+
+Query executes a query and returns streaming Rows.
+
+
+##### `func (c *Conn) QueryRow(ctx context.Context, sqlText string, args ...any) Row`
+
+QueryRow executes a query expected to return at most one row.
+
+
+##### `func (c *Conn) SendBatch(ctx context.Context, b *Batch) BatchResults`
+
+SendBatch sends a batch of queries on this connection inside an implicit transaction.
+
+
+##### `func (c *Conn) WaitForNotification(ctx context.Context) (*Notification, error)`
+
+WaitForNotification blocks until a notification arrives on any channel this
+connection is listening on (via LISTEN), ctx is canceled, or the connection
+closes.
+
+
+#### `type CopyFromSource`
+
+CopyFromSource is the data source for CopyFrom.
+
+
+```go
+// CopyFromSource is the data source for CopyFrom.
+type CopyFromSource interface {
+	Next() bool
+	Values() ([]any, error)
+	Err() error
+}
+```
+
+##### `func CopyFromRows(rows [][]any) CopyFromSource`
+
+CopyFromRows returns a CopyFromSource over a slice of row value slices.
+
+
+##### `func CopyFromSlice(length int, next func(int) ([]any, error)) CopyFromSource`
+
+CopyFromSlice returns a CopyFromSource backed by an indexed generator function.
+
+
+#### `type Date`
+
+Date represents a nullable PostgreSQL date value.
+
+
+```go
+// Date represents a nullable PostgreSQL date value.
+type Date struct {
+	Time	time.Time
+	Valid	bool
+}
+```
+
+##### `func (d *Date) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (d Date) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type FieldDescription`
+
+FieldDescription describes a single result column.
+
+
+```go
+// FieldDescription describes a single result column.
+type FieldDescription struct {
+	Name		string
+	DataTypeOID	uint32
+	TypeModifier	int32
+}
+```
+
+#### `type Float4`
+
+Float4 represents a nullable PostgreSQL real (float4) value.
+
+
+```go
+// Float4 represents a nullable PostgreSQL real (float4) value.
+type Float4 struct {
+	Float32	float32
+	Valid	bool
+}
+```
+
+##### `func (f *Float4) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (f Float4) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Float8`
+
+Float8 represents a nullable PostgreSQL double precision (float8) value.
+
+
+```go
+// Float8 represents a nullable PostgreSQL double precision (float8) value.
+type Float8 struct {
+	Float64	float64
+	Valid	bool
+}
+```
+
+##### `func (f *Float8) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (f Float8) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Identifier`
+
+Identifier represents a PostgreSQL schema/table/column identifier path.
+
+
+```go
+// Identifier represents a PostgreSQL schema/table/column identifier path.
+type Identifier []string
+```
+
+##### `func (ident Identifier) Sanitize() string`
+
+Sanitize quotes each component of the identifier for safe inclusion in SQL.
+
+
+#### `type Int2`
+
+Int2 represents a nullable PostgreSQL smallint (int2) value.
+
+
+```go
+// Int2 represents a nullable PostgreSQL smallint (int2) value.
+type Int2 struct {
+	Int16	int16
+	Valid	bool
+}
+```
+
+##### `func (n *Int2) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (n Int2) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Int4`
+
+Int4 represents a nullable PostgreSQL integer (int4) value.
+
+
+```go
+// Int4 represents a nullable PostgreSQL integer (int4) value.
+type Int4 struct {
+	Int32	int32
+	Valid	bool
+}
+```
+
+##### `func (n *Int4) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (n Int4) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Int8`
+
+Int8 represents a nullable PostgreSQL bigint (int8) value.
+
+
+```go
+// Int8 represents a nullable PostgreSQL bigint (int8) value.
+type Int8 struct {
+	Int64	int64
+	Valid	bool
+}
+```
+
+##### `func (n *Int8) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (n Int8) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type JSONB`
+
+JSONB represents a nullable PostgreSQL jsonb (or json) value.
+
+
+```go
+// JSONB represents a nullable PostgreSQL jsonb (or json) value.
+type JSONB struct {
+	Bytes	[]byte
+	Valid	bool
+}
+```
+
+##### `func (j JSONB) MarshalJSON() ([]byte, error)`
+
+MarshalJSON implements json.Marshaler.
+
+
+##### `func (j *JSONB) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (j *JSONB) UnmarshalJSON(data []byte) error`
+
+UnmarshalJSON implements json.Unmarshaler.
+
+
+##### `func (j JSONB) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type NamedArgs`
+
+NamedArgs maps named parameters (@name) in a SQL query to values.
+
+
+```go
+// NamedArgs maps named parameters (@name) in a SQL query to values.
+type NamedArgs map[string]any
+```
+
+##### `func (na NamedArgs) RewriteQuery(_ context.Context, _ *Conn, query string, _ []any) (string, []any, error)`
+
+RewriteQuery replaces @name placeholders with positional $1, $2, ... parameters.
+
+
+#### `type Notification`
+
+Notification represents a PostgreSQL LISTEN/NOTIFY message delivered to a Conn.
+
+
+```go
+// Notification represents a PostgreSQL LISTEN/NOTIFY message delivered to a Conn.
+type Notification struct {
+	PID	uint32
+	Channel	string
+	Payload	string
+}
+```
+
+#### `type Numeric`
+
+Numeric represents a nullable arbitrary-precision PostgreSQL numeric value
+as Int * 10^Exp (or NaN).
+
+
+```go
+// Numeric represents a nullable arbitrary-precision PostgreSQL numeric value
+// as Int * 10^Exp (or NaN).
+type Numeric struct {
+	Int	*big.Int
+	Exp	int32
+	NaN	bool
+	Valid	bool
+}
+```
+
+##### `func NumericFromString(s string) (Numeric, error)`
+
+NumericFromString parses a decimal string (or "NaN") into a Numeric.
+
+
+##### `func (n Numeric) Float64() (float64, error)`
+
+Float64 converts the Numeric to a float64.
+
+
+##### `func (n *Numeric) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (n Numeric) String() string`
+
+String formats the Numeric as a canonical decimal string, "NaN", or "".
+
+
+##### `func (n Numeric) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type PgError`
+
+PgError represents a PostgreSQL server error compatible with pgconn.PgError.
+
+
+```go
+// PgError represents a PostgreSQL server error compatible with pgconn.PgError.
+type PgError struct {
+	Severity	string
+	Code		string
+	Message		string
+	Detail		string
+	Hint		string
+	Position	int32
+	ConstraintName	string
+	TableName	string
+	ColumnName	string
+	// contains filtered or unexported fields
+}
+```
+
+##### `func (e *PgError) Error() string`
+
+Error returns the formatted PostgreSQL diagnostic string.
+
+
+##### `func (e *PgError) SQLState() string`
+
+SQLState returns the five-character PostgreSQL SQLSTATE code.
+
+
+##### `func (e *PgError) Unwrap() error`
+
+Unwrap returns the underlying error wrapped by this PgError.
+
+
+#### `type Pool`
+
+Pool is a concurrency-safe connection pool compatible with pgxpool.Pool.
+
+
+```go
+// Pool is a concurrency-safe connection pool compatible with pgxpool.Pool.
+type Pool struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func NewPoolFromCatalog(catalog *supersql.Catalog) *Pool`
+
+NewPoolFromCatalog creates a Pool over an already-opened supersql.Catalog.
+
+
+##### `func NewPoolFromConnector(connector *supersql.Connector) *Pool`
+
+NewPoolFromConnector creates a Pool over an existing supersql.Connector.
+Calling Close on the returned Pool closes its sql.DB pool; the caller retains
+ownership of closing the Connector unless OpenPool constructed it.
+
+
+##### `func OpenPool(ctx context.Context, opts supersql.OpenOptions) (*Pool, error)`
+
+OpenPool opens a supersql database and returns a Pool over it.
+
+
+##### `func OpenPoolWithConfig(ctx context.Context, cfg PoolConfig) (*Pool, error)`
+
+OpenPoolWithConfig opens a supersql database with pool sizing and lifecycle hooks.
+
+
+##### `func (p *Pool) Acquire(ctx context.Context) (*PoolConn, error)`
+
+Acquire checks out an isolated session connection from the pool.
+
+
+##### `func (p *Pool) AcquireFunc(ctx context.Context, fn func(*PoolConn) error) error`
+
+AcquireFunc acquires a connection, runs fn, and releases the connection.
+
+
+##### `func (p *Pool) Begin(ctx context.Context) (Tx, error)`
+
+Begin starts a transaction with default (SERIALIZABLE) isolation on an acquired connection.
+
+
+##### `func (p *Pool) BeginFunc(ctx context.Context, fn func(Tx) error) error`
+
+BeginFunc starts a transaction and runs fn, committing on nil error or rolling back otherwise.
+
+
+##### `func (p *Pool) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error)`
+
+BeginTx starts a transaction with TxOptions on an acquired connection.
+Calling Commit or Rollback automatically releases the connection back to the pool.
+
+
+##### `func (p *Pool) Catalog() *supersql.Catalog`
+
+Catalog returns the underlying *supersql.Catalog.
+
+
+##### `func (p *Pool) Close()`
+
+Close closes all connections in the pool and, if opened via OpenPool, closes
+the underlying Catalog.
+
+
+##### `func (p *Pool) CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error)`
+
+CopyFrom performs a bulk insert of rows into tableName on an acquired connection.
+
+
+##### `func (p *Pool) Exec(ctx context.Context, sqlText string, arguments ...any) (CommandTag, error)`
+
+Exec executes a SQL statement on a pooled connection and returns its CommandTag.
+
+
+##### `func (p *Pool) Ping(ctx context.Context) error`
+
+Ping verifies the pool can acquire a session and communicate with the engine.
+
+
+##### `func (p *Pool) Query(ctx context.Context, sqlText string, args ...any) (Rows, error)`
+
+Query executes a query on a pooled connection and returns streaming Rows.
+The acquired connection is automatically released when Rows.Close() is called.
+
+
+##### `func (p *Pool) QueryRow(ctx context.Context, sqlText string, args ...any) Row`
+
+QueryRow executes a query expected to return at most one row.
+
+
+##### `func (p *Pool) SendBatch(ctx context.Context, b *Batch) BatchResults`
+
+SendBatch sends a batch of queries over a pooled connection inside an implicit transaction.
+
+
+##### `func (p *Pool) Stat() PoolStat`
+
+Stat returns pool connection statistics.
+
+
+##### `func (p *Pool) StdDB() *sql.DB`
+
+StdDB returns the underlying *sql.DB handle.
+
+
+#### `type PoolConfig`
+
+PoolConfig configures a Pool.
+
+
+```go
+// PoolConfig configures a Pool.
+type PoolConfig struct {
+	OpenOptions	supersql.OpenOptions
+	MaxConns	int32
+	MinConns	int32
+	MaxConnLifetime	time.Duration
+	MaxConnIdleTime	time.Duration
+	BeforeConnect	func(context.Context, *PoolConfig) error
+	AfterConnect	func(context.Context, *Conn) error
+	BeforeAcquire	func(context.Context, *Conn) bool
+	AfterRelease	func(*Conn) bool
+}
+```
+
+#### `type PoolConn`
+
+PoolConn is an acquired connection from a Pool.
+
+
+```go
+// PoolConn is an acquired connection from a Pool.
+type PoolConn struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func (pc *PoolConn) Begin(ctx context.Context) (Tx, error)`
+
+Begin starts a transaction on this connection.
+
+
+##### `func (pc *PoolConn) BeginFunc(ctx context.Context, fn func(Tx) error) error`
+
+BeginFunc starts a transaction on this connection and executes fn.
+
+
+##### `func (pc *PoolConn) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error)`
+
+BeginTx starts a transaction with options on this connection.
+
+
+##### `func (pc *PoolConn) Conn() *Conn`
+
+Conn returns the underlying *Conn.
+
+
+##### `func (pc *PoolConn) CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error)`
+
+CopyFrom performs a bulk insert of rows on this connection.
+
+
+##### `func (pc *PoolConn) Exec(ctx context.Context, sqlText string, arguments ...any) (CommandTag, error)`
+
+Exec executes a SQL statement on this connection.
+
+
+##### `func (pc *PoolConn) Ping(ctx context.Context) error`
+
+Ping verifies the connection is still alive.
+
+
+##### `func (pc *PoolConn) Query(ctx context.Context, sqlText string, args ...any) (Rows, error)`
+
+Query executes a SQL query on this connection.
+
+
+##### `func (pc *PoolConn) QueryRow(ctx context.Context, sqlText string, args ...any) Row`
+
+QueryRow executes a query returning at most one row on this connection.
+
+
+##### `func (pc *PoolConn) Release()`
+
+Release returns the connection to the Pool.
+
+
+##### `func (pc *PoolConn) SendBatch(ctx context.Context, b *Batch) BatchResults`
+
+SendBatch sends a batch of queries on this connection.
+
+
+##### `func (pc *PoolConn) WaitForNotification(ctx context.Context) (*Notification, error)`
+
+WaitForNotification blocks until a notification arrives on this acquired
+pool connection, ctx is canceled, or the connection is released/closed.
+
+
+#### `type PoolStat`
+
+PoolStat reports connection pool statistics compatible with pgxpool.Stat.
+
+
+```go
+// PoolStat reports connection pool statistics compatible with pgxpool.Stat.
+type PoolStat struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func (s PoolStat) AcquiredConns() int32`
+
+AcquiredConns returns the number of connections currently checked out of the pool.
+
+
+##### `func (s PoolStat) IdleConns() int32`
+
+IdleConns returns the number of idle connections currently held in the pool.
+
+
+##### `func (s PoolStat) TotalConns() int32`
+
+TotalConns returns the total number of open connections in the pool.
+
+
+#### `type QueryRewriter`
+
+QueryRewriter rewrites a query and its arguments before execution.
+
+
+```go
+// QueryRewriter rewrites a query and its arguments before execution.
+type QueryRewriter interface {
+	RewriteQuery(ctx context.Context, conn *Conn, sql string, args []any) (newSQL string, newArgs []any, err error)
+}
+```
+
+#### `type QueuedQuery`
+
+QueuedQuery represents a single queued item in a Batch.
+
+
+```go
+// QueuedQuery represents a single queued item in a Batch.
+type QueuedQuery struct {
+	SQL		string
+	Arguments	[]any
+	// contains filtered or unexported fields
+}
+```
+
+##### `func (q *QueuedQuery) Exec(fn func(ct CommandTag) error)`
+
+Exec registers a callback to process the CommandTag returned by this queued query.
+
+
+##### `func (q *QueuedQuery) Query(fn func(rows Rows) error)`
+
+Query registers a callback to process the rows returned by this queued query when BatchResults.Close() is called.
+
+
+##### `func (q *QueuedQuery) QueryRow(fn func(row Row) error)`
+
+QueryRow registers a callback to process the single row returned by this queued query.
+
+
+#### `type Row`
+
+Row is a convenience wrapper over Rows for QueryRow.
+
+
+```go
+// Row is a convenience wrapper over Rows for QueryRow.
+type Row interface {
+	Scan(dest ...any) error
+}
+```
+
+#### `type RowToFunc`
+
+RowToFunc maps a single CollectableRow to a value of type T.
+
+
+```go
+// RowToFunc maps a single CollectableRow to a value of type T.
+type RowToFunc[T any] func(row CollectableRow) (T, error)
+```
+
+#### `type Rows`
+
+Rows is the result set returned from Query.
+
+
+```go
+// Rows is the result set returned from Query.
+type Rows interface {
+	Close()
+	Err() error
+	CommandTag() CommandTag
+	FieldDescriptions() []FieldDescription
+	Next() bool
+	Scan(dest ...any) error
+	Values() ([]any, error)
+	RawValues() [][]byte
+	Conn() *Conn
+}
+```
+
+#### `type Text`
+
+Text represents a nullable PostgreSQL text value.
+
+
+```go
+// Text represents a nullable PostgreSQL text value.
+type Text struct {
+	String	string
+	Valid	bool
+}
+```
+
+##### `func (t *Text) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (t Text) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Timestamp`
+
+Timestamp represents a nullable PostgreSQL timestamp without time zone value.
+
+
+```go
+// Timestamp represents a nullable PostgreSQL timestamp without time zone value.
+type Timestamp struct {
+	Time	time.Time
+	Valid	bool
+}
+```
+
+##### `func (t *Timestamp) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (t Timestamp) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Timestamptz`
+
+Timestamptz represents a nullable PostgreSQL timestamp with time zone value.
+
+
+```go
+// Timestamptz represents a nullable PostgreSQL timestamp with time zone value.
+type Timestamptz struct {
+	Time	time.Time
+	Valid	bool
+}
+```
+
+##### `func (t *Timestamptz) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (t Timestamptz) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+#### `type Tx`
+
+Tx represents a database transaction or nested savepoint transaction.
+
+
+```go
+// Tx represents a database transaction or nested savepoint transaction.
+type Tx interface {
+	Begin(ctx context.Context) (Tx, error)
+	BeginFunc(ctx context.Context, fn func(Tx) error) error
+	Commit(ctx context.Context) error
+	Rollback(ctx context.Context) error
+	CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error)
+	SendBatch(ctx context.Context, b *Batch) BatchResults
+	Prepare(ctx context.Context, name, sql string) error
+	Exec(ctx context.Context, sql string, arguments ...any) (commandTag CommandTag, err error)
+	Query(ctx context.Context, sql string, args ...any) (Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) Row
+	Conn() *Conn
+}
+```
+
+#### `type TxAccessMode`
+
+TxAccessMode represents the transaction access mode.
+
+
+```go
+// TxAccessMode represents the transaction access mode.
+type TxAccessMode string
+```
+
+##### `ReadWrite, ReadOnly`
+
+Transaction access modes supported by TxOptions.
+
+
+```go
+// Transaction access modes supported by TxOptions.
+const (
+	ReadWrite	TxAccessMode	= "read write"
+	ReadOnly	TxAccessMode	= "read only"
+)
+```
+
+#### `type TxDeferrableMode`
+
+TxDeferrableMode represents the transaction deferrable mode.
+
+
+```go
+// TxDeferrableMode represents the transaction deferrable mode.
+type TxDeferrableMode string
+```
+
+##### `Deferrable, NotDeferrable`
+
+Transaction deferrable modes supported by TxOptions.
+
+
+```go
+// Transaction deferrable modes supported by TxOptions.
+const (
+	Deferrable	TxDeferrableMode	= "deferrable"
+	NotDeferrable	TxDeferrableMode	= "not deferrable"
+)
+```
+
+#### `type TxIsoLevel`
+
+TxIsoLevel represents the transaction isolation level.
+
+
+```go
+// TxIsoLevel represents the transaction isolation level.
+type TxIsoLevel string
+```
+
+##### `Serializable, RepeatableRead, ReadCommitted, ReadUncommitted`
+
+Transaction isolation levels supported by TxOptions.
+
+
+```go
+// Transaction isolation levels supported by TxOptions.
+const (
+	Serializable	TxIsoLevel	= "serializable"
+	RepeatableRead	TxIsoLevel	= "repeatable read"
+	ReadCommitted	TxIsoLevel	= "read committed"
+	ReadUncommitted	TxIsoLevel	= "read uncommitted"
+)
+```
+
+#### `type TxOptions`
+
+TxOptions configures a transaction started with BeginTx.
+
+
+```go
+// TxOptions configures a transaction started with BeginTx.
+type TxOptions struct {
+	IsoLevel	TxIsoLevel
+	AccessMode	TxAccessMode
+	DeferrableMode	TxDeferrableMode
+	BeginQuery	string
+}
+```
+
+#### `type UUID`
+
+UUID represents a nullable PostgreSQL uuid value.
+
+
+```go
+// UUID represents a nullable PostgreSQL uuid value.
+type UUID struct {
+	Bytes	[16]byte
+	Valid	bool
+}
+```
+
+##### `func (u *UUID) Scan(src any) error`
+
+Scan implements sql.Scanner.
+
+
+##### `func (u UUID) String() string`
+
+String formats the UUID in canonical hyphenated lowercase form, or empty when invalid.
+
+
+##### `func (u UUID) Value() (driver.Value, error)`
+
+Value implements driver.Valuer.
+
+
+## `pgwire` package reference
+
+Import path `github.com/gosuda/supersql-alpha/pgwire`.
+
+### Package documentation
+
+Package pgwire implements an optional, pure-Go (CGO_ENABLED=0) PostgreSQL
+v3.0 wire protocol server over a SuperSQL Connector.
+
+Each accepted TCP (or TLS-upgraded) client connection opens its own isolated
+SQL session via Connector.Connect, keeping transactions, session settings,
+prepared statements, portals, and temporary objects isolated per client.
+
+Supported protocol capabilities include:
+  - Startup negotiation: SSLRequest (TLS upgrade when TLSConfig is set),
+    CancelRequest (in-flight statement cancellation by PID/secret key), and
+    StartupMessage v3.0.
+  - Authentication: trust (AuthenticationOk), cleartext password
+    (AuthenticationCleartextPassword), or custom AuthFunc.
+  - Simple Query Protocol ('Q') with multi-statement splitting and accurate
+    transaction status reporting ('I', 'T', 'E').
+  - Extended Query Protocol ('P' Parse, 'B' Bind, 'D' Describe Statement and
+    Portal, 'E' Execute with maxRows / PortalSuspended, 'C' Close, 'H' Flush,
+    'S' Sync, 'X' Terminate) with text and binary parameter decoding and
+    result encoding.
+  - Asynchronous NotificationResponse ('A') delivery via Config.NotifyHandler
+    or Server.Notify for LISTEN/NOTIFY integration.
+
+
+### Types
+
+#### `type Config`
+
+Config configures a PostgreSQL v3.0 wire protocol Server.
+
+
+```go
+// Config configures a PostgreSQL v3.0 wire protocol Server.
+type Config struct {
+	// Connector supplies isolated SuperSQL sessions per client connection.
+	// If passed to NewServer directly, that argument takes precedence.
+	Connector	*supersql.Connector
+
+	// Password enables cleartext password authentication when non-empty and
+	// AuthFunc is nil. When both Password and AuthFunc are empty/nil, trust
+	// authentication (AuthenticationOk) is used.
+	Password	string
+
+	// AuthFunc optionally overrides password verification with custom logic.
+	// Returning a non-nil error rejects the client with SQLSTATE 28P01 (or the
+	// error's SQLSTATE if it carries one).
+	AuthFunc	func(ctx context.Context, user, database, password string) error
+
+	// TLSConfig enables SSLRequest ('S') upgrades via tls.Server when non-nil.
+	// When nil, SSLRequest is declined with 'N'.
+	TLSConfig	*tls.Config
+
+	// MaxConnections caps concurrent active client sessions. Defaults to 128.
+	MaxConnections	int
+
+	// ReadTimeout bounds individual wire frame reads and startup negotiation.
+	// Zero disables read timeouts.
+	ReadTimeout	time.Duration
+
+	// IdleTimeout bounds how long an idle connection may wait for the next
+	// frontend message before being closed. Zero disables idle timeouts.
+	IdleTimeout	time.Duration
+
+	// ApplicationVersion is reported in the server_version ParameterStatus.
+	// Defaults to "18.4 (SuperSQL)".
+	ApplicationVersion	string
+
+	// Logger receives optional diagnostic log lines.
+	Logger	func(format string, args ...any)
+
+	// NotifyHandler is invoked once per authenticated connection with the
+	// connection's context, backend PID, and a thread-safe NotifySender that
+	// pushes NotificationResponse ('A') frames over the wire. The optional
+	// returned cleanup function is called when the connection closes.
+	NotifyHandler	func(ctx context.Context, pid int32, send NotifySender) (cleanup func())
+}
+```
+
+#### `type Notification`
+
+Notification represents an asynchronous PostgreSQL LISTEN/NOTIFY payload
+delivered over the wire as a NotificationResponse ('A') frame.
+
+
+```go
+// Notification represents an asynchronous PostgreSQL LISTEN/NOTIFY payload
+// delivered over the wire as a NotificationResponse ('A') frame.
+type Notification struct {
+	PID	int32
+	Channel	string
+	Payload	string
+}
+```
+
+#### `type NotifySender`
+
+NotifySender delivers asynchronous NotificationResponse ('A') frames to a
+connected client. It is safe for concurrent use from any goroutine.
+
+
+```go
+// NotifySender delivers asynchronous NotificationResponse ('A') frames to a
+// connected client. It is safe for concurrent use from any goroutine.
+type NotifySender func(Notification) error
+```
+
+#### `type Server`
+
+Server accepts PostgreSQL v3.0 wire protocol connections and routes each
+client to its own isolated SuperSQL session.
+
+
+```go
+// Server accepts PostgreSQL v3.0 wire protocol connections and routes each
+// client to its own isolated SuperSQL session.
+type Server struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func NewServer(connector *supersql.Connector, cfg Config) (*Server, error)`
+
+NewServer constructs a PostgreSQL v3.0 wire protocol Server over connector.
+The server borrows connector and never closes it when Server.Close is called.
+
+
+##### `func NewServerFromCatalog(db *supersql.Catalog, cfg Config) (*Server, error)`
+
+NewServerFromCatalog is a convenience constructor wrapping an already opened
+*supersql.Catalog. Closing the returned Server does not close db.
+
+
+##### `func (s *Server) ActiveConnections() int`
+
+ActiveConnections reports the number of currently active authenticated client
+sessions.
+
+
+##### `func (s *Server) Addr() net.Addr`
+
+Addr returns the listener's network address once Serve or ListenAndServe has
+bound a listener, or nil before serving starts.
+
+
+##### `func (s *Server) BroadcastNotify(senderPID int32, channel, payload string)`
+
+BroadcastNotify delivers an asynchronous NotificationResponse ('A') frame to
+every currently connected client.
+
+
+##### `func (s *Server) Close() error`
+
+Close stops accepting new connections, closes all active client connections,
+and waits for all connection goroutines to finish. It does not close the
+underlying *supersql.Connector.
+
+
+##### `func (s *Server) ListenAndServe(ctx context.Context, addr string) error`
+
+ListenAndServe listens on TCP address addr (e.g. "127.0.0.1:5432" or
+"127.0.0.1:0") and serves PostgreSQL v3.0 wire protocol clients until ctx is
+canceled or Close is called.
+
+
+##### `func (s *Server) Notify(pid int32, channel, payload string) error`
+
+Notify delivers an asynchronous NotificationResponse ('A') frame to the
+client connection identified by pid.
+
+
+##### `func (s *Server) Serve(ctx context.Context, ln net.Listener) error`
+
+Serve accepts incoming connections on ln and serves them until ctx is
+canceled, Close is called, or ln returns a fatal error.
+
+
+## `clock` package reference
+
+Import path `github.com/gosuda/supersql-alpha/clock`.
+
+### Package documentation
+
+Package clock defines certified continuous SI time independently of a provider.
+
+
+### Constants
+
+#### `ScaleName`
+
+ScaleName is the canonical identifier for the continuous SI nanosecond scale.
+
+
+```go
+// ScaleName is the canonical identifier for the continuous SI nanosecond scale.
+const ScaleName = "si_ns_1970"
+```
+
+### Variables
+
+#### `ErrClockUnavailable, ErrClockEpochChanged, ErrClockRange`
+
+Sentinel errors returned by certified Clock implementations.
+
+
+```go
+// Sentinel errors returned by certified Clock implementations.
+var (
+	ErrClockUnavailable	= errors.New("certified clock unavailable")
+	ErrClockEpochChanged	= errors.New("certified clock epoch changed")
+	ErrClockRange		= errors.New("certified clock value out of range")
+)
+```
+
+#### `ErrClockScale`
+
+ErrClockScale reports an invalid or incompatible SI scale descriptor or leap-second history.
+
+
+```go
+// ErrClockScale reports an invalid or incompatible SI scale descriptor or leap-second history.
+var ErrClockScale = errors.New("incompatible SI clock scale or leap history")
+```
+
+### Functions
+
+#### `func ValidateScale(ctx context.Context, scale ScaleDescriptor, maxBytes uint64) error`
+
+ValidateScale validates the provider-independent GSTL1 persistence contract.
+It borrows the descriptor only through this call and allocates no entry table.
+
+
+#### `func ValidateScaleExtension(ctx context.Context, previous, next ScaleDescriptor, protected Instant, maxBytes uint64) error`
+
+ValidateScaleExtension permits only an unchanged history or appended entries
+whose first affected SI instant is strictly beyond the protected timestamp.
+
+
+### Types
+
+#### `type Clock`
+
+Clock is borrowed by the database; its host owns provider startup and shutdown.
+Reads and waits must be concurrency-safe and honor cancellation without
+per-request network polling. Failed assurance must never return an estimate.
+
+
+```go
+// Clock is borrowed by the database; its host owns provider startup and shutdown.
+// Reads and waits must be concurrency-safe and honor cancellation without
+// per-request network polling. Failed assurance must never return an estimate.
+type Clock interface {
+	// Read returns a fresh nonnegative closed interval in Synced or Holdover
+	// status, validated against the provider's width, raw age and continuity bounds.
+	Read(context.Context) (Reading, error)
+	// WaitUntilAfter requires a fresh valid sample in exactly epoch proving
+	// Earliest > target. Equality, elapsed timers and stale watermarks do not suffice.
+	WaitUntilAfter(context.Context, Instant, Epoch) error
+	// Scale returns owned canonical GSTL1 bytes; mutating them cannot alter the provider.
+	Scale() ScaleDescriptor
+	FromUTC(time.Time) (Instant, error)
+	ToUTC(Instant) (UTCProjection, error)
+}
+```
+
+#### `type Epoch`
+
+Epoch identifies a continuous certified-clock assurance epoch, leap-second
+history, and provider configuration.
+
+
+```go
+// Epoch identifies a continuous certified-clock assurance epoch, leap-second
+// history, and provider configuration.
+type Epoch struct {
+	Assurance	[16]byte
+	LeapHistory	[32]byte
+	Config		[32]byte
+}
+```
+
+#### `type Instant`
+
+Instant counts SI nanoseconds since 1970-01-01T00:00:00 UTC, including leap seconds.
+
+
+```go
+// Instant counts SI nanoseconds since 1970-01-01T00:00:00 UTC, including leap seconds.
+type Instant int64
+```
+
+#### `type Reading`
+
+Reading is a certified closed SI interval [Earliest, Latest] with its epoch
+and synchronization status.
+
+
+```go
+// Reading is a certified closed SI interval [Earliest, Latest] with its epoch
+// and synchronization status.
+type Reading struct {
+	Earliest, Latest	Instant
+	Epoch			Epoch
+	Status			Status
+}
+```
+
+#### `type ScaleDescriptor`
+
+ScaleDescriptor carries the SI scale name and canonical GSTL1 leap-second
+history bytes with their SHA-256 identity.
+
+
+```go
+// ScaleDescriptor carries the SI scale name and canonical GSTL1 leap-second
+// history bytes with their SHA-256 identity.
+type ScaleDescriptor struct {
+	Name			string
+	LeapHistoryID		[32]byte
+	CanonicalLeapHistory	[]byte
+}
+```
+
+#### `type Status`
+
+Status reports the synchronization state of a certified clock reading.
+
+
+```go
+// Status reports the synchronization state of a certified clock reading.
+type Status uint8
+```
+
+##### `Synced, Holdover`
+
+Certified clock synchronization states.
+
+
+```go
+// Certified clock synchronization states.
+const (
+	Synced	Status	= iota + 1
+	Holdover
+)
+```
+
+#### `type UTCProjection`
+
+UTCProjection is the civil UTC projection of an SI Instant, with LeapSecond
+set when the instant falls inside a positive leap second.
+
+
+```go
+// UTCProjection is the civil UTC projection of an SI Instant, with LeapSecond
+// set when the instant falls inside a positive leap second.
+type UTCProjection struct {
+	Time		time.Time
+	LeapSecond	bool
+}
+```
+
+## `clock/local` package reference
+
+Import path `github.com/gosuda/supersql-alpha/clock/local` (package `localclock`).
+
+### Package documentation
+
+Package localclock provides a standalone single-process clock.Clock backed by
+the host OS wall and monotonic clocks. It requires no external NTP or PTP
+synchronization and is intended for single-process embedded databases.
+
+
+### Types
+
+#### `type Clock`
+
+Clock is a concurrency-safe standalone clock.Clock backed by the host OS wall
+and monotonic clocks with a strict monotonic high-water mark.
+
+
+```go
+// Clock is a concurrency-safe standalone clock.Clock backed by the host OS wall
+// and monotonic clocks with a strict monotonic high-water mark.
+type Clock struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func New(opts ...Option) *Clock`
+
+New constructs a standalone local clock with safe zero-config defaults.
+
+
+##### `func (c *Clock) FromUTC(value time.Time) (clock.Instant, error)`
+
+FromUTC converts a UTC timestamp to its SI nanosecond instant under this
+clock's canonical GSTL1 leap history.
+
+
+##### `func (c *Clock) Read(ctx context.Context) (clock.Reading, error)`
+
+Read returns a fresh nonnegative closed interval [Earliest, Latest] in
+clock.Synced status. Readings never move backward even if the OS wall clock
+steps backward.
+
+
+##### `func (c *Clock) Scale() clock.ScaleDescriptor`
+
+Scale returns owned canonical GSTL1 bytes; mutating them cannot alter the clock.
+
+
+##### `func (c *Clock) ToUTC(value clock.Instant) (clock.UTCProjection, error)`
+
+ToUTC projects an SI nanosecond instant onto UTC under this clock's canonical
+GSTL1 leap history. An inserted positive leap second projects onto the
+preceding UTC second with LeapSecond set.
+
+
+##### `func (c *Clock) WaitUntilAfter(ctx context.Context, target clock.Instant, epoch clock.Epoch) error`
+
+WaitUntilAfter blocks until a fresh reading in epoch proves Earliest > target,
+or until ctx is canceled.
+
+
+#### `type Option`
+
+Option configures a local Clock constructed by New.
+
+
+```go
+// Option configures a local Clock constructed by New.
+type Option func(*config)
+```
+
+##### `func WithInitialFloor(floor clock.Instant) Option`
+
+WithInitialFloor sets a minimum starting SI instant for the clock.
+Negative values are clamped to zero.
+
+
+##### `func WithUncertainty(d time.Duration) Option`
+
+WithUncertainty configures the interval width (Latest - Earliest) returned by
+Read. Negative values are clamped to zero. The default is zero.
+
+
+## `clock/gstime` package reference
+
+Import path `github.com/gosuda/supersql-alpha/clock/gstime` (package `gstimeclock`).
+
+### Package documentation
+
+Package gstimeclock adapts gstime's certified SI intervals; it does not qualify raw backends.
+
+
+### Functions
+
+#### `func New(service *gstime.ClockService, history *gstime.LeapHistory) (clock.Clock, error)`
+
+New borrows a service, which may still be unanchored. Its caller owns workers,
+raw-clock qualification and invalidation, and must keep the service history immutable.
+
+
+### Types
+
+#### `type Config`
+
+Config configures a gstime-backed certified clock Provider.
+
+
+```go
+// Config configures a gstime-backed certified clock Provider.
+type Config struct {
+	Sync	config.Config
+	// Raw must include suspend; its physical bounds and sources remain caller-qualified.
+	Raw		rawclock.RawClock
+	LeapHistory	*gstime.LeapHistory
+}
+```
+
+#### `type Provider`
+
+Provider owns its synchronization worker until Close cancels and joins it.
+Open's context bounds initialization; the supplied raw clock remains caller-owned.
+
+
+```go
+// Provider owns its synchronization worker until Close cancels and joins it.
+// Open's context bounds initialization; the supplied raw clock remains caller-owned.
+type Provider struct {
+	// contains filtered or unexported fields
+}
+```
+
+##### `func Open(ctx context.Context, cfg Config) (*Provider, error)`
+
+Open starts a gstime synchronization engine, waits for initial sync within
+ctx, and returns a certified clock Provider.
+
+
+##### `func (p *Provider) Close() error`
+
+Close cancels the synchronization worker and closes the underlying gstime
+engine. It is safe to call more than once.
+
+
+##### `func (c Provider) FromUTC(value time.Time) (clock.Instant, error)`
+
+FromUTC converts a civil UTC timestamp into a continuous SI Instant using
+the clock's leap-second history.
+
+
+##### `func (c Provider) Read(ctx context.Context) (clock.Reading, error)`
+
+Read returns a validated certified SI interval from the underlying gstime service.
+
+
+##### `func (c Provider) Scale() clock.ScaleDescriptor`
+
+Scale returns an owned copy of the canonical GSTL1 scale descriptor.
+
+
+##### `func (c Provider) ToUTC(instant clock.Instant) (clock.UTCProjection, error)`
+
+ToUTC projects a continuous SI Instant onto a civil UTC timestamp and
+reports whether the instant lies inside a positive leap second.
+
+
+##### `func (c Provider) WaitUntilAfter(ctx context.Context, target clock.Instant, epoch clock.Epoch) error`
+
+WaitUntilAfter blocks until a fresh certified reading in epoch proves
+Earliest > target, or until ctx or the provider lifetime ends.
+
 

@@ -42,54 +42,183 @@ const (
 	tsDefaultParserOID model.OID = 3722
 	tsSimpleConfigOID  model.OID = 3748
 	tsSimpleDictOID    model.OID = 3765
+
+	// Deterministic built-in OIDs for the 29 embedded PostgreSQL Snowball
+	// dictionaries (<language>_stem) and configurations (<language>). They sit
+	// inside PostgreSQL's initdb range (12000..16383), well below the durable
+	// catalog allocator floor (20000) and custom analyzer OIDs (0x70000000+).
+	tsSnowballDictBaseOID   model.OID = 13800
+	tsSnowballConfigBaseOID model.OID = 13900
 )
 
+var builtinSnowballLanguages = [...]string{
+	"arabic", "armenian", "basque", "catalan", "danish", "dutch", "english",
+	"estonian", "finnish", "french", "german", "greek", "hindi", "hungarian",
+	"indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian",
+	"portuguese", "romanian", "russian", "serbian", "spanish", "swedish",
+	"tamil", "turkish", "yiddish",
+}
+
+var builtinSnowballIndex = func() map[string]int {
+	index := make(map[string]int, len(builtinSnowballLanguages))
+	for i, language := range builtinSnowballLanguages {
+		index[language] = i
+	}
+	return index
+}()
 
 func simpleTextSearchDictionary() model.TextSearchDictionary {
 	return model.TextSearchDictionary{OID: tsSimpleDictOID, Name: "pg_catalog.simple", Kind: model.TextSearchSimpleDictionary, Accept: true}
 }
 
-
-func builtinTextSearchConfiguration(oid model.OID) (model.TextSearchConfiguration, bool) {
-	if oid != tsSimpleConfigOID {
-		return model.TextSearchConfiguration{}, false
+func snowballTextSearchDictionary(idx int) model.TextSearchDictionary {
+	language := builtinSnowballLanguages[idx]
+	stopWords := ""
+	if model.HasNativeTextSearchStopWords(language) {
+		stopWords = language
 	}
-	dictionary := simpleTextSearchDictionary()
+	return model.TextSearchDictionary{
+		OID:               tsSnowballDictBaseOID + model.OID(idx),
+		Name:              "pg_catalog." + language + "_stem",
+		Kind:              model.TextSearchSnowballDictionary,
+		Language:          language,
+		StopWordsLanguage: stopWords,
+		Stemmer:           NativeTextSearchStemmer{},
+	}
+}
+
+func snowballTextSearchConfiguration(idx int) model.TextSearchConfiguration {
+	language := builtinSnowballLanguages[idx]
+	dictionary := snowballTextSearchDictionary(idx)
+	asciiDictionary := dictionary
+	if language == "hindi" || language == "russian" {
+		asciiDictionary = snowballTextSearchDictionary(builtinSnowballIndex["english"])
+	}
+	simple := simpleTextSearchDictionary()
 	mappings := make([]model.TextSearchMapping, 0, 19)
 	for token := uint16(1); token <= 23; token++ {
-		if token == 12 || token == 13 || token == 14 || token == 23 { continue }
-		mappings = append(mappings, model.TextSearchMapping{TokenType: token, Dictionaries: []model.TextSearchDictionary{dictionary}})
+		switch token {
+		case 3, 4, 5, 6, 7, 8, 9, 15, 18, 19, 20, 21, 22:
+			mappings = append(mappings, model.TextSearchMapping{TokenType: token, Dictionaries: []model.TextSearchDictionary{simple}})
+		case 1, 11, 16:
+			mappings = append(mappings, model.TextSearchMapping{TokenType: token, Dictionaries: []model.TextSearchDictionary{asciiDictionary}})
+		case 2, 10, 17:
+			mappings = append(mappings, model.TextSearchMapping{TokenType: token, Dictionaries: []model.TextSearchDictionary{dictionary}})
+		}
 	}
-	return model.TextSearchConfiguration{OID: oid, Name: "pg_catalog.simple", Parser: tsDefaultParserOID, Mappings: mappings}, true
+	return model.TextSearchConfiguration{
+		OID:      tsSnowballConfigBaseOID + model.OID(idx),
+		Name:     "pg_catalog." + language,
+		Parser:   tsDefaultParserOID,
+		Mappings: mappings,
+	}
 }
 
-func builtinTextSearchConfigurationName(oid model.OID) (string, bool) {
-	configuration, ok := builtinTextSearchConfiguration(oid)
-	if !ok { return "", false }
-	return configuration.Name, true
-}
-
-func builtinTextSearchDictionary(oid model.OID) (model.TextSearchDictionary, bool) {
-	if oid == tsSimpleDictOID { return simpleTextSearchDictionary(), true }
-	return model.TextSearchDictionary{}, false
-}
-
-func builtinTextSearchDictionaryName(oid model.OID) (string, bool) {
-	dictionary, ok := builtinTextSearchDictionary(oid)
-	if !ok { return "", false }
-	return dictionary.Name, true
-}
-
-func builtinTextSearchConfigurationByName(name string) (model.TextSearchConfiguration, bool) {
-	if value := strings.ToLower(strings.TrimSpace(name)); value == "simple" || value == "pg_catalog.simple" {
-		return builtinTextSearchConfiguration(tsSimpleConfigOID)
+func builtinTextSearchConfiguration(oid model.OID) (model.TextSearchConfiguration, bool) {
+	if oid == tsSimpleConfigOID {
+		dictionary := simpleTextSearchDictionary()
+		mappings := make([]model.TextSearchMapping, 0, 19)
+		for token := uint16(1); token <= 23; token++ {
+			if token == 12 || token == 13 || token == 14 || token == 23 {
+				continue
+			}
+			mappings = append(mappings, model.TextSearchMapping{TokenType: token, Dictionaries: []model.TextSearchDictionary{dictionary}})
+		}
+		return model.TextSearchConfiguration{OID: oid, Name: "pg_catalog.simple", Parser: tsDefaultParserOID, Mappings: mappings}, true
+	}
+	if oid >= tsSnowballConfigBaseOID && oid < tsSnowballConfigBaseOID+model.OID(len(builtinSnowballLanguages)) {
+		return snowballTextSearchConfiguration(int(oid - tsSnowballConfigBaseOID)), true
 	}
 	return model.TextSearchConfiguration{}, false
 }
 
-func builtinTextSearchDictionaryByName(name string) (model.TextSearchDictionary, bool) {
-	if value := strings.ToLower(strings.TrimSpace(name)); value == "simple" || value == "pg_catalog.simple" {
+func builtinTextSearchConfigurationName(oid model.OID) (string, bool) {
+	configuration, ok := builtinTextSearchConfiguration(oid)
+	if !ok {
+		return "", false
+	}
+	return configuration.Name, true
+}
+
+func builtinTextSearchDictionary(oid model.OID) (model.TextSearchDictionary, bool) {
+	if oid == tsSimpleDictOID {
 		return simpleTextSearchDictionary(), true
+	}
+	if oid >= tsSnowballDictBaseOID && oid < tsSnowballDictBaseOID+model.OID(len(builtinSnowballLanguages)) {
+		return snowballTextSearchDictionary(int(oid - tsSnowballDictBaseOID)), true
+	}
+	return model.TextSearchDictionary{}, false
+}
+
+// BuiltinTextSearchDictionary resolves a built-in PostgreSQL text search
+// dictionary (simple or an embedded Snowball stemmer) by its fixed OID.
+func BuiltinTextSearchDictionary(oid model.OID) (model.TextSearchDictionary, bool) {
+	return builtinTextSearchDictionary(oid)
+}
+
+func builtinTextSearchDictionaryName(oid model.OID) (string, bool) {
+	dictionary, ok := builtinTextSearchDictionary(oid)
+	if !ok {
+		return "", false
+	}
+	return dictionary.Name, true
+}
+
+func parseBuiltinTextSearchObjectName(name string) (string, bool) {
+	parts, err := ParseQualifiedName(context.Background(), name, 4096)
+	if err != nil {
+		return "", false
+	}
+	switch len(parts) {
+	case 1:
+		return parts[0], true
+	case 2:
+		if parts[0] != "pg_catalog" {
+			return "", false
+		}
+		return parts[1], true
+	default:
+		return "", false
+	}
+}
+
+func builtinTextSearchConfigurationByName(name string) (model.TextSearchConfiguration, bool) {
+	obj, ok := parseBuiltinTextSearchObjectName(name)
+	if !ok {
+		return model.TextSearchConfiguration{}, false
+	}
+	if obj == "simple" {
+		return builtinTextSearchConfiguration(tsSimpleConfigOID)
+	}
+	if idx, found := builtinSnowballIndex[obj]; found {
+		return snowballTextSearchConfiguration(idx), true
+	}
+	return model.TextSearchConfiguration{}, false
+}
+
+// HasBuiltinTextSearchConfiguration reports whether name identifies a built-in
+// PostgreSQL text search configuration (simple or any embedded Snowball
+// language) and returns its canonical pg_catalog-qualified name.
+func HasBuiltinTextSearchConfiguration(name string) (string, bool) {
+	configuration, ok := builtinTextSearchConfigurationByName(name)
+	if !ok {
+		return "", false
+	}
+	return configuration.Name, true
+}
+
+func builtinTextSearchDictionaryByName(name string) (model.TextSearchDictionary, bool) {
+	obj, ok := parseBuiltinTextSearchObjectName(name)
+	if !ok {
+		return model.TextSearchDictionary{}, false
+	}
+	if obj == "simple" {
+		return simpleTextSearchDictionary(), true
+	}
+	if language, trimmed := strings.CutSuffix(obj, "_stem"); trimmed {
+		if idx, found := builtinSnowballIndex[language]; found {
+			return snowballTextSearchDictionary(idx), true
+		}
 	}
 	return model.TextSearchDictionary{}, false
 }

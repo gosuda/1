@@ -611,6 +611,7 @@ func (database *Catalog) executionEnvironment(query *runtime.Query, builtins bui
 	exprLimits.MaxOutputBytes = 32 << 20
 	env := exec.Environment{
 		Query: query, Keys: database.keys, Builtin: builtins, Catalog: database.source,
+		TextSearch:      database.customTextSearchRuntime(),
 		MutationTargets: newStackMutationTargets{descriptors: database.currentDescriptors(), policies: database.policies},
 		Limits: exec.Limits{
 			Expressions: exprLimits, BatchRows: columnar.DefaultBatchSize, BatchBytes: 32 << 20, ParameterBytes: 32 << 20, MetadataBytes: 8 << 20,

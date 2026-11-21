@@ -29,6 +29,7 @@ provider, because a live database holds fences certified by that provider.
 | EncryptionKey | []byte | - | EncryptionKey enables optional pure-Go AES-256-GCM at-rest encryption for newly written SST runs, WAL files, and encrypted backups when set to a 32-byte key. Nil disables at-rest encryption. |
 | WALArchiveDir | string | - | WALArchiveDir enables continuous WAL segment archiving into the given directory for Point-in-Time Recovery (PITR). Empty disables WAL archiving. |
 | WALArchiveKey | []byte | - | WALArchiveKey optionally encrypts archived WAL segments with a 32-byte AES-256-GCM key when WALArchiveDir is set. |
+| TextSearchAnalyzers | map[string]TextSearchAnalyzer | - | TextSearchAnalyzers pre-registers custom Go text search analyzers keyed by configuration name (ASCII case-folded to lowercase, 1..63 bytes, without NUL bytes or dots). Invalid names, duplicate case-folded names, or nil analyzers are rejected by Open with SQLSTATE 22023. |
 
 Open rejects an empty `Directory` with `ErrDirectoryRequired`, a nil or unavailable `Clock` with `ErrClockRequired`, and maps an incompatible directory layout to `*UpgradeRequired`. A nonzero `Compaction` replaces the whole backend envelope rather than merging field by field.
 
@@ -89,7 +90,7 @@ The root package fixes its own envelope when it opens a database; the table list
 
 | Location | Fields |
 | --- | --- |
-| catalog.go:160 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
+| catalog.go:165 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
 | internal/controlplane/schema/column_policy.go:67 | MaxBytes=options.MetadataBytes MaxDepth=64 MaxItems=int(options.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:122 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:163 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |

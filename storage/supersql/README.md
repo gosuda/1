@@ -18,6 +18,9 @@ GOPRIVATE=github.com/gosuda/supersql-alpha go get github.com/gosuda/supersql-alp
 
 Set `GOPRIVATE` (or `GONOSUMDB`) so the Go toolchain fetches the module directly from Git, and ensure Git credentials (`ssh` or `GITHUB_TOKEN`) are configured for `github.com`.
 
+- **Requirements**: Go `1.27.3` or later (`go 1.27.3` in [`go.mod`](go.mod)), pure Go (`CGO_ENABLED=0`).
+- **Runtime dependencies**: Production packages have zero `jackc/pgx` runtime dependency (`github.com/jackc/pgx/v5` in `go.mod` is imported only by integration tests).
+
 ---
 
 ## Quick Start
@@ -151,6 +154,7 @@ Supports Simple & Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`PortalSus
 - **Queries (DQL)**: `UNION`/`INTERSECT`/`EXCEPT`, `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`/`LATERAL` joins, `WITH` / `WITH RECURSIVE` CTEs, window functions, `GROUPING SETS`/`ROLLUP`/`CUBE`, correlated subqueries, row locking (`FOR UPDATE` / `FOR SHARE` / `NOWAIT` / `SKIP LOCKED`), and time-travel queries (`AS OF SYSTEM TIME <timestamptz>`).
 - **Mutations (DML)**: Multi-row `INSERT`, `INSERT ... ON CONFLICT DO NOTHING / DO UPDATE`, `UPDATE ... FROM`, `DELETE ... USING`, `MERGE INTO`, `RETURNING`, and streaming `COPY ... FROM STDIN` / `TO STDOUT`.
 - **Indexes (B-tree & GIN)**: Composite primary/unique/foreign keys, `CHECK` constraints, secondary/partial/`INCLUDE` covering B-tree indexes, and **GIN inverted indexes** (`USING gin`) for `jsonb` (`jsonb_ops`, `jsonb_path_ops`: `@>`, `?`, `?|`, `?&`), arrays (`array_ops`: `@>`, `&&`), and full-text search `tsvector` (`tsvector_ops`: `@@`).
+- **Full-Text Search & Custom `TextSearchAnalyzer`**: `'simple'` plus all 29 built-in pure-Go PostgreSQL Snowball language configurations (`'english'`, `'french'`, `'german'`, `'spanish'`, etc.), plus Go-native custom analyzer registration (`OpenOptions.TextSearchAnalyzers` / `Catalog.RegisterTextSearchAnalyzer`) for Korean/Japanese morphological analyzers, n-gram tokenizers, or domain stemmers.
 - **Schema, Procedural & Pure-Go ICU Collations**: Views, materialized views, sequences, domains, enums, composite types, ranges, triggers, functions, procedures, `DO $$ ... $$` blocks in SQL and `PL/pgSQL`, and **pure-Go ICU/locale collations** (`"en-US-x-icu"`, `"ko-KR-x-icu"`, `"ja-JP-x-icu"`, case-insensitive `-u-ks-level2`, numeric `-u-kn-true`, plus `CREATE / DROP COLLATION`).
 - **Multi-Tenant Security, RBAC & Session GUC**:
   - **Object-Level Privileges & Ownership**: `GRANT` / `REVOKE` (`WITH GRANT OPTION`, `ALL TABLES/SEQUENCES/FUNCTIONS IN SCHEMA`, `PUBLIC`), `ALTER TABLE/VIEW/SEQUENCE/SCHEMA/FUNCTION ... OWNER TO`, `CREATE SCHEMA ... AUTHORIZATION`, and `SECURITY DEFINER` routines with safe caller-role restoration.
@@ -183,6 +187,7 @@ SuperSQL omits cluster-wide and heap-specific PostgreSQL features; every exclude
 | :--- | :--- |
 | **[`docs/sql/`](docs/sql/README.md)** | PostgreSQL 18 SQL syntax guide, statement support matrix, [PG 18 differences](docs/sql/pg18-differences.md), GIN indexes, RBAC/RLS, PL/pgSQL, ICU collations, `LISTEN`/`NOTIFY`, and `EXPLAIN (ANALYZE, BUFFERS)` (doctest-verified) |
 | **[`docs/guides/pgx-and-orms.md`](docs/guides/pgx-and-orms.md)** | Integration guide for `database/sql`, `supersql/pgx`, `pgwire`, `psql`, `sqlc`, GORM, Ent, and Bun |
+| **[`docs/guides/custom-text-search.md`](docs/guides/custom-text-search.md)** | Built-in 29 Snowball FTS configs and custom Go `TextSearchAnalyzer` registration (Korean/Japanese/custom tokenizers + GIN) |
 | **[`docs/guides/backup-encryption-pitr.md`](docs/guides/backup-encryption-pitr.md)** | AES-256-GCM at-rest encryption, hot & incremental backup chains, WAL archiving, and PITR |
 | **[`docs/guides/observability-tuning.md`](docs/guides/observability-tuning.md)** | `QueryObserver`, `OnSlowQuery`, `Catalog.Metrics`, Auto-`ANALYZE`, and memory/timeout tuning |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System diagram, package map, NeoSepia PAX v2 internals, MVCC/locking, optimizer/executor pipeline, resource bounds |

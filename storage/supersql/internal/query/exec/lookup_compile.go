@@ -317,8 +317,9 @@ type lookupFactory struct {
 	keys     []exjoin.Key
 	mapping  []int
 	program  *expr.Program
-	layouts  []model.TypeLayout
-	captures *columnar.Batch
+	layouts       []model.TypeLayout
+	captures      *columnar.Batch
+	allowAdmitted bool
 }
 
 func (c *invocation) lookup(node physical.NodeSpec, children []storage.BatchCursor, options exjoin.Options) (storage.BatchCursor, error) {
@@ -358,7 +359,7 @@ func (c *invocation) lookup(node physical.NodeSpec, children []storage.BatchCurs
 	if err := c.charge(uint64(unsafe.Sizeof(lookupFactory{})) + uint64(len(right.node.Output))*uint64(unsafe.Sizeof(int(0)))); err != nil {
 		return nil, err
 	}
-	factory := &lookupFactory{env: &c.portal.env, scan: spec, keys: options.Keys, mapping: make([]int, len(right.node.Output)), captures: c.captures}
+	factory := &lookupFactory{env: &c.portal.env, scan: spec, keys: options.Keys, mapping: make([]int, len(right.node.Output)), captures: c.captures, allowAdmitted: c.skipLockedOccurrence(spec.Request.Occurrence)}
 	for i, slot := range right.node.Output {
 		graph, _ := c.plan.Graph(slot.Graph)
 		info, _ := graph.Slot(slot.ID)
@@ -420,7 +421,7 @@ func (f *lookupFactory) Open(ctx context.Context, left []model.Value) (storage.B
 	if err != nil {
 		return nil, errors.Join(err, probe.Close())
 	}
-	var input storage.BatchCursor = &scanCursor{reader: f.env.Reader, spec: spec, decision: decision, maxBytes: limit, releasePlan: true}
+	var input storage.BatchCursor = &scanCursor{reader: f.env.Reader, spec: spec, decision: decision, maxBytes: limit, releasePlan: true, allowAdmitted: f.allowAdmitted}
 	probe.cursor = input
 	if f.program != nil {
 		state, err := expr.NewState(f.program, expr.StateOptions{Captures: f.captures, WorkAllocator: f.env.Query.Allocator(runtime.WorkMemory), OutputAllocator: f.env.Query.Allocator(runtime.OutputMemory), Sequences: f.env.Sequences, Relations: f.env.Relations, Temporal: f.env.Temporal, Settings: f.env.Settings, TextSearch: f.env.TextSearch, Advisory: f.env.Advisory, Native: f.env.Native})

@@ -17,6 +17,7 @@ import (
 	"github.com/gosuda/supersql-alpha/clock"
 )
 
+// Config configures a gstime-backed certified clock Provider.
 type Config struct {
 	Sync config.Config
 	// Raw must include suspend; its physical bounds and sources remain caller-qualified.
@@ -34,6 +35,8 @@ type Provider struct {
 	closeErr  error
 }
 
+// Open starts a gstime synchronization engine, waits for initial sync within
+// ctx, and returns a certified clock Provider.
 func Open(ctx context.Context, cfg Config) (*Provider, error) {
 	return open(ctx, cfg)
 }
@@ -141,6 +144,8 @@ func providerError(ctx context.Context, err error) error {
 	return err
 }
 
+// Close cancels the synchronization worker and closes the underlying gstime
+// engine. It is safe to call more than once.
 func (p *Provider) Close() error {
 	p.closeOnce.Do(func() {
 		p.cancel()

@@ -375,6 +375,12 @@ func (c *cursor) configure(ctx context.Context) error {
 			column.MissingValue = model.Value{}
 		}
 		ownedLayouts[i], c.columnIDs[i], c.tableLayouts[i] = column, column.ID, owned
+		if descriptorColumn.Generated != nil {
+			if c.generatedColumns == nil {
+				c.generatedColumns = make([]bool, len(o.Layout))
+			}
+			c.generatedColumns[i] = true
+		}
 		if !descriptorColumn.SystemIdentity {
 			c.visibleColumns = append(c.visibleColumns, i)
 			c.visibleLayouts = append(c.visibleLayouts, owned)

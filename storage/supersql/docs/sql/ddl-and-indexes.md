@@ -25,17 +25,19 @@ CREATE TABLE app.orders (
     customer_email TEXT NOT NULL,
     unit_price NUMERIC(10, 2) NOT NULL CHECK (unit_price >= 0),
     qty INT NOT NULL CHECK (qty > 0),
+    total NUMERIC(12, 2) GENERATED ALWAYS AS (unit_price * qty) STORED,
     status TEXT NOT NULL DEFAULT 'open'
 );
 
 CREATE VIEW app.open_orders WITH (security_barrier = true) AS
-    SELECT id, customer_email, unit_price * qty AS total
+    SELECT id, customer_email, total
     FROM app.orders
     WHERE status = 'open';
 
 INSERT INTO app.orders (customer_email, unit_price, qty)
 VALUES ('alice@example.com', 19.50, 3);
 
+SELECT id, customer_email, total FROM app.orders;
 SELECT customer_email, total FROM app.open_orders;
 ```
 
@@ -95,7 +97,7 @@ ON table_name USING gin ( column_name [ operator_class ] )
 | `jsonb` | `jsonb_ops` | Yes | `@>`, `<@`, `?`, `?\|`, `?&` | Indexes object keys, path/value pairs, top-level strings, and direct string elements of top-level arrays |
 | `jsonb` | `jsonb_path_ops` | No | `@>`, `<@` | Compact path-value postings only; `?`/`?\|`/`?&` do not use a `jsonb_path_ops` index |
 | `T[]` (arrays) | `array_ops` | Yes | `@>`, `<@`, `&&` | Supports `int[]`, `text[]`, `uuid[]`, etc. (`NULL` elements skipped) |
-| `tsvector` | `tsvector_ops` | Yes | `@@` | Supports `tsvector @@ tsquery` and `tsquery @@ tsvector` (built-in config: `'simple'`) |
+| `tsvector` | `tsvector_ops` | Yes | `@@` | Supports `tsvector @@ tsquery` and `tsquery @@ tsvector` (built-in `'simple'` + 29 Snowball languages, plus custom Go `TextSearchAnalyzer` — see [`docs/guides/custom-text-search.md`](../guides/custom-text-search.md)) |
 
 ### GIN Constraints & Exclusions (`0A000`)
 - Single-column only; `UNIQUE`, `INCLUDE`, expression keys, `NULLS NOT DISTINCT`, explicit `ASC`/`DESC`, and custom `opclassopts` are rejected with `0A000`.
@@ -121,10 +123,10 @@ CREATE INDEX idx_articles_tsv_gin  ON articles USING gin (tsv);
 INSERT INTO articles VALUES
     (1, '{"author":"alice","featured":true,"labels":["go","db"]}'::jsonb,
         ARRAY['golang', 'postgres'],
-        to_tsvector('simple', 'Pure Go embedded PostgreSQL database engine')),
+        to_tsvector('english', 'Pure Go embedded PostgreSQL database engine')),
     (2, '["go","sqlite"]'::jsonb,
         ARRAY['rust', 'storage'],
-        to_tsvector('simple', 'Columnar storage with Bloom filters'));
+        to_tsvector('english', 'Columnar storage with Bloom filters'));
 
 -- JSONB containment (@>) and key/top-level-array existence (?)
 SELECT id FROM articles WHERE meta @> '{"author":"alice"}'::jsonb;
@@ -133,8 +135,8 @@ SELECT id FROM articles WHERE meta ? 'go' ORDER BY id;
 -- Array overlap (&&) and containment (@>)
 SELECT id FROM articles WHERE tags && ARRAY['golang', 'zig'];
 
--- Full-text search (@@) using built-in 'simple' configuration
-SELECT id FROM articles WHERE tsv @@ to_tsquery('simple', 'embedded & database');
+-- Full-text search (@@) using built-in 'english' Snowball configuration
+SELECT id FROM articles WHERE tsv @@ to_tsquery('english', 'embed & databas');
 
 -- Confirm GIN Index Scan in EXPLAIN
 EXPLAIN SELECT id FROM articles WHERE tags && ARRAY['golang'];

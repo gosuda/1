@@ -568,7 +568,8 @@ func (p *PartitionPlan) PrepareInsert(ctx context.Context, transaction Transacti
 		clear(logical.Values)
 		return nil, nil, model.Row{}, err
 	}
-	candidate, err := transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: selected.target, ColumnIDs: selected.rootToChild, Values: logical.Values, Allocator: allocator, MaxBytes: maximum, Expressions: expressions})
+	childColumns, childValues := filterNonGeneratedColumns(selected.columns, selected.rootToChild, logical.Values)
+	candidate, err := transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: selected.target, ColumnIDs: childColumns, Values: childValues, Allocator: allocator, MaxBytes: maximum, Expressions: expressions})
 	if err != nil {
 		clear(logical.Values)
 		return nil, nil, model.Row{}, err
