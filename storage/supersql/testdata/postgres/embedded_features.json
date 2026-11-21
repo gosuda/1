@@ -12,7 +12,7 @@
     {
       "id": "server_transport",
       "disposition": "unsupported",
-      "reason": "PostgreSQL wire transport and psql client commands are not embedded SQL.",
+      "reason": "psql backslash commands are not embedded SQL; optional PostgreSQL v3.0 TCP wire transport is provided out-of-band via the public pgwire package.",
       "ast_match": [
         "psql client commands and transport negotiation (not SQL AST)"
       ],
@@ -204,20 +204,15 @@
     {
       "id": "authorization",
       "disposition": "unsupported",
-      "reason": "Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded.",
+      "reason": "Native MVCC roles, object-level GRANT/REVOKE (including WITH GRANT OPTION and ALL IN SCHEMA), ALTER ... OWNER TO, CREATE SCHEMA AUTHORIZATION, SECURITY DEFINER, and Row-Level Security (RLS) are supported; ALTER DEFAULT PRIVILEGES, DROP/REASSIGN OWNED, ALTER ROLE SET, SECURITY LABEL, and SET SESSION AUTHORIZATION remain excluded.",
       "ast_match": [
         "AlterRoleSetStmt",
-        "GrantStmt",
         "AlterDefaultPrivilegesStmt",
         "DropOwnedStmt",
         "ReassignOwnedStmt",
-        "AlterOwnerStmt",
         "SecLabelStmt",
-        "CreateSchemaStmt.authrole present",
-        "routine option security = true",
         "VariableSetStmt.name = session_authorization",
-        "AlterTableCmd.subtype = AT_ChangeOwner",
-        "object kind ROLE, DEFACL, PARAMETER_ACL"
+        "object kind ROLE (unsupported operations), DEFACL, PARAMETER_ACL"
       ],
       "resolved_objects": [
         {
@@ -1580,11 +1575,9 @@
     {
       "id": "notifications",
       "disposition": "unsupported",
-      "reason": "PostgreSQL asynchronous notification channels are not provided.",
+      "reason": "In-process transactional LISTEN, NOTIFY, UNLISTEN, pg_notify(), and pg_listening_channels() are supported; server queue-introspection functions (pg_notification_queue_usage) remain excluded.",
       "ast_match": [
-        "ListenStmt",
-        "NotifyStmt",
-        "UnlistenStmt"
+        "pg_notification_queue_usage() server queue introspection"
       ],
       "resolved_objects": [
         {
@@ -3203,12 +3196,12 @@
     {
       "id": "locale_providers",
       "disposition": "unsupported",
-      "reason": "Only UTF8 and deterministic C/POSIX/default collations are available.",
+      "reason": "UTF8, deterministic C/POSIX/default collations, pure-Go ICU collations (e.g. en-US-x-icu, ko-KR-x-icu, -u-ks-level2, -u-kn-true), and CREATE/DROP COLLATION are supported; libc provider, custom ICU rules, ALTER COLLATION, CREATE CONVERSION, and non-UTF8 database encodings remain excluded.",
       "ast_match": [
         "AlterCollationStmt",
         "CreateConversionStmt",
-        "object kind COLLATION, CONVERSION",
-        "resolved collation outside C/POSIX/default",
+        "CREATE COLLATION with provider=libc or rules",
+        "object kind CONVERSION (and ALTER/RENAME/COMMENT on COLLATION)",
         "resolved encoding other than UTF8"
       ],
       "resolved_objects": [
@@ -5085,15 +5078,14 @@
     {
       "id": "non_btree_indexes",
       "disposition": "unsupported",
-      "reason": "Only logical ordered B-tree index semantics are available.",
+      "reason": "Ordered B-tree indexes and GIN inverted indexes (jsonb_ops, jsonb_path_ops, array_ops, tsvector_ops) are supported; GiST, SP-GiST, BRIN, Hash, custom access methods, and operator class/family DDL remain excluded.",
       "ast_match": [
         "CreateAmStmt",
         "CreateOpClassStmt",
         "CreateOpFamilyStmt",
         "AlterOpFamilyStmt",
-        "IndexStmt.access_method outside empty/btree",
+        "IndexStmt.access_method outside empty/btree/gin",
         "object kind ACCESS_METHOD, OPCLASS, OPFAMILY, AMOP, AMPROC",
-        "resolved non-B-tree opclass or opclass parameters",
         "IndexElem.opclassopts nonempty"
       ],
       "resolved_objects": [
@@ -7994,10 +7986,10 @@
     {
       "id": "server_observability",
       "disposition": "unsupported",
-      "reason": "PostgreSQL server processes, physical statistics, and server-only settings are unavailable.",
+      "reason": "EXPLAIN (ANALYZE, BUFFERS), QueryObserver/OnSlowQuery hooks, and Catalog.Metrics are supported; PostgreSQL server-process views (pg_stat_activity), EXPLAIN (WAL, MEMORY), and server-only GUC settings remain excluded.",
       "ast_match": [
-        "resolved unsupported built-in GUC",
-        "resolved excluded pg_catalog relation/function/field"
+        "EXPLAIN (WAL) / EXPLAIN (MEMORY)",
+        "resolved server-only pg_catalog views, functions, and GUCs"
       ],
       "resolved_objects": [
         {

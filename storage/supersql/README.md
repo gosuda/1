@@ -181,6 +181,10 @@ SuperSQL omits cluster-wide and heap-specific PostgreSQL features; every exclude
 
 | Document | Contents |
 | :--- | :--- |
+| **[`docs/sql/`](docs/sql/README.md)** | PostgreSQL 18 SQL syntax guide, statement support matrix, [PG 18 differences](docs/sql/pg18-differences.md), GIN indexes, RBAC/RLS, PL/pgSQL, ICU collations, `LISTEN`/`NOTIFY`, and `EXPLAIN (ANALYZE, BUFFERS)` (doctest-verified) |
+| **[`docs/guides/pgx-and-orms.md`](docs/guides/pgx-and-orms.md)** | Integration guide for `database/sql`, `supersql/pgx`, `pgwire`, `psql`, `sqlc`, GORM, Ent, and Bun |
+| **[`docs/guides/backup-encryption-pitr.md`](docs/guides/backup-encryption-pitr.md)** | AES-256-GCM at-rest encryption, hot & incremental backup chains, WAL archiving, and PITR |
+| **[`docs/guides/observability-tuning.md`](docs/guides/observability-tuning.md)** | `QueryObserver`, `OnSlowQuery`, `Catalog.Metrics`, Auto-`ANALYZE`, and memory/timeout tuning |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System diagram, package map, NeoSepia PAX v2 internals, MVCC/locking, optimizer/executor pipeline, resource bounds |
 | [`docs/reference/api.md`](docs/reference/api.md) | Generated public Go API reference |
 | [`docs/reference/configuration.md`](docs/reference/configuration.md) | Generated `OpenOptions`, `CompactionConfig`, and runtime limits |

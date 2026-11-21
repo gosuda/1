@@ -20,24 +20,24 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 
 | Feature | Disposition | SQLSTATE | AST match | Objects | Reason |
 | --- | --- | --- | --- | --- | --- |
-| server_transport | unsupported | 0A000 | 1 | 0 | PostgreSQL wire transport and psql client commands are not embedded SQL. |
+| server_transport | unsupported | 0A000 | 1 | 0 | psql backslash commands are not embedded SQL; optional PostgreSQL v3.0 TCP wire transport is provided out-of-band via the public pgwire package. |
 | cluster_admin | unsupported | 0A000 | 16 | 10 | Database instances and filesystem placement are host-owned. |
-| authorization | unsupported | 0A000 | 12 | 2 | Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded. |
+| authorization | unsupported | 0A000 | 7 | 2 | Native MVCC roles, object-level GRANT/REVOKE (including WITH GRANT OPTION and ALL IN SCHEMA), ALTER ... OWNER TO, CREATE SCHEMA AUTHORIZATION, SECURITY DEFINER, and Row-Level Security (RLS) are supported; ALTER DEFAULT PRIVILEGES, DROP/REASSIGN OWNED, ALTER ROLE SET, SECURITY LABEL, and SET SESSION AUTHORIZATION remain excluded. |
 | external_code | unsupported | 0A000 | 12 | 5 | External extensions and native or external language handlers are not loaded. |
 | foreign_data | unsupported | 0A000 | 13 | 0 | Only local database objects participate in execution. |
 | replication | unsupported | 0A000 | 7 | 61 | The embedded backend has no PostgreSQL replication or archive SQL interface. |
 | prepared_transactions | unsupported | 0A000 | 2 | 2 | Distributed prepared transactions and exported snapshots are not implemented. |
 | weaker_isolation | unsupported | 0A000 | 2 | 0 | Read-write transactions accept only SERIALIZABLE; read-only transactions use fixed snapshots. |
-| notifications | unsupported | 0A000 | 3 | 3 | PostgreSQL asynchronous notification channels are not provided. |
+| notifications | unsupported | 0A000 | 1 | 3 | In-process transactional LISTEN, NOTIFY, UNLISTEN, pg_notify(), and pg_listening_channels() are supported; server queue-introspection functions (pg_notification_queue_usage) remain excluded. |
 | server_io | unsupported | 0A000 | 2 | 41 | SQL cannot access server files, programs, or PostgreSQL large objects. |
 | xml | unsupported | 0A000 | 3 | 34 | XML types and operations are outside the fixed SQL profile. |
-| locale_providers | unsupported | 0A000 | 5 | 7 | Only UTF8 and deterministic C/POSIX/default collations are available. |
+| locale_providers | unsupported | 0A000 | 5 | 7 | UTF8, deterministic C/POSIX/default collations, pure-Go ICU collations (e.g. en-US-x-icu, ko-KR-x-icu, -u-ks-level2, -u-kn-true), and CREATE/DROP COLLATION are supported; libc provider, custom ICU rules, ALTER COLLATION, CREATE CONVERSION, and non-UTF8 database encodings remain excluded. |
 | physical_storage | unsupported | 0A000 | 10 | 98 | PostgreSQL physical storage and transaction identities are not NeoSepia objects. |
-| non_btree_indexes | unsupported | 0A000 | 8 | 117 | Only logical ordered B-tree index semantics are available. |
+| non_btree_indexes | unsupported | 0A000 | 7 | 117 | Ordered B-tree indexes and GIN inverted indexes (jsonb_ops, jsonb_path_ops, array_ops, tsvector_ops) are supported; GiST, SP-GiST, BRIN, Hash, custom access methods, and operator class/family DDL remain excluded. |
 | advanced_exclusion | unsupported | 0A000 | 4 | 0 | Temporal constraints and non-equality or non-B-tree exclusion constraints are unavailable. |
 | rewrite_hooks | unsupported | 0A000 | 5 | 10 | User rewrite rules and DDL event triggers are unavailable. |
 | physical_maintenance | unsupported | 0A000 | 5 | 0 | PostgreSQL heap and cluster maintenance is not embedded backend maintenance. |
-| server_observability | unsupported | 0A000 | 2 | 797 | PostgreSQL server processes, physical statistics, and server-only settings are unavailable. |
+| server_observability | unsupported | 0A000 | 2 | 797 | EXPLAIN (ANALYZE, BUFFERS), QueryObserver/OnSlowQuery hooks, and Catalog.Metrics are supported; PostgreSQL server-process views (pg_stat_activity), EXPLAIN (WAL, MEMORY), and server-only GUC settings remain excluded. |
 | aggregate_or_replace | unsupported | 0A000 | 1 | 0 | Replacing an existing aggregate with CREATE OR REPLACE AGGREGATE is not implemented; only the CREATE AGGREGATE form is admitted. |
 | session_state | unsupported | 0A000 | 2 | 0 | Session-local sequence state cannot be discarded, so DISCARD SEQUENCES and the sequence reset of DISCARD ALL are unavailable. |
 | write_descriptor_expansion | unsupported | 0A000 | 1 | 0 | A write target whose descriptor requires constraint, index, trigger, or partition expansion the embedded writer does not implement. |
@@ -50,7 +50,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 
 ### `server_transport`
 
-PostgreSQL wire transport and psql client commands are not embedded SQL.
+psql backslash commands are not embedded SQL; optional PostgreSQL v3.0 TCP wire transport is provided out-of-band via the public pgwire package.
 
 | Field | Value |
 | --- | --- |
@@ -105,7 +105,7 @@ Resolved objects: 10.
 
 ### `authorization`
 
-Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded.
+Native MVCC roles, object-level GRANT/REVOKE (including WITH GRANT OPTION and ALL IN SCHEMA), ALTER ... OWNER TO, CREATE SCHEMA AUTHORIZATION, SECURITY DEFINER, and Row-Level Security (RLS) are supported; ALTER DEFAULT PRIVILEGES, DROP/REASSIGN OWNED, ALTER ROLE SET, SECURITY LABEL, and SET SESSION AUTHORIZATION remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -116,17 +116,12 @@ Native MVCC roles and Row-Level Security (RLS) policies are supported; table/obj
 AST match strings:
 
 - `AlterRoleSetStmt`
-- `GrantStmt`
 - `AlterDefaultPrivilegesStmt`
 - `DropOwnedStmt`
 - `ReassignOwnedStmt`
-- `AlterOwnerStmt`
 - `SecLabelStmt`
-- `CreateSchemaStmt.authrole present`
-- `routine option security = true`
 - `VariableSetStmt.name = session_authorization`
-- `AlterTableCmd.subtype = AT_ChangeOwner`
-- `object kind ROLE, DEFACL, PARAMETER_ACL`
+- `object kind ROLE (unsupported operations), DEFACL, PARAMETER_ACL`
 
 Resolved objects: 2.
 
@@ -275,7 +270,7 @@ No resolved catalog objects.
 
 ### `notifications`
 
-PostgreSQL asynchronous notification channels are not provided.
+In-process transactional LISTEN, NOTIFY, UNLISTEN, pg_notify(), and pg_listening_channels() are supported; server queue-introspection functions (pg_notification_queue_usage) remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -285,9 +280,7 @@ PostgreSQL asynchronous notification channels are not provided.
 
 AST match strings:
 
-- `ListenStmt`
-- `NotifyStmt`
-- `UnlistenStmt`
+- `pg_notification_queue_usage() server queue introspection`
 
 Resolved objects: 3.
 
@@ -354,7 +347,7 @@ Resolved objects: 34.
 
 ### `locale_providers`
 
-Only UTF8 and deterministic C/POSIX/default collations are available.
+UTF8, deterministic C/POSIX/default collations, pure-Go ICU collations (e.g. en-US-x-icu, ko-KR-x-icu, -u-ks-level2, -u-kn-true), and CREATE/DROP COLLATION are supported; libc provider, custom ICU rules, ALTER COLLATION, CREATE CONVERSION, and non-UTF8 database encodings remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -366,8 +359,8 @@ AST match strings:
 
 - `AlterCollationStmt`
 - `CreateConversionStmt`
-- `object kind COLLATION, CONVERSION`
-- `resolved collation outside C/POSIX/default`
+- `CREATE COLLATION with provider=libc or rules`
+- `object kind CONVERSION (and ALTER/RENAME/COMMENT on COLLATION)`
 - `resolved encoding other than UTF8`
 
 Resolved objects: 7.
@@ -419,7 +412,7 @@ Resolved objects: 98.
 
 ### `non_btree_indexes`
 
-Only logical ordered B-tree index semantics are available.
+Ordered B-tree indexes and GIN inverted indexes (jsonb_ops, jsonb_path_ops, array_ops, tsvector_ops) are supported; GiST, SP-GiST, BRIN, Hash, custom access methods, and operator class/family DDL remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -433,9 +426,8 @@ AST match strings:
 - `CreateOpClassStmt`
 - `CreateOpFamilyStmt`
 - `AlterOpFamilyStmt`
-- `IndexStmt.access_method outside empty/btree`
+- `IndexStmt.access_method outside empty/btree/gin`
 - `object kind ACCESS_METHOD, OPCLASS, OPFAMILY, AMOP, AMPROC`
-- `resolved non-B-tree opclass or opclass parameters`
 - `IndexElem.opclassopts nonempty`
 
 Resolved objects: 117.
@@ -517,7 +509,7 @@ No resolved catalog objects.
 
 ### `server_observability`
 
-PostgreSQL server processes, physical statistics, and server-only settings are unavailable.
+EXPLAIN (ANALYZE, BUFFERS), QueryObserver/OnSlowQuery hooks, and Catalog.Metrics are supported; PostgreSQL server-process views (pg_stat_activity), EXPLAIN (WAL, MEMORY), and server-only GUC settings remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -527,8 +519,8 @@ PostgreSQL server processes, physical statistics, and server-only settings are u
 
 AST match strings:
 
-- `resolved unsupported built-in GUC`
-- `resolved excluded pg_catalog relation/function/field`
+- `EXPLAIN (WAL) / EXPLAIN (MEMORY)`
+- `resolved server-only pg_catalog views, functions, and GUCs`
 
 Resolved objects: 797.
 
