@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,10 +20,14 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/bind"
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	expr "github.com/gosuda/supersql-alpha/internal/query/exec/expr"
+	"github.com/gosuda/supersql-alpha/internal/query/physical"
+	"github.com/gosuda/supersql-alpha/internal/query/session"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
@@ -168,12 +174,12 @@ var _ driver.Connector = (*Connector)(nil)
 // OpenConnector opens the native database like Open and returns the connector
 // that serves driver.Conn sessions over it.
 func OpenConnector(ctx context.Context, options OpenOptions) (*Connector, error) {
-	if options.Clock == nil {
+	if clockUnavailable(options.Clock) {
 		return nil, ErrClockRequired
 	}
 	database, err := Open(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
 	return &Connector{database: database}, nil
 }
@@ -186,7 +192,7 @@ func (connector *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	scope, err := connector.database.newSession(ctx)
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
 	return &connection{database: connector.database, scope: scope, done: make(chan struct{})}, nil
 }
@@ -247,33 +253,33 @@ func (c *connection) check() error {
 
 // execSQL parses with this session's lexical settings and runs each statement
 // through the session pipeline, returning the last statement's outcome.
-func (c *connection) execSQL(ctx context.Context, text string, args []driver.NamedValue) (Outcome, error) {
+func (c *connection) execSQL(ctx context.Context, text string, args []driver.NamedValue) (outcome, error) {
 	parsed, err := c.scope.txns.Parse(ctx, text, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, wrapError(err)
 	}
 	return c.execParsed(ctx, parsed, args)
 }
 
-func (c *connection) execParsed(ctx context.Context, parsed *zpgparse.ExtendedParseResult, args []driver.NamedValue) (Outcome, error) {
+func (c *connection) execParsed(ctx context.Context, parsed *zpgparse.ExtendedParseResult, args []driver.NamedValue) (outcome, error) {
 	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) == 0 {
-		return Outcome{}, ErrMissingStatement
+		return outcome{}, ErrMissingStatement
 	}
 	if len(args) != 0 && len(parsed.ParseResult.Stmts) != 1 {
-		return Outcome{}, &model.Error{Code: "42601", Message: "cannot insert multiple commands into a parameterized statement"}
+		return outcome{}, wrapError(&model.Error{Code: "42601", Message: "cannot insert multiple commands into a parameterized statement"})
 	}
 	parameters, err := driverParameters(args)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, wrapError(err)
 	}
-	var outcome Outcome
+	var out outcome
 	for index := range parsed.ParseResult.Stmts {
 		stmtParsed := c.scope.rewriteCompatIsolation(parsed, index)
-		if outcome, err = c.database.execStatement(ctx, c.scope, stmtParsed, index, parameters, 0, nil, nil); err != nil {
-			return outcome, err
+		if out, err = c.database.execStatement(ctx, c.scope, stmtParsed, index, parameters, 0, nil, nil); err != nil {
+			return out, wrapError(err)
 		}
 	}
-	return outcome, nil
+	return out, nil
 }
 
 func (c *connection) Prepare(query string) (driver.Stmt, error) {
@@ -286,10 +292,10 @@ func (c *connection) PrepareContext(ctx context.Context, query string) (driver.S
 	}
 	parsed, err := c.scope.txns.Parse(ctx, query, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
 	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) != 1 {
-		return nil, &model.Error{Code: "42601", Message: "a prepared statement must contain exactly one statement"}
+		return nil, wrapError(&model.Error{Code: "42601", Message: "a prepared statement must contain exactly one statement"})
 	}
 	return &statement{conn: c, parsed: parsed}, nil
 }
@@ -299,7 +305,7 @@ func (c *connection) Close() error {
 		return nil
 	}
 	close(c.done)
-	return c.scope.close()
+	return wrapError(c.scope.close())
 }
 
 func (c *connection) Begin() (driver.Tx, error) {
@@ -325,7 +331,7 @@ func (c *connection) BeginTx(ctx context.Context, options driver.TxOptions) (dri
 			}
 		}
 		if begin == "" {
-			return nil, &model.Error{Code: "0A000", Message: fmt.Sprintf("isolation level %q is not supported; the engine is serializable", sql.IsolationLevel(options.Isolation))}
+			return nil, wrapError(&model.Error{Code: "0A000", Message: fmt.Sprintf("isolation level %q is not supported; the engine is serializable", sql.IsolationLevel(options.Isolation))})
 		}
 	}
 	if options.ReadOnly {
@@ -366,8 +372,19 @@ func (c *connection) CheckNamedValue(nv *driver.NamedValue) error {
 	case int8:
 		nv.Value = int64(v)
 		return nil
+	case uint64:
+		if v <= math.MaxInt64 {
+			nv.Value = int64(v)
+		} else {
+			nv.Value = strconv.FormatUint(v, 10)
+		}
+		return nil
 	case uint:
-		nv.Value = int64(v)
+		if uint64(v) <= math.MaxInt64 {
+			nv.Value = int64(v)
+		} else {
+			nv.Value = strconv.FormatUint(uint64(v), 10)
+		}
 		return nil
 	case uint32:
 		nv.Value = int64(v)
@@ -444,7 +461,9 @@ func (c *connection) CheckNamedValue(nv *driver.NamedValue) error {
 		nv.Value = string(raw)
 		return nil
 	default:
-		return nil
+		// Delegate custom Go scalar types (e.g. type UserID int64, type Status
+		// string) and pointers to database/sql's DefaultParameterConverter.
+		return driver.ErrSkip
 	}
 }
 
@@ -488,13 +507,13 @@ func (c *connection) ExecContext(ctx context.Context, query string, args []drive
 	if err := c.check(); err != nil {
 		return nil, err
 	}
-	outcome, err := c.execSQL(ctx, query, args)
+	out, err := c.execSQL(ctx, query, args)
 	if err != nil {
 		return nil, err
 	}
 	return driverResult{
-		tag:          formatCommandTag(outcome.Tag, outcome.RowsAffected),
-		rowsAffected: int64(outcome.RowsAffected),
+		tag:          formatCommandTag(out.Tag, out.RowsAffected),
+		rowsAffected: int64(out.RowsAffected),
 	}, nil
 }
 
@@ -504,92 +523,54 @@ func (c *connection) QueryContext(ctx context.Context, query string, args []driv
 	}
 	parsed, err := c.scope.txns.Parse(ctx, query, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
 	return c.queryParsed(ctx, parsed, args)
 }
 
-// queryParsed streams the last statement's rows through a pump: the session
-// invocation runs on its own goroutine so the driver pulls rows from a bounded
-// channel instead of materializing the whole result. Statements before the
-// last are drained to completion first.
+// queryParsed streams statements through a per-statement pump. Single-statement
+// queries stream directly; multi-statement queries advance through result sets
+// via driver.RowsNextResultSet while skipping intermediate non-row statements.
 func (c *connection) queryParsed(ctx context.Context, parsed *zpgparse.ExtendedParseResult, args []driver.NamedValue) (driver.Rows, error) {
 	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) == 0 {
 		return nil, ErrMissingStatement
 	}
 	if len(args) != 0 && len(parsed.ParseResult.Stmts) != 1 {
-		return nil, &model.Error{Code: "42601", Message: "cannot insert multiple commands into a parameterized statement"}
+		return nil, wrapError(&model.Error{Code: "42601", Message: "cannot insert multiple commands into a parameterized statement"})
 	}
 	parameters, err := driverParameters(args)
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
-	statements := parsed.ParseResult.Stmts
-	pumpCtx, cancel := context.WithCancel(ctx)
 	rows := &queryRows{
-		builtins: c.scope.builtins(),
-		incoming: make(chan [][]model.Value, 4),
-		ready:    make(chan []bind.ResultColumn, 1),
-		done:     make(chan struct{}),
-		closed:   make(chan struct{}),
-		connDone: c.done,
-		cancel:   cancel,
+		conn:       c,
+		ctx:        ctx,
+		parsed:     parsed,
+		parameters: parameters,
+		builtins:   c.scope.builtins(),
+		connDone:   c.done,
 	}
-	go func() {
-		// LIFO: incoming closes after err is set and before done, so a Next
-		// that drains the channel observes the terminal error deterministically.
-		defer close(rows.done)
-		defer close(rows.incoming)
-		for index := 0; index < len(statements)-1; index++ {
-			stmtParsed := c.scope.rewriteCompatIsolation(parsed, index)
-			if _, runErr := c.database.execStatement(pumpCtx, c.scope, stmtParsed, index, nil, 0, drainRows, nil); runErr != nil {
-				rows.err = runErr
-				return
-			}
-		}
-		lastIndex := len(statements) - 1
-		stmtParsed := c.scope.rewriteCompatIsolation(parsed, lastIndex)
-		_, runErr := c.database.execStatement(pumpCtx, c.scope, stmtParsed, lastIndex, parameters, 0, rows.stream, nil)
-		rows.err = runErr
-	}()
-	select {
-	case columns := <-rows.ready:
-		rows.columns = columns
-		return rows, nil
-	case <-rows.done:
-		if rows.err != nil {
-			return nil, rows.err
-		}
-		// done implies stream already ran for row statements; its buffered
-		// ready send is still waiting, so collect it without blocking.
-		select {
-		case rows.columns = <-rows.ready:
-		default:
-		}
-		return rows, nil
-	case <-c.done:
-		cancel()
-		<-rows.done
-		return nil, driver.ErrBadConn
+	if err := rows.advanceToNextResultSet(true); err != nil {
+		return nil, wrapError(err)
 	}
+	return rows, nil
 }
 
-// drainRows consumes a non-terminal statement's row source without retaining
-// it, so earlier statements in a multi-statement query commit normally.
-func drainRows(ctx context.Context, _ []bind.ResultColumn, _ builtin.ResolveOptions, source rowSource) error {
-	if source == nil {
-		return nil
+// queryPrepared streams a cached *session.Prepared directly through queryRows.
+func (c *connection) queryPrepared(ctx context.Context, prepared *session.Prepared, parameters []expr.ParameterValue) (*queryRows, error) {
+	rows := &queryRows{
+		conn:     c,
+		ctx:      ctx,
+		builtins: c.scope.builtins(),
+		connDone: c.done,
 	}
-	var batch columnar.Batch
-	for {
-		err := source.Next(ctx, &batch)
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
+	if err := rows.startStream(func(pumpCtx context.Context, stream rowStream) error {
+		_, runErr := c.database.runPreparedCore(pumpCtx, c.scope, prepared, parameters, 0, stream)
+		return runErr
+	}); err != nil {
+		return nil, wrapError(err)
 	}
+	return rows, nil
 }
 
 func (c *connection) Ping(ctx context.Context) error {
@@ -599,15 +580,27 @@ func (c *connection) Ping(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// ResetSession replaces a dirty session scope — one holding an open or failed
-// transaction — so pooled reuse never inherits transactional state. Clean
-// sessions keep their settings, prepared statements and temporary objects,
-// matching PostgreSQL session semantics across pool checkout.
+// ResetSession sanitizes a pooled connection before reuse: an active or failed
+// transaction replaces the entire session scope, while a clean session resets
+// all session settings, custom GUCs, active role, session_user, sequence
+// currval/lastval state, held cursors, SQL prepared statements, temporary
+// objects, and session advisory locks so state never leaks across callers.
 func (c *connection) ResetSession(ctx context.Context) error {
 	if c.closed.Load() {
 		return driver.ErrBadConn
 	}
 	if !c.scope.txns.Active() {
+		if err := c.scope.settings.ResetAllSessionState(ctx); err != nil {
+			return driver.ErrBadConn
+		}
+		if c.scope.sequences != nil {
+			if err := c.scope.sequences.Discard(ctx); err != nil {
+				return driver.ErrBadConn
+			}
+		}
+		if err := c.scope.txns.ResetSessionObjects(ctx); err != nil {
+			return driver.ErrBadConn
+		}
 		return nil
 	}
 	fresh, err := c.database.newSession(ctx)
@@ -636,23 +629,46 @@ func (tx *transaction) Commit() error {
 		return errors.New("supersql: transaction already finished")
 	}
 	_, err := tx.conn.execSQL(tx.ctx, "COMMIT", nil)
-	return err
+	return wrapError(err)
 }
 
 func (tx *transaction) Rollback() error {
 	if !tx.finished.CompareAndSwap(false, true) {
 		return errors.New("supersql: transaction already finished")
 	}
-	_, err := tx.conn.execSQL(tx.ctx, "ROLLBACK", nil)
-	return err
+	rollbackCtx := context.Background()
+	if tx.ctx != nil {
+		// Detach cancellation so an already-canceled or timed-out BeginTx
+		// context still executes ROLLBACK and releases locks and snapshot pins.
+		rollbackCtx = context.WithoutCancel(tx.ctx)
+	}
+	_, err := tx.conn.execSQL(rollbackCtx, "ROLLBACK", nil)
+	return wrapError(err)
 }
 
-// statement is one driver.Stmt: a syntax-checked single statement re-planned
-// per invocation under the connection's own session.
+type cachedStatementPlan struct {
+	prepared     *session.Prepared
+	identity     txn.CatalogReadIdentity
+	ddlSeq       uint64
+	currentRole  string
+	sessionUser  string
+	searchPath   []string
+	builtins     builtin.ResolveOptions
+	paramLayouts []model.TypeLayout
+}
+
+// statement is one driver.Stmt: a syntax-checked single statement that caches
+// bound/planned state keyed by CatalogReadIdentity, role, search_path, semantic
+// settings, and declared parameter types, invalidating automatically on DDL or
+// session context changes.
 type statement struct {
 	conn   *connection
 	parsed *zpgparse.ExtendedParseResult
 	closed atomic.Bool
+
+	mu                sync.Mutex
+	cached            *cachedStatementPlan
+	parameterizedScan bool
 }
 
 var (
@@ -663,6 +679,9 @@ var (
 
 func (s *statement) Close() error {
 	s.closed.Store(true)
+	s.mu.Lock()
+	s.cached = nil
+	s.mu.Unlock()
 	return nil
 }
 
@@ -678,13 +697,33 @@ func (s *statement) ExecContext(ctx context.Context, args []driver.NamedValue) (
 	if s.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
-	outcome, err := s.conn.execParsed(ctx, s.parsed, args)
-	if err != nil {
+	if err := s.conn.check(); err != nil {
 		return nil, err
 	}
+	parameters, err := driverParameters(args)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	if prepared, ok := s.resolveCachedPlan(ctx, parameters); ok {
+		out, runErr := s.conn.database.runPreparedCore(ctx, s.conn.scope, prepared, parameters, 0, nil)
+		if runErr == nil {
+			return driverResult{
+				tag:          formatCommandTag(out.Tag, out.RowsAffected),
+				rowsAffected: int64(out.RowsAffected),
+			}, nil
+		}
+		if !isStalePreparedError(runErr) {
+			return nil, wrapError(runErr)
+		}
+		s.evictCachedPlan()
+	}
+	out, err := s.conn.execParsed(ctx, s.parsed, args)
+	if err != nil {
+		return nil, wrapError(err)
+	}
 	return driverResult{
-		tag:          formatCommandTag(outcome.Tag, outcome.RowsAffected),
-		rowsAffected: int64(outcome.RowsAffected),
+		tag:          formatCommandTag(out.Tag, out.RowsAffected),
+		rowsAffected: int64(out.RowsAffected),
 	}, nil
 }
 
@@ -696,7 +735,193 @@ func (s *statement) QueryContext(ctx context.Context, args []driver.NamedValue) 
 	if s.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
+	if err := s.conn.check(); err != nil {
+		return nil, err
+	}
+	parameters, err := driverParameters(args)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	if prepared, ok := s.resolveCachedPlan(ctx, parameters); ok {
+		rows, runErr := s.conn.queryPrepared(ctx, prepared, parameters)
+		if runErr == nil {
+			return rows, nil
+		}
+		if !isStalePreparedError(runErr) {
+			return nil, wrapError(runErr)
+		}
+		s.evictCachedPlan()
+	}
 	return s.conn.queryParsed(ctx, s.parsed, args)
+}
+
+func (s *statement) evictCachedPlan() {
+	s.mu.Lock()
+	s.cached = nil
+	s.mu.Unlock()
+}
+
+func cacheablePreparedStmt(parsed *zpgparse.ExtendedParseResult) bool {
+	if parsed == nil || parsed.ParseResult == nil || len(parsed.ParseResult.Stmts) != 1 {
+		return false
+	}
+	if len(parsed.TemporalClauses) != 0 || len(parsed.OnlineDDLClauses) != 0 {
+		return false
+	}
+	raw := parsed.ParseResult.Stmts[0]
+	if raw == nil || raw.Stmt == nil {
+		return false
+	}
+	node := raw.Stmt
+	return node.GetSelectStmt() != nil ||
+		node.GetInsertStmt() != nil ||
+		node.GetUpdateStmt() != nil ||
+		node.GetDeleteStmt() != nil ||
+		node.GetMergeStmt() != nil
+}
+
+func preparedHasScans(prepared *session.Prepared) bool {
+	if prepared == nil || prepared.Graph() == nil || prepared.Graph().Plan() == nil {
+		return false
+	}
+	plan := prepared.Graph().Plan()
+	for index := uint32(1); index <= plan.NodeCount(); index++ {
+		node, ok := plan.Node(physical.NodeID(index))
+		if !ok {
+			continue
+		}
+		alg := node.Metadata().Algorithm
+		if alg == physical.TableScan || alg == physical.SecondaryScan {
+			return true
+		}
+	}
+	return false
+}
+
+func equalTypeLayouts(a, b []model.TypeLayout) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !model.TypeLayoutsEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isStalePreparedError(err error) bool {
+	if SQLState(err) != "0A000" {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "prepared query") && strings.Contains(msg, "prepare again")
+}
+
+// resolveCachedPlan returns a cached *session.Prepared when the statement is
+// eligible and the catalog identity, role, search_path, semantic settings, and
+// declared parameter layouts match. Parameterized queries containing table or
+// index scans bypass the generic cache so runtime parameters specialize index
+// spans on every invocation.
+func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.ParameterValue) (*session.Prepared, bool) {
+	c := s.conn
+	if c == nil || c.database == nil || c.scope == nil || c.database.readOnly || c.scope.txns.Active() {
+		return nil, false
+	}
+	if !cacheablePreparedStmt(s.parsed) {
+		return nil, false
+	}
+	s.mu.Lock()
+	if len(parameters) > 0 && s.parameterizedScan {
+		s.mu.Unlock()
+		return nil, false
+	}
+	cached := s.cached
+	s.mu.Unlock()
+
+	view, err := c.database.manager.ClosedReadView(ctx)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = view.Close() }()
+
+	var identity txn.CatalogReadIdentity
+	if identified, ok := view.(interface{ CatalogIdentity() txn.CatalogReadIdentity }); ok {
+		identity = identified.CatalogIdentity()
+	}
+	if identity == (txn.CatalogReadIdentity{}) {
+		return nil, false
+	}
+
+	ddlSeq := c.scope.ddlSeq.Load()
+	currentRole := c.scope.settings.CurrentRole()
+	sessionUser := c.scope.settings.SessionUser()
+	searchPath := c.scope.settings.SearchPath()
+	builtins := c.scope.builtins()
+	declaredLayouts := declaredParameterLayouts(parameters)
+
+	if cached != nil &&
+		cached.identity == identity &&
+		cached.ddlSeq == ddlSeq &&
+		cached.currentRole == currentRole &&
+		cached.sessionUser == sessionUser &&
+		slices.Equal(cached.searchPath, searchPath) &&
+		builtins.SameSemantics(cached.builtins) &&
+		equalTypeLayouts(cached.paramLayouts, declaredLayouts) {
+		return cached.prepared, true
+	}
+
+	snapshot, err := c.database.catalog.TransactionSnapshot(view, catalog.BorrowReader)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = snapshot.Close() }()
+
+	types, err := c.scope.txns.DeclaredTypeRuntime(ctx, snapshot, *c.database.typeRuntimeOptions(builtins))
+	if err != nil {
+		return nil, false
+	}
+	builtins.Types = types
+
+	prepareOpts, err := c.scope.prepareOptions(ctx, snapshot, view, builtins)
+	if err != nil {
+		return nil, false
+	}
+	prepareOpts.Normalize.Builtin = builtins
+	prepareOpts.Bind.Builtin = builtins
+	if effectiveWork := c.scope.settings.Resources().EffectiveWorkMemoryBytes; effectiveWork > 0 && prepareOpts.Optimize.WorkingMemory > 0 {
+		prepareOpts.Optimize.WorkingMemory = uint64(effectiveWork)
+	}
+	prepareOpts.Optimize.StatisticsKeyEncoder = c.database.keys.WithResolveOptions(builtins)
+
+	rawStmt := s.parsed.ParseResult.Stmts[0]
+	prepared, err := session.Prepare(ctx, rawStmt, snapshot, prepareOpts, declaredLayouts)
+	if err != nil || prepared == nil || prepared.Graph() == nil {
+		return nil, false
+	}
+	if len(parameters) > 0 && preparedHasScans(prepared) {
+		// Parameterized scan queries benefit from per-invocation span narrowing
+		// via Optimize.Parameters rather than a generic full-scan plan.
+		s.mu.Lock()
+		s.parameterizedScan = true
+		s.mu.Unlock()
+		return nil, false
+	}
+
+	entry := &cachedStatementPlan{
+		prepared:     prepared,
+		identity:     identity,
+		ddlSeq:       ddlSeq,
+		currentRole:  currentRole,
+		sessionUser:  sessionUser,
+		searchPath:   slices.Clone(searchPath),
+		builtins:     builtins,
+		paramLayouts: slices.Clone(declaredLayouts),
+	}
+	s.mu.Lock()
+	s.cached = entry
+	s.mu.Unlock()
+	return prepared, true
 }
 
 func driverNamedValues(args []driver.Value) []driver.NamedValue {
@@ -722,36 +947,70 @@ func (r driverResult) RowsAffected() (int64, error) { return r.rowsAffected, nil
 
 func (r driverResult) CommandTag() string { return r.tag }
 
+// rowStreamState owns the channel lifecycle for one streaming statement inside
+// queryRows, keeping multi-statement NextResultSet transitions race-free.
+type rowStreamState struct {
+	incoming     chan [][]model.Value
+	ready        chan []bind.ResultColumn
+	done         chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
+	cancel       context.CancelFunc
+	err          error
+	errDelivered atomic.Bool
+}
+
+func (s *rowStreamState) finish() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		<-s.done
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
+}
+
 // queryRows is a streaming driver.Rows: a pump goroutine runs the statement
 // invocation and hands copied row batches across a bounded channel, so Next
 // pulls rows instead of reading a materialized result. Close stops the row
-// feed and waits for the session to unwind its portal; it deliberately does
-// not cancel the statement context, because a canceled statement aborts the
-// surrounding transaction while a portal closed early must not.
+// feed, waits for the session to unwind its portal, and surfaces any deferred
+// statement or write-draining error (e.g. from INSERT ... RETURNING).
 type queryRows struct {
+	conn       *connection
+	ctx        context.Context
+	parsed     *zpgparse.ExtendedParseResult
+	parameters []expr.ParameterValue
+	nextStmt   int
+
 	columns  []bind.ResultColumn
 	builtins builtin.ResolveOptions
+	connDone <-chan struct{}
 
-	incoming  chan [][]model.Value
-	ready     chan []bind.ResultColumn
-	done      chan struct{}
-	closed    chan struct{}
-	closeOnce sync.Once
-	connDone  <-chan struct{}
-	cancel    context.CancelFunc
-	err       error
+	mu        sync.Mutex
+	state     *rowStreamState
+	closedAll bool
+	closeErr  error
 
 	current [][]model.Value
 	pos     int
 	codecs  []builtin.TypeTextCodec
 }
 
-var _ driver.Rows = (*queryRows)(nil)
+var (
+	_ driver.Rows                           = (*queryRows)(nil)
+	_ driver.RowsColumnTypeDatabaseTypeName = (*queryRows)(nil)
+	_ driver.RowsColumnTypeScanType         = (*queryRows)(nil)
+	_ driver.RowsColumnTypeNullable         = (*queryRows)(nil)
+	_ driver.RowsNextResultSet              = (*queryRows)(nil)
+)
 
 func (rows *queryRows) Columns() []string {
 	names := make([]string, len(rows.columns))
-	for index, column := range rows.columns {
-		names[index] = column.Name
+	for index, col := range rows.columns {
+		names[index] = col.Name
 	}
 	return names
 }
@@ -759,18 +1018,266 @@ func (rows *queryRows) Columns() []string {
 func (rows *queryRows) ColumnOIDs() ([]uint32, []int32) {
 	oids := make([]uint32, len(rows.columns))
 	mods := make([]int32, len(rows.columns))
-	for index, column := range rows.columns {
-		oids[index] = uint32(column.Layout.Type.ID)
-		mods[index] = column.Layout.Type.Modifier
+	for index, col := range rows.columns {
+		oids[index] = uint32(col.Layout.Type.ID)
+		mods[index] = col.Layout.Type.Modifier
 	}
 	return oids, mods
 }
 
-// stream is the session-side consume callback: it publishes the result columns
-// once, then forwards each batch's copied rows to the driver side. An early
-// Close returns nil so the statement completes normally; only a statement
-// cancellation or connection teardown propagates as an error.
-func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, builtins builtin.ResolveOptions, source rowSource) error {
+// ColumnTypeOID returns the PostgreSQL type OID and type modifier for column index.
+func (rows *queryRows) ColumnTypeOID(index int) (uint32, int32) {
+	if index < 0 || index >= len(rows.columns) {
+		return 0, -1
+	}
+	return uint32(rows.columns[index].Layout.Type.ID), rows.columns[index].Layout.Type.Modifier
+}
+
+func (rows *queryRows) ColumnTypeDatabaseTypeName(index int) string {
+	if index < 0 || index >= len(rows.columns) {
+		return ""
+	}
+	return pgDatabaseTypeName(rows.columns[index].Layout.Type.ID)
+}
+
+func (rows *queryRows) ColumnTypeScanType(index int) reflect.Type {
+	if index < 0 || index >= len(rows.columns) {
+		return reflect.TypeFor[any]()
+	}
+	switch rows.columns[index].Layout.Type.ID {
+	case 16:
+		return reflect.TypeFor[bool]()
+	case 17:
+		return reflect.TypeFor[[]byte]()
+	case 20, 21, 23, 26:
+		return reflect.TypeFor[int64]()
+	case 700, 701:
+		return reflect.TypeFor[float64]()
+	case 1082, 1114, 1184:
+		return reflect.TypeFor[time.Time]()
+	default:
+		return reflect.TypeFor[string]()
+	}
+}
+
+func (rows *queryRows) ColumnTypeNullable(index int) (nullable, ok bool) {
+	if index < 0 || index >= len(rows.columns) {
+		return false, false
+	}
+	return rows.columns[index].Nullable, true
+}
+
+func pgDatabaseTypeName(id model.TypeID) string {
+	switch id {
+	case 16:
+		return "BOOL"
+	case 17:
+		return "BYTEA"
+	case 18:
+		return "CHAR"
+	case 19:
+		return "NAME"
+	case 20:
+		return "INT8"
+	case 21:
+		return "INT2"
+	case 23:
+		return "INT4"
+	case 25:
+		return "TEXT"
+	case 26:
+		return "OID"
+	case 114:
+		return "JSON"
+	case 700:
+		return "FLOAT4"
+	case 701:
+		return "FLOAT8"
+	case 705:
+		return "UNKNOWN"
+	case 1000:
+		return "_BOOL"
+	case 1001:
+		return "_BYTEA"
+	case 1005:
+		return "_INT2"
+	case 1007:
+		return "_INT4"
+	case 1009:
+		return "_TEXT"
+	case 1014:
+		return "_BPCHAR"
+	case 1015:
+		return "_VARCHAR"
+	case 1016:
+		return "_INT8"
+	case 1021:
+		return "_FLOAT4"
+	case 1022:
+		return "_FLOAT8"
+	case 1028:
+		return "_OID"
+	case 1042:
+		return "BPCHAR"
+	case 1043:
+		return "VARCHAR"
+	case 1082:
+		return "DATE"
+	case 1083:
+		return "TIME"
+	case 1114:
+		return "TIMESTAMP"
+	case 1184:
+		return "TIMESTAMPTZ"
+	case 1186:
+		return "INTERVAL"
+	case 1231:
+		return "_NUMERIC"
+	case 1266:
+		return "TIMETZ"
+	case 1560:
+		return "BIT"
+	case 1562:
+		return "VARBIT"
+	case 1700:
+		return "NUMERIC"
+	case 2950:
+		return "UUID"
+	case 2951:
+		return "_UUID"
+	case 3802:
+		return "JSONB"
+	case 3807:
+		return "_JSONB"
+	default:
+		return fmt.Sprintf("OID(%d)", id)
+	}
+}
+
+func (rows *queryRows) startStream(run func(pumpCtx context.Context, stream rowStream) error) error {
+	pumpCtx, cancel := context.WithCancel(rows.ctx)
+	state := &rowStreamState{
+		incoming: make(chan [][]model.Value, 4),
+		ready:    make(chan []bind.ResultColumn, 1),
+		done:     make(chan struct{}),
+		closed:   make(chan struct{}),
+		cancel:   cancel,
+	}
+	rows.mu.Lock()
+	rows.state = state
+	rows.mu.Unlock()
+	rows.current = nil
+	rows.pos = 0
+	rows.codecs = nil
+
+	go func() {
+		// LIFO: incoming closes after err is set and before done, so a Next
+		// that drains the channel observes the terminal error deterministically.
+		defer close(state.done)
+		defer close(state.incoming)
+		state.err = run(pumpCtx, func(ctx context.Context, columns []bind.ResultColumn, builtins builtin.ResolveOptions, source rowSource) error {
+			return rows.streamToState(state, ctx, columns, builtins, source)
+		})
+	}()
+
+	select {
+	case columns := <-state.ready:
+		rows.columns = columns
+		return nil
+	case <-state.done:
+		if state.err != nil {
+			cancel()
+			return state.err
+		}
+		select {
+		case rows.columns = <-state.ready:
+		default:
+			rows.columns = nil
+		}
+		return nil
+	case <-rows.connDone:
+		cancel()
+		<-state.done
+		return driver.ErrBadConn
+	}
+}
+
+func (rows *queryRows) advanceToNextResultSet(initial bool) error {
+	if rows.parsed == nil || rows.parsed.ParseResult == nil {
+		return io.EOF
+	}
+	stmts := rows.parsed.ParseResult.Stmts
+	for rows.nextStmt < len(stmts) {
+		index := rows.nextStmt
+		rows.nextStmt++
+		var params []expr.ParameterValue
+		if len(stmts) == 1 {
+			params = rows.parameters
+		}
+		stmtParsed := rows.conn.scope.rewriteCompatIsolation(rows.parsed, index)
+		err := rows.startStream(func(pumpCtx context.Context, stream rowStream) error {
+			_, runErr := rows.conn.database.execStatement(pumpCtx, rows.conn.scope, stmtParsed, index, params, 0, stream, nil)
+			return runErr
+		})
+		if err != nil {
+			return err
+		}
+		// Skip intermediate statements that produce no columns (e.g. SET/DDL
+		// preceding a SELECT), stopping on the first result set with columns or
+		// on the final statement for an initial call.
+		if len(rows.columns) > 0 || (initial && rows.nextStmt >= len(stmts)) {
+			return nil
+		}
+		rows.mu.Lock()
+		state := rows.state
+		rows.mu.Unlock()
+		state.finish()
+		if state != nil && state.err != nil {
+			return state.err
+		}
+	}
+	return io.EOF
+}
+
+func (rows *queryRows) HasNextResultSet() bool {
+	rows.mu.Lock()
+	closed := rows.closedAll
+	rows.mu.Unlock()
+	if closed || rows.parsed == nil || rows.parsed.ParseResult == nil {
+		return false
+	}
+	return rows.nextStmt < len(rows.parsed.ParseResult.Stmts)
+}
+
+func (rows *queryRows) NextResultSet() error {
+	rows.mu.Lock()
+	closed := rows.closedAll
+	prev := rows.state
+	rows.mu.Unlock()
+	if closed {
+		return io.EOF
+	}
+	if prev != nil {
+		prev.finish()
+		if prev.err != nil && !prev.errDelivered.Swap(true) {
+			return wrapError(prev.err)
+		}
+	}
+	if !rows.HasNextResultSet() {
+		return io.EOF
+	}
+	err := rows.advanceToNextResultSet(false)
+	if errors.Is(err, io.EOF) {
+		return io.EOF
+	}
+	return wrapError(err)
+}
+
+// streamToState is the session-side consume callback: it publishes the result
+// columns once, then forwards each batch's copied rows to the driver side. An
+// early Close returns nil so SELECT completes cleanly while write statements
+// (e.g. INSERT ... RETURNING) still drain remaining mutations to completion.
+func (rows *queryRows) streamToState(state *rowStreamState, ctx context.Context, columns []bind.ResultColumn, builtins builtin.ResolveOptions, source rowSource) error {
 	// The statement's own resolve options carry the declared-type resolver, so
 	// driver-side rendering of enum and domain columns stays valid after the
 	// statement releases its snapshot pin.
@@ -778,7 +1285,7 @@ func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, 
 		rows.builtins.Types = builtins.Types
 	}
 	select {
-	case rows.ready <- columns:
+	case state.ready <- columns:
 	default:
 	}
 	if source == nil {
@@ -787,7 +1294,7 @@ func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, 
 	var batch columnar.Batch
 	for {
 		select {
-		case <-rows.closed:
+		case <-state.closed:
 			return nil
 		default:
 		}
@@ -801,7 +1308,7 @@ func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, 
 		for lane := range batch.Rows() {
 			row := make([]model.Value, len(batch.Columns))
 			for index := range batch.Columns {
-				value, _, copyErr := columnar.CopyValue(ctx, &batch.Columns[index], batch.Lane(lane), 1<<20)
+				value, _, copyErr := columnar.CopyValue(ctx, &batch.Columns[index], batch.Lane(lane), 32<<20)
 				if copyErr != nil {
 					return copyErr
 				}
@@ -810,8 +1317,8 @@ func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, 
 			out = append(out, row)
 		}
 		select {
-		case rows.incoming <- out:
-		case <-rows.closed:
+		case state.incoming <- out:
+		case <-state.closed:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -822,33 +1329,72 @@ func (rows *queryRows) stream(ctx context.Context, columns []bind.ResultColumn, 
 }
 
 func (rows *queryRows) Close() error {
-	rows.closeOnce.Do(func() { close(rows.closed) })
-	<-rows.done
-	if rows.cancel != nil {
-		rows.cancel()
-		rows.cancel = nil
+	rows.mu.Lock()
+	if rows.closedAll {
+		err := rows.closeErr
+		rows.mu.Unlock()
+		return err
 	}
-	return nil
+	rows.closedAll = true
+	state := rows.state
+	rows.mu.Unlock()
+
+	var closeErr error
+	if state != nil {
+		state.finish()
+		if state.err != nil && !state.errDelivered.Swap(true) {
+			closeErr = wrapError(state.err)
+		}
+	}
+
+	rows.mu.Lock()
+	rows.closeErr = closeErr
+	rows.mu.Unlock()
+	return closeErr
 }
 
 func (rows *queryRows) Next(dest []driver.Value) error {
+	rows.mu.Lock()
+	state := rows.state
+	rows.mu.Unlock()
+	if rows.ctx != nil {
+		if err := rows.ctx.Err(); err != nil {
+			if state != nil {
+				state.finish()
+				state.errDelivered.Store(true)
+			}
+			return err
+		}
+	}
+	if state == nil {
+		return io.EOF
+	}
+	var ctxDone <-chan struct{}
+	if rows.ctx != nil {
+		ctxDone = rows.ctx.Done()
+	}
 	for rows.pos >= len(rows.current) {
 		select {
-		case batch, ok := <-rows.incoming:
+		case batch, ok := <-state.incoming:
 			if !ok {
-				<-rows.done
-				if rows.err != nil {
-					return rows.err
+				<-state.done
+				if state.err != nil {
+					state.errDelivered.Store(true)
+					return wrapError(state.err)
 				}
 				return io.EOF
 			}
 			rows.current = batch
 			rows.pos = 0
+		case <-ctxDone:
+			state.finish()
+			state.errDelivered.Store(true)
+			return rows.ctx.Err()
 		case <-rows.connDone:
-			if rows.cancel != nil {
-				rows.cancel()
+			if state.cancel != nil {
+				state.cancel()
 			}
-			<-rows.done
+			<-state.done
 			return driver.ErrBadConn
 		}
 	}
@@ -860,7 +1406,7 @@ func (rows *queryRows) Next(dest []driver.Value) error {
 		}
 		converted, err := rows.driverValue(index, value)
 		if err != nil {
-			return err
+			return wrapError(err)
 		}
 		dest[index] = converted
 	}
@@ -905,7 +1451,7 @@ func (rows *queryRows) driverValue(index int, value model.Value) (driver.Value, 
 	if err != nil {
 		return nil, err
 	}
-	rendered, err := codec.Output(context.Background(), []model.Value{value}, builtin.CallBudget{MemoryBytes: 4 << 20, OutputBytes: 4 << 20})
+	rendered, err := codec.Output(context.Background(), []model.Value{value}, builtin.CallBudget{MemoryBytes: 32 << 20, OutputBytes: 32 << 20})
 	if err != nil {
 		return nil, err
 	}

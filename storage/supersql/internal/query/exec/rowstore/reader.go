@@ -133,6 +133,16 @@ func (r *Reader) read(ctx context.Context, position Position, sequential bool) (
 	if err != nil {
 		return nil, 0, err
 	}
+	needed := frameHeaderBytes + size
+	if needed > uint64(len(r.frame)) {
+		reserve := max(uint64(r.claim.Bytes()), needed+max(r.spool.limits.DecodeBytes, needed)+codecScratchBytes)
+		if resizeErr := r.claim.Resize(int64(reserve)); resizeErr != nil {
+			return nil, 0, resizeErr
+		}
+		grown := make([]byte, int(needed))
+		copy(grown[:frameHeaderBytes], r.frame[:frameHeaderBytes])
+		r.frame = grown
+	}
 	header := r.frame[:frameHeaderBytes]
 	payload := r.frame[frameHeaderBytes : frameHeaderBytes+int(size)]
 	if err := r.readAt(ctx, payload, offset+frameHeaderBytes); err != nil {
@@ -141,9 +151,14 @@ func (r *Reader) read(ctx context.Context, position Position, sequential bool) (
 	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(header[24:28]) {
 		return nil, 0, ErrCorrupt
 	}
-	value, err := storage.DecodeValue(ctx, payload, r.spool.limits.DecodeBytes)
+	value, err := storage.DecodeValue(ctx, payload, r.spool.effectiveDecodeBytes())
 	if err != nil {
 		return nil, 0, errors.Join(ErrCorrupt, err)
+	}
+	if needed > r.spool.limits.MaxRecordBytes {
+		r.frame = make([]byte, int(r.spool.limits.MaxRecordBytes))
+		shrunk := max(r.spool.limits.MaxRecordBytes+r.spool.limits.DecodeBytes+codecScratchBytes, r.spool.limits.MaxRecordBytes+needed+codecScratchBytes)
+		_ = r.claim.Resize(int64(shrunk))
 	}
 	if value.Type != model.TypeComposite || value.IsNull {
 		return nil, 0, ErrCorrupt
@@ -173,7 +188,7 @@ func (r *Reader) readHeader(ctx context.Context, offset uint64) (uint64, error) 
 		return 0, ErrCorrupt
 	}
 	size := binary.LittleEndian.Uint64(header[16:24])
-	if size > r.spool.limits.MaxRecordBytes-frameHeaderBytes || size > r.limit-offset-frameHeaderBytes {
+	if size > r.spool.effectiveMaxRecordBytes()-frameHeaderBytes || size > r.limit-offset-frameHeaderBytes {
 		return 0, ErrCorrupt
 	}
 	return size, nil

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/bind"
@@ -50,7 +51,7 @@ func (cursor *commandCursor) Next(ctx context.Context, out *columnar.Batch) erro
 	return nil
 }
 
-func (transactions *Transactions) runCommand(ctx context.Context, prepared *Prepared, consume func(context.Context, *Prepared, *Rows) error) (result ExecutionResult, err error) {
+func (transactions *Transactions) runCommand(ctx context.Context, prepared *Prepared, store *catalog.Store, consume func(context.Context, *Prepared, *Rows) error) (result ExecutionResult, err error) {
 	defer func() { result.Warnings = transactions.settings.visibleWarnings(result.Warnings) }()
 	command := prepared.bound.Command()
 	recovery := false
@@ -68,12 +69,17 @@ func (transactions *Transactions) runCommand(ctx context.Context, prepared *Prep
 		}
 	}()
 	cursor := &commandCursor{columns: prepared.Columns()}
-	before := *transactions.settings
+	before := transactions.settings.snapshotState()
+	isSettingOrRole := false
+	switch command.(type) {
+	case bind.SettingCommand, bind.RoleCommand:
+		isSettingOrRole = true
+	}
 	completed := false
 	defer func() {
 		if !completed && err == nil {
-			if _, setting := command.(bind.SettingCommand); setting {
-				*transactions.settings = before
+			if isSettingOrRole {
+				transactions.settings.restoreState(before)
 			}
 			transactions.markFailed(errSessionStatementPanic)
 		}
@@ -81,6 +87,8 @@ func (transactions *Transactions) runCommand(ctx context.Context, prepared *Prep
 	switch command := command.(type) {
 	case bind.SettingCommand:
 		result, cursor.values, err = transactions.executeSetting(ctx, command)
+	case bind.RoleCommand:
+		result, err = transactions.executeRoleCommand(ctx, command, store)
 	case bind.TransactionCommand:
 		result, err = transactions.executeTransactionCommand(ctx, command)
 	case bind.ConstraintModeCommand:
@@ -103,8 +111,8 @@ func (transactions *Transactions) runCommand(ctx context.Context, prepared *Prep
 		}
 		rows.mu.Unlock()
 		if err != nil {
-			if _, setting := command.(bind.SettingCommand); setting {
-				*transactions.settings = before
+			if isSettingOrRole {
+				transactions.settings.restoreState(before)
 			}
 		}
 	}()
@@ -135,9 +143,68 @@ func (transactions *Transactions) executeTableLock(ctx context.Context, command 
 	return result, err
 }
 
+func (transactions *Transactions) executeRoleCommand(ctx context.Context, command bind.RoleCommand, store *catalog.Store) (ExecutionResult, error) {
+	tag := command.Tag
+	if tag == "" {
+		tag = "SET"
+	}
+	result := ExecutionResult{Tag: tag}
+	if command.Action == bind.ResetRole || strings.TrimSpace(command.Target) == "" {
+		if err := transactions.settings.ResetRole(ctx, command.Local); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	if store == nil {
+		return result, settingError("55000", "catalog store is not configured for SET ROLE")
+	}
+	currentRole := transactions.settings.CurrentRole()
+	var authorizedTarget string
+	authorizeInView := func(readCtx context.Context) error {
+		view, err := transactions.transaction.ReadView(readCtx, catalogLayoutDependencies(store))
+		if err != nil {
+			return err
+		}
+		snapshot, err := store.TransactionSnapshot(view, catalog.BorrowReader)
+		if err != nil {
+			return errors.Join(err, view.Close())
+		}
+		target, authErr := bind.CheckSetRoleAuthorization(readCtx, snapshot, currentRole, command.Target, 4096)
+		closeErr := errors.Join(snapshot.Close(), view.Close())
+		if authErr != nil {
+			return errors.Join(authErr, closeErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		authorizedTarget = target
+		return nil
+	}
+	if transactions.active && transactions.transaction != nil {
+		if err := transactions.routineAtomicStatement(ctx, authorizeInView); err != nil {
+			return result, err
+		}
+	} else {
+		if err := transactions.begin(ctx, TransactionStart{}); err != nil {
+			return result, err
+		}
+		authErr := transactions.transaction.Statement(ctx, authorizeInView)
+		endErr := transactions.endRollback(context.WithoutCancel(ctx))
+		if authErr != nil {
+			return result, errors.Join(authErr, endErr)
+		}
+		if endErr != nil {
+			return result, endErr
+		}
+	}
+	if err := transactions.settings.SetRole(ctx, authorizedTarget, command.Local); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 func (transactions *Transactions) executeSetting(ctx context.Context, command bind.SettingCommand) (result ExecutionResult, rows [][]model.Value, err error) {
-	stagedSettings := *transactions.settings
-	settings := &stagedSettings
+	settings := transactions.settings.cloneForStaging()
 	scope := SessionScope
 	if command.Local {
 		scope = LocalScope
@@ -185,7 +252,7 @@ func (transactions *Transactions) executeSetting(ctx context.Context, command bi
 			rows = append(rows, []model.Value{model.StringVal(setting.Name), setting.Value, model.StringVal(settingDescription(setting.Name))})
 		}
 	case bind.SetTransactionSettings, bind.SetSessionCharacteristics:
-		staged := *settings
+		staged := settings.cloneForStaging()
 		prefix := ""
 		if command.Action == bind.SetSessionCharacteristics {
 			prefix = "default_"
@@ -210,7 +277,7 @@ func (transactions *Transactions) executeSetting(ctx context.Context, command bi
 			if command.Action == bind.SetTransactionSettings && !transactions.active {
 				result.Warnings = append(result.Warnings, model.Error{Code: "25P01", Message: "SET TRANSACTION can only be used in transaction blocks"})
 			} else {
-				*settings = staged
+				settings.commitStaged(staged)
 			}
 		}
 	default:
@@ -219,7 +286,7 @@ func (transactions *Transactions) executeSetting(ctx context.Context, command bi
 	if err == nil {
 		err = transactions.syncSettingPolicy(ctx, settings)
 		if err == nil {
-			*transactions.settings = *settings
+			transactions.settings.commitStaged(settings)
 		}
 	}
 	if changed.Warning != nil {
@@ -382,7 +449,7 @@ func (transactions *Transactions) executeTransactionCommand(ctx context.Context,
 }
 
 func (settings *Settings) visibleWarnings(warnings []model.Error) []model.Error {
-	switch settings.current[clientMinMessages].text {
+	switch settings.clientMinMessages() {
 	case "error":
 		return nil
 	default:

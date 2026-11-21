@@ -99,6 +99,7 @@ const (
 	IDPgTSDict RelationID = 82
 	IDPgTSParser RelationID = 83
 	IDPgTSTemplate RelationID = 84
+	IDPgPolicies RelationID = 85
 )
 
 type DeclarationKind uint8
@@ -850,7 +851,7 @@ func registryTypeNames(relation Relation) (string, string) {
 func logicalRelationDeclaration(relation Relation) DeclarationKind {
 	if relation.Namespace == "pg_catalog" {
 		switch relation.ID {
-		case IDPgIndexes, IDPgMatviews, IDPgRoles, IDPgSequences, IDPgSettings, IDPgStats, IDPgTables, IDPgUser, IDPgViews:
+		case IDPgIndexes, IDPgMatviews, IDPgPolicies, IDPgRoles, IDPgSequences, IDPgSettings, IDPgStats, IDPgTables, IDPgUser, IDPgViews:
 			return DeclarationView
 		default:
 			return DeclarationTable
@@ -1027,6 +1028,7 @@ func buildRegistry() []Relation {
 		r(IDPgOperator, "pg_catalog", "pg_operator", 2617, c("oid", 26, false, "", -1), c("oprname", 19, false, "", -1), c("oprnamespace", 26, false, "", -1), c("oprowner", 26, false, "", -1), c("oprkind", 18, false, "", -1), c("oprcanmerge", 16, false, "", -1), c("oprcanhash", 16, false, "", -1), c("oprleft", 26, false, "", -1), c("oprright", 26, false, "", -1), c("oprresult", 26, false, "", -1), c("oprcom", 26, false, "", -1), c("oprnegate", 26, false, "", -1), c("oprcode", 24, false, "", -1), c("oprrest", 24, false, "", -1), c("oprjoin", 24, false, "", -1)),
 		r(IDPgOpfamily, "pg_catalog", "pg_opfamily", 2753, c("oid", 26, false, "", -1), c("opfmethod", 26, false, "", -1), c("opfname", 19, false, "", -1), c("opfnamespace", 26, false, "", -1), c("opfowner", 26, false, "", -1)),
 		r(IDPgPartitionedTable, "pg_catalog", "pg_partitioned_table", 3350, c("partrelid", 26, false, "", -1), c("partstrat", 18, false, "", -1), c("partnatts", 21, false, "", -1), c("partdefid", 26, false, "", -1), c("partattrs", 22, false, "", -1), c("partclass", 30, false, "", -1), c("partcollation", 30, false, "", -1), c("partexprs", 194, true, "", -1)),
+		r(IDPgPolicies, "pg_catalog", "pg_policies", 0, c("schemaname", 19, false, "", -1), c("tablename", 19, false, "", -1), c("policyname", 19, false, "", -1), c("permissive", 25, false, "", -1), c("roles", 1003, true, "", -1), c("cmd", 25, false, "", -1), c("qual", 25, true, "", -1), c("with_check", 25, true, "", -1)),
 		r(IDPgProc, "pg_catalog", "pg_proc", 1255, c("oid", 26, false, "", -1), c("proname", 19, false, "", -1), c("pronamespace", 26, false, "", -1), c("proowner", 26, false, "", -1), c("prolang", 26, false, "", -1), c("procost", 700, false, "", -1), c("prorows", 700, false, "", -1), c("provariadic", 26, false, "", -1), c("prosupport", 24, false, "", -1), c("prokind", 18, false, "", -1), c("prosecdef", 16, false, "", -1), c("proleakproof", 16, false, "", -1), c("proisstrict", 16, false, "", -1), c("proretset", 16, false, "", -1), c("provolatile", 18, false, "", -1), c("proparallel", 18, false, "", -1), c("pronargs", 21, false, "", -1), c("pronargdefaults", 21, false, "", -1), c("prorettype", 26, false, "", -1), c("proargtypes", 30, false, "", -1), c("proallargtypes", 1028, true, "", -1), c("proargmodes", 1002, true, "", -1), c("proargnames", 1009, true, "", -1), c("proargdefaults", 194, true, "", -1), c("protrftypes", 1028, true, "", -1), c("prosrc", 25, false, "", -1), c("probin", 25, true, "", -1), c("prosqlbody", 194, true, "", -1), c("proconfig", 1009, true, "", -1), c("proacl", 1034, true, "", -1)),
 		r(IDPgRange, "pg_catalog", "pg_range", 3541, c("rngtypid", 26, false, "", -1), c("rngsubtype", 26, false, "", -1), c("rngmultitypid", 26, false, "", -1), c("rngcollation", 26, false, "", -1), c("rngsubopc", 26, false, "", -1), c("rngcanonical", 24, false, "", -1), c("rngsubdiff", 24, false, "", -1)),
 		r(IDPgRoles, "pg_catalog", "pg_roles", 0, c("rolname", 19, false, "", -1), c("rolsuper", 16, false, "", -1), c("rolinherit", 16, false, "", -1), c("rolcreaterole", 16, false, "", -1), c("rolcreatedb", 16, false, "", -1), c("rolcanlogin", 16, false, "", -1), c("rolreplication", 16, false, "", -1), c("rolconnlimit", 23, false, "", -1), c("rolpassword", 25, true, "", -1), c("rolvaliduntil", 1184, true, "", -1), c("rolbypassrls", 16, false, "", -1), c("rolconfig", 1009, true, "", -1), c("oid", 26, false, "", -1)),

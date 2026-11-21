@@ -81,7 +81,7 @@ func runDirectoryBytes(t testing.TB, directory string) int64 {
 func insertMaintenanceRows(t testing.TB, ctx context.Context, database *Catalog, table string, count int) {
 	t.Helper()
 	for id := 1; id <= count; id++ {
-		if _, err := database.Exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (%d, %d)`, table, id, id*10), 0); err != nil {
+		if _, err := database.exec(ctx, fmt.Sprintf(`INSERT INTO %s VALUES (%d, %d)`, table, id, id*10), 0); err != nil {
 			t.Fatalf("INSERT %d: %v", id, err)
 		}
 	}
@@ -111,7 +111,7 @@ func TestMaintenanceLoopBoundsHistory(t *testing.T) {
 			}
 		}
 	})
-	if _, err := database.Exec(ctx, `CREATE TABLE maintenance_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE maintenance_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 	insertMaintenanceRows(t, ctx, database, "maintenance_items", 40)
@@ -131,7 +131,7 @@ func TestMaintenanceLoopBoundsHistory(t *testing.T) {
 	if err := database.MaintenanceError(); err != nil {
 		t.Fatalf("maintenance error while running: %v", err)
 	}
-	selected, err := database.Exec(ctx, `SELECT count(*) FROM maintenance_items`, 0)
+	selected, err := database.exec(ctx, `SELECT count(*) FROM maintenance_items`, 0)
 	if err != nil {
 		t.Fatalf("SELECT after maintenance: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestMaintenanceDisabledLeavesHistory(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	if _, err := database.Exec(ctx, `CREATE TABLE disabled_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE disabled_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 	insertMaintenanceRows(t, ctx, database, "disabled_items", 40)
@@ -200,7 +200,7 @@ func TestMaintenanceErrorSurfacesFatalFailure(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	})
-	if _, err := database.Exec(ctx, `CREATE TABLE fatal_items (id bigint PRIMARY KEY)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE fatal_items (id bigint PRIMARY KEY)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 	// Closing the backend underneath the loop makes the next probe report
@@ -285,7 +285,7 @@ func TestMaintenanceSigkillHelper(t *testing.T) {
 		}
 	}()
 	for id := first; ; id++ {
-		if _, err := database.Exec(ctx, fmt.Sprintf(`INSERT INTO sigkill_items VALUES (%d, %d)`, id, id), 0); err != nil {
+		if _, err := database.exec(ctx, fmt.Sprintf(`INSERT INTO sigkill_items VALUES (%d, %d)`, id, id), 0); err != nil {
 			t.Fatalf("INSERT %d: %v", id, err)
 		}
 		fmt.Printf("acked %d\n", id)
@@ -304,7 +304,7 @@ func TestMaintenanceSigkillRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := database.Exec(ctx, `CREATE TABLE sigkill_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE sigkill_items (id bigint PRIMARY KEY, value bigint)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
 	if err := database.Close(); err != nil {
@@ -369,7 +369,7 @@ func requireContiguousRows(t testing.TB, ctx context.Context, directory string, 
 			t.Error(err)
 		}
 	}()
-	outcome, err := database.Exec(ctx, `SELECT id FROM sigkill_items ORDER BY id`, 0)
+	outcome, err := database.exec(ctx, `SELECT id FROM sigkill_items ORDER BY id`, 0)
 	if err != nil {
 		t.Fatalf("SELECT after kill: %v", err)
 	}

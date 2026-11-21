@@ -75,6 +75,7 @@ func (counts *advisoryCounts) exclusive() bool {
 
 type advisoryLockItem struct {
 	holders map[uint64]*advisoryCounts
+	changed chan struct{}
 }
 
 type advisoryAcquisition struct {
@@ -94,6 +95,7 @@ type advisoryOwnerState struct {
 	transactions map[uint64]*advisoryTransaction
 	waiting      int
 	cancelled    bool
+	closed       chan struct{}
 }
 
 type AdvisorySavepoint struct {
@@ -102,14 +104,13 @@ type AdvisorySavepoint struct {
 }
 
 type AdvisoryLockManager struct {
-	mu          sync.Mutex
-	limits      AdvisoryLimits
-	locks       map[AdvisoryKey]*advisoryLockItem
-	owners      map[uint64]*advisoryOwnerState
-	waiters     int
-	holds       int
-	usedBytes   uint64
-	changed     chan struct{}
+	mu        sync.Mutex
+	limits    AdvisoryLimits
+	locks     map[AdvisoryKey]*advisoryLockItem
+	owners    map[uint64]*advisoryOwnerState
+	waiters   int
+	holds     int
+	usedBytes uint64
 }
 
 const (
@@ -135,9 +136,8 @@ func NewAdvisoryLockManagerWithLimits(limits AdvisoryLimits) (*AdvisoryLockManag
 	}
 	return &AdvisoryLockManager{
 		limits: limits,
-		locks: make(map[AdvisoryKey]*advisoryLockItem),
+		locks:  make(map[AdvisoryKey]*advisoryLockItem),
 		owners: make(map[uint64]*advisoryOwnerState),
-		changed: make(chan struct{}),
 	}, nil
 }
 
@@ -240,14 +240,22 @@ func (manager *AdvisoryLockManager) acquire(ctx context.Context, owner AdvisoryO
 		if waitContext != nil {
 			timeoutDone = waitContext.Done()
 		}
-		changed := manager.changed
+		if item.changed == nil {
+			item.changed = make(chan struct{})
+		}
+		keyChanged := item.changed
+		if state.closed == nil {
+			state.closed = make(chan struct{})
+		}
+		sessionClosed := state.closed
 		waited = true
 		waitStarted := time.Now()
 		manager.mu.Unlock()
 		select {
 		case <-ctx.Done():
 		case <-timeoutDone:
-		case <-changed:
+		case <-sessionClosed:
+		case <-keyChanged:
 		}
 		manager.mu.Lock()
 		waitDuration += time.Since(waitStarted)
@@ -403,8 +411,9 @@ func (manager *AdvisoryLockManager) Unlock(owner AdvisoryOwner, key AdvisoryKey,
 	}
 	*count--
 	manager.holds--
+	manager.notifyKey(key)
 	manager.removeHolderIfEmpty(owner.SessionID, key, state, holder)
-	manager.notify()
+	manager.removeOwnerIfEmpty(owner.SessionID, state)
 	return true
 }
 
@@ -446,13 +455,8 @@ func (manager *AdvisoryLockManager) RollbackTransactionLocks(owner AdvisoryOwner
 	if mark.ordinal > transaction.sequence {
 		return errAdvisorySavepoint
 	}
-	changed := false
 	for transaction.head != nil && transaction.head.ordinal > mark.ordinal {
 		manager.popTransactionAcquisition(owner.SessionID, state, transaction)
-		changed = true
-	}
-	if changed {
-		manager.notify()
 	}
 	return nil
 }
@@ -477,7 +481,6 @@ func (manager *AdvisoryLockManager) ReleaseTransactionLocks(owner AdvisoryOwner)
 	delete(state.transactions, owner.TransactionID)
 	manager.usedBytes -= advisoryTransactionBytes
 	manager.removeOwnerIfEmpty(owner.SessionID, state)
-	manager.notify()
 }
 
 func (manager *AdvisoryLockManager) popTransactionAcquisition(sessionID uint64, state *advisoryOwnerState, transaction *advisoryTransaction) {
@@ -491,6 +494,7 @@ func (manager *AdvisoryLockManager) popTransactionAcquisition(sessionID uint64, 
 	}
 	manager.holds--
 	manager.usedBytes -= advisoryAcquisitionBytes
+	manager.notifyKey(acquisition.key)
 	manager.removeHolderIfEmpty(sessionID, acquisition.key, state, holder)
 	*acquisition = advisoryAcquisition{}
 }
@@ -515,21 +519,22 @@ func (manager *AdvisoryLockManager) releaseSession(sessionID uint64, closeSessio
 	if state == nil {
 		return
 	}
-	state.cancelled = state.cancelled || closeSession
-	changed := false
+	if closeSession && !state.cancelled {
+		state.cancelled = true
+		if state.closed != nil {
+			close(state.closed)
+		}
+	}
 	for key, holder := range state.held {
 		count := holder.sessionShared + holder.sessionExclusive
 		if count != 0 {
 			holder.sessionShared, holder.sessionExclusive = 0, 0
 			manager.holds -= count
-			changed = true
+			manager.notifyKey(key)
 		}
 		manager.removeHolderIfEmpty(sessionID, key, state, holder)
 	}
 	manager.removeOwnerIfEmpty(sessionID, state)
-	if changed || closeSession {
-		manager.notify()
-	}
 }
 
 func (manager *AdvisoryLockManager) removeHolderIfEmpty(sessionID uint64, key AdvisoryKey, state *advisoryOwnerState, holder *advisoryCounts) {
@@ -541,6 +546,10 @@ func (manager *AdvisoryLockManager) removeHolderIfEmpty(sessionID uint64, key Ad
 	if item != nil {
 		delete(item.holders, sessionID)
 		if len(item.holders) == 0 {
+			if item.changed != nil {
+				close(item.changed)
+				item.changed = nil
+			}
 			delete(manager.locks, key)
 			manager.usedBytes -= advisoryItemBytes
 		}
@@ -556,9 +565,13 @@ func (manager *AdvisoryLockManager) removeOwnerIfEmpty(sessionID uint64, state *
 	manager.usedBytes -= advisoryOwnerBytes
 }
 
-func (manager *AdvisoryLockManager) notify() {
-	close(manager.changed)
-	manager.changed = make(chan struct{})
+func (manager *AdvisoryLockManager) notifyKey(key AdvisoryKey) {
+	item := manager.locks[key]
+	if item == nil || item.changed == nil {
+		return
+	}
+	close(item.changed)
+	item.changed = nil
 }
 
 type lockTimeoutKey struct{}

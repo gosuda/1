@@ -63,7 +63,7 @@ func (transactions *Transactions) executeNamedPrepared(ctx context.Context, comm
 		options.Environment.Sequences = readOnlySequences{SequenceRuntime: options.Environment.Sequences}
 	}
 	completed := false
-	beforeSettings := *transactions.settings
+	beforeSettings := transactions.settings.snapshotState()
 	deferredMark := len(transactions.deferredTriggers)
 	defer func() {
 		if !completed {
@@ -167,8 +167,7 @@ func (transactions *Transactions) executeNamedPrepared(ctx context.Context, comm
 	result.Tag = "EXECUTE"
 	result.Warnings = append(result.Warnings, targetWarnings(target)...)
 	if err != nil {
-		transactions.settings.current = beforeSettings.current
-		transactions.settings.retained = beforeSettings.retained
+		transactions.settings.restoreStatementSettings(beforeSettings)
 		result.RowsAffected = 0
 		transactions.markFailed(err)
 		if automatic {
@@ -228,7 +227,7 @@ func (transactions *Transactions) namedPreparedStale(ctx context.Context, entry 
 	if len(entry.analysis.statistics) != 0 && (options.Statistics == nil || options.Statistics.Store == nil) {
 		return false, errPreparedDependency
 	}
-	if namedPreparedSettingsChanged(entry, transactions.settings.SearchPath(), options.Environment.Builtin) {
+	if namedPreparedSettingsChanged(entry, transactions.settings.SearchPath(), transactions.settings.CurrentRole(), options.Environment.Builtin) {
 		return true, nil
 	}
 	if err := entry.analysis.validatePublication(transactions.transaction.PublicationOwner()); err != nil {
@@ -291,8 +290,8 @@ func (transactions *Transactions) validateNamedAnalysisDependencies(ctx context.
 	return nil
 }
 
-func namedPreparedSettingsChanged(entry *namedPreparedStatement, path []string, current builtin.ResolveOptions) bool {
-	if entry == nil || !slices.Equal(entry.searchPath, path) {
+func namedPreparedSettingsChanged(entry *namedPreparedStatement, path []string, currentRole string, current builtin.ResolveOptions) bool {
+	if entry == nil || entry.currentRole != currentRole || !slices.Equal(entry.searchPath, path) {
 		return true
 	}
 	current.Types = nil

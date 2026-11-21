@@ -63,6 +63,9 @@ func (pin *runPin) pointSources(ctx context.Context, timestamp model.Timestamp, 
 	perSource := uint64(unsafe.Sizeof(runVersionCursor{})) + uint64(unsafe.Sizeof((*runVersionCursor)(nil)))
 	var count uint64
 	if err := pin.visitSnapshot(ctx, request.Target, timestamp, func(file *sstFile) error {
+		if !file.mayContainKey(request.Key) {
+			return nil
+		}
 		first, end, err := file.Candidates(ctx, request.Key, timestamp)
 		if err != nil {
 			return err
@@ -91,6 +94,9 @@ func (pin *runPin) pointSources(ctx context.Context, timestamp model.Timestamp, 
 		}
 	}()
 	if err := pin.visitSnapshot(ctx, request.Target, timestamp, func(file *sstFile) error {
+		if !file.mayContainKey(request.Key) {
+			return nil
+		}
 		first, end, err := file.Candidates(ctx, request.Key, timestamp)
 		if err != nil {
 			return err

@@ -22,21 +22,33 @@ import (
 )
 
 const (
-	baseManifestMagic      = "NSBASE03"
-	baseManifestHeader     = 176
-	baseManifestEntryBytes = 144
-	baseTransactionBytes   = 80
-	baseManifestPending    = ".base.pending"
+	baseManifestMagic             = "NSBASE04"
+	baseManifestHeader            = 176
+	baseManifestEntryBytes        = 144
+	baseTransactionBytes          = 80
+	baseManifestPending           = ".base.pending"
+	defaultMaxRetainedTransactions = uint64(4096)
 )
 
+var txnRecordNodeBytes = func() uint64 {
+	var tree ordered.Tree[recoveryTxnID, transactionRecord]
+	next, _, err := tree.Set(recoveryTxnID{1}, transactionRecord{}, 4096)
+	if err != nil || next.NodeBytes() == 0 {
+		return 128
+	}
+	return next.NodeBytes()
+}()
+
 type runBase struct {
-	Generation   uint64
-	Position     uint64
-	CommitTS     model.Timestamp
-	Floor        model.Timestamp
-	Epoch        clock.Epoch
-	Files        []preparedRun
-	Transactions ordered.Tree[recoveryTxnID, transactionRecord]
+	Generation     uint64
+	Position       uint64
+	CommitTS       model.Timestamp
+	Floor          model.Timestamp
+	PrunedPosition uint64
+	PrunedCommitTS model.Timestamp
+	Epoch          clock.Epoch
+	Files          []preparedRun
+	Transactions   ordered.Tree[recoveryTxnID, transactionRecord]
 }
 
 type baseTransaction struct {
@@ -52,10 +64,16 @@ func (base runBase) validate(maxFiles, identityBytes uint64) error {
 	if base.Generation == 0 || base.Position == 0 || base.CommitTS <= 0 || base.Floor < 0 || uint64(len(base.Files)) > maxFiles {
 		return storage.ErrCorruptStorage
 	}
+	if (base.PrunedPosition == 0) != (base.PrunedCommitTS == 0) {
+		return storage.ErrCorruptStorage
+	}
+	if base.PrunedPosition >= base.Position || base.PrunedCommitTS < 0 || base.PrunedCommitTS >= base.CommitTS {
+		return storage.ErrCorruptStorage
+	}
 	if base.Epoch.Assurance == ([16]byte{}) || base.Epoch.LeapHistory == ([32]byte{}) || base.Epoch.Config == ([32]byte{}) {
 		return storage.ErrCorruptStorage
 	}
-	if base.Transactions.Len() != base.Position || base.Transactions.NodeBytes() > identityBytes {
+	if base.Transactions.Len() != base.Position-base.PrunedPosition || base.Transactions.NodeBytes() > identityBytes {
 		return storage.ErrCorruptStorage
 	}
 	for _, file := range base.Files {
@@ -136,9 +154,10 @@ func encodeRunBase(ctx context.Context, base runBase, metadataBytes, identityByt
 		}
 		return a.id.Compare(b.id)
 	})
-	var previousTS model.Timestamp
+	previousTS := base.PrunedCommitTS
 	for i, transaction := range transactions {
-		if transaction.record.Result.LogPosition != uint64(i+1) || transaction.record.Result.CommitTS <= previousTS || transaction.record.Result.AppliedCount == 0 {
+		expectedPosition := base.PrunedPosition + uint64(i) + 1
+		if transaction.record.Result.LogPosition != expectedPosition || transaction.record.Result.CommitTS <= previousTS || transaction.record.Result.AppliedCount == 0 {
 			return nil, storage.ErrCorruptStorage
 		}
 		previousTS = transaction.record.Result.CommitTS
@@ -159,6 +178,8 @@ func encodeRunBase(ctx context.Context, base runBase, metadataBytes, identityByt
 	copy(data[80:112], base.Epoch.LeapHistory[:])
 	copy(data[112:144], base.Epoch.Config[:])
 	binary.LittleEndian.PutUint64(data[144:152], boundBytes)
+	binary.LittleEndian.PutUint64(data[152:160], base.PrunedPosition)
+	binary.LittleEndian.PutUint64(data[160:168], uint64(base.PrunedCommitTS))
 	boundOffset := baseManifestHeader + len(base.Files)*baseManifestEntryBytes
 	offset := baseManifestHeader
 	for _, file := range base.Files {
@@ -209,8 +230,10 @@ func decodeRunBase(ctx context.Context, data []byte, expectedGeneration, metadat
 	}
 	fileCount := binary.LittleEndian.Uint64(data[48:56])
 	transactionCount := binary.LittleEndian.Uint64(data[56:64])
-	entryBytes, boundBytes, err := runBaseFormat(data[:baseManifestHeader])
-	if err != nil { return runBase{}, err }
+	entryBytes, boundBytes, prunedPosition, prunedCommitTS, err := runBaseFormat(data[:baseManifestHeader])
+	if err != nil {
+		return runBase{}, err
+	}
 	size, err := baseManifestSize(fileCount, transactionCount, boundBytes, entryBytes, metadataBytes, identityBytes)
 	if err != nil {
 		return runBase{}, err
@@ -223,14 +246,16 @@ func decodeRunBase(ctx context.Context, data []byte, expectedGeneration, metadat
 		return runBase{}, storage.ErrCorruptStorage
 	}
 	base := runBase{
-		Generation: binary.LittleEndian.Uint64(data[16:24]),
-		Position:   binary.LittleEndian.Uint64(data[24:32]),
-		CommitTS:   model.Timestamp(binary.LittleEndian.Uint64(data[32:40])),
-		Floor:      model.Timestamp(binary.LittleEndian.Uint64(data[40:48])),
-		Epoch:      clock.Epoch{Assurance: [16]byte(data[64:80]), LeapHistory: [32]byte(data[80:112]), Config: [32]byte(data[112:144])},
-		Files:      make([]preparedRun, int(fileCount)),
+		Generation:     binary.LittleEndian.Uint64(data[16:24]),
+		Position:       binary.LittleEndian.Uint64(data[24:32]),
+		CommitTS:       model.Timestamp(binary.LittleEndian.Uint64(data[32:40])),
+		Floor:          model.Timestamp(binary.LittleEndian.Uint64(data[40:48])),
+		PrunedPosition: prunedPosition,
+		PrunedCommitTS: prunedCommitTS,
+		Epoch:          clock.Epoch{Assurance: [16]byte(data[64:80]), LeapHistory: [32]byte(data[80:112]), Config: [32]byte(data[112:144])},
+		Files:          make([]preparedRun, int(fileCount)),
 	}
-	if base.Generation != expectedGeneration || transactionCount != base.Position {
+	if base.Generation != expectedGeneration || (base.PrunedPosition == 0) != (base.PrunedCommitTS == 0) || base.PrunedPosition >= base.Position || base.PrunedCommitTS < 0 || base.PrunedCommitTS >= base.CommitTS || transactionCount != base.Position-base.PrunedPosition {
 		return runBase{}, storage.ErrCorruptStorage
 	}
 	offset := baseManifestHeader
@@ -284,8 +309,9 @@ func decodeRunBase(ctx context.Context, data []byte, expectedGeneration, metadat
 		return runBase{}, storage.ErrCorruptStorage
 	}
 	offset = boundEnd
-	var previousTS model.Timestamp
-	for position := uint64(1); position <= transactionCount; position++ {
+	previousTS := base.PrunedCommitTS
+	for i := uint64(0); i < transactionCount; i++ {
+		position := base.PrunedPosition + i + 1
 		if err := ctx.Err(); err != nil {
 			return runBase{}, err
 		}
@@ -402,8 +428,10 @@ func loadRunBase(ctx context.Context, root *os.Root, generation, metadataBytes, 
 	if binary.LittleEndian.Uint64(header[8:16]) != uint64(info.Size()) || fileCount > maxFiles {
 		return runBase{}, storage.ErrCorruptStorage
 	}
-	entryBytes, boundBytes, err := runBaseFormat(header[:])
-	if err != nil { return runBase{}, err }
+	entryBytes, boundBytes, _, _, err := runBaseFormat(header[:])
+	if err != nil {
+		return runBase{}, err
+	}
 	size, err := baseManifestSize(fileCount, transactionCount, boundBytes, entryBytes, metadataBytes, identityBytes)
 	if err != nil {
 		return runBase{}, err
@@ -458,7 +486,7 @@ func openBaseFiles(ctx context.Context, root *os.Root, descriptors []preparedRun
 			return nil, openErr
 		}
 		opened = append(opened, file)
-		cost := nativeBytes + uint64(cap(file.index)) + uint64(cap(file.descriptor.LowerKey)+cap(file.descriptor.UpperKey))
+		cost := file.residentCost()
 		if cost > maxBytes-used {
 			return nil, columnar.ErrBatchBudget
 		}
@@ -467,18 +495,181 @@ func openBaseFiles(ctx context.Context, root *os.Root, descriptors []preparedRun
 	return opened, nil
 }
 
-func runBaseFormat(header []byte) (uint64, uint64, error) {
-	entryBytes, boundBytes, reservedStart := uint64(baseManifestEntryBytes), uint64(0), 152
+func runBaseFormat(header []byte) (entryBytes, boundBytes, prunedPosition uint64, prunedCommitTS model.Timestamp, err error) {
+	entryBytes = uint64(baseManifestEntryBytes)
+	reservedStart := 168
 	switch string(header[:8]) {
 	case baseManifestMagic:
 		boundBytes = binary.LittleEndian.Uint64(header[144:152])
+		prunedPosition = binary.LittleEndian.Uint64(header[152:160])
+		prunedCommitTS = model.Timestamp(binary.LittleEndian.Uint64(header[160:168]))
+	case "NSBASE03":
+		boundBytes = binary.LittleEndian.Uint64(header[144:152])
+		reservedStart = 152
 	case "NSBASE02":
 		entryBytes, reservedStart = 128, 144
 	default:
-		return 0, 0, storage.ErrCorruptStorage
+		return 0, 0, 0, 0, storage.ErrCorruptStorage
 	}
 	for _, reserved := range header[reservedStart:baseManifestHeader] {
-		if reserved != 0 { return 0, 0, storage.ErrCorruptStorage }
+		if reserved != 0 {
+			return 0, 0, 0, 0, storage.ErrCorruptStorage
+		}
 	}
-	return entryBytes, boundBytes, nil
+	return entryBytes, boundBytes, prunedPosition, prunedCommitTS, nil
+}
+
+func maxRetainedBaseTransactions(identityBytes uint64) uint64 {
+	memCap := identityBytes / txnRecordNodeBytes
+	if memCap >= 8 {
+		memCap /= 4
+	} else {
+		memCap /= 2
+	}
+	diskCap := (identityBytes / baseTransactionBytes) / 2
+	limit := min(defaultMaxRetainedTransactions, memCap, diskCap)
+	if limit == 0 {
+		return 1
+	}
+	return limit
+}
+
+// pruneBaseTransactions retires covered transaction identities older than floor
+// or outside the bounded recent dedup window, always retaining at least the
+// frontier commit so recent retries stay idempotent while identity memory stays
+// strictly bounded regardless of lifetime commit count.
+func pruneBaseTransactions(
+	ctx context.Context,
+	current ordered.Tree[recoveryTxnID, transactionRecord],
+	prunedPosition uint64,
+	prunedCommitTS model.Timestamp,
+	frontierPosition uint64,
+	floor model.Timestamp,
+	identityBytes uint64,
+) (ordered.Tree[recoveryTxnID, transactionRecord], uint64, model.Timestamp, coveredFenceIndex, error) {
+	if frontierPosition == 0 || prunedPosition >= frontierPosition || current.Len() != frontierPosition-prunedPosition {
+		return ordered.Tree[recoveryTxnID, transactionRecord]{}, 0, 0, coveredFenceIndex{}, storage.ErrCorruptStorage
+	}
+	entries := make([]baseTransaction, 0, int(current.Len()))
+	cursor := current.First(false)
+	for {
+		if err := ctx.Err(); err != nil {
+			return ordered.Tree[recoveryTxnID, transactionRecord]{}, 0, 0, coveredFenceIndex{}, err
+		}
+		id, record, ok := cursor.Next()
+		if !ok {
+			break
+		}
+		entries = append(entries, baseTransaction{id: id, record: record})
+	}
+	slices.SortFunc(entries, func(a, b baseTransaction) int {
+		if a.record.Result.LogPosition < b.record.Result.LogPosition {
+			return -1
+		}
+		if a.record.Result.LogPosition > b.record.Result.LogPosition {
+			return 1
+		}
+		return a.id.Compare(b.id)
+	})
+	prevTS := prunedCommitTS
+	for i, entry := range entries {
+		if entry.record.Result.LogPosition != prunedPosition+uint64(i)+1 || entry.record.Result.CommitTS <= prevTS {
+			return ordered.Tree[recoveryTxnID, transactionRecord]{}, 0, 0, coveredFenceIndex{}, storage.ErrCorruptStorage
+		}
+		prevTS = entry.record.Result.CommitTS
+	}
+	keepFrom := 0
+	if floor > 0 {
+		for keepFrom < len(entries)-1 && entries[keepFrom].record.Result.CommitTS < floor {
+			keepFrom++
+		}
+	}
+	maxRetained := maxRetainedBaseTransactions(identityBytes)
+	if uint64(len(entries)-keepFrom) > maxRetained {
+		keepFrom = len(entries) - int(maxRetained)
+	}
+	newPrunedPos := prunedPosition
+	newPrunedTS := prunedCommitTS
+	retained := entries[keepFrom:]
+	var nextTree ordered.Tree[recoveryTxnID, transactionRecord]
+	if keepFrom == 0 {
+		nextTree = current
+	} else {
+		newPrunedPos = entries[keepFrom-1].record.Result.LogPosition
+		newPrunedTS = entries[keepFrom-1].record.Result.CommitTS
+		for _, entry := range retained {
+			if err := ctx.Err(); err != nil {
+				return ordered.Tree[recoveryTxnID, transactionRecord]{}, 0, 0, coveredFenceIndex{}, err
+			}
+			var err error
+			nextTree, _, err = nextTree.Set(entry.id, entry.record, identityBytes-nextTree.NodeBytes())
+			if err != nil {
+				return ordered.Tree[recoveryTxnID, transactionRecord]{}, 0, 0, coveredFenceIndex{}, err
+			}
+		}
+	}
+	timestamps := make([]model.Timestamp, len(retained))
+	for i, entry := range retained {
+		timestamps[i] = entry.record.Result.CommitTS
+	}
+	fenceIdx := coveredFenceIndex{
+		prunedPosition: newPrunedPos,
+		prunedCommitTS: newPrunedTS,
+		timestamps:     timestamps,
+	}
+	return nextTree, newPrunedPos, newPrunedTS, fenceIdx, nil
+}
+
+func buildCoveredFenceIndex(ctx context.Context, base runBase) (coveredFenceIndex, error) {
+	if base.Position == 0 {
+		return coveredFenceIndex{}, nil
+	}
+	count := base.Position - base.PrunedPosition
+	if base.Transactions.Len() != count {
+		return coveredFenceIndex{}, storage.ErrCorruptStorage
+	}
+	timestamps := make([]model.Timestamp, int(count))
+	cursor := base.Transactions.First(false)
+	for {
+		if err := ctx.Err(); err != nil {
+			return coveredFenceIndex{}, err
+		}
+		_, record, ok := cursor.Next()
+		if !ok {
+			break
+		}
+		if record.Result.LogPosition <= base.PrunedPosition || record.Result.LogPosition > base.Position {
+			return coveredFenceIndex{}, storage.ErrCorruptStorage
+		}
+		timestamps[record.Result.LogPosition-base.PrunedPosition-1] = record.Result.CommitTS
+	}
+	prevTS := base.PrunedCommitTS
+	for _, ts := range timestamps {
+		if ts <= prevTS {
+			return coveredFenceIndex{}, storage.ErrCorruptStorage
+		}
+		prevTS = ts
+	}
+	return coveredFenceIndex{
+		prunedPosition: base.PrunedPosition,
+		prunedCommitTS: base.PrunedCommitTS,
+		timestamps:     timestamps,
+	}, nil
+}
+
+func subsetTransactionRecords(sub, sup ordered.Tree[recoveryTxnID, transactionRecord]) bool {
+	if sub.Len() > sup.Len() {
+		return false
+	}
+	cursor := sub.First(false)
+	for {
+		id, record, ok := cursor.Next()
+		if !ok {
+			return true
+		}
+		other, found := sup.Get(id)
+		if !found || other != record {
+			return false
+		}
+	}
 }

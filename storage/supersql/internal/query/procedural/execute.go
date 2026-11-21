@@ -369,14 +369,21 @@ func (f *frame) outputParameters() SQLResult {
 	return SQLResult{Columns: []model.TypeLayout{f.result}, Rows: [][]model.Value{{value}}}
 }
 
+func (f *frame) step(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.steps++
+	if f.steps > f.program.limits.MaxSteps {
+		return ErrLimit
+	}
+	return nil
+}
+
 func (f *frame) run(ctx context.Context, statements []statement) (signal, error) {
 	for _, stmt := range statements {
-		if err := ctx.Err(); err != nil {
+		if err := f.step(ctx); err != nil {
 			return signal{}, err
-		}
-		f.steps++
-		if f.steps > f.program.limits.MaxSteps {
-			return signal{}, ErrLimit
 		}
 		sig, err := f.runStatement(ctx, stmt)
 		if err != nil {
@@ -664,6 +671,9 @@ func (f *frame) runLoop(ctx context.Context, stmt statement) (signal, error) {
 	switch stmt.LoopKind {
 	case "loop":
 		for {
+			if err := f.step(ctx); err != nil {
+				return signal{}, err
+			}
 			again, sig, err := runBody()
 			if err != nil || !again {
 				return sig, err
@@ -671,6 +681,9 @@ func (f *frame) runLoop(ctx context.Context, stmt statement) (signal, error) {
 		}
 	case "while":
 		for {
+			if err := f.step(ctx); err != nil {
+				return signal{}, err
+			}
 			matched, err := f.condition(ctx, stmt.Parameters[0])
 			if err != nil || !matched {
 				return signal{}, err
@@ -701,6 +714,9 @@ func (f *frame) runLoop(ctx context.Context, stmt statement) (signal, error) {
 		}
 		iterated := false
 		for current := lower; (step > 0 && current <= upper) || (step < 0 && current >= upper); current += step {
+			if err := f.step(ctx); err != nil {
+				return signal{}, err
+			}
 			iterated = true
 			if err := f.assign(stmt.Target-1, model.Int64Val(current), nil); err != nil {
 				return signal{}, err
@@ -772,6 +788,9 @@ func (f *frame) runLoop(ctx context.Context, stmt statement) (signal, error) {
 			// An empty dimension makes the whole array have no elements, so the
 			// iterator yields nothing rather than a run of empty slices.
 			for start := 0; length > 0 && start+length <= len(value.ArrayVal); start += length {
+				if err := f.step(ctx); err != nil {
+					return signal{}, err
+				}
 				iterated = true
 				slice := model.Value{Type: model.TypeArray, Dimensions: dimensions, ArrayVal: value.ArrayVal[start : start+length]}
 				if err := f.assign(stmt.Target-1, slice, nil); err != nil {
@@ -785,6 +804,9 @@ func (f *frame) runLoop(ctx context.Context, stmt statement) (signal, error) {
 			}
 		} else {
 			for _, element := range value.ArrayVal {
+				if err := f.step(ctx); err != nil {
+					return signal{}, err
+				}
 				iterated = true
 				if err := f.assign(stmt.Target-1, element, nil); err != nil {
 					return signal{}, err
@@ -811,6 +833,9 @@ func (f *frame) runQueryLoop(ctx context.Context, stmt statement, result SQLResu
 	f.setRecordLayout(stmt.Target-1, result.Columns, result.ColumnNames)
 	iterated := false
 	for _, row := range result.Rows {
+		if err := f.step(ctx); err != nil {
+			return signal{}, err
+		}
 		iterated = true
 		if err := f.assign(stmt.Target-1, model.Value{}, row); err != nil {
 			return signal{}, err

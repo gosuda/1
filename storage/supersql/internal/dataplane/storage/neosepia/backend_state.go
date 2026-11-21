@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"time"
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/clock"
@@ -14,11 +15,13 @@ import (
 )
 
 const (
-	databaseStateMagic   = "NSDB0001"
-	databaseStateName    = "database.state"
-	databaseStatePending = "database.state.pending"
-	databaseStateHeader  = 176
-	databaseScaleHeader  = 56
+	databaseStateMagic        = "NSDB0002"
+	databaseStateName         = "database.state"
+	databaseStatePending      = "database.state.pending"
+	databaseStateHeader       = 184
+	databaseStateLegacyHeader = 176
+	databaseScaleHeader       = 56
+	closedHorizonLease        = model.Timestamp(5 * time.Second)
 )
 
 type scaleVersion struct {
@@ -31,20 +34,36 @@ type databaseState struct {
 	Generation     uint64
 	HistoryFloor   model.Timestamp
 	Closed         storage.ReadFence
+	ClosedHorizon  model.Timestamp
 	BaseGeneration uint64
 	Scales         []scaleVersion
 }
 
+func closedHorizonFor(closedTS model.Timestamp) model.Timestamp {
+	if closedTS <= 0 {
+		return 0
+	}
+	if closedTS > model.Timestamp(math.MaxInt64)-closedHorizonLease {
+		return model.Timestamp(math.MaxInt64)
+	}
+	return closedTS + closedHorizonLease
+}
+
 func (state databaseState) validate(ctx context.Context, maxBytes uint64) error {
-	if state.Generation == 0 || state.BaseGeneration > state.Generation || state.HistoryFloor < 0 || state.Closed.ClosedTS < 0 || len(state.Scales) == 0 {
+	if state.Generation == 0 || state.BaseGeneration > state.Generation || state.HistoryFloor < 0 || state.Closed.ClosedTS < 0 || state.ClosedHorizon < 0 || len(state.Scales) == 0 {
 		return storage.ErrCorruptStorage
 	}
 	if state.Closed.ClosedTS == 0 {
-		if state.Closed != (storage.ReadFence{}) {
+		if state.Closed != (storage.ReadFence{}) || state.ClosedHorizon != 0 {
 			return storage.ErrCorruptStorage
 		}
-	} else if state.Closed.ID == ([16]byte{}) {
-		return storage.ErrCorruptStorage
+	} else {
+		if state.Closed.ID == ([16]byte{}) {
+			return storage.ErrCorruptStorage
+		}
+		if state.ClosedHorizon != 0 && state.ClosedHorizon < state.Closed.ClosedTS {
+			return storage.ErrCorruptStorage
+		}
 	}
 	var previous scaleVersion
 	closedScale := state.Closed.ClosedTS == 0
@@ -117,6 +136,7 @@ func encodeDatabaseState(ctx context.Context, state databaseState, maxBytes uint
 	copy(data[80:112], state.Closed.Epoch.LeapHistory[:])
 	copy(data[112:144], state.Closed.Epoch.Config[:])
 	binary.LittleEndian.PutUint64(data[168:176], state.BaseGeneration)
+	binary.LittleEndian.PutUint64(data[176:184], uint64(state.ClosedHorizon))
 	binary.LittleEndian.PutUint64(data[144:152], uint64(len(state.Scales)))
 	copy(data[152:168], clock.ScaleName)
 	offset := databaseStateHeader
@@ -146,7 +166,19 @@ func decodeDatabaseState(ctx context.Context, data []byte, maxAllocation uint64)
 	if err := ctx.Err(); err != nil {
 		return databaseState{}, err
 	}
-	if len(data) < databaseStateHeader+sha256.Size || string(data[:8]) != databaseStateMagic || binary.LittleEndian.Uint64(data[8:16]) != uint64(len(data)) {
+	if len(data) < databaseStateLegacyHeader+sha256.Size || binary.LittleEndian.Uint64(data[8:16]) != uint64(len(data)) {
+		return databaseState{}, storage.ErrCorruptStorage
+	}
+	var headerSize int
+	switch string(data[:8]) {
+	case databaseStateMagic:
+		headerSize = databaseStateHeader
+	case "NSDB0001":
+		headerSize = databaseStateLegacyHeader
+	default:
+		return databaseState{}, storage.ErrCorruptStorage
+	}
+	if len(data) < headerSize+sha256.Size {
 		return databaseState{}, storage.ErrCorruptStorage
 	}
 	if uint64(len(data)) > maxAllocation {
@@ -170,16 +202,21 @@ func decodeDatabaseState(ctx context.Context, data []byte, maxAllocation uint64)
 	}
 	count := binary.LittleEndian.Uint64(data[144:152])
 	remaining := maxAllocation - uint64(len(data))
-	if count > remaining/uint64(unsafe.Sizeof(scaleVersion{})) || count > uint64((end-databaseStateHeader)/databaseScaleHeader) {
+	if count > remaining/uint64(unsafe.Sizeof(scaleVersion{})) || count > uint64((end-headerSize)/databaseScaleHeader) {
 		return databaseState{}, storage.ErrDecodeBudget
+	}
+	var closedHorizon model.Timestamp
+	if headerSize == databaseStateHeader {
+		closedHorizon = model.Timestamp(binary.LittleEndian.Uint64(data[176:184]))
 	}
 	state := databaseState{
 		Generation: binary.LittleEndian.Uint64(data[16:24]), BaseGeneration: binary.LittleEndian.Uint64(data[168:176]),
-		HistoryFloor: model.Timestamp(binary.LittleEndian.Uint64(data[24:32])),
-		Closed:       storage.ReadFence{ID: [16]byte(data[48:64]), ClosedTS: model.Timestamp(binary.LittleEndian.Uint64(data[32:40])), LogPosition: binary.LittleEndian.Uint64(data[40:48]), Epoch: clock.Epoch{Assurance: [16]byte(data[64:80]), LeapHistory: [32]byte(data[80:112]), Config: [32]byte(data[112:144])}},
-		Scales:       make([]scaleVersion, int(count)),
+		HistoryFloor:  model.Timestamp(binary.LittleEndian.Uint64(data[24:32])),
+		Closed:        storage.ReadFence{ID: [16]byte(data[48:64]), ClosedTS: model.Timestamp(binary.LittleEndian.Uint64(data[32:40])), LogPosition: binary.LittleEndian.Uint64(data[40:48]), Epoch: clock.Epoch{Assurance: [16]byte(data[64:80]), LeapHistory: [32]byte(data[80:112]), Config: [32]byte(data[112:144])}},
+		ClosedHorizon: closedHorizon,
+		Scales:        make([]scaleVersion, int(count)),
 	}
-	offset := databaseStateHeader
+	offset := headerSize
 	for i := range state.Scales {
 		if err := ctx.Err(); err != nil {
 			return databaseState{}, err

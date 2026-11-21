@@ -10,9 +10,9 @@ import (
 
 // execSQL runs one statement through the public Catalog.Exec surface and
 // fails the test on error.
-func execSQL(t *testing.T, ctx context.Context, database *Catalog, statement string) Outcome {
+func execSQL(t *testing.T, ctx context.Context, database *Catalog, statement string) outcome {
 	t.Helper()
-	outcome, err := database.Exec(ctx, statement, 0)
+	outcome, err := database.exec(ctx, statement, 0)
 	if err != nil {
 		t.Fatalf("%q: %v", statement, err)
 	}
@@ -260,7 +260,7 @@ func TestLogicalCatalogRelations(t *testing.T) {
 		{`SELECT xmin FROM pg_catalog.pg_class`, "physical_storage"},
 		{`SELECT * FROM pg_catalog.pg_policy`, "server_observability"},
 	} {
-		_, err := database.Exec(ctx, excluded.statement, 0)
+		_, err := database.exec(ctx, excluded.statement, 0)
 		if err == nil || sqlStateOf(err) != "0A000" {
 			t.Fatalf("%s: expected 0A000, got %v", excluded.statement, err)
 		}
@@ -311,7 +311,7 @@ func TestDeclaredTypeKeys(t *testing.T) {
 	if got := queryValue(t, ctx, database, `SELECT string_agg(p::text, ',') FROM (SELECT p FROM dk ORDER BY p) s`); got.StrVal != "1,2" {
 		t.Fatalf("domain primary key ordering = %q, want base order 1,2", got.StrVal)
 	}
-	if _, err := database.Exec(ctx, `INSERT INTO dk VALUES (-1)`, 0); err == nil || sqlStateOf(err) != "23514" {
+	if _, err := database.exec(ctx, `INSERT INTO dk VALUES (-1)`, 0); err == nil || sqlStateOf(err) != "23514" {
 		t.Fatalf("domain CHECK rejection: expected SQLSTATE 23514, got %v", err)
 	}
 	if got := queryValue(t, ctx, database, `SELECT string_agg(p::text, ',') FROM (SELECT p FROM dk WHERE p > 1 ORDER BY p) s`); got.StrVal != "2" {
@@ -357,7 +357,7 @@ func TestPublicParseErrorState(t *testing.T) {
 		`SELEC 1`,
 		`CREATE TABLE (`,
 	} {
-		_, err := database.Exec(ctx, statement, 0)
+		_, err := database.exec(ctx, statement, 0)
 		if err == nil {
 			t.Fatalf("%q: expected a syntax error", statement)
 		}

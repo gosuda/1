@@ -45,9 +45,9 @@ func (cursor *runVersionCursor) nextSequence(ctx context.Context) (versionRow, e
 			first, end, err := file.spanCandidates(ctx, state.spans, cursor.snapshotTS)
 			if err != nil { return versionRow{}, err }
 			if first == end { continue }
-			state.current = runVersionCursor{run: file, nextBlock: first, endBlock: end, maxBytes: cursor.maxBytes, memory: cursor.memory, snapshotTS: cursor.snapshotTS}
+			state.current = runVersionCursor{run: file, nextBlock: first, endBlock: end, maxBytes: cursor.maxBytes, memory: cursor.memory, snapshotTS: cursor.snapshotTS, predicate: cursor.predicate, zonePruneSafe: cursor.zonePruneSafe, yieldPruned: cursor.yieldPruned}
 			if state.direction == storage.ScanReverse {
-				state.reverse = reverseRunState{first: first, nextBlock: end-1, nextRow: -1, key: state.key[:0]}
+				state.reverse = reverseRunState{first: first, nextBlock: end - 1, nextRow: -1, key: state.key[:0]}
 				state.current.reverse = &state.reverse
 			}
 			found = true
@@ -59,11 +59,15 @@ func (cursor *runVersionCursor) nextSequence(ctx context.Context) (versionRow, e
 
 func (pin *runPin) visitScanSources(ctx context.Context, timestamp model.Timestamp, spec paxScanSpec, observer storage.ScanObserver, visit func(*sstFile, []*sstFile) error) error {
 	if pin.closed { return storage.ErrClosed }
+	key := targetGeneration(spec.Target)
 	for generation := pin.generation; generation != nil; generation = generation.parent {
+		files := generation.byTarget[key]
+		if len(files) == 0 {
+			continue
+		}
 		var sequenced [MaxLevels]bool
-		for _, file := range generation.files {
+		for _, file := range files {
 			if err := ctx.Err(); err != nil { return err }
-			if targetGeneration(file.target) != targetGeneration(spec.Target) { continue }
 			if file.tier == inactiveTier && timestamp >= file.historyUntil {
 				if observer != nil {
 					observer.ObserveScan(storage.ScanObservation{
@@ -81,7 +85,7 @@ func (pin *runPin) visitScanSources(ctx context.Context, timestamp model.Timesta
 			if file.tier == activeTier && file.level != 0 && file.rangeCount == 0 {
 				if sequenced[file.level] { continue }
 				sequenced[file.level] = true
-				if err := visit(nil, generation.levels[file.level]); err != nil { return err }
+				if err := visit(nil, generation.byTargetLevels[key][file.level]); err != nil { return err }
 			} else if err := visit(file, nil); err != nil { return err }
 		}
 	}

@@ -43,7 +43,7 @@ func (transactions *Transactions) Parse(ctx context.Context, sql string, options
 	if err := operation.Err(); err != nil {
 		return nil, sessionTransactionError(err)
 	}
-	if transactions.settings.current[clientMinMessages].text == "error" {
+	if transactions.settings.clientMinMessages() == "error" {
 		result.Diagnostics = nil
 	}
 	return result, nil

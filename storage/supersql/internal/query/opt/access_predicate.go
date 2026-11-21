@@ -105,6 +105,12 @@ func (b *storagePredicateBuilder) operand(id ir.ScalarID, depth uint32) (uint32,
 		return 0, false
 	}
 	switch scalar.Kind {
+	case ir.Once:
+		if scalar.OperandCount() != 1 {
+			return 0, false
+		}
+		inner, _ := b.optimizer.graph.Operand(id, 0)
+		return b.operand(inner, depth+1)
 	case ir.Slot:
 		column, found := b.column(scalar.Slot)
 		if !found {
@@ -134,6 +140,36 @@ func (b *storagePredicateBuilder) operand(id ir.ScalarID, depth uint32) (uint32,
 		b.constants[index] = value
 		b.constantCount++
 		return b.append(storage.PredicateNode{Kind: storage.PredicateConstant, Type: typ, ConstantIndex: uint32(index)})
+	case ir.Param:
+		for _, parameter := range b.optimizer.options.Parameters {
+			if !b.optimizer.step(1) {
+				return 0, false
+			}
+			if parameter.Number != scalar.Parameter {
+				continue
+			}
+			if (!scalar.Nullable && parameter.Value.IsNull) || parameter.Value.Type != typ.Storage || !accessModelLayoutEqual(b.optimizer.graph, scalar.Layout, parameter.Layout) {
+				return 0, false
+			}
+			if b.constantCount >= len(b.constants) {
+				b.optimizer.err = ErrLimit
+				return 0, false
+			}
+			remaining := b.optimizer.options.MaxBytes - b.optimizer.bytes
+			value, used, err := model.CopyValue(b.optimizer.ctx, parameter.Value, remaining)
+			if err != nil {
+				b.optimizer.err = err
+				return 0, false
+			}
+			if !b.optimizer.charge(used, 1) {
+				return 0, false
+			}
+			index := b.constantCount
+			b.constants[index] = value
+			b.constantCount++
+			return b.append(storage.PredicateNode{Kind: storage.PredicateConstant, Type: typ, ConstantIndex: uint32(index)})
+		}
+		return 0, false
 	default:
 		return 0, false
 	}
@@ -157,7 +193,7 @@ func (b *storagePredicateBuilder) lower(id ir.ScalarID, allowPartialAnd bool, de
 	}
 	startNodes, startConstants := b.nodeCount, b.constantCount
 	switch scalar.Kind {
-	case ir.Const:
+	case ir.Const, ir.Param:
 		return b.operand(id, depth+1)
 	case ir.Call:
 		if scalar.Operator == 0 || scalar.OperandCount() != 2 {

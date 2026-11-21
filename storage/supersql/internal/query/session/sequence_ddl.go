@@ -99,6 +99,8 @@ func executeSequenceDDL(ctx context.Context, t *Transactions, create *zpgparse.C
 			return settingError("25006", "cannot execute sequence DDL in a read-only transaction")
 		}
 		options.Binding.Bind.SearchPath = declarationSearchPath(t.settings.SearchPath(), options.Binding.SchemaContext)
+		options.Binding.Bind.CurrentRole = t.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = t.settings.SessionUser()
 		if options.Binding.SchemaContext == "" && len(t.named.temporary) != 0 && !slices.Contains(options.Binding.Bind.SearchPath, temporarySchemaName) {
 			options.Binding.Bind.SearchPath = append([]string{temporarySchemaName}, options.Binding.Bind.SearchPath...)
 		}

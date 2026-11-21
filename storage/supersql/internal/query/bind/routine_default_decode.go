@@ -193,7 +193,7 @@ func (b *binder) validateRoutineDefaultSignature(signature ir.SignatureSpec, dep
 		if err := ValidateBuiltinFunction(function, 0); err != nil {
 			return err
 		}
-		if signature.Strict != known.Strict || signature.Nullable != functionNullable(known) || signature.Effects != signatureEffects(known) {
+		if signature.Strict != known.Strict || signature.Nullable != functionNullable(known) || signature.Effects != b.signatureEffects(known, signature.InputCollation) {
 			return bindError("22023", "routine default function traits changed", 0)
 		}
 		return nil

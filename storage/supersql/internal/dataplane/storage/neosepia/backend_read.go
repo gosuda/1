@@ -11,7 +11,7 @@ import (
 
 func (backend *Backend) OpenSnapshot(ctx context.Context, spec storage.SnapshotSpec) (storage.SnapshotReader, error) {
 	backend.mu.Lock()
-	needsCommitLock := !backend.closed && (spec.Fence.ClosedTS > backend.closedTimestamp() || backend.metadataUncertain || backend.state.Closed.ClosedTS == 0 || backend.stateFault != nil)
+	needsCommitLock := !backend.closed && (spec.Fence.ClosedTS > backend.closedTimestamp() || spec.Fence.ClosedTS > backend.persistedHorizon || backend.metadataUncertain || backend.state.Closed.ClosedTS == 0 || backend.stateFault != nil)
 	if needsCommitLock {
 		backend.mu.Unlock()
 		backend.commitMu.Lock()
@@ -26,7 +26,8 @@ func (backend *Backend) OpenSnapshot(ctx context.Context, spec storage.SnapshotS
 	if err != nil {
 		return nil, err
 	}
-	return newSnapshotReader(ctx, pin, spec, backend.encoder, backend.limits.reads())
+	mem := backend.memtable.snapshot()
+	return newSnapshotReaderWithMem(ctx, pin, mem, spec, backend.encoder, backend.limits.reads())
 }
 
 // The caller holds backend.mu through pin acquisition.
@@ -54,7 +55,7 @@ func (backend *Backend) prepareRead(ctx context.Context, spec storage.SnapshotSp
 	if !backend.knownEpoch(spec.Fence.Epoch) {
 		return storage.ErrSnapshotNotClosed
 	}
-	if err := backend.runs.validateFence(ctx, spec.Fence, backend.transactions); err != nil {
+	if err := backend.validateFenceLocked(ctx, spec.Fence); err != nil {
 		return err
 	}
 	if backend.pending != nil && spec.Fence.ClosedTS > backend.closedTimestamp() {
@@ -68,10 +69,11 @@ func (backend *Backend) prepareRead(ctx context.Context, spec storage.SnapshotSp
 		if backend.state.Generation == ^uint64(0) {
 			return storage.ErrCorruptStorage
 		}
-		if backend.state.Closed.ClosedTS == 0 || backend.stateFault != nil {
+		if backend.state.Closed.ClosedTS == 0 || spec.Fence.ClosedTS > backend.persistedHorizon || backend.stateFault != nil {
 			next := backend.state
 			next.Generation++
 			next.Closed = spec.Fence
+			next.ClosedHorizon = max(backend.persistedHorizon, closedHorizonFor(spec.Fence.ClosedTS))
 			uncertain, err := writeDatabaseState(ctx, backend.directory.root, next, backend.limits.MetadataBytes, backend.stateFault)
 			if err != nil {
 				backend.metadataUncertain = uncertain
@@ -82,6 +84,7 @@ func (backend *Backend) prepareRead(ctx context.Context, spec storage.SnapshotSp
 			}
 			backend.state = next
 			backend.durableClosed = next.Closed
+			backend.persistedHorizon = next.ClosedHorizon
 			backend.stateDirty = false
 		} else {
 			backend.state.Closed = spec.Fence
@@ -141,14 +144,19 @@ func (backend *Backend) resolveMetadata(ctx context.Context) error {
 		return err
 	}
 	var recoveredBase runBase
+	var recoveredFence coveredFenceIndex
 	if state.BaseGeneration != previous.BaseGeneration {
 		base, err := loadRunBase(ctx, backend.directory.runs, state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles)
 		if err != nil {
 			return err
 		}
 		if base.Floor != state.HistoryFloor || base.Position != backend.frontier.LogPosition || base.CommitTS != backend.frontier.CommitTS ||
-			base.Epoch != backend.publishedEpoch || !sameTransactionRecords(base.Transactions, backend.transactions) {
+			base.Epoch != backend.publishedEpoch || base.PrunedPosition < backend.prunedPosition || !subsetTransactionRecords(base.Transactions, backend.transactions) {
 			return storage.ErrCorruptStorage
+		}
+		recoveredFence, err = buildCoveredFenceIndex(ctx, base)
+		if err != nil {
+			return err
 		}
 		files, err := openBaseFiles(ctx, backend.directory.runs, base.Files, backend.limits.preparation().File, backend.limits.ResidentBytes)
 		if err != nil {
@@ -166,6 +174,7 @@ func (backend *Backend) resolveMetadata(ctx context.Context) error {
 		return err
 	}
 	backend.durableClosed = state.Closed
+	backend.persistedHorizon = max(state.Closed.ClosedTS, state.ClosedHorizon)
 	if state.Closed.ClosedTS < previous.Closed.ClosedTS {
 		state.Closed = previous.Closed
 		backend.stateDirty = true
@@ -173,6 +182,12 @@ func (backend *Backend) resolveMetadata(ctx context.Context) error {
 		backend.stateDirty = false
 	}
 	backend.state = state
+	if recoveredBase.Generation != 0 {
+		backend.transactions = recoveredBase.Transactions
+		backend.prunedPosition = recoveredBase.PrunedPosition
+		backend.prunedCommitTS = recoveredBase.PrunedCommitTS
+		backend.fenceIndex = recoveredFence
+	}
 	backend.metadataUncertain = false
 	if len(backend.maintenanceGate) == 0 {
 		backend.collectionBoundary = 0

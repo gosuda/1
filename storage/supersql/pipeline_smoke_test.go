@@ -23,9 +23,9 @@ func TestEmbeddedPipelineSmoke(t *testing.T) {
 		}
 	}()
 
-	exec := func(sql string) Outcome {
+	exec := func(sql string) outcome {
 		t.Helper()
-		outcome, err := database.Exec(ctx, sql, 0)
+		outcome, err := database.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%q => %v", sql, err)
 		}
@@ -94,7 +94,7 @@ func TestEmbeddedPipelineSmoke(t *testing.T) {
 
 	// A read-only transaction rejects writes with SQLSTATE 25006. Exec shares
 	// one session, so the aborted transaction needs an explicit ROLLBACK.
-	if _, err := database.Exec(ctx, `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY; INSERT INTO t VALUES (5, 'z', 50); COMMIT`, 0); err == nil {
+	if _, err := database.exec(ctx, `BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY; INSERT INTO t VALUES (5, 'z', 50); COMMIT`, 0); err == nil {
 		t.Fatal("write inside READ ONLY transaction succeeded; want 25006")
 	}
 	exec(`ROLLBACK`)

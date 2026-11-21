@@ -28,53 +28,57 @@ A database directory contains:
 
 | Constant | Value | Location |
 | --- | --- | --- |
-| paxMagic | 0x32584150 | internal/dataplane/storage/neosepia/pax_format.go:17 |
-| paxVersion | 2 | internal/dataplane/storage/neosepia/pax_format.go:18 |
-| paxHeaderSize | 64 | internal/dataplane/storage/neosepia/pax_format.go:19 |
-| paxVersionSize | 40 | internal/dataplane/storage/neosepia/pax_format.go:21 |
-| databaseStateMagic | "NSDB0001" | internal/dataplane/storage/neosepia/backend_state.go:17 |
-| databaseStateName | "database.state" | internal/dataplane/storage/neosepia/backend_state.go:18 |
-| databaseStatePending | "database.state.pending" | internal/dataplane/storage/neosepia/backend_state.go:19 |
-| databaseStateHeader | 176 | internal/dataplane/storage/neosepia/backend_state.go:20 |
+| paxMagic | 0x32584150 | internal/dataplane/storage/neosepia/pax_format.go:18 |
+| paxVersion | 2 | internal/dataplane/storage/neosepia/pax_format.go:19 |
+| paxHeaderSize | 64 | internal/dataplane/storage/neosepia/pax_format.go:20 |
+| paxVersionSize | 40 | internal/dataplane/storage/neosepia/pax_format.go:22 |
+| databaseStateMagic | "NSDB0002" | internal/dataplane/storage/neosepia/backend_state.go:18 |
+| databaseStateName | "database.state" | internal/dataplane/storage/neosepia/backend_state.go:19 |
+| databaseStatePending | "database.state.pending" | internal/dataplane/storage/neosepia/backend_state.go:20 |
+| databaseStateHeader | 184 | internal/dataplane/storage/neosepia/backend_state.go:21 |
 | commitMagic | "NSTXBEG2" | internal/dataplane/storage/neosepia/commit_store.go:21 |
 | commitEndMagic | "NSTXCMT2" | internal/dataplane/storage/neosepia/commit_store.go:22 |
 | commitHeaderSize | 128 | internal/dataplane/storage/neosepia/commit_store.go:20 |
 | runManifestMagic | "NSRUNS01" | internal/dataplane/storage/neosepia/run_manifest.go:21 |
-| runManifestHeaderBytes | 160 | internal/dataplane/storage/neosepia/run_manifest.go:22 |
-| runManifestEntryBytes | 80 | internal/dataplane/storage/neosepia/run_manifest.go:23 |
-| baseManifestMagic | "NSBASE03" | internal/dataplane/storage/neosepia/base_manifest.go:25 |
+| runManifestHeaderBytes | 160 | internal/dataplane/storage/neosepia/run_manifest.go:23 |
+| runManifestEntryBytes | 80 | internal/dataplane/storage/neosepia/run_manifest.go:24 |
+| baseManifestMagic | "NSBASE04" | internal/dataplane/storage/neosepia/base_manifest.go:25 |
 | baseManifestHeader | 176 | internal/dataplane/storage/neosepia/base_manifest.go:26 |
 | baseManifestEntryBytes | 144 | internal/dataplane/storage/neosepia/base_manifest.go:27 |
 | baseTransactionBytes | 80 | internal/dataplane/storage/neosepia/base_manifest.go:28 |
 | baseManifestPending | ".base.pending" | internal/dataplane/storage/neosepia/base_manifest.go:29 |
-| sstMagic | "NSSST003" | internal/dataplane/storage/neosepia/sst_write.go:19 |
-| sstHeaderSize | 80 | internal/dataplane/storage/neosepia/sst_write.go:20 |
-| sstIndexHeaderSize | 16 | internal/dataplane/storage/neosepia/sst_write.go:22 |
+| sstMagic | "NSSST004" | internal/dataplane/storage/neosepia/sst_write.go:20 |
+| sstHeaderSize | 80 | internal/dataplane/storage/neosepia/sst_write.go:23 |
+| sstIndexHeaderSize | sstIndexHeaderSizeV4 | internal/dataplane/storage/neosepia/sst_write.go:30 |
 | checkpointMagic | "NSCP0001" | internal/dataplane/storage/neosepia/backend_checkpoint.go:17 |
 | checkpointPrefix | ".checkpoint-" | internal/dataplane/storage/neosepia/backend_checkpoint.go:18 |
 | jobEncoding | "SJOB0001" | internal/controlplane/schema/jobs.go:62 |
-| nativeSpoolDirectory | "tmp" | open.go:76 |
-| nativeFenceSecretFile | "fence.secret" | open.go:77 |
-| nativeFenceSecretSize | 32 | open.go:78 |
+| nativeSpoolDirectory | "tmp" | options.go:33 |
+| nativeFenceSecretFile | "fence.secret" | options.go:34 |
+| nativeFenceSecretSize | 32 | options.go:35 |
 
 ## File name patterns
 
 | Constructor | Format | Location |
 | --- | --- | --- |
-| commitName | `%020d.wal` | internal/dataplane/storage/neosepia/commit_store.go:164 |
-| pendingCommitName | `.%020d.pending` | internal/dataplane/storage/neosepia/commit_store.go:165 |
-| runManifestName | `%020d.runs` | internal/dataplane/storage/neosepia/run_manifest.go:41 |
-| preparedRunName | `%020d-%08x.sst` | internal/dataplane/storage/neosepia/run_manifest.go:42 |
-| baseManifestName | `base-%020d.runs` | internal/dataplane/storage/neosepia/base_manifest.go:47 |
+| commitName | `%020d.wal` | internal/dataplane/storage/neosepia/commit_store.go:155 |
+| pendingCommitName | `.%020d.pending` | internal/dataplane/storage/neosepia/commit_store.go:156 |
+| runManifestName | `%020d.runs` | internal/dataplane/storage/neosepia/run_manifest.go:92 |
+| preparedRunName | `%020d-%08x.sst` | internal/dataplane/storage/neosepia/run_manifest.go:93 |
+| baseManifestName | `base-%020d.runs` | internal/dataplane/storage/neosepia/base_manifest.go:59 |
 
 ## Legacy format markers
 
-2 retired magic values are still recognised so that an older directory is rejected or read rather than silently misread.
+6 retired magic values are still recognised so that an older directory is rejected or read rather than silently misread.
 
 | Magic | Location |
 | --- | --- |
-| `NSBASE02` | internal/dataplane/storage/neosepia/base_manifest.go:475 |
-| `NSSST002` | internal/dataplane/storage/neosepia/sst_read.go:72 |
+| `NSDB0001` | internal/dataplane/storage/neosepia/backend_directory.go:100 |
+| `NSBASE03` | internal/dataplane/storage/neosepia/base_manifest.go:506 |
+| `NSBASE02` | internal/dataplane/storage/neosepia/base_manifest.go:509 |
+| `NSRUNS02` | internal/dataplane/storage/neosepia/run_manifest.go:22 |
+| `NSSST003` | internal/dataplane/storage/neosepia/sst_write.go:21 |
+| `NSSST002` | internal/dataplane/storage/neosepia/sst_write.go:22 |
 
 ## Recovery order
 

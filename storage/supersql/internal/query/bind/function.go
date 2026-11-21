@@ -22,6 +22,16 @@ func signatureEffects(sig builtin.Signature) ir.Effects {
 	}
 	return e
 }
+func (b *binder) signatureEffects(sig builtin.Signature, inputCollation model.CollationID) ir.Effects {
+	e := ir.Effects{MayError: builtin.ScalarMayErrorWithCollation(sig.ID, inputCollation, b.options.DefaultCollation)}
+	switch sig.Volatility {
+	case 's':
+		e.Volatility = ir.Stable
+	case 'v':
+		e.Volatility = ir.Volatile
+	}
+	return e
+}
 func (b *binder) signature(sig builtin.Signature, op model.OperatorID, args []model.TypeLayout, result model.TypeLayout, inputCollation model.CollationID, variadicArray bool) (ir.SignatureID, error) {
 	parameters := make([]ir.LayoutID, len(args))
 	for i, arg := range args {
@@ -35,7 +45,7 @@ func (b *binder) signature(sig builtin.Signature, op model.OperatorID, args []mo
 	if err != nil {
 		return 0, err
 	}
-	spec := ir.Signature{Function: sig.ID, Operator: op, Result: layout, InputCollation: inputCollation, VariadicArray: variadicArray, Strict: sig.Strict, SetReturning: sig.ReturnsSet, Nullable: functionNullable(sig), Effects: signatureEffects(sig)}
+	spec := ir.Signature{Function: sig.ID, Operator: op, Result: layout, InputCollation: inputCollation, VariadicArray: variadicArray, Strict: sig.Strict, SetReturning: sig.ReturnsSet, Nullable: functionNullable(sig), Effects: b.signatureEffects(sig, inputCollation)}
 	if op != 0 {
 		spec.Function = 0
 	}
@@ -114,7 +124,7 @@ func (b *binder) invokeArguments(s *scope, sig builtin.Signature, op model.Opera
 	if op != 0 {
 		payload.Function = 0
 	}
-	return b.addScalar(s, expression{typ: result, collation: resultState, nullable: nullable, effects: signatureEffects(sig), position: pos}, payload, args)
+	return b.addScalar(s, expression{typ: result, collation: resultState, nullable: nullable, effects: b.signatureEffects(sig, state.id), position: pos}, payload, args)
 }
 func (b *binder) overloadScore(sig builtin.Signature, args []expression) int {
 	if sig.Variadic == 2276 {

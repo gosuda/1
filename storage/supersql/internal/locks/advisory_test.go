@@ -88,3 +88,124 @@ func TestAdvisoryCancellationAndKeySpaces(t *testing.T) {
 		manager.CloseSession(second.SessionID)
 	})
 }
+
+func TestAdvisoryPerKeyWakeupAvoidsThunderingHerd(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager, err := NewAdvisoryLockManagerWithLimits(DefaultAdvisoryLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		holderA := AdvisoryOwner{SessionID: 1}
+		holderB := AdvisoryOwner{SessionID: 2}
+		waiterA := AdvisoryOwner{SessionID: 3}
+		waiterB := AdvisoryOwner{SessionID: 4}
+		keyA := KeyFromBigInt(100)
+		keyB := KeyFromBigInt(200)
+
+		if err := manager.Lock(t.Context(), holderA, keyA, AdvisoryExclusive, ScopeSession); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Lock(t.Context(), holderB, keyB, AdvisoryExclusive, ScopeSession); err != nil {
+			t.Fatal(err)
+		}
+
+		acquiredA := make(chan error, 1)
+		acquiredB := make(chan error, 1)
+		go func() { acquiredA <- manager.Lock(t.Context(), waiterA, keyA, AdvisoryExclusive, ScopeSession) }()
+		go func() { acquiredB <- manager.Lock(t.Context(), waiterB, keyB, AdvisoryExclusive, ScopeSession) }()
+		synctest.Wait()
+
+		manager.mu.Lock()
+		itemB := manager.locks[keyB]
+		if itemB == nil || itemB.changed == nil {
+			manager.mu.Unlock()
+			t.Fatal("expected keyB waiter notification channel")
+		}
+		keyBChanged := itemB.changed
+		manager.mu.Unlock()
+
+		if !manager.Unlock(holderA, keyA, AdvisoryExclusive) {
+			t.Fatal("unlock keyA failed")
+		}
+		synctest.Wait()
+
+		if err := <-acquiredA; err != nil {
+			t.Fatalf("waiterA lock failed: %v", err)
+		}
+		select {
+		case <-keyBChanged:
+			t.Fatal("unlocking keyA spuriously woke waiter on keyB")
+		default:
+		}
+		manager.mu.Lock()
+		if manager.locks[keyB] == nil || manager.locks[keyB].changed != keyBChanged {
+			manager.mu.Unlock()
+			t.Fatal("keyB notification channel was replaced during unrelated keyA unlock")
+		}
+		manager.mu.Unlock()
+
+		// Closing a waiting session that holds no locks still wakes its waiter cleanly.
+		manager.CloseSession(waiterB.SessionID)
+		synctest.Wait()
+		if err := <-acquiredB; !errors.Is(err, errAdvisorySessionClosed) {
+			t.Fatalf("closed waiterB result = %v, want errAdvisorySessionClosed", err)
+		}
+
+		// Savepoint rollback wakes waiters only on keys released after the savepoint.
+		txOwner := AdvisoryOwner{SessionID: 5, TransactionID: 55}
+		waiterC := AdvisoryOwner{SessionID: 6}
+		waiterD := AdvisoryOwner{SessionID: 7}
+		keyC := KeyFromBigInt(300)
+		keyD := KeyFromBigInt(400)
+		if err := manager.Lock(t.Context(), txOwner, keyC, AdvisoryExclusive, ScopeTransaction); err != nil {
+			t.Fatal(err)
+		}
+		savepoint, err := manager.TransactionSavepoint(txOwner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Lock(t.Context(), txOwner, keyD, AdvisoryExclusive, ScopeTransaction); err != nil {
+			t.Fatal(err)
+		}
+		acquiredC := make(chan error, 1)
+		acquiredD := make(chan error, 1)
+		go func() { acquiredC <- manager.Lock(t.Context(), waiterC, keyC, AdvisoryExclusive, ScopeSession) }()
+		go func() { acquiredD <- manager.Lock(t.Context(), waiterD, keyD, AdvisoryExclusive, ScopeSession) }()
+		synctest.Wait()
+
+		manager.mu.Lock()
+		keyCChanged := manager.locks[keyC].changed
+		manager.mu.Unlock()
+
+		if err := manager.RollbackTransactionLocks(txOwner, savepoint); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if err := <-acquiredD; err != nil {
+			t.Fatalf("waiterD lock after rollback failed: %v", err)
+		}
+		select {
+		case <-keyCChanged:
+			t.Fatal("rolling back keyD spuriously woke waiter on keyC")
+		default:
+		}
+
+		manager.ReleaseTransactionLocks(txOwner)
+		synctest.Wait()
+		if err := <-acquiredC; err != nil {
+			t.Fatalf("waiterC lock after tx release failed: %v", err)
+		}
+
+		manager.CloseSession(holderB.SessionID)
+		manager.CloseSession(waiterA.SessionID)
+		manager.CloseSession(waiterC.SessionID)
+		manager.CloseSession(waiterD.SessionID)
+
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		if len(manager.locks) != 0 || len(manager.owners) != 0 || manager.waiters != 0 || manager.holds != 0 || manager.usedBytes != 0 {
+			t.Fatalf("retained state: keys=%d owners=%d waiters=%d holds=%d bytes=%d", len(manager.locks), len(manager.owners), manager.waiters, manager.holds, manager.usedBytes)
+		}
+	})
+}
+

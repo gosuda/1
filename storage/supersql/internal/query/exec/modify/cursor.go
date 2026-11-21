@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
@@ -68,6 +69,9 @@ type cursor struct {
 	mutatedTargets           *distinctset.Set
 	conflictState            mergeActionState
 	conflictInput            *columnar.Builder
+	rlsInsertCheck           *expr.State
+	rlsUpdateCheck           *expr.State
+	rlsCheckInput            *columnar.Builder
 	assignmentInput          *columnar.Builder
 	returnInput              *columnar.Builder
 	output                   *columnar.Builder
@@ -105,9 +109,13 @@ func (c *cursor) check(ctx context.Context) error {
 	return nil
 }
 
+func (c *cursor) rowPayloadBytes() uint64 {
+	return max(c.options.MaxRecordBytes*8, c.options.MaxRowBytes)
+}
+
 func (c *cursor) spool(ctx context.Context, layouts []model.TypeLayout) (*rowstore.Spool, error) {
 	o := c.options
-	return rowstore.New(ctx, o.Query, layouts, rowstore.Limits{MemoryBytes: o.SpoolMemoryBytes, MaxBytes: o.MaxSpoolBytes, MaxRows: o.MaxRows, MaxRecordBytes: o.MaxRecordBytes, MetadataBytes: c.metadata, DecodeBytes: o.MaxRecordBytes * 8, MaxReaders: 1})
+	return rowstore.New(ctx, o.Query, layouts, rowstore.Limits{MemoryBytes: o.SpoolMemoryBytes, MaxBytes: o.MaxSpoolBytes, MaxRows: o.MaxRows, MaxRecordBytes: o.MaxRecordBytes, MaxLargeRecordBytes: o.MaxRowBytes, MetadataBytes: c.metadata, DecodeBytes: o.MaxRecordBytes * 8, MaxReaders: 1})
 }
 
 func copyBatchRow(ctx context.Context, batch *columnar.Batch, lane int, values []model.Value, maximum uint64) error {
@@ -197,7 +205,7 @@ func (c *cursor) freeze(ctx context.Context) error {
 				return resource("modify input row limit")
 			}
 			count++
-			if err := copyBatchRow(ctx, &batch, batch.Lane(lane), c.row[:inputWidth], c.options.MaxRecordBytes*8); err != nil {
+			if err := copyBatchRow(ctx, &batch, batch.Lane(lane), c.row[:inputWidth], c.rowPayloadBytes()); err != nil {
 				return err
 			}
 			targetPresent := c.options.Operation != storage.MutationInsert
@@ -276,7 +284,7 @@ func (c *cursor) freeze(ctx context.Context) error {
 					}
 					if c.options.Partitions.sourceImage {
 						sourceImage.Reset()
-						if err := storage.EncodeValue(ctx, &sourceImage, model.Value{Type: model.TypeComposite, ArrayVal: old.Values}, c.options.MaxRecordBytes*8); err != nil {
+						if err := storage.EncodeValue(ctx, &sourceImage, model.Value{Type: model.TypeComposite, ArrayVal: old.Values}, c.rowPayloadBytes()); err != nil {
 							return err
 						}
 						c.row[len(c.row)-1] = model.BytesVal(sourceImage.Bytes())
@@ -324,8 +332,29 @@ func (c *cursor) assignments(ctx context.Context, input []model.Value, state *ex
 	if output.Rows() != 1 || len(output.Columns) != len(values) {
 		return nil, storage.ErrInvalidLayout
 	}
-	if err := copyBatchRow(ctx, &output, output.Lane(0), values, c.options.MaxRecordBytes*8); err != nil {
-		return nil, err
+	rowLimit := c.rowPayloadBytes()
+	remaining := rowLimit
+	for i := range values {
+		value, used, err := columnar.CopyValue(ctx, &output.Columns[i], output.Lane(0), remaining)
+		if err != nil {
+			return nil, err
+		}
+		values[i], remaining = value, remaining-used
+	}
+	if rowLimit-remaining > c.options.MaxRecordBytes {
+		if err := state.ReleaseOutput(); err != nil {
+			return nil, err
+		}
+		if c.assignmentInput != nil && c.assignmentInput != c.conflictInput {
+			if err := c.assignmentInput.Close(); err != nil {
+				return nil, err
+			}
+			var err error
+			c.assignmentInput, err = columnar.NewBuilder(c.options.InputLayouts, columnar.BuilderOptions{MaxRows: 1, MaxBytes: c.options.BatchBytes, Allocator: c.options.Query.Allocator(runtime.WorkMemory)})
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return values, nil
 }
@@ -364,7 +393,7 @@ func (c *cursor) mutate(ctx context.Context, frozen []model.Value, operation sto
 		if oldEnd >= len(frozen) || frozen[oldEnd].IsNull || frozen[oldEnd].Type != model.TypeBytes {
 			return false, storage.ErrInvalidLayout
 		}
-		decoded, decodeErr := storage.DecodeValue(ctx, frozen[oldEnd].BytesVal, o.MaxRecordBytes*8)
+		decoded, decodeErr := storage.DecodeValue(ctx, frozen[oldEnd].BytesVal, c.rowPayloadBytes())
 		if decodeErr != nil || decoded.Type != model.TypeComposite || len(decoded.ArrayVal) != len(source.layout) {
 			return false, errors.Join(decodeErr, storage.ErrInvalidLayout)
 		}
@@ -380,7 +409,7 @@ func (c *cursor) mutate(ctx context.Context, frozen []model.Value, operation sto
 	if logicalMutationTarget(o.TargetKind) {
 		previous := model.Row{Values: old}
 		if operation == storage.MutationDelete {
-			replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerDelete, &previous, nil, o.MaxRecordBytes*8)
+			replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerDelete, &previous, nil, c.rowPayloadBytes())
 			if triggerErr != nil {
 				return false, triggerErr
 			}
@@ -402,7 +431,7 @@ func (c *cursor) mutate(ctx context.Context, frozen []model.Value, operation sto
 		for i, column := range c.assignmentColumns {
 			current.Values[column] = assigned[i]
 		}
-		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerUpdate, &previous, &current, o.MaxRecordBytes*8)
+		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerUpdate, &previous, &current, c.rowPayloadBytes())
 		if triggerErr != nil {
 			return false, triggerErr
 		}
@@ -436,7 +465,7 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 	if operation == storage.MutationDelete {
 		previous := &model.Row{Key: oldKey, Values: old}
 		if o.Triggers != nil {
-			_, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerDelete, previous, nil, o.MaxRecordBytes*8)
+			_, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerDelete, previous, nil, c.rowPayloadBytes())
 			if triggerErr != nil {
 				return triggerErr
 			}
@@ -461,18 +490,22 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 			return err
 		}
 	}
-	candidate, err := o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: mappedColumns, Values: assigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: o.MaxRecordBytes * 8, Expressions: partitionExpressions(*o)})
+	rowLimit := c.rowPayloadBytes()
+	candidate, err := o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: mappedColumns, Values: assigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, candidate.Close()) }()
-	claim, err := o.Query.Allocator(runtime.WorkMemory).Reserve(o.MaxRecordBytes * 8)
+	claim, err := o.Query.Allocator(runtime.WorkMemory).Reserve(0)
 	if err != nil {
 		return err
 	}
 	defer claim.Release()
-	current, _, err := candidate.CopyRow(ctx, o.MaxRecordBytes*8)
+	current, used, err := candidate.CopyRow(ctx, rowLimit)
 	if err != nil {
+		return err
+	}
+	if err := claim.Resize(used); err != nil {
 		return err
 	}
 	defer func() {
@@ -481,7 +514,7 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		current = model.Row{}
 	}()
 	if o.Triggers != nil {
-		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerUpdate, &previous, &current, o.MaxRecordBytes*8)
+		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerUpdate, &previous, &current, rowLimit)
 		if triggerErr != nil {
 			return triggerErr
 		}
@@ -498,17 +531,25 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		if source != nil {
 			fullColumns = source.columnIDs
 		}
-		candidate, err = o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: fullColumns, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: o.MaxRecordBytes * 8, Expressions: partitionExpressions(*o)})
+		candidate, err = o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: fullColumns, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 		if err != nil {
 			return err
 		}
-		current, _, err = candidate.CopyRow(ctx, o.MaxRecordBytes*8)
+		current, used, err = candidate.CopyRow(ctx, rowLimit)
 		if err != nil {
+			return err
+		}
+		if err := claim.Resize(used); err != nil {
 			return err
 		}
 	}
 	if o.Conflict != nil && o.Conflict.Action == ir.ConflictUpdate && !bytes.Equal(oldKey, current.Key) {
 		if err := c.recordConflictIdentity(ctx, current.Values); err != nil {
+			return err
+		}
+	}
+	if operation == storage.MutationUpdate && c.rlsUpdateCheck != nil {
+		if err := c.checkRLS(ctx, c.rlsUpdateCheck, source, current.Values); err != nil {
 			return err
 		}
 	}
@@ -529,18 +570,63 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 	}
 	return c.finishPartitionMutation(ctx, frozen, operation, source, old, oldKey, &current)
 }
+
+func (c *cursor) checkRLS(ctx context.Context, state *expr.State, route *partitionChild, row []model.Value) error {
+	if state == nil {
+		return nil
+	}
+	source := row
+	if route != nil && c.options.Partitions != nil {
+		buf := make([]model.Value, len(c.tableLayouts))
+		projected, err := c.options.Partitions.Project(route, row, buf)
+		if err != nil {
+			return err
+		}
+		source = projected
+	}
+	visible := c.visibleRow(source, c.newImage)
+	defer clear(c.newImage)
+	c.rlsCheckInput.Reset()
+	if err := c.rlsCheckInput.Append(ctx, []model.Value{{Type: model.TypeComposite, ArrayVal: visible}}); err != nil {
+		return err
+	}
+	var batch, out columnar.Batch
+	if err := c.rlsCheckInput.Publish(&batch); err != nil {
+		return err
+	}
+	if err := state.Eval(ctx, &batch, c.options.Parameters, &out, expr.Direct); err != nil {
+		return err
+	}
+	if out.Rows() != 1 || len(out.Columns) != 1 {
+		return storage.ErrInvalidLayout
+	}
+	value, _, err := columnar.CopyValue(ctx, &out.Columns[0], out.Lane(0), c.options.MaxRecordBytes)
+	if err != nil {
+		return err
+	}
+	if value.IsNull || value.Type != model.TypeBoolean || value.IntVal == 0 {
+		tableName := c.descriptor.Name().Name
+		return &model.Error{
+			Code:    "42501",
+			Message: fmt.Sprintf("new row violates row-level security policy for table %q", tableName),
+			Table:   tableName,
+		}
+	}
+	return nil
+}
 func (c *cursor) movePartitionRow(ctx context.Context, frozen []model.Value, source, destination *partitionChild, previous, proposed *model.Row) (err error) {
 	o := &c.options
 	columnIDs, err := o.Partitions.mapColumns(destination, c.columnIDs)
 	if err != nil {
 		return err
 	}
-	candidate, err := o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: destination.target, ColumnIDs: columnIDs, Values: proposed.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: o.MaxRecordBytes * 8, Expressions: partitionExpressions(*o)})
+	rowLimit := c.rowPayloadBytes()
+	candidate, err := o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: destination.target, ColumnIDs: columnIDs, Values: proposed.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, candidate.Close()) }()
-	current, _, err := candidate.CopyRow(ctx, o.MaxRecordBytes*8)
+	current, _, err := candidate.CopyRow(ctx, rowLimit)
 	if err != nil {
 		return err
 	}
@@ -563,12 +649,12 @@ func (c *cursor) movePartitionRow(ctx context.Context, frozen []model.Value, sou
 	}
 	expressions := partitionExpressions(*o)
 	if relational, ok := source.expansion.(RelationalExpansion); ok {
-		if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), o.MaxRecordBytes*8, previous, nil); err != nil {
+		if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), rowLimit, previous, nil); err != nil {
 			return err
 		}
 	}
 	if relational, ok := destination.expansion.(RelationalExpansion); ok {
-		if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), o.MaxRecordBytes*8, nil, &current); err != nil {
+		if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), rowLimit, nil, &current); err != nil {
 			return err
 		}
 	}
@@ -671,7 +757,7 @@ func (c *cursor) finishMutationWithView(ctx context.Context, frozen []model.Valu
 		}
 		if relational, ok := o.Expansion.(RelationalExpansion); ok {
 			expressions := model.ExpressionRuntime{Sequences: o.Sequences, Relations: o.Relations, Temporal: o.Temporal, Settings: o.Settings, TextSearch: o.TextSearch, Advisory: o.Advisory, Native: o.Native}
-			if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), o.MaxRecordBytes*8, previous, current); err != nil {
+			if err := relational.ExpandRelational(ctx, o.ConstraintTransaction, c, o.Triggers, expressions, o.Query.Allocator(runtime.WorkMemory), c.rowPayloadBytes(), previous, current); err != nil {
 				return err
 			}
 		}
@@ -681,7 +767,7 @@ func (c *cursor) finishMutationWithView(ctx context.Context, frozen []model.Valu
 		if operation != storage.MutationInsert {
 			previous = &model.Row{Key: oldKey, Values: old}
 		}
-		if err := o.Triggers.AfterRow(ctx, c.descriptor, triggerEvent(operation), previous, current, o.MaxRecordBytes*8); err != nil {
+		if err := o.Triggers.AfterRow(ctx, c.descriptor, triggerEvent(operation), previous, current, c.rowPayloadBytes()); err != nil {
 			return err
 		}
 	}
@@ -1134,7 +1220,13 @@ func (c *cursor) Close() error {
 	if c.returning != nil {
 		c.closeErr = errors.Join(c.closeErr, c.returning.Close())
 	}
-	for _, builder := range []*columnar.Builder{c.assignmentInput, c.conflictInput, c.returnInput, c.output} {
+	if c.rlsInsertCheck != nil {
+		c.closeErr = errors.Join(c.closeErr, c.rlsInsertCheck.Close())
+	}
+	if c.rlsUpdateCheck != nil {
+		c.closeErr = errors.Join(c.closeErr, c.rlsUpdateCheck.Close())
+	}
+	for _, builder := range []*columnar.Builder{c.assignmentInput, c.conflictInput, c.rlsCheckInput, c.returnInput, c.output} {
 		if builder != nil {
 			c.closeErr = errors.Join(c.closeErr, builder.Close())
 		}
@@ -1151,8 +1243,8 @@ func (c *cursor) Close() error {
 	c.columnIDs, c.tableLayouts, c.returnLayouts = nil, nil, nil
 	c.visibleColumns, c.visibleLayouts, c.oldImage, c.newImage = nil, nil, nil, nil
 	c.keyColumns, c.assignmentColumns = nil, nil
-	c.assignmentInput, c.returnInput, c.output = nil, nil, nil
-	c.assignment, c.returning, c.claim, c.descriptor = nil, nil, nil, nil
+	c.assignmentInput, c.rlsCheckInput, c.returnInput, c.output = nil, nil, nil, nil
+	c.assignment, c.returning, c.rlsInsertCheck, c.rlsUpdateCheck, c.claim, c.descriptor = nil, nil, nil, nil, nil, nil
 	c.options = Options{}
 	return c.closeErr
 }

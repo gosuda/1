@@ -79,11 +79,11 @@ func (transaction *Transaction) LockTables(ctx context.Context, requests []Table
 		mode := tableLockMode(request.Mode)
 		all := lockRequest{ObjectID: request.Target.ObjectID, Generation: request.Target.Generation, Lower: lockBound{Unbounded: true}, Upper: lockBound{Unbounded: true}}
 		if _, err := transaction.manager.locks.acquire(operation, transaction.owner, all, mode, policy); err != nil {
-			return transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+			return transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 		}
 	}
 	if err := transaction.active(operation); err != nil {
-		return transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+		return transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 	}
 	return nil
 }

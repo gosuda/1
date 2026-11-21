@@ -111,6 +111,12 @@ type Settings interface {
 	CatalogSettings(context.Context) ([]Setting, error)
 }
 
+// RoleProvider optionally exposes the session's active role to catalog views
+// such as pg_stats for row-level security filtering.
+type RoleProvider interface {
+	CurrentRole() string
+}
+
 type Setting struct {
 	Name             string
 	Value            model.Value

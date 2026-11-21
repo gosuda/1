@@ -21,6 +21,25 @@ func (backend *Backend) ScrubRange(ctx context.Context, request storage.ScrubReq
 		backend.mu.Unlock()
 		return storage.ScrubReport{}, storage.ErrClosed
 	}
+	needsFlush := !backend.memtable.empty()
+	backend.mu.Unlock()
+	if needsFlush {
+		backend.commitMu.Lock()
+		backend.mu.Lock()
+		if !backend.closed && !backend.memtable.empty() {
+			err = backend.flushMemtableLocked(ctx, 0)
+		}
+		backend.mu.Unlock()
+		backend.commitMu.Unlock()
+		if err != nil {
+			return storage.ScrubReport{}, err
+		}
+	}
+	backend.mu.Lock()
+	if backend.closed {
+		backend.mu.Unlock()
+		return storage.ScrubReport{}, storage.ErrClosed
+	}
 	limits := backend.limits
 	pin, pinErr := backend.runs.pin(ctx)
 	backend.mu.Unlock()
@@ -57,7 +76,7 @@ func (backend *Backend) ScrubRange(ctx context.Context, request storage.ScrubReq
 			return err
 		}
 		for index := first; index < end; index++ {
-			block, err := file.ReadBlock(ctx, index, limits.ReadBlockBytes, nil)
+			block, err := file.readBlockUncached(ctx, index, limits.ReadBlockBytes, nil)
 			if err != nil {
 				return err
 			}

@@ -32,6 +32,7 @@ type mvccCursor struct {
 	advance      bool
 	closed       bool
 	initialized  bool
+	initIdx      int
 	reverse      bool
 	retainFuture bool
 }
@@ -86,7 +87,7 @@ func newVersionMerge(ctx context.Context, sources []*runVersionCursor, timestamp
 		if source == nil {
 			return nil, storage.ErrInvalidScanPlan
 		}
-		reverse := source.reverse != nil || (source.sequence != nil && source.sequence.direction == storage.ScanReverse)
+		reverse := source.reverse != nil || (source.sequence != nil && source.sequence.direction == storage.ScanReverse) || (source.mem != nil && source.mem.direction == storage.ScanReverse)
 		if reverse != (direction == storage.ScanReverse) {
 			return nil, storage.ErrInvalidScanPlan
 		}
@@ -105,9 +106,14 @@ func newVersionMerge(ctx context.Context, sources []*runVersionCursor, timestamp
 }
 
 func (cursor *mvccCursor) initialize(ctx context.Context) error {
-	for i := range cursor.heads {
+	for cursor.initIdx < len(cursor.heads) {
+		i := cursor.initIdx
 		version, err := cursor.heads[i].source.Next(ctx)
+		if err == errBlockZonePruned {
+			return errBlockZonePruned
+		}
 		if err == io.EOF {
+			cursor.initIdx++
 			continue
 		}
 		if err != nil {
@@ -115,6 +121,7 @@ func (cursor *mvccCursor) initialize(ctx context.Context) error {
 		}
 		cursor.heads[i].version = version
 		cursor.heap = append(cursor.heap, uint32(i))
+		cursor.initIdx++
 	}
 	for index := len(cursor.heap) / 2; index > 0; index-- {
 		cursor.down(index - 1)
@@ -128,7 +135,7 @@ func (cursor *mvccCursor) Next(ctx context.Context) (_ versionRow, err error) {
 		return versionRow{}, io.EOF
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && err != errBlockZonePruned {
 			err = iterationError(err, cursor.Close())
 		}
 	}()
@@ -202,6 +209,9 @@ func (cursor *mvccCursor) advanceHead(ctx context.Context) error {
 	head := &cursor.heads[cursor.heap[0]]
 	version, err := head.source.Next(ctx)
 	if err != nil {
+		if err == errBlockZonePruned {
+			return errBlockZonePruned
+		}
 		head.version = versionRow{}
 		if err != io.EOF {
 			return err

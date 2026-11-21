@@ -134,18 +134,6 @@ func (executor *routineExecutor) executeReenteredStatement(ctx context.Context, 
 	if request.Statement.Stmt.GetTransactionStmt() != nil {
 		return result, settingError("2D000", "invalid transaction termination")
 	}
-	var checkBatch func(context.Context, *columnar.Batch) error
-	hadReturning := true
-	if executor.options.RewriteStatement != nil {
-		var rewritten *zpgparse.RawStmt
-		rewritten, checkBatch, hadReturning, err = executor.options.RewriteStatement(ctx, request.Statement)
-		if err != nil {
-			return result, err
-		}
-		if rewritten != nil {
-			request.Statement = rewritten
-		}
-	}
 	execution := executor.execution
 	execution.Dependencies = nil
 	execution.Routines = nil
@@ -196,13 +184,6 @@ func (executor *routineExecutor) executeReenteredStatement(ctx context.Context, 
 	used := uint64(0)
 	consume := func(ctx context.Context, prepared *Prepared, rows *Rows) error {
 		columns := prepared.Columns()
-		if checkBatch != nil {
-			if !hadReturning {
-				columns = nil
-			} else if len(columns) > 0 {
-				columns = columns[:len(columns)-1]
-			}
-		}
 		result.Columns = make([]model.TypeLayout, len(columns))
 		result.ColumnNames = make([]string, len(columns))
 		for i := range columns {
@@ -216,9 +197,6 @@ func (executor *routineExecutor) executeReenteredStatement(ctx context.Context, 
 		for {
 			remaining := request.MaxRows - len(result.Rows)
 			batchLimit := min(remaining+1, columnar.DefaultBatchSize)
-			if checkBatch != nil && !hadReturning {
-				batchLimit = columnar.DefaultBatchSize
-			}
 			batch := columnar.Batch{MaxRows: batchLimit}
 			nextErr := rows.Next(ctx, &batch)
 			if nextErr == io.EOF {
@@ -226,14 +204,6 @@ func (executor *routineExecutor) executeReenteredStatement(ctx context.Context, 
 			}
 			if nextErr != nil {
 				return nextErr
-			}
-			if checkBatch != nil {
-				if err := checkBatch(ctx, &batch); err != nil {
-					return err
-				}
-				if !hadReturning {
-					continue
-				}
 			}
 			for rowIndex := range batch.Rows() {
 				if len(result.Rows) >= request.MaxRows {
@@ -405,12 +375,16 @@ func walkCatalogDiscovery(ctx context.Context, transaction *txn.Transaction, sto
 	if err != nil {
 		return nil, 0, identity, false, err
 	}
-	dependencies := append(slices.Clone(base), root)
+	roleRoot, err := store.NamespaceScanDependency(ctx, 0, model.ObjectRole)
+	if err != nil {
+		return nil, 0, identity, false, err
+	}
+	dependencies := append(slices.Clone(base), root, roleRoot)
 	// Execution resolves catalog objects by OID (regclass casts, sequence and
 	// introspection builtins, capability frames) through the OID index. Those
 	// OIDs are runtime values, so the index is declared whole; the descriptor
 	// rows it reports are declared per discovered object below.
-	if err := charge(dependencyBytes); err != nil {
+	if err := charge(2 * dependencyBytes); err != nil {
 		return nil, 0, identity, false, err
 	}
 	dependencies = append(dependencies, store.OIDScanDependency())
@@ -466,6 +440,11 @@ func walkCatalogDiscovery(ctx context.Context, transaction *txn.Transaction, sto
 		}
 		if position != len(schemas) {
 			return catalog.ErrDescriptorChanged
+		}
+		if err := snapshot.ScanNamespaceReferences(ctx, 0, model.ObjectRole, func(reference catalog.NamespaceReference) error {
+			return appendDescriptor(reference.ID)
+		}); err != nil {
+			return err
 		}
 		for _, schema := range schemas {
 			for _, kind := range catalogDiscoveryKinds {

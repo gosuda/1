@@ -8,12 +8,24 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
+
+const (
+	jobKindGuard              byte = 1
+	jobKindActive             byte = 2
+	jobKindDefinition         byte = 3
+	jobKindJobRetirement      byte = 4
+	jobKindOrdinaryRetirement byte = 5
+	jobKindTerminal           byte = 8
+)
+
+var errPruneBatchFull = errors.New("terminal job prune batch full")
 
 type JobReader interface {
 	Get(context.Context, storage.ReadRequest) (model.Row, error)
@@ -26,12 +38,20 @@ type JobStoreOptions struct {
 	BatchRows                            int
 }
 
+type jobStoreWatcher struct {
+	id   uint64
+	wake func()
+}
+
 // JobStore borrows Encoder and has no independent commit. Create/Update must be
 // composed with descriptor/policy changes inside the caller's atomic statement.
 // The composition root allocates Target; no new global ObjectID is reserved here.
 type JobStore struct {
-	options    JobStoreOptions
-	normalizer *txn.RowNormalizer
+	options     JobStoreOptions
+	normalizer  *txn.RowNormalizer
+	wakeMu      sync.Mutex
+	nextWatcher uint64
+	watchers    []jobStoreWatcher
 }
 
 func NewJobStore(ctx context.Context, options JobStoreOptions) (*JobStore, error) {
@@ -49,8 +69,10 @@ func NewJobStore(ctx context.Context, options JobStoreOptions) (*JobStore, error
 	if options.RecordBytes > uint64(math.MaxInt)/8 || options.MetadataBytes > uint64(math.MaxInt) || options.KeyBytes > options.RecordBytes {
 		return nil, ErrJobLimit
 	}
-	if _, err := options.Encoder.EncodePrefix(ctx, jobKeyLayout(), []model.Value{model.BytesVal(jobLogicalKey(2, math.MaxUint64))}, options.KeyBytes); err != nil {
-		return nil, err
+	for _, kind := range [...]byte{jobKindActive, jobKindTerminal} {
+		if _, err := options.Encoder.EncodePrefix(ctx, jobKeyLayout(), []model.Value{model.BytesVal(jobLogicalKey(kind, math.MaxUint64))}, options.KeyBytes); err != nil {
+			return nil, err
+		}
 	}
 	columns := jobColumns()
 	normalizer, err := txn.NewRowNormalizer(ctx, options.Target, []txn.ColumnRule{{Layout: columns[0], KeyPosition: 1}, {Layout: columns[1]}}, options.MetadataBytes)
@@ -59,6 +81,39 @@ func NewJobStore(ctx context.Context, options JobStoreOptions) (*JobStore, error
 	}
 	return &JobStore{options: options, normalizer: normalizer}, nil
 }
+
+func (s *JobStore) registerWake(wake func()) func() {
+	if s == nil || wake == nil {
+		return func() {}
+	}
+	s.wakeMu.Lock()
+	s.nextWatcher++
+	id := s.nextWatcher
+	s.watchers = append(s.watchers, jobStoreWatcher{id: id, wake: wake})
+	s.wakeMu.Unlock()
+	return func() {
+		s.wakeMu.Lock()
+		defer s.wakeMu.Unlock()
+		for i, watcher := range s.watchers {
+			if watcher.id == id {
+				s.watchers = slices.Delete(s.watchers, i, i+1)
+				return
+			}
+		}
+	}
+}
+
+func (s *JobStore) notifyWatchers() {
+	if s == nil {
+		return
+	}
+	s.wakeMu.Lock()
+	for _, watcher := range s.watchers {
+		watcher.wake()
+	}
+	s.wakeMu.Unlock()
+}
+
 func jobColumns() []storage.ColumnLayout {
 	typ := model.Type{ID: 17, Storage: model.TypeBytes}
 	return []storage.ColumnLayout{{ID: 1, Type: typ}, {ID: 2, Type: typ}}
@@ -135,28 +190,37 @@ func (s *JobStore) readLimit(ctx context.Context, reader JobReader, key []byte, 
 	}
 	return row.Values[0].BytesVal, nil
 }
-func (s *JobStore) Get(ctx context.Context, reader JobReader, id JobID) (Job, error) {
+func (s *JobStore) getWithKind(ctx context.Context, reader JobReader, id JobID) (Job, byte, error) {
 	if reader == nil || id == 0 {
-		return Job{}, ErrJobRecord
+		return Job{}, 0, ErrJobRecord
 	}
-	data, err := s.read(ctx, reader, jobLogicalKey(2, uint64(id)))
+	kind := jobKindActive
+	data, err := s.read(ctx, reader, jobLogicalKey(jobKindActive, uint64(id)))
+	if errors.Is(err, storage.ErrRowNotFound) {
+		kind = jobKindTerminal
+		data, err = s.read(ctx, reader, jobLogicalKey(jobKindTerminal, uint64(id)))
+	}
 	if err != nil {
-		return Job{}, err
+		return Job{}, 0, err
 	}
 	job, err := DecodeJob(ctx, data, s.options.RecordBytes)
 	if err != nil {
-		return Job{}, err
+		return Job{}, 0, err
 	}
-	if job.ID != id {
-		return Job{}, ErrJobRecord
+	if job.ID != id || (kind == jobKindTerminal && !job.Terminal()) {
+		return Job{}, 0, ErrJobRecord
 	}
-	return job, nil
+	return job, kind, nil
+}
+func (s *JobStore) Get(ctx context.Context, reader JobReader, id JobID) (Job, error) {
+	job, _, err := s.getWithKind(ctx, reader, id)
+	return job, err
 }
 func (s *JobStore) Active(ctx context.Context, reader JobReader, table model.ObjectID) (Job, error) {
 	if reader == nil || table == 0 {
 		return Job{}, ErrJobRecord
 	}
-	data, err := s.read(ctx, reader, jobLogicalKey(1, uint64(table)))
+	data, err := s.read(ctx, reader, jobLogicalKey(jobKindGuard, uint64(table)))
 	if err != nil {
 		return Job{}, err
 	}
@@ -220,14 +284,32 @@ func (s *JobStore) Update(ctx context.Context, transaction txn.MutationApplier, 
 	if active.ID != next.ID {
 		return ErrJobConflict
 	}
-	var mutations [2]storage.Mutation
-	mutations[0], err = s.mutation(ctx, storage.MutationUpdate, jobLogicalKey(2, uint64(next.ID)), payload)
+	if !next.Terminal() {
+		mutation, err := s.mutation(ctx, storage.MutationUpdate, jobLogicalKey(jobKindActive, uint64(next.ID)), payload)
+		if err != nil {
+			return err
+		}
+		return transaction.ApplyMutations(ctx, []storage.Mutation{mutation})
+	}
+	// Move completed/failed/canceled jobs out of the active job prefix (2) into
+	// the prunable terminal archive prefix (8) so active scans stay bounded by
+	// concurrent jobs rather than lifetime job count.
+	var mutations [4]storage.Mutation
+	mutations[0], err = s.mutation(ctx, storage.MutationDelete, jobLogicalKey(jobKindActive, uint64(next.ID)), nil)
 	if err != nil {
 		return err
 	}
-	count := 1
-	if next.Terminal() {
-		mutations[1], err = s.mutation(ctx, storage.MutationDelete, jobLogicalKey(1, uint64(next.TableID)), nil)
+	mutations[1], err = s.mutation(ctx, storage.MutationDelete, jobLogicalKey(jobKindGuard, uint64(next.TableID)), nil)
+	if err != nil {
+		return err
+	}
+	mutations[2], err = s.mutation(ctx, storage.MutationInsert, jobLogicalKey(jobKindTerminal, uint64(next.ID)), payload)
+	if err != nil {
+		return err
+	}
+	count := 3
+	if next.Kind != AddIndexJob {
+		mutations[3], err = s.mutation(ctx, storage.MutationDelete, jobLogicalKey(jobKindDefinition, uint64(next.ID)), nil)
 		if err != nil {
 			return err
 		}
@@ -236,10 +318,151 @@ func (s *JobStore) Update(ctx context.Context, transaction txn.MutationApplier, 
 	return transaction.ApplyMutations(ctx, mutations[:count])
 }
 
+// DeleteTerminalJob removes one terminal job record (and any leftover immutable
+// definition) once its protection has cleared and no retirement record remains.
+func (s *JobStore) DeleteTerminalJob(ctx context.Context, transaction txn.MutationApplier, id JobID) error {
+	if s == nil || s.normalizer == nil || transaction == nil || id == 0 {
+		return ErrJobRecord
+	}
+	job, kind, err := s.getWithKind(ctx, transaction, id)
+	if err != nil {
+		return err
+	}
+	if !job.Terminal() || job.ProtectedTimestamp != 0 {
+		return ErrJobTransition
+	}
+	switch _, _, retErr := s.retirements(ctx, transaction, id); {
+	case retErr == nil:
+		return ErrJobConflict
+	case !errors.Is(retErr, storage.ErrRowNotFound):
+		return retErr
+	}
+	return s.deletePrunableJobs(ctx, transaction, []prunableJob{{id: id, kind: kind, hasDefinition: job.Kind != AddIndexJob}})
+}
+
+type prunableJob struct {
+	id            JobID
+	kind          byte
+	hasDefinition bool
+}
+
+// PruneTerminalJobs deletes the oldest terminal jobs whose retirement work is
+// complete while retaining up to keepRecent most recent terminal job records.
+func (s *JobStore) PruneTerminalJobs(ctx context.Context, reader storage.SnapshotReader, transaction txn.MutationApplier, keepRecent uint64) (int, error) {
+	if s == nil || s.normalizer == nil || reader == nil || transaction == nil {
+		return 0, ErrJobRecord
+	}
+	batchLimit := max(s.options.MaxJobs, 64)
+	prunable, err := s.collectPrunableTerminalJobs(ctx, reader, keepRecent, batchLimit, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(prunable) == 0 {
+		return 0, nil
+	}
+	if err := s.deletePrunableJobs(ctx, transaction, prunable); err != nil {
+		return 0, err
+	}
+	return len(prunable), nil
+}
+
+func (s *JobStore) collectPrunableTerminalJobs(ctx context.Context, reader storage.SnapshotReader, keepRecent, batchLimit uint64, ignoreRetirements map[JobID]bool) ([]prunableJob, error) {
+	if batchLimit == 0 {
+		return nil, nil
+	}
+	windowCap := min(keepRecent, 64)
+	window := make([]prunableJob, 0, windowCap)
+	prunable := make([]prunableJob, 0, min(batchLimit, 64))
+	consider := func(candidate prunableJob) error {
+		if !ignoreRetirements[candidate.id] {
+			switch _, _, err := s.retirements(ctx, reader, candidate.id); {
+			case err == nil:
+				return nil
+			case !errors.Is(err, storage.ErrRowNotFound):
+				return err
+			}
+		}
+		prunable = append(prunable, candidate)
+		if uint64(len(prunable)) >= batchLimit {
+			return errPruneBatchFull
+		}
+		return nil
+	}
+	visit := func(kind byte, job Job) error {
+		if !job.Terminal() || job.ProtectedTimestamp != 0 {
+			return nil
+		}
+		entry := prunableJob{id: job.ID, kind: kind, hasDefinition: job.Kind != AddIndexJob}
+		if keepRecent == 0 {
+			return consider(entry)
+		}
+		window = append(window, entry)
+		if uint64(len(window)) <= keepRecent {
+			return nil
+		}
+		oldest := window[0]
+		copy(window, window[1:])
+		window = window[:len(window)-1]
+		return consider(oldest)
+	}
+	err := s.scanKind(ctx, reader, jobKindTerminal, false, func(job Job) error {
+		return visit(jobKindTerminal, job)
+	})
+	if errors.Is(err, errPruneBatchFull) {
+		return prunable, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Also prune any legacy terminal records left in prefix 2 by earlier releases.
+	err = s.scanKind(ctx, reader, jobKindActive, false, func(job Job) error {
+		if !job.Terminal() {
+			return nil
+		}
+		return visit(jobKindActive, job)
+	})
+	if errors.Is(err, errPruneBatchFull) {
+		return prunable, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return prunable, nil
+}
+
+func (s *JobStore) deletePrunableJobs(ctx context.Context, transaction txn.MutationApplier, jobs []prunableJob) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	mutations := make([]storage.Mutation, 0, len(jobs)*2)
+	for _, entry := range jobs {
+		delJob, err := s.mutation(ctx, storage.MutationDelete, jobLogicalKey(entry.kind, uint64(entry.id)), nil)
+		if err != nil {
+			return err
+		}
+		mutations = append(mutations, delJob)
+		if entry.hasDefinition {
+			delDef, err := s.mutation(ctx, storage.MutationDelete, jobLogicalKey(jobKindDefinition, uint64(entry.id)), nil)
+			if err != nil {
+				return err
+			}
+			mutations = append(mutations, delDef)
+		}
+	}
+	return transaction.ApplyMutations(ctx, mutations)
+}
+
 // Dependencies covers the job record, immutable definition, retirement record,
-// and active-table guard. Acquire it before composing job and descriptor mutations.
+// terminal archive record, and active-table guard. Acquire it before composing
+// job and descriptor mutations.
 func (s *JobStore) Dependencies(id JobID, table model.ObjectID) txn.ReadDependency {
-	keys := [][]byte{jobLogicalKey(1, uint64(table)), jobLogicalKey(2, uint64(id)), jobLogicalKey(3, uint64(id)), jobLogicalKey(4, uint64(id))}
+	keys := [][]byte{
+		jobLogicalKey(jobKindGuard, uint64(table)),
+		jobLogicalKey(jobKindActive, uint64(id)),
+		jobLogicalKey(jobKindDefinition, uint64(id)),
+		jobLogicalKey(jobKindJobRetirement, uint64(id)),
+		jobLogicalKey(jobKindTerminal, uint64(id)),
+	}
 	spans := make([]storage.KeySpan, len(keys))
 	for i, key := range keys {
 		bound := storage.KeyBound{Values: []model.Value{model.BytesVal(key)}, Inclusive: true}
@@ -248,13 +471,32 @@ func (s *JobStore) Dependencies(id JobID, table model.ObjectID) txn.ReadDependen
 	return txn.ReadDependency{Target: s.options.Target, KeyLayout: jobKeyLayout(), Spans: spans}
 }
 
-// Scan streams owned job records; callback ownership ends with this call unless
-// the callback retains a returned Job. Cursor and issued plan are always retired.
-func (s *JobStore) Scan(ctx context.Context, reader storage.SnapshotReader, visit func(Job) error) (err error) {
+// Scan streams owned active job records; callback ownership ends with this call
+// unless the callback retains a returned Job. Cursor and issued plan are always
+// retired. MaxJobs bounds active (non-terminal) jobs, not lifetime history.
+func (s *JobStore) Scan(ctx context.Context, reader storage.SnapshotReader, visit func(Job) error) error {
+	return s.scanKind(ctx, reader, jobKindActive, true, visit)
+}
+
+// ScanTerminal streams archived terminal job records in ascending JobID order.
+func (s *JobStore) ScanTerminal(ctx context.Context, reader storage.SnapshotReader, visit func(Job) error) error {
+	return s.scanKind(ctx, reader, jobKindTerminal, false, visit)
+}
+
+func (s *JobStore) scanKind(ctx context.Context, reader storage.SnapshotReader, kind byte, enforceActiveLimit bool, visit func(Job) error) (err error) {
 	if reader == nil || visit == nil {
 		return ErrJobRecord
 	}
-	request := storage.PushdownRequest{Target: s.options.Target, Layout: jobColumns(), KeyLayout: jobKeyLayout(), ColumnIDs: []model.ColumnID{1, 2}, Spans: []storage.KeySpan{{Lower: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{2})}, Inclusive: true}, Upper: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{3})}}}}}
+	request := storage.PushdownRequest{
+		Target:    s.options.Target,
+		Layout:    jobColumns(),
+		KeyLayout: jobKeyLayout(),
+		ColumnIDs: []model.ColumnID{1, 2},
+		Spans: []storage.KeySpan{{
+			Lower: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{kind})}, Inclusive: true},
+			Upper: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{kind + 1})}},
+		}},
+	}
 	plan, err := reader.PlanScan(ctx, request)
 	if plan.Binding != ([32]byte{}) {
 		defer func() { err = errors.Join(err, reader.ReleasePlan(plan)) }()
@@ -275,7 +517,7 @@ func (s *JobStore) Scan(ctx context.Context, reader storage.SnapshotReader, visi
 	if cursor == nil {
 		return storage.ErrInvalidScanPlan
 	}
-	var seen uint64
+	var activeSeen uint64
 	var previous JobID
 	batch := columnar.Batch{MaxRows: s.options.BatchRows}
 	defer batch.Reset()
@@ -297,9 +539,6 @@ func (s *JobStore) Scan(ctx context.Context, reader storage.SnapshotReader, visi
 			return columnar.ErrInvalidBatch
 		}
 		for row := range batch.Rows() {
-			if seen == s.options.MaxJobs {
-				return ErrJobLimit
-			}
 			lane := batch.Lane(row)
 			key, _, err := columnar.CopyValue(ctx, &batch.Columns[0], lane, s.options.KeyBytes)
 			if err != nil {
@@ -314,25 +553,34 @@ func (s *JobStore) Scan(ctx context.Context, reader storage.SnapshotReader, visi
 			if nullValue || wrongType {
 				return ErrJobRecord
 			}
-			if len(key.BytesVal) != 9 || key.BytesVal[0] != 2 {
+			if len(key.BytesVal) != 9 || key.BytesVal[0] != kind {
 				return ErrJobRecord
 			}
 			job, err := DecodeJob(ctx, value.BytesVal, s.options.RecordBytes)
 			if err != nil {
 				return err
 			}
-			if !bytes.Equal(key.BytesVal, jobLogicalKey(2, uint64(job.ID))) {
+			if !bytes.Equal(key.BytesVal, jobLogicalKey(kind, uint64(job.ID))) {
+				return ErrJobRecord
+			}
+			if kind == jobKindTerminal && !job.Terminal() {
 				return ErrJobRecord
 			}
 			if job.ID <= previous {
 				return ErrJobRecord
 			}
+			if enforceActiveLimit && !job.Terminal() {
+				if activeSeen == s.options.MaxJobs {
+					return ErrJobLimit
+				}
+				activeSeen++
+			}
 			previous = job.ID
 			if err := visit(job); err != nil {
 				return err
 			}
-			seen++
 		}
 		batch.Reset()
 	}
 }
+

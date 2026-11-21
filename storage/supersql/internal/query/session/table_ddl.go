@@ -118,6 +118,8 @@ func executeTableDeclaration(ctx context.Context, t *Transactions, options Table
 			}
 		}()
 		options.Binding.Bind.SearchPath = declarationSearchPath(t.settings.SearchPath(), options.Binding.SchemaContext)
+		options.Binding.Bind.CurrentRole = t.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = t.settings.SessionUser()
 		options.Binding.Owner = t.settings.Principal().OID()
 		options.Binding.Bind.Builtin = t.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = t.temporal

@@ -209,6 +209,9 @@ func (b *binder) modification(s *scope, target mutationTarget, input relation, k
 			return relation{}, err
 		}
 	}
+	if err := b.applyModifyRLS(s, target, kind, &spec, false, false); err != nil {
+		return relation{}, err
+	}
 	viewSteps, viewEffects, err := b.bindViewMutationSteps(s, target)
 	if err != nil {
 		return relation{}, err
@@ -532,7 +535,15 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 	if target.automatic() {
 		b.mutationProvenance = target.executionDescriptor.ID()
 	}
+	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	if target.executionDescriptor != nil {
+		b.rlsTargetID = target.executionDescriptor.ID()
+	} else {
+		b.rlsTargetID = target.descriptor.ID()
+	}
+	b.rlsTargetCommand = "UPDATE"
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
+	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return input, err
@@ -875,7 +886,15 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 	if target.automatic() {
 		b.mutationProvenance = target.executionDescriptor.ID()
 	}
+	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	if target.executionDescriptor != nil {
+		b.rlsTargetID = target.executionDescriptor.ID()
+	} else {
+		b.rlsTargetID = target.descriptor.ID()
+	}
+	b.rlsTargetCommand = "DELETE"
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
+	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return input, err

@@ -621,18 +621,25 @@ func emitPGViews(ctx context.Context, snapshot Snapshot, relation Relation, opti
 		default:
 			return &model.Error{Code: "XX000", Message: "relation metadata is unavailable"}
 		}
-		owner, err := principalName(ownerOID)
-		if err != nil {
-			return err
+		var owner string
+		var err error
+		if object.spec.Table != nil && object.spec.Table.OwnerName != "" {
+			owner = object.spec.Table.OwnerName
+		} else {
+			owner, err = principalName(ownerOID)
+			if err != nil {
+				return err
+			}
 		}
 		switch relation.ID {
 		case IDPgTables:
-			hasIndexes, hasTriggers := false, false
+			hasIndexes, hasTriggers, rowSecurity := false, false, false
 			if object.spec.Table != nil {
 				hasIndexes = len(object.spec.Table.Indexes) != 0
 				hasTriggers = len(object.spec.Table.Triggers) != 0
+				rowSecurity = object.spec.Table.RowSecurity
 			}
-			return emitCatalogRow(relation, emit, fv("schemaname", stringValue(object.schema.name)), fv("tablename", stringValue(object.spec.Name.Name)), fv("tableowner", stringValue(owner)), fv("hasindexes", boolValue(hasIndexes)), fv("hasrules", boolValue(false)), fv("hastriggers", boolValue(hasTriggers)), fv("rowsecurity", boolValue(false)))
+			return emitCatalogRow(relation, emit, fv("schemaname", stringValue(object.schema.name)), fv("tablename", stringValue(object.spec.Name.Name)), fv("tableowner", stringValue(owner)), fv("hasindexes", boolValue(hasIndexes)), fv("hasrules", boolValue(false)), fv("hastriggers", boolValue(hasTriggers)), fv("rowsecurity", boolValue(rowSecurity)))
 		case IDPgViews:
 			return emitCatalogRow(relation, emit, fv("schemaname", stringValue(object.schema.name)), fv("viewname", stringValue(object.spec.Name.Name)), fv("viewowner", stringValue(owner)), fv("definition", stringValue(object.spec.View.Definition)))
 		default:

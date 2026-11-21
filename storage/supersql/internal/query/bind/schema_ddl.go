@@ -130,6 +130,9 @@ func bindAlterTable(ctx context.Context, statement *zpgparse.AlterTableStmt, sna
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(table, int(rangeVar.Location)+1); err != nil {
+		return nil, err
+	}
 	if versionReserve == 0 || table.State() != model.StatePublic || table.Version() > math.MaxUint64-versionReserve || table.Physical().Generation == math.MaxUint64 {
 		return nil, bindError("55000", "table is not available for an online schema change", int(rangeVar.Location)+1)
 	}

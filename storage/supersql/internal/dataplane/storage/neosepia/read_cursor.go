@@ -78,7 +78,7 @@ func (cursor *readCursor) Next(ctx context.Context) (_ readRow, err error) {
 		return readRow{}, io.EOF
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && err != errBlockZonePruned {
 			err = iterationError(err, cursor.Close())
 		}
 	}()
@@ -92,6 +92,9 @@ func (cursor *readCursor) Next(ctx context.Context) (_ readRow, err error) {
 		}
 		if !cursor.baseReady && !cursor.baseDone {
 			cursor.committed, err = cursor.base.Next(ctx)
+			if err == errBlockZonePruned {
+				return readRow{}, errBlockZonePruned
+			}
 			if err != nil && err != io.EOF {
 				return readRow{}, err
 			}

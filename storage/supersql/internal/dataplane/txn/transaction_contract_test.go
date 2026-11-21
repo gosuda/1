@@ -543,43 +543,49 @@ func TestManagedSavepointRestoresReadAndWriteLocks(t *testing.T) {
 		if err := transaction.RollbackTo(t.Context(), mark); err != nil {
 			t.Fatal(err)
 		}
+		// Post-savepoint write lock on key 4 is released.
 		later := contractBegin(t, fixture.manager, options)
-		contractApply(t, later, write(3, 33), write(4, 44))
+		contractApply(t, later, write(4, 44))
 		contractCommit(t, later)
 		request.Key = contractKey(2)
 		contractValues(t, transaction, request, 20)
-		for _, key := range []int64{3, 4} {
-			request.Key = contractKey(key)
-			contractValues(t, transaction, request, key*11)
-		}
+		// Key 3 remains absent (Strict 2PL retained lockShare), while key 4 reflects later's commit.
+		request.Key = contractKey(3)
+		contractAbsent(t, transaction, request)
+		request.Key = contractKey(4)
+		contractValues(t, transaction, request, 44)
 		readCompetitor := contractBegin(t, fixture.manager, options)
 		writeCompetitor := contractBegin(t, fixture.manager, options)
-		readDone, writeDone := make(chan error, 1), make(chan error, 1)
+		postReadCompetitor := contractBegin(t, fixture.manager, options)
+		readDone, writeDone, postReadDone := make(chan error, 1), make(chan error, 1), make(chan error, 1)
 		go func() { readDone <- readCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(1, 91)}) }()
 		go func() { writeDone <- writeCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(2, 22)}) }()
+		go func() { postReadDone <- postReadCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(3, 33)}) }()
 		synctest.Wait()
-		for _, pending := range []<-chan error{readDone, writeDone} {
+		for _, pending := range []<-chan error{readDone, writeDone, postReadDone} {
 			select {
 			case err := <-pending:
-				t.Fatalf("rollback released a pre-savepoint lock: %v", err)
+				t.Fatalf("rollback released a retained lock: %v", err)
 			default:
 			}
 		}
 		if err := transaction.Rollback(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-readDone; err != nil {
-			t.Fatal(err)
-		}
-		if err := <-writeDone; err != nil {
-			t.Fatal(err)
+		for _, pending := range []<-chan error{readDone, writeDone, postReadDone} {
+			if err := <-pending; err != nil {
+				t.Fatal(err)
+			}
 		}
 		contractCommit(t, readCompetitor)
 		contractCommit(t, writeCompetitor)
+		contractCommit(t, postReadCompetitor)
 		current := contractBegin(t, fixture.manager, TransactionOptions{Mode: ReadOnly})
 		contractValues(t, current, fixture.request, 91)
 		request.Key = contractKey(2)
 		contractValues(t, current, request, 22)
+		request.Key = contractKey(3)
+		contractValues(t, current, request, 33)
 	})
 }
 

@@ -123,10 +123,10 @@ func statementFeature(message protoreflect.Message) FeatureID {
 		*zpgparse.CreateTableSpaceStmt, *zpgparse.DropTableSpaceStmt, *zpgparse.AlterTableSpaceOptionsStmt,
 		*zpgparse.AlterTableMoveAllStmt:
 		return ClusterAdmin
-	case *zpgparse.CreateRoleStmt, *zpgparse.AlterRoleStmt, *zpgparse.AlterRoleSetStmt, *zpgparse.DropRoleStmt,
-		*zpgparse.GrantStmt, *zpgparse.GrantRoleStmt, *zpgparse.AlterDefaultPrivilegesStmt,
+	case *zpgparse.AlterRoleSetStmt,
+		*zpgparse.GrantStmt, *zpgparse.AlterDefaultPrivilegesStmt,
 		*zpgparse.DropOwnedStmt, *zpgparse.ReassignOwnedStmt, *zpgparse.AlterOwnerStmt,
-		*zpgparse.CreatePolicyStmt, *zpgparse.AlterPolicyStmt, *zpgparse.SecLabelStmt:
+		*zpgparse.SecLabelStmt:
 		return Authorization
 	case *zpgparse.CreateExtensionStmt, *zpgparse.AlterExtensionStmt, *zpgparse.AlterExtensionContentsStmt,
 		*zpgparse.LoadStmt, *zpgparse.CreatePLangStmt, *zpgparse.CreateTransformStmt:
@@ -169,6 +169,9 @@ func statementFeature(message protoreflect.Message) FeatureID {
 			return PhysicalStorage
 		}
 		if node.Schemaname == "pg_catalog" {
+			if node.Relname == "pg_policies" {
+				return ""
+			}
 			return builtinRelationFeature("pg_catalog." + node.Relname)
 		}
 	case *zpgparse.CreateStmt:
@@ -283,6 +286,9 @@ func statementFeature(message protoreflect.Message) FeatureID {
 	case *zpgparse.VariableSetStmt:
 		return settingStatementFeature(node)
 	case *zpgparse.VariableShowStmt:
+		if strings.EqualFold(node.Name, "role") {
+			return ""
+		}
 		feature, _ := builtinSettingFeature(strings.ToLower(node.Name))
 		return feature
 	case *zpgparse.DefElem:
@@ -301,7 +307,7 @@ func objectKindFeature(kind zpgparse.ObjectType) FeatureID {
 	switch kind {
 	case zpgparse.ObjectType_OBJECT_DATABASE, zpgparse.ObjectType_OBJECT_TABLESPACE:
 		return ClusterAdmin
-	case zpgparse.ObjectType_OBJECT_ROLE, zpgparse.ObjectType_OBJECT_POLICY, zpgparse.ObjectType_OBJECT_DEFACL, zpgparse.ObjectType_OBJECT_PARAMETER_ACL:
+	case zpgparse.ObjectType_OBJECT_ROLE, zpgparse.ObjectType_OBJECT_DEFACL, zpgparse.ObjectType_OBJECT_PARAMETER_ACL:
 		return Authorization
 	case zpgparse.ObjectType_OBJECT_EXTENSION, zpgparse.ObjectType_OBJECT_LANGUAGE, zpgparse.ObjectType_OBJECT_TRANSFORM, zpgparse.ObjectType_OBJECT_TSPARSER, zpgparse.ObjectType_OBJECT_TSTEMPLATE:
 		return ExternalCode
@@ -323,7 +329,7 @@ func objectKindFeature(kind zpgparse.ObjectType) FeatureID {
 
 func alterTableFeature(kind zpgparse.AlterTableType) FeatureID {
 	switch kind {
-	case zpgparse.AlterTableType_AT_ChangeOwner, zpgparse.AlterTableType_AT_EnableRowSecurity, zpgparse.AlterTableType_AT_DisableRowSecurity, zpgparse.AlterTableType_AT_ForceRowSecurity, zpgparse.AlterTableType_AT_NoForceRowSecurity:
+	case zpgparse.AlterTableType_AT_ChangeOwner:
 		return Authorization
 	case zpgparse.AlterTableType_AT_SetTableSpace:
 		return ClusterAdmin

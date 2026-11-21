@@ -250,6 +250,9 @@ func TestUninstalledDurableBaseKeepsRecoveryInputsAndCollectionFence(t *testing.
 		if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, id, model.Timestamp(id)*10, 100-int64(id), 100+int64(id))); err != nil {
 			t.Fatal(err)
 		}
+		if err := fixture.backend.flushMemtableLocked(t.Context(), 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	reader := fixture.snapshot(t, 20).(*snapshotReader)
 	var retained []*runPin

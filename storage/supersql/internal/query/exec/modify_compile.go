@@ -132,6 +132,7 @@ func (c *invocation) modify(id physical.NodeID, node physical.NodeSpec, children
 	options.ConstraintTransaction = &c.portal.mutations
 	options.Encoder = c.portal.env.Keys
 	options.Parameters = c.portal.env.Parameters
+	options.BorrowParameters = true
 	options.Subqueries = c
 	options.Sequences = c.portal.env.Sequences
 	options.Relations = c.portal.env.Relations
@@ -268,6 +269,27 @@ func (c *invocation) modify(id physical.NodeID, node physical.NodeSpec, children
 		}
 		if needsLookup && options.Conflicts == nil {
 			return nil, &RequiredExecutionError{Node: id, Algorithm: node.Algorithm, Reason: "unique conflict owner lookup"}
+		}
+	}
+	options.RLSInsertCheck = nil
+	options.RLSUpdateCheck = nil
+	if relation.RLSRow != 0 {
+		info, ok := graph.Slot(relation.RLSRow)
+		if !ok {
+			return nil, ErrInvalid
+		}
+		rlsInputs := []physical.Slot{{Graph: node.Logical.Graph, ID: relation.RLSRow, Layout: info.Layout, Nullable: info.Nullable}}
+		if relation.RLSInsertCheck != 0 {
+			options.RLSInsertCheck, err = c.program(node.Logical.Graph, []ir.ScalarID{relation.RLSInsertCheck}, rlsInputs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if relation.RLSUpdateCheck != 0 {
+			options.RLSUpdateCheck, err = c.program(node.Logical.Graph, []ir.ScalarID{relation.RLSUpdateCheck}, rlsInputs)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	options.Returning = nil

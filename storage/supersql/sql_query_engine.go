@@ -12,10 +12,8 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
-// QueryMetrics reports per-statement execution counters. The native engine
-// does not maintain the legacy block-level counters; the fields remain part
-// of the QueryResult contract.
-type QueryMetrics struct {
+// queryMetrics reports per-statement execution counters for in-package tests.
+type queryMetrics struct {
 	ExecutionTimeMicros int64
 	BlocksScanned       int
 	BlocksPruned        int
@@ -23,21 +21,21 @@ type QueryMetrics struct {
 	RowsMatched         int
 }
 
-// QueryResult is the materialized result of one Execute call.
-type QueryResult struct {
+// queryResult is the materialized result of one in-package Execute call.
+type queryResult struct {
 	Columns       []string
 	IntegerBits   []uint8
 	HiddenColumns []bool
 	Rows          [][]any
 	RowsAffected  int
-	Metrics       QueryMetrics
+	Metrics       queryMetrics
 	Explain       string
 	Message       string
 }
 
 // String renders the result for display: the EXPLAIN text when present, the
 // command tag when there are no rows, otherwise the materialized row table.
-func (r *QueryResult) String() string {
+func (r *queryResult) String() string {
 	if r.Explain != "" {
 		return r.Explain
 	}
@@ -62,28 +60,21 @@ func (r *QueryResult) String() string {
 	return sb.String()
 }
 
-// SQLQueryEngine is a materializing convenience over the native session
-// pipeline. It executes SQL text against one catalog through a dedicated
-// session: one engine owns one session scope, so transactions, settings,
-// prepared statements and cursors persist across Execute calls exactly like a
-// database/sql connection. Rows are converted with the same model.Value mapping
-// the driver uses. It is not safe for concurrent use; concurrent callers create
-// one engine each or go through OpenConnector.
-type SQLQueryEngine struct {
+// sqlQueryEngine is an in-package materializing convenience over the native
+// session pipeline. Public callers use OpenConnector with database/sql.
+type sqlQueryEngine struct {
 	catalog *Catalog
 
 	mu    sync.Mutex
 	scope *sessionScope
 }
 
-// NewSQLQueryEngineWithCatalog returns an engine bound to catalog. The catalog
-// stays owned by its opener; the engine's session is established lazily on the
-// first Execute.
-func NewSQLQueryEngineWithCatalog(catalog *Catalog) *SQLQueryEngine {
-	return &SQLQueryEngine{catalog: catalog}
+// newSQLQueryEngineWithCatalog returns an in-package engine bound to catalog.
+func newSQLQueryEngineWithCatalog(catalog *Catalog) *sqlQueryEngine {
+	return &sqlQueryEngine{catalog: catalog}
 }
 
-func (engine *SQLQueryEngine) session(ctx context.Context) (*sessionScope, error) {
+func (engine *sqlQueryEngine) session(ctx context.Context) (*sessionScope, error) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.scope != nil {
@@ -101,16 +92,15 @@ func (engine *SQLQueryEngine) session(ctx context.Context) (*sessionScope, error
 }
 
 // Execute runs every statement in sqlText through the engine's session and
-// returns the last statement's materialized result. Parameters are not part of
-// this surface; callers needing $n arguments use OpenConnector.
-func (engine *SQLQueryEngine) Execute(ctx context.Context, sqlText string) (*QueryResult, error) {
+// returns the last statement's materialized result.
+func (engine *sqlQueryEngine) Execute(ctx context.Context, sqlText string) (*queryResult, error) {
 	return engine.executeParameters(ctx, sqlText, nil)
 }
 
 // executeParameters carries typed $n parameters into the session pipeline;
 // binding infers undeclared layouts and the session restates them against the
 // bound parameter list. Parameterized input is limited to one statement.
-func (engine *SQLQueryEngine) executeParameters(ctx context.Context, sqlText string, parameters []expr.ParameterValue) (*QueryResult, error) {
+func (engine *sqlQueryEngine) executeParameters(ctx context.Context, sqlText string, parameters []expr.ParameterValue) (*queryResult, error) {
 	scope, err := engine.session(ctx)
 	if err != nil {
 		return nil, err
@@ -129,35 +119,35 @@ func (engine *SQLQueryEngine) executeParameters(ctx context.Context, sqlText str
 	if len(parameters) != 0 && len(parsed.ParseResult.Stmts) != 1 {
 		return nil, &model.Error{Code: "42601", Message: "cannot insert multiple commands into a parameterized statement"}
 	}
-	var outcome Outcome
+	var out outcome
 	for index := range parsed.ParseResult.Stmts {
-		if outcome, err = database.execStatement(ctx, scope, parsed, index, parameters, 0, nil, nil); err != nil {
+		if out, err = database.execStatement(ctx, scope, parsed, index, parameters, 0, nil, nil); err != nil {
 			return nil, err
 		}
 	}
-	return engine.queryResult(outcome, scope)
+	return engine.queryResult(out, scope)
 }
 
-func (engine *SQLQueryEngine) queryResult(outcome Outcome, scope *sessionScope) (*QueryResult, error) {
-	columns := make([]bind.ResultColumn, len(outcome.Columns))
-	for index, column := range outcome.Columns {
-		columns[index] = bind.ResultColumn{Name: column.Name, Layout: column.Layout, Nullable: column.Nullable}
+func (engine *sqlQueryEngine) queryResult(out outcome, scope *sessionScope) (*queryResult, error) {
+	columns := make([]bind.ResultColumn, len(out.Columns))
+	for index, col := range out.Columns {
+		columns[index] = bind.ResultColumn{Name: col.Name, Layout: col.Layout, Nullable: col.Nullable}
 	}
 	builtins := scope.builtins()
-	if outcome.builtins.Types != nil {
-		builtins.Types = outcome.builtins.Types
+	if out.builtins.Types != nil {
+		builtins.Types = out.builtins.Types
 	}
 	rows := &queryRows{columns: columns, builtins: builtins}
-	result := &QueryResult{
+	result := &queryResult{
 		Columns:      rows.Columns(),
-		RowsAffected: int(outcome.RowsAffected),
-		Message:      outcome.Tag,
+		RowsAffected: int(out.RowsAffected),
+		Message:      out.Tag,
 	}
-	if len(outcome.Rows) == 0 {
+	if len(out.Rows) == 0 {
 		return result, nil
 	}
-	result.Rows = make([][]any, len(outcome.Rows))
-	for rowIndex, row := range outcome.Rows {
+	result.Rows = make([][]any, len(out.Rows))
+	for rowIndex, row := range out.Rows {
 		values := make([]any, len(row))
 		for index, value := range row {
 			converted, err := rows.driverValue(index, value)
@@ -172,7 +162,7 @@ func (engine *SQLQueryEngine) queryResult(outcome Outcome, scope *sessionScope) 
 }
 
 // Close releases the engine's session. The catalog stays open.
-func (engine *SQLQueryEngine) Close() error {
+func (engine *sqlQueryEngine) Close() error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.scope == nil {

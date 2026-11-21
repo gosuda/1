@@ -27,7 +27,11 @@ type pinnedScanCursor struct {
 
 // SourceBytes bounds source metadata and live blocks. Plan metadata, predicate
 // scratch, output selections and merge state have separate quotas.
-func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, direction storage.ScanDirection, spec paxScanSpec, limits pinnedScanLimits) (_ *pinnedScanCursor, err error) {
+func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, direction storage.ScanDirection, spec paxScanSpec, limits pinnedScanLimits) (*pinnedScanCursor, error) {
+	return pin.scanWithMem(ctx, nil, timestamp, direction, spec, limits)
+}
+
+func (pin *runPin) scanWithMem(ctx context.Context, mem *memtableSnapshot, timestamp model.Timestamp, direction storage.ScanDirection, spec paxScanSpec, limits pinnedScanLimits) (_ *pinnedScanCursor, err error) {
 	if direction != storage.ScanForward && direction != storage.ScanReverse {
 		return nil, storage.ErrInvalidScanPlan
 	}
@@ -49,9 +53,9 @@ func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, directio
 	observer := storage.ScanObserverFromContext(ctx)
 	if observer != nil {
 		observer.ObserveScan(storage.ScanObservation{
-			ReadBytes: storage.ObservationCount{Known: true},
+			ReadBytes:    storage.ObservationCount{Known: true},
 			DecodedBytes: storage.ObservationCount{Known: true},
-			BlocksRead: storage.ObservationCount{Known: true},
+			BlocksRead:   storage.ObservationCount{Known: true},
 			BlocksPruned: storage.ObservationCount{Known: true},
 			RangesPruned: storage.ObservationCount{Known: true},
 		})
@@ -68,7 +72,21 @@ func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, directio
 		return nil, columnar.ErrBatchBudget
 	}
 	perSource := metadata + sourceOverhead
+	var memBlocks []*memPAXBlock
+	if mem != nil && len(spec.Spans) != 0 && timestamp >= mem.firstCommitTS {
+		memBlockLimits := blockLimits{MaxRows: max(1, spec.MaxRows), MaxBytes: max(limits.BlockBytes, uint64(4<<20)), MaxDecodedBytes: max(limits.BlockBytes, uint64(16<<20))}
+		memBlocks, err = mem.targetBlocks(ctx, spec.Target, memBlockLimits)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var count uint64
+	if len(memBlocks) > 0 {
+		if ledgerBytes > sourceBytes || count >= (sourceBytes-ledgerBytes)/perSource {
+			return nil, columnar.ErrBatchBudget
+		}
+		count++
+	}
 	if len(spec.Spans) != 0 {
 		if err := retained.visitScanSources(ctx, timestamp, spec, nil, func(_ *sstFile, _ []*sstFile) error {
 			if count == uint64(math.MaxInt) || ledgerBytes > sourceBytes || count >= (sourceBytes-ledgerBytes)/perSource {
@@ -92,7 +110,10 @@ func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, directio
 			}
 		}
 	}()
-	if count != 0 {
+	if len(memBlocks) > 0 {
+		sources = append(sources, newMemVersionCursor(memBlocks, direction, limits.BlockBytes, memory))
+	}
+	if count != 0 && len(spec.Spans) != 0 {
 		if err := retained.visitScanSources(ctx, timestamp, spec, observer, func(file *sstFile, sequence []*sstFile) error {
 			if sequence != nil {
 				sources = append(sources, newRunSequenceCursor(sequence, spec.Target, spec.Spans, direction, limits.BlockBytes, limits.Reverse, memory))
@@ -119,6 +140,9 @@ func (pin *runPin) scan(ctx context.Context, timestamp model.Timestamp, directio
 		}); err != nil {
 			return nil, err
 		}
+	}
+	if spec.Predicate != nil && len(sources) > 0 {
+		attachScanZonePruning(sources, spec.Predicate)
 	}
 	visible, err := newMVCCCursor(ctx, sources, timestamp, limits.Merge, direction)
 	if err != nil {

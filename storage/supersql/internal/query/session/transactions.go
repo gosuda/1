@@ -456,7 +456,7 @@ func (transactions *Transactions) begin(ctx context.Context, start TransactionSt
 		readOnly := true
 		characteristics.ReadOnly = &readOnly
 	}
-	staged := *transactions.settings
+	staged := transactions.settings.cloneForStaging()
 	if err := staged.Begin(characteristics); err != nil {
 		return err
 	}
@@ -495,7 +495,7 @@ func (transactions *Transactions) begin(ctx context.Context, start TransactionSt
 		}
 		return err
 	}
-	*transactions.settings = staged
+	transactions.settings.commitStaged(staged)
 	transactions.active, transactions.transaction = true, transaction
 	transactions.generation++
 	clear(transactions.advisoryMarks)
@@ -520,11 +520,7 @@ func (transactions *Transactions) begin(ctx context.Context, start TransactionSt
 }
 
 func (transactions *Transactions) characteristics() transactionCharacteristics {
-	return transactionCharacteristics{
-		isolation:  transactions.settings.current[transactionIsolation].text,
-		readOnly:   transactions.settings.current[transactionReadOnly].flag,
-		deferrable: transactions.settings.current[transactionDeferrable].flag,
-	}
+	return transactions.settings.transactionCharacteristics()
 }
 
 func (transactions *Transactions) Commit(ctx context.Context, chain bool) (EndResult, error) {
@@ -703,7 +699,7 @@ func (transactions *Transactions) savepoint(ctx context.Context, name string) er
 	if err := transactions.ordinary(); err != nil {
 		return err
 	}
-	if len(transactions.savepoints) != len(transactions.settings.savepoints) || len(transactions.savepoints) != len(transactions.advisoryMarks) || len(transactions.savepoints) != len(transactions.deferredMarks) || len(transactions.savepoints) != len(transactions.deferredConstraintMarks) || len(transactions.savepoints) != len(transactions.constraintSavepoints) || len(transactions.savepoints) != len(transactions.cursorSavepoints) || len(transactions.savepoints) != len(transactions.named.temporaryMarks) {
+	if len(transactions.savepoints) != transactions.settings.savepointCount() || len(transactions.savepoints) != len(transactions.advisoryMarks) || len(transactions.savepoints) != len(transactions.deferredMarks) || len(transactions.savepoints) != len(transactions.deferredConstraintMarks) || len(transactions.savepoints) != len(transactions.constraintSavepoints) || len(transactions.savepoints) != len(transactions.cursorSavepoints) || len(transactions.savepoints) != len(transactions.named.temporaryMarks) {
 		return transactions.abortPair(errSessionTransactionState)
 	}
 	if err := transactions.settings.Savepoint(name); err != nil {
@@ -744,11 +740,11 @@ func (transactions *Transactions) namedSavepoint(name string) (int, error) {
 	if name == "" || !transactions.settings.validString(name) {
 		return 0, settingError("22023", "invalid savepoint name")
 	}
-	index, err := transactions.settings.savepointIndex(name)
+	index, err := transactions.settings.findSavepointIndex(name)
 	if err != nil {
 		return 0, err
 	}
-	if len(transactions.savepoints) != len(transactions.settings.savepoints) || len(transactions.savepoints) != len(transactions.advisoryMarks) || len(transactions.savepoints) != len(transactions.deferredMarks) || len(transactions.savepoints) != len(transactions.deferredConstraintMarks) || len(transactions.savepoints) != len(transactions.constraintSavepoints) || len(transactions.savepoints) != len(transactions.cursorSavepoints) || len(transactions.savepoints) != len(transactions.named.temporaryMarks) || index >= len(transactions.savepoints) {
+	if len(transactions.savepoints) != transactions.settings.savepointCount() || len(transactions.savepoints) != len(transactions.advisoryMarks) || len(transactions.savepoints) != len(transactions.deferredMarks) || len(transactions.savepoints) != len(transactions.deferredConstraintMarks) || len(transactions.savepoints) != len(transactions.constraintSavepoints) || len(transactions.savepoints) != len(transactions.cursorSavepoints) || len(transactions.savepoints) != len(transactions.named.temporaryMarks) || index >= len(transactions.savepoints) {
 		return 0, transactions.abortPair(errSessionTransactionState)
 	}
 	return index, nil
@@ -1069,6 +1065,47 @@ func (transactions *Transactions) Close() error {
 	}
 	transactions.closeReturned = true
 	return transactions.closeError
+}
+
+// ResetSessionObjects discards all session-scoped objects (held cursors, SQL
+// prepared statements, session-level advisory locks, and temporary relations)
+// so a pooled connection returns to the pool completely clean. When no
+// temporary objects exist, it completes in O(1) without opening a transaction.
+func (transactions *Transactions) ResetSessionObjects(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return sessionTransactionError(err)
+	}
+	select {
+	case transactions.gate <- struct{}{}:
+	case <-ctx.Done():
+		return sessionTransactionError(ctx.Err())
+	}
+	if transactions.closed || context.Cause(transactions.life) != nil || transactions.active || transactions.indexSubmission != nil || transactions.sequences.blocked() || transactions.fence != nil {
+		<-transactions.gate
+		return errSessionTransactionState
+	}
+	var resetErr error
+	if len(transactions.named.cursors) != 0 || len(transactions.named.prepared) != 0 {
+		resetErr = errors.Join(resetErr, transactions.closeNamedObjects())
+	}
+	if transactions.advisory.Manager != nil {
+		transactions.advisory.Manager.UnlockAllSession(transactions.advisory.SessionID)
+	}
+	hasTemporary := len(transactions.named.temporary) != 0 || transactions.named.options.DiscardTemporary != nil
+	<-transactions.gate
+	if !hasTemporary {
+		return resetErr
+	}
+	operation, finish, err := transactions.enter(ctx)
+	if err != nil {
+		return errors.Join(resetErr, err)
+	}
+	defer finish()
+	if transactions.active {
+		return errors.Join(resetErr, errSessionTransactionState)
+	}
+	_, temporaryErr := transactions.discardTemporary(operation)
+	return errors.Join(resetErr, temporaryErr)
 }
 
 type sessionTimeout struct {

@@ -9,9 +9,10 @@ import (
 var errOverlayCheckpoint = errors.New("overlay checkpoint belongs to another transaction")
 
 type overlayCheckpoint struct {
-	owner   *Overlay
-	state   overlayState
-	ordinal uint64
+	owner                     *Overlay
+	state                     overlayState
+	ordinal                   uint64
+	payloadBytes, inlineBytes uint64
 }
 
 func (overlay *Overlay) checkpoint() (overlayCheckpoint, error) {
@@ -20,7 +21,13 @@ func (overlay *Overlay) checkpoint() (overlayCheckpoint, error) {
 	if overlay.closed {
 		return overlayCheckpoint{}, storage.ErrClosed
 	}
-	return overlayCheckpoint{owner: overlay, state: overlay.state, ordinal: overlay.lastOrdinal}, nil
+	return overlayCheckpoint{
+		owner:        overlay,
+		state:        overlay.state,
+		ordinal:      overlay.lastOrdinal,
+		payloadBytes: overlay.payloadBytes,
+		inlineBytes:  overlay.inlineBytes,
+	}, nil
 }
 
 // The transaction validates savepoint branch membership through its mutation log
@@ -40,8 +47,9 @@ func (overlay *Overlay) restore(checkpoint overlayCheckpoint) error {
 	if overlay.lastOrdinal != checkpoint.ordinal {
 		overlay.catalogVersion++
 	}
-	overlay.state, overlay.lastOrdinal = checkpoint.state, checkpoint.ordinal
-	// Discarded nodes can still belong to frozen views; retain the conservative
-	// allocation charge until the overlay closes rather than undercount live data.
+	overlay.state = checkpoint.state
+	overlay.lastOrdinal = checkpoint.ordinal
+	overlay.payloadBytes = checkpoint.payloadBytes
+	overlay.inlineBytes = checkpoint.inlineBytes
 	return nil
 }

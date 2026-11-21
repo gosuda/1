@@ -38,7 +38,7 @@ func (transactions *Transactions) indexAutocommit() error {
 	if transactions.settings.InTransaction() {
 		return transactions.abortPair(errSessionTransactionState)
 	}
-	staged := *transactions.settings
+	staged := transactions.settings.cloneForStaging()
 	if err := staged.Begin(BeginOptions{}); err != nil {
 		return err
 	}

@@ -55,11 +55,139 @@ func (o *optimizer) inventory() {
 			continue
 		}
 		outputs := allocate[model.SlotID](o, uint64(r.OutputCount()))
+		if o.err != nil {
+			return
+		}
 		for i := range outputs {
 			outputs[i], _ = o.graph.Output(id, uint32(i))
 		}
 		o.propagateScanPredicate(child, r.Predicate, outputs, parents, 0)
 	}
+	for id := ir.RelID(1); id <= ir.RelID(o.graph.RelCount()) && o.step(1); id++ {
+		r, _ := o.graph.Rel(id)
+		if r.Kind != ir.Join || r.Predicate == 0 || r.InputCount() != 2 || r.SecurityBarrier || r.Effects.Volatility != ir.Immutable || r.Effects.MayError {
+			continue
+		}
+		pushLeft, pushRight := false, false
+		switch r.JoinKind {
+		case ir.InnerJoin, ir.SemiJoin:
+			pushLeft, pushRight = true, true
+		case ir.LeftJoin, ir.AntiJoin:
+			pushRight = true
+		case ir.RightJoin:
+			pushLeft = true
+		}
+		if pushLeft {
+			o.propagateJoinOnPredicate(id, 0, r.Predicate, parents, 0)
+		}
+		if pushRight {
+			o.propagateJoinOnPredicate(id, 1, r.Predicate, parents, 0)
+		}
+	}
+}
+
+func (o *optimizer) propagateJoinOnPredicate(joinID ir.RelID, inputIndex uint32, predicate ir.ScalarID, parents []uint32, depth uint32) {
+	child, ok := o.graph.Input(joinID, inputIndex)
+	if !ok || child == 0 || parents[child] != 1 {
+		return
+	}
+	childRel, _ := o.graph.Rel(child)
+	childSlots := allocate[model.SlotID](o, uint64(childRel.OutputCount()))
+	if o.err != nil {
+		return
+	}
+	for i := range childSlots {
+		childSlots[i], _ = o.graph.Output(child, uint32(i))
+	}
+	childPredicate := o.filterPredicateForOutputs(predicate, childSlots, 0)
+	if childPredicate == 0 {
+		return
+	}
+	o.propagateScanPredicate(child, childPredicate, childSlots, parents, depth+1)
+}
+
+func (o *optimizer) propagateJoinChildPredicate(joinID ir.RelID, inputIndex uint32, predicate ir.ScalarID, outputs []model.SlotID, parents []uint32, depth uint32) {
+	child, ok := o.graph.Input(joinID, inputIndex)
+	if !ok || child == 0 || parents[child] != 1 {
+		return
+	}
+	leftID, _ := o.graph.Input(joinID, 0)
+	leftRel, _ := o.graph.Rel(leftID)
+	childRel, _ := o.graph.Rel(child)
+	offset := uint32(0)
+	if inputIndex == 1 {
+		offset = leftRel.OutputCount()
+	}
+	if uint64(offset)+uint64(childRel.OutputCount()) > uint64(len(outputs)) {
+		return
+	}
+	mapped := allocate[model.SlotID](o, uint64(childRel.OutputCount()))
+	if o.err != nil {
+		return
+	}
+	for k := range childRel.OutputCount() {
+		mapped[k] = outputs[offset+k]
+	}
+	childPredicate := o.filterPredicateForOutputs(predicate, mapped, 0)
+	if childPredicate == 0 {
+		return
+	}
+	o.propagateScanPredicate(child, childPredicate, mapped, parents, depth)
+}
+
+func (o *optimizer) scalarUsesOnlySlots(id ir.ScalarID, allowed []model.SlotID, depth uint32) (usesOnly bool, refsSlot bool) {
+	if id == 0 || depth >= o.options.IR.MaxDepth || !o.step(1) {
+		return false, false
+	}
+	s, ok := o.graph.Scalar(id)
+	if !ok || s.Effects.Volatility != ir.Immutable || s.Effects.MayError || s.Kind == ir.Subquery {
+		return false, false
+	}
+	if s.Kind == ir.Slot {
+		if s.Slot == 0 || !slices.Contains(allowed, s.Slot) {
+			return false, true
+		}
+		return true, true
+	}
+	for i := range s.OperandCount() {
+		child, _ := o.graph.Operand(id, i)
+		okChild, childRefs := o.scalarUsesOnlySlots(child, allowed, depth+1)
+		if !okChild {
+			return false, refsSlot || childRefs
+		}
+		refsSlot = refsSlot || childRefs
+	}
+	return true, refsSlot
+}
+
+func (o *optimizer) filterPredicateForOutputs(predicate ir.ScalarID, allowed []model.SlotID, depth uint32) ir.ScalarID {
+	if predicate == 0 || depth >= o.options.IR.MaxDepth || !o.step(1) {
+		return 0
+	}
+	if usesOnly, refsSlot := o.scalarUsesOnlySlots(predicate, allowed, 0); usesOnly && refsSlot {
+		return predicate
+	}
+	s, ok := o.graph.Scalar(predicate)
+	if !ok || s.Kind != ir.Bool || s.BoolOp != ir.And {
+		return 0
+	}
+	var match ir.ScalarID
+	count := 0
+	for i := range s.OperandCount() {
+		child, _ := o.graph.Operand(predicate, i)
+		sub := o.filterPredicateForOutputs(child, allowed, depth+1)
+		if sub != 0 {
+			match = sub
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	if count == 1 {
+		return match
+	}
+	return predicate
 }
 
 func (o *optimizer) propagateScanPredicate(id ir.RelID, predicate ir.ScalarID, outputs []model.SlotID, parents []uint32, depth uint32) {
@@ -75,8 +203,13 @@ func (o *optimizer) propagateScanPredicate(id ir.RelID, predicate ir.ScalarID, o
 	}
 	switch relation.Kind {
 	case ir.Scan:
-		o.predicates[id] = predicate
-		o.predicateSlots[id] = outputs
+		if o.predicates[id] == 0 {
+			o.predicates[id] = predicate
+			o.predicateSlots[id] = outputs
+		}
+	case ir.Filter:
+		child, _ := o.graph.Input(id, 0)
+		o.propagateScanPredicate(child, predicate, outputs, parents, depth+1)
 	case ir.SetOp:
 		for i := range relation.InputCount() {
 			child, _ := o.graph.Input(id, i)
@@ -86,6 +219,9 @@ func (o *optimizer) propagateScanPredicate(id ir.RelID, predicate ir.ScalarID, o
 		child, _ := o.graph.Input(id, 0)
 		input, _ := o.graph.Rel(child)
 		mapped := allocate[model.SlotID](o, uint64(input.OutputCount()))
+		if o.err != nil {
+			return
+		}
 		for i := range outputs {
 			output, _ := o.graph.Output(id, uint32(i))
 			for j := range relation.BindingCount() {
@@ -108,6 +244,27 @@ func (o *optimizer) propagateScanPredicate(id ir.RelID, predicate ir.ScalarID, o
 			}
 		}
 		o.propagateScanPredicate(child, predicate, mapped, parents, depth+1)
+	case ir.Join:
+		if relation.InputCount() != 2 {
+			return
+		}
+		// Only push predicates from above a join onto sides preserved without
+		// NULL-extension by the join semantics.
+		pushLeft, pushRight := false, false
+		switch relation.JoinKind {
+		case ir.InnerJoin, ir.CrossJoin:
+			pushLeft, pushRight = true, true
+		case ir.LeftJoin, ir.SemiJoin, ir.AntiJoin, ir.MarkJoin:
+			pushLeft = true
+		case ir.RightJoin:
+			pushRight = true
+		}
+		if pushLeft {
+			o.propagateJoinChildPredicate(id, 0, predicate, outputs, parents, depth+1)
+		}
+		if pushRight {
+			o.propagateJoinChildPredicate(id, 1, predicate, outputs, parents, depth+1)
+		}
 	}
 }
 func (o *optimizer) base(id ir.RelID) physical.NodeSpec {

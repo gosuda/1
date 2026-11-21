@@ -118,6 +118,8 @@ func ExecuteTypeCommand(ctx context.Context, transactions *Transactions, node *z
 			return settingError("25006", "cannot execute type DDL in a read-only transaction")
 		}
 		options.Binding.Bind.SearchPath = transactions.settings.SearchPath()
+		options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 		options.Binding.Owner = transactions.settings.Principal().OID()
 		options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = transactions.temporal

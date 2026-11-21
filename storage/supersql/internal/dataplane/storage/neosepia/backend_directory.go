@@ -97,12 +97,12 @@ func stateMagicPrefix(root *os.Root, name string, partial bool) (_ bool, err err
 	var magic [len(databaseStateMagic)]byte
 	count, readErr := io.ReadFull(file, magic[:])
 	if partial && (readErr == io.EOF || readErr == io.ErrUnexpectedEOF) {
-		return bytes.Equal(magic[:count], []byte(databaseStateMagic)[:count]), nil
+		return bytes.Equal(magic[:count], []byte(databaseStateMagic)[:count]) || bytes.Equal(magic[:count], []byte("NSDB0001")[:count]), nil
 	}
 	if readErr != nil {
 		return false, readErr
 	}
-	return string(magic[:]) == databaseStateMagic, nil
+	return string(magic[:]) == databaseStateMagic || string(magic[:]) == "NSDB0001", nil
 }
 
 func emptyNativeDirectory(root *os.Root, name string) (_ bool, err error) {

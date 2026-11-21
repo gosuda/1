@@ -25,8 +25,27 @@ func (s *Spool) encode(ctx context.Context, row []model.Value) ([]byte, error) {
 	if err := validateRow(ctx, row, s.layouts); err != nil {
 		return nil, err
 	}
+	composite := model.Value{Type: model.TypeComposite, ArrayVal: row}
 	writer := frameWriter{data: s.scratch, used: frameHeaderBytes}
-	if err := storage.EncodeValue(ctx, &writer, model.Value{Type: model.TypeComposite, ArrayVal: row}, s.limits.MaxRecordBytes-frameHeaderBytes); err != nil {
+	err := storage.EncodeValue(ctx, &writer, composite, uint64(len(s.scratch))-frameHeaderBytes)
+	if err != nil && s.limits.MaxLargeRecordBytes > uint64(len(s.scratch)) {
+		var counter countWriter
+		if measureErr := storage.EncodeValue(ctx, &counter, composite, s.limits.MaxLargeRecordBytes-frameHeaderBytes); measureErr == nil {
+			needed := uint64(counter) + frameHeaderBytes
+			if needed > uint64(len(s.scratch)) {
+				reserve := max(uint64(s.appendClaim.Bytes()), needed+s.limits.DecodeBytes+codecScratchBytes)
+				if resizeErr := s.appendClaim.Resize(int64(reserve)); resizeErr != nil {
+					return nil, resizeErr
+				}
+				s.scratch = make([]byte, int(needed))
+				writer = frameWriter{data: s.scratch, used: frameHeaderBytes}
+				err = storage.EncodeValue(ctx, &writer, composite, uint64(len(s.scratch))-frameHeaderBytes)
+			}
+		} else {
+			err = measureErr
+		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	frame := writer.data[:writer.used]
@@ -37,6 +56,13 @@ func (s *Spool) encode(ctx context.Context, row []model.Value) ([]byte, error) {
 	binary.LittleEndian.PutUint32(frame[24:28], crc32.ChecksumIEEE(frame[frameHeaderBytes:]))
 	binary.LittleEndian.PutUint32(frame[28:32], crc32.ChecksumIEEE(frame[:28]))
 	return frame, context.Cause(ctx)
+}
+
+type countWriter uint64
+
+func (w *countWriter) Write(data []byte) (int, error) {
+	*w += countWriter(len(data))
+	return len(data), nil
 }
 
 type frameWriter struct {

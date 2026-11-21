@@ -28,6 +28,7 @@ type Options struct {
 	// SearchPath contains exact normalized namespace names, not SQL fragments.
 	SearchPath       []string
 	CurrentRole      string
+	SessionUser      string
 	Collation        model.CollationID
 	DefaultCollation model.CollationID
 	// Builtin captures input-codec settings while SQL literals are bound.
@@ -338,6 +339,13 @@ type binder struct {
 	allowWindowKeySRF   bool
 	procedureCall       bool
 	mutationProvenance  model.ObjectID
+	rlsStack            map[model.ObjectID]bool
+	rlsRoles            map[string]model.RoleMetadata
+	rlsRolesLoaded      bool
+	rlsTargetID         model.ObjectID
+	rlsTargetCommand    string
+	rlsMergeHasUpdate   bool
+	rlsMergeHasDelete   bool
 }
 
 func bindError(code, message string, position int) error {

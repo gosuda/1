@@ -422,6 +422,10 @@ func bindRoutineSetting(b *binder, statement *zpgparse.VariableSetStmt, current 
 	if statement == nil || statement.Name == "" || statement.IsLocal {
 		return model.RoutineSetting{}, bindError("42601", "invalid routine SET option", 0)
 	}
+	switch strings.ToLower(strings.TrimSpace(statement.Name)) {
+	case "supersql.active_role", "supersql.session_user", "role", "session_authorization":
+		return model.RoutineSetting{}, bindError("42501", "permission denied to set parameter \""+statement.Name+"\" in routine configuration", int(statement.Location)+1)
+	}
 	if err := ValidateSetting(statement.Name, int(statement.Location)+1); err != nil {
 		return model.RoutineSetting{}, err
 	}

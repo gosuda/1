@@ -114,10 +114,10 @@ func (transaction *Transaction) Get(ctx context.Context, request storage.ReadReq
 		}
 		if transaction.mode == ReadWrite {
 			if err := transaction.lockIntent(operation, request.Target); err != nil {
-				return model.Row{}, transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+				return model.Row{}, transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 			}
 			if _, err := transaction.manager.locks.acquire(operation, transaction.owner, pointLock(request.Target, request.Key), lockShare, lockWait); err != nil {
-				err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+				err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 				return model.Row{}, transactionError(err)
 			}
 		}
@@ -125,7 +125,7 @@ func (transaction *Transaction) Get(ctx context.Context, request storage.ReadReq
 	result, err := transaction.snapshot(operation)
 	if err != nil {
 		if position.owner != nil {
-			err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+			err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 		}
 		return model.Row{}, transactionError(err)
 	}
@@ -137,7 +137,7 @@ func (transaction *Transaction) Get(ctx context.Context, request storage.ReadReq
 		return row, nil
 	}
 	if position.owner != nil && (!errors.Is(getErr, storage.ErrRowNotFound) || closeErr != nil) {
-		err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+		err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 	}
 	return model.Row{}, transactionError(err)
 }
@@ -305,7 +305,7 @@ func (transaction *Transaction) readView(ctx context.Context, dependencies []Rea
 	if err != nil || !acquired {
 		transaction.resources.Add(-1)
 		if position.owner != nil {
-			err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+			err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 		}
 		return nil, false, transactionError(err)
 	}
@@ -314,7 +314,7 @@ func (transaction *Transaction) readView(ctx context.Context, dependencies []Rea
 	if err := transaction.viewSpace.charge(used); err != nil {
 		transaction.resources.Add(-1)
 		if position.owner != nil {
-			err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+			err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 		}
 		return nil, false, err
 	}
@@ -323,7 +323,7 @@ func (transaction *Transaction) readView(ctx context.Context, dependencies []Rea
 		transaction.resources.Add(-1)
 		transaction.viewSpace.release(used)
 		if position.owner != nil {
-			err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+			err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 		}
 		return nil, false, transactionError(err)
 	}
@@ -332,7 +332,7 @@ func (transaction *Transaction) readView(ctx context.Context, dependencies []Rea
 		transaction.resources.Add(-1)
 		transaction.viewSpace.release(used)
 		if position.owner != nil {
-			err = errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position))
+			err = errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position))
 		}
 		return nil, false, errors.Join(errTransactionBudget, err, reader.Close())
 	}

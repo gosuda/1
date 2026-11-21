@@ -19,7 +19,34 @@ type transactionCheckpoint struct {
 type transactionMark struct {
 	transaction *Transaction
 	checkpoint  transactionCheckpoint
+	charge      uint64
 	valid       bool
+}
+
+// lifecycleAbortError wraps a lock-rollback failure caused by a concurrent
+// transaction abort (wound, Rollback, Close, or manager shutdown). Full abort
+// cleanup releases all locks via locks.release, so rollbackStatement must not
+// record this error in manager.transactionCloseError.
+type lifecycleAbortError struct {
+	cause error
+}
+
+func (e *lifecycleAbortError) Error() string { return e.cause.Error() }
+func (e *lifecycleAbortError) Unwrap() error { return e.cause }
+
+func (transaction *Transaction) isLifecycleAbortError(err error) bool {
+	if errors.Is(err, errLockWounded) {
+		return true
+	}
+	if cause := context.Cause(transaction.life); cause != nil {
+		if errors.Is(err, cause) || errors.Is(err, errLockOwnerState) {
+			return true
+		}
+	}
+	if transaction.State() != Active && errors.Is(err, errLockOwnerState) {
+		return true
+	}
+	return false
 }
 
 // Savepoint is an opaque retained-branch mark. Copying it preserves identity.
@@ -50,14 +77,15 @@ func (transaction *Transaction) checkpoint() (transactionCheckpoint, error) {
 
 func (transaction *Transaction) restore(ctx context.Context, position transactionCheckpoint) error {
 	if transaction.log != nil {
-		// Validate the log's retained branch before publishing an older overlay root.
-		if err := transaction.log.rollback(ctx, position.log); err != nil {
+		// Validate the log's retained branch before closing views or truncating frames.
+		if err := transaction.log.validatePosition(ctx, position.log); err != nil {
 			return err
 		}
 	}
 	err := transaction.closeViews(position.views)
 	transaction.publications.rollback(position.ordinal)
 	if transaction.log != nil {
+		err = errors.Join(err, transaction.log.rollback(ctx, position.log))
 		err = errors.Join(err, transaction.overlay.restore(position.overlay))
 	}
 	if err != nil {
@@ -71,12 +99,19 @@ func (transaction *Transaction) restore(ctx context.Context, position transactio
 	for _, mark := range transaction.marks[position.marks:] {
 		mark.valid = false
 		mark.checkpoint = transactionCheckpoint{}
+		transaction.metadataUsed -= mark.charge
+		mark.charge = 0
 	}
 	clear(transaction.marks[position.marks:])
 	transaction.marks = transaction.marks[:position.marks]
-	// Slice capacity and caller-held invalid savepoint handles remain charged.
+	if len(transaction.marks) == 0 && cap(transaction.marks) > 64 {
+		transaction.marks = nil
+	}
 	if transaction.owner != nil {
 		if err := transaction.manager.locks.rollback(transaction.owner, position.locks); err != nil {
+			if transaction.isLifecycleAbortError(err) {
+				return &lifecycleAbortError{cause: err}
+			}
 			return err
 		}
 	}
@@ -104,7 +139,7 @@ func (transaction *Transaction) Savepoint(ctx context.Context) (Savepoint, error
 	if err != nil {
 		return Savepoint{}, transactionError(err)
 	}
-	mark := &transactionMark{transaction: transaction, checkpoint: position, valid: true}
+	mark := &transactionMark{transaction: transaction, checkpoint: position, charge: charge, valid: true}
 	transaction.marks = append(transaction.marks, mark)
 	mark.checkpoint.marks = len(transaction.marks)
 	transaction.metadataUsed += charge
@@ -168,8 +203,13 @@ func (transaction *Transaction) ReleaseSavepoint(ctx context.Context, savepoint 
 	for _, released := range transaction.marks[index:] {
 		released.valid = false
 		released.checkpoint = transactionCheckpoint{}
+		transaction.metadataUsed -= released.charge
+		released.charge = 0
 	}
 	clear(transaction.marks[index:])
 	transaction.marks = transaction.marks[:index]
+	if len(transaction.marks) == 0 && cap(transaction.marks) > 64 {
+		transaction.marks = nil
+	}
 	return nil
 }

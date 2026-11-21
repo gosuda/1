@@ -138,7 +138,7 @@ func (c *cursor) projectViewRow(ctx context.Context, row *model.Row, enforce, ou
 		}
 		next := step.outputValues[bank]
 		for j := range next {
-			value, _, err := columnar.CopyValue(ctx, &projected.Columns[j], projected.Lane(0), c.options.MaxRecordBytes)
+			value, _, err := columnar.CopyValue(ctx, &projected.Columns[j], projected.Lane(0), c.rowPayloadBytes())
 			if err != nil {
 				return nil, owned, err
 			}

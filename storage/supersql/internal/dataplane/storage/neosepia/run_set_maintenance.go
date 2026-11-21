@@ -19,13 +19,14 @@ func (pin *runPin) maintenanceTargets(ctx context.Context) ([]storage.ObjectRef,
 	}
 	targets := make(map[objectGeneration]storage.ObjectRef)
 	for generation := pin.generation; generation != nil; generation = generation.parent {
-		for _, file := range generation.files {
+		for key, files := range generation.byTarget {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			key := targetGeneration(file.target)
-			if existing, exists := targets[key]; !exists || file.target.DescriptorVersion > existing.DescriptorVersion {
-				targets[key] = file.target
+			for _, file := range files {
+				if existing, exists := targets[key]; !exists || file.target.DescriptorVersion > existing.DescriptorVersion {
+					targets[key] = file.target
+				}
 			}
 		}
 	}
@@ -142,11 +143,11 @@ func (set *runSet) checkReplacement(ctx context.Context, position uint64, timest
 		if file == nil {
 			return storage.ErrCorruptStorage
 		}
-		file.mu.RLock()
-		closed := file.file == nil
-		cost := uint64(unsafe.Sizeof(sstFile{})) + uint64(cap(file.index)) + uint64(cap(file.descriptor.LowerKey)+cap(file.descriptor.UpperKey))
-		file.mu.RUnlock()
-		if closed || cost > remaining-bytes {
+		if file.isClosed() {
+			return columnar.ErrBatchBudget
+		}
+		cost := file.residentCost()
+		if cost > remaining-bytes {
 			return columnar.ErrBatchBudget
 		}
 		bytes += cost
@@ -235,16 +236,19 @@ func (set *runSet) replaceLevelRange(ctx context.Context, position uint64, times
 		if file == nil {
 			return storage.ErrCorruptStorage
 		}
-		file.mu.RLock()
-		closed := file.file == nil
-		cost := uint64(unsafe.Sizeof(sstFile{})) + uint64(cap(file.index)) + uint64(cap(file.descriptor.LowerKey)+cap(file.descriptor.UpperKey))
-		file.mu.RUnlock()
-		if closed || cost > remaining-bytes {
+		if file.isClosed() {
+			return columnar.ErrBatchBudget
+		}
+		cost := file.residentCost()
+		if cost > remaining-bytes {
 			return columnar.ErrBatchBudget
 		}
 		bytes += cost
 	}
-	next := &runGeneration{files: files, position: position, timestamp: timestamp, baseGeneration: baseGeneration, references: 1, bytes: bytes}
+	for _, file := range files {
+		file.attachRuntime(set.fds, set.blockCache)
+	}
+	next := &runGeneration{files: files, position: position, firstPosition: position, timestamp: timestamp, baseGeneration: baseGeneration, references: 1, bytes: bytes}
 	next.indexTiers()
 	if err := next.validateLevels(ctx); err != nil {
 		return err

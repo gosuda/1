@@ -49,7 +49,7 @@ func (set *runSet) openReplacementFiles(ctx context.Context, root *os.Root, desc
 		if err := ctx.Err(); err != nil { return nil, err }
 		if file, exists := current[descriptor.Name]; exists {
 			file.mu.Lock()
-			if file.file == nil || !samePreparedRun(file.descriptor, descriptor) || file.references == math.MaxUint64 {
+			if file.core == nil || !samePreparedRun(file.descriptor, descriptor) || file.references == math.MaxUint64 {
 				file.mu.Unlock()
 				return nil, storage.ErrCorruptStorage
 			}
@@ -67,33 +67,62 @@ func (set *runSet) openReplacementFiles(ctx context.Context, root *os.Root, desc
 		} else {
 			file, err = openPreparedRun(ctx, root, descriptor, limits, maxBytes-used, scratch)
 		}
-		if err != nil { return nil, err }
+		if err != nil {
+			return nil, err
+		}
 		opened = append(opened, file)
-		cost := uint64(unsafe.Sizeof(sstFile{})) + uint64(cap(file.index)) + uint64(cap(file.descriptor.LowerKey)+cap(file.descriptor.UpperKey))
-		if cost > maxBytes-used { return nil, columnar.ErrBatchBudget }
+		cost := file.residentCost()
+		if cost > maxBytes-used {
+			return nil, columnar.ErrBatchBudget
+		}
 		used += cost
 	}
 	return opened, nil
 }
 
 func openLinkedFragment(ctx context.Context, root *os.Root, descriptor preparedRun, source *sstFile, limits sstLimits, maxBytes uint64) (_ *sstFile, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !validFragmentBounds(descriptor, limits.Block.MaxBytes) {
+		return nil, storage.ErrCorruptStorage
+	}
 	file, err := root.Open(descriptor.Name)
-	if err != nil { return nil, err }
-	owned := true
-	defer func() { if owned { err = errors.Join(err, file.Close()) } }()
-	info, err := file.Stat()
-	if err != nil { return nil, err }
-	original, err := source.file.Stat()
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if statErr != nil {
+		return nil, errors.Join(statErr, closeErr)
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	original, err := source.statFile()
+	if err != nil {
+		return nil, err
+	}
 	if !os.SameFile(info, original) || descriptor.Checksum != source.descriptor.Checksum || descriptor.Target != source.target || descriptor.Bytes != source.descriptor.Bytes || descriptor.Rows != source.rows {
 		return nil, storage.ErrCorruptStorage
 	}
-	limits.MaxIndexBytes = min(limits.MaxIndexBytes, maxBytes)
-	run, err := openSST(ctx, file, limits)
-	if err != nil { return nil, err }
-	owned = false
+	absPath, err := filepath.Abs(filepath.Join(root.Name(), descriptor.Name))
+	if err != nil {
+		return nil, err
+	}
+	source.mu.RLock()
+	core := source.core
+	if core == nil {
+		source.mu.RUnlock()
+		return nil, storage.ErrClosed
+	}
+	core.coreRefs.Add(1)
+	source.mu.RUnlock()
+	run := newSSTFileFromCore(core, true)
 	run.descriptor = descriptor
-	run.physicalPath, err = filepath.Abs(filepath.Join(root.Name(), descriptor.Name))
-	if err != nil { return nil, errors.Join(err, run.Close()) }
+	run.physicalPath = absPath
+	if run.residentCost() > maxBytes {
+		return nil, errors.Join(columnar.ErrBatchBudget, run.Close())
+	}
 	return run, nil
 }

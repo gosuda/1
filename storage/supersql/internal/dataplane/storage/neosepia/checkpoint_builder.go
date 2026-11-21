@@ -226,7 +226,14 @@ func (builder *checkpointBuilder) finish(ctx context.Context) (err error) {
 			}
 			continue
 		}
-		if err := builder.finishCommit(ctx, commits, runs, generation.position, scratch, seen); err != nil {
+		firstPos := generation.firstPosition
+		if firstPos == 0 || firstPos == generation.position {
+			if err := builder.finishCommit(ctx, commits, runs, generation.position, scratch, seen); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := builder.finishCoalescedCommit(ctx, commits, runs, firstPos, generation.position, scratch, seen); err != nil {
 			return err
 		}
 	}
@@ -276,6 +283,46 @@ func (builder *checkpointBuilder) finishCommit(ctx context.Context, commits, run
 		return err
 	}
 	return builder.hashEntry(ctx, runs, runManifestName(position), "runs/"+runManifestName(position), nil, scratch, seen)
+}
+
+func (builder *checkpointBuilder) finishCoalescedCommit(ctx context.Context, commits, runs *os.Root, firstPos, lastPos uint64, scratch []byte, seen []bool) error {
+	decisions := make([]runDecision, 0, int(lastPos-firstPos+1))
+	for pos := firstPos; pos <= lastPos; pos++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		record, err := openCommit(ctx, commits, pos, builder.limits.recovery().Batch)
+		if err != nil {
+			return err
+		}
+		d := runDecision{Position: pos, TxID: record.Batch.TxID, CommitTS: record.Result.CommitTS, Identity: record.Identity, MutationCount: record.Result.AppliedCount}
+		closeErr := record.Close()
+		if closeErr != nil {
+			return closeErr
+		}
+		decisions = append(decisions, d)
+		if err := builder.hashEntry(ctx, commits, commitName(pos), "commits/"+commitName(pos), nil, scratch, seen); err != nil {
+			return err
+		}
+	}
+	coalesced, err := makeCoalescedDecision(decisions)
+	if err != nil {
+		return err
+	}
+	files, err := loadCoalescedRunManifest(ctx, runs, coalesced, builder.limits.preparation())
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		known := storage.CheckpointFile{Name: "runs/" + file.Name, Size: file.Bytes, SHA256: file.Checksum}
+		if err := builder.hashEntry(ctx, runs, file.Name, known.Name, &known, scratch, seen); err != nil {
+			return err
+		}
+	}
+	return builder.hashEntry(ctx, runs, runManifestName(lastPos), "runs/"+runManifestName(lastPos), nil, scratch, seen)
 }
 
 func (builder *checkpointBuilder) finishBase(ctx context.Context, runs *os.Root, generation *runGeneration, scratch []byte, seen []bool) error {

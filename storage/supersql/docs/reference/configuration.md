@@ -12,9 +12,10 @@ provider, because a live database holds fences certified by that provider.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | Directory | string | none; required | Directory is the database directory. Open creates it when absent. |
-| Compaction | CompactionConfig | zero value selects `neosepia.DefaultLimits()` | Compaction replaces the NeoSepia default limits when nonzero. |
+| Compaction | CompactionConfig | zero value selects `neosepia.DefaultLimits()` | Compaction overrides individual storage backend resource limits when nonzero; zero fields inherit DefaultCompactionConfig(). |
 | Clock | clock.Clock | none; required | Clock is the certified time source borrowed by the database. |
 | Maintenance | MaintenanceConfig | - | Maintenance bounds the background reclamation loop Open starts. The zero value selects the defaults; Maintenance.Disabled stops the loop. |
+| HistoryRetention | time.Duration | - | HistoryRetention configures the durable MVCC history retention window. Zero selects the default (24h); negative values are rejected by Open. |
 | HistoricalReadOnly | bool | false | HistoricalReadOnly opens the database without requiring fresh certified readiness: no writes and no latest reads are accepted, only retained historical snapshots are served. The clock may be unsynchronized. |
 | Parallelism | int | - | Parallelism sets the execution worker pool concurrency. Zero or negative selects runtime.GOMAXPROCS(0). |
 | MemoryBudgetBytes | uint64 | - | MemoryBudgetBytes overrides the shared query memory budget (default 256 MiB). |
@@ -82,6 +83,7 @@ The root package fixes its own envelope when it opens a database; the table list
 
 | Location | Fields |
 | --- | --- |
+| catalog.go:143 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
 | internal/controlplane/schema/column_policy.go:67 | MaxBytes=options.MetadataBytes MaxDepth=64 MaxItems=int(options.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:122 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:163 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
@@ -101,16 +103,15 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/controlplane/schema/relational_policy.go:244 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=s.limits.MaxColumns |
 | internal/controlplane/schema/relational_policy.go:68 | MaxBytes=maxBytes - fixed MaxDepth=64 MaxItems=max(set.limits.MaxColumns, len(set.indexes)) |
 | internal/query/bind/bind_limits.go:80 | MaxBytes=limits.MaxBytes MaxDepth=int(min(limits.MaxDepth, 64)) MaxItems=int(limits.MaxOperands) |
-| internal/query/catalogrel/rows.go:311 | MaxBytes=options.MaxDescriptorBytes MaxDepth=options.MaxDescriptorDepth MaxItems=options.MaxDescriptorItems |
-| internal/query/exec/modify/options.go:297 | MaxBytes=c.metadata / 2 MaxDepth=64 MaxItems=int(c.metadata / 64) |
+| internal/query/catalogrel/rows.go:307 | MaxBytes=options.MaxDescriptorBytes MaxDepth=options.MaxDescriptorDepth MaxItems=options.MaxDescriptorItems |
+| internal/query/exec/modify/options.go:301 | MaxBytes=c.metadata / 2 MaxDepth=64 MaxItems=int(c.metadata / 64) |
 | internal/query/exec/modify_compile.go:53 | MaxBytes=c.portal.env.Limits.MetadataBytes MaxDepth=64 MaxItems=c.portal.env.Limits.Expressions.MaxRegisters |
 | internal/query/procedural/compile.go:439 | MaxBytes=c.options.Bind.Limits.MaxBytes MaxDepth=int(min(c.options.Bind.Limits.MaxDepth, 64)) MaxItems=int(c.options.Bind.Limits.MaxOperands) |
 | internal/query/procedural/trigger.go:267 | MaxBytes=maxBytes MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
 | internal/query/procedural/trigger.go:322 | MaxBytes=max(maxBytes, runtime.limits.MaxResultBytes) MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
-| internal/query/session/catalog_access.go:112 | MaxBytes=budget.remaining MaxDepth=64 MaxItems=int(budget.remaining) |
+| internal/query/session/catalog_access.go:124 | MaxBytes=budget.remaining MaxDepth=64 MaxItems=int(budget.remaining) |
 | internal/query/session/declaration.go:909 | MaxBytes=options.Limits.MetadataBytes MaxDepth=64 MaxItems=options.Limits.MaxColumns |
 | internal/query/session/native_catalog.go:452 | MaxBytes=1 << 16 MaxDepth=8 MaxItems=8 |
-| open.go:284 | MaxBytes=1 << 20 MaxDepth=64 MaxItems=1024 |
 
 ## `ir.Limits`
 
@@ -131,8 +132,8 @@ The root package's `Catalog.irLimits` supplies the default envelope for statemen
 | --- | --- |
 | internal/query/exec/aggregate_project.go:69 | MaxBytes=p.env.Limits.MetadataBytes MaxDepth=512 MaxNodes=handles MaxOperands=handles MaxSlots=handles SourceBytes=math.MaxUint32 |
 | internal/query/exec/residual.go:108 | MaxBytes=limits.MaxBytes MaxDepth=uint32(limits.MaxDepth) MaxNodes=uint32(limits.MaxInstructions) MaxOperands=uint32(limits.MaxInstructions) MaxSlots=uint32(limits.MaxInstructions) SourceBytes=1 |
-| internal/query/session/setting_command.go:19 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
-| open.go:865 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
+| internal/query/session/setting_command.go:20 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
+| session_scope.go:120 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
 
 ## `supersql.CopyOptions`
 
@@ -204,11 +205,11 @@ Constants declared alongside the type:
 | DescriptorLimits | internal/model/descriptor.go | 3 |
 | Limits | internal/query/exec/expr/program.go | 8 |
 | Limits | internal/query/exec/portal.go | 5 |
-| Limits | internal/query/exec/rowstore/spool.go | 7 |
+| Limits | internal/query/exec/rowstore/spool.go | 8 |
 | Limits | internal/query/explain/plan.go | 3 |
 | Limits | internal/query/fragment/graph.go | 5 |
 | Limits | internal/query/ir/types.go | 6 |
-| Limits | internal/query/opt/span/extract.go | 4 |
+| Limits | internal/query/opt/span/extract.go | 5 |
 | Limits | internal/query/partition/router.go | 3 |
 | Limits | internal/query/physical/types.go | 5 |
 | Limits | internal/query/procedural/types.go | 11 |

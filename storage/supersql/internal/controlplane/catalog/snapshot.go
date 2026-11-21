@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
@@ -271,6 +272,42 @@ func (s *CatalogSnapshot) ResolveOID(ctx context.Context, oid model.OID) (Publis
 	return d, nil
 }
 
+// Role resolves a cluster-wide role descriptor by case-folded name.
+func (s *CatalogSnapshot) Role(ctx context.Context, name string) (*model.Descriptor, error) {
+	normalized := strings.ToLower(name)
+	if normalized == "" {
+		return nil, model.ErrInvalidDescriptor
+	}
+	published, err := s.Resolve(ctx, model.NamespaceName{
+		Parent: 0,
+		Kind:   model.ObjectRole,
+		Name:   normalized,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if published.Descriptor == nil || published.Descriptor.Kind() != model.ObjectRole {
+		return nil, ErrCorruptCatalog
+	}
+	return published.Descriptor, nil
+}
+
+// ListRoles scans all cluster-wide role descriptors visible in this snapshot.
+func (s *CatalogSnapshot) ListRoles(ctx context.Context) ([]*model.Descriptor, error) {
+	var roles []*model.Descriptor
+	err := s.ScanNamespace(ctx, 0, model.ObjectRole, func(published PublishedDescriptor) error {
+		if published.Descriptor == nil || published.Descriptor.Kind() != model.ObjectRole {
+			return ErrCorruptCatalog
+		}
+		roles = append(roles, published.Descriptor)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return roles, nil
+}
+
 // ScanNamespace streams one namespace/kind through bounded storage batches.
 // visit may retain its owned descriptor but must not close this snapshot.
 func (s *CatalogSnapshot) ScanNamespace(ctx context.Context, parent model.ObjectID, kind model.ObjectKind, visit func(PublishedDescriptor) error) error {
@@ -278,11 +315,14 @@ func (s *CatalogSnapshot) ScanNamespace(ctx context.Context, parent model.Object
 		return model.ErrInvalidDescriptor
 	}
 	return s.ScanNamespaceReferences(ctx, parent, kind, func(reference NamespaceReference) error {
-		descriptor, err := s.Resolve(ctx, reference.Name)
+		descriptor, err := s.Descriptor(ctx, reference.ID)
+		if errors.Is(err, ErrUnknownObject) {
+			return ErrCorruptCatalog
+		}
 		if err != nil {
 			return err
 		}
-		if descriptor.Descriptor.ID() != reference.ID || descriptor.Descriptor.Version() != reference.Version {
+		if descriptor.Descriptor.ID() != reference.ID || descriptor.Descriptor.Version() != reference.Version || descriptor.Descriptor.Name() != reference.Name {
 			return ErrCorruptCatalog
 		}
 		return visit(descriptor)

@@ -27,13 +27,22 @@ type Position uint64
 // DecodeBytes bounds one decoded row, including nested headers and temporaries.
 // MetadataBytes covers the owned schema, append row headers and active readers.
 type Limits struct {
-	MemoryBytes    uint64
-	MaxBytes       uint64
-	MaxRows        uint64
-	MaxRecordBytes uint64
-	MetadataBytes  uint64
-	DecodeBytes    uint64
-	MaxReaders     int
+	MemoryBytes         uint64
+	MaxBytes            uint64
+	MaxRows             uint64
+	MaxRecordBytes      uint64
+	MaxLargeRecordBytes uint64
+	MetadataBytes       uint64
+	DecodeBytes         uint64
+	MaxReaders          int
+}
+
+func (s *Spool) effectiveMaxRecordBytes() uint64 {
+	return max(s.limits.MaxRecordBytes, s.limits.MaxLargeRecordBytes)
+}
+
+func (s *Spool) effectiveDecodeBytes() uint64 {
+	return max(s.limits.DecodeBytes, s.limits.MaxLargeRecordBytes)
 }
 
 // Spool borrows its query until Close returns. Appends are serialized; readers
@@ -71,12 +80,15 @@ func New(ctx context.Context, query *runtime.Query, layouts []model.TypeLayout, 
 	if query == nil || invalidExtent || invalidWorkspace {
 		return nil, runtime.ErrInvalidConfig
 	}
-	for _, size := range [...]uint64{limits.MemoryBytes, limits.MaxBytes, limits.MaxRecordBytes, limits.MetadataBytes, limits.DecodeBytes} {
+	for _, size := range [...]uint64{limits.MemoryBytes, limits.MaxBytes, limits.MaxRecordBytes, limits.MaxLargeRecordBytes, limits.MetadataBytes, limits.DecodeBytes} {
 		if size > uint64(math.MaxInt) {
 			return nil, runtime.ErrInvalidConfig
 		}
 	}
 	if limits.MaxRecordBytes > uint64(math.MaxInt)-codecScratchBytes || limits.DecodeBytes > uint64(math.MaxInt)-limits.MaxRecordBytes-codecScratchBytes {
+		return nil, runtime.ErrInvalidConfig
+	}
+	if limits.MaxLargeRecordBytes > uint64(math.MaxInt)-codecScratchBytes {
 		return nil, runtime.ErrInvalidConfig
 	}
 	if err := errors.Join(context.Cause(ctx), context.Cause(query.Context())); err != nil {
@@ -229,7 +241,7 @@ func (s *Spool) AppendBatch(ctx context.Context, batch *columnar.Batch) (int, er
 	defer clear(s.row)
 	for row := range batch.Rows() {
 		clear(s.row)
-		remaining := s.limits.DecodeBytes
+		remaining := s.effectiveDecodeBytes()
 		for i := range batch.Columns {
 			value, used, err := columnar.CopyValue(ctx, &batch.Columns[i], batch.Lane(row), remaining)
 			if err != nil {

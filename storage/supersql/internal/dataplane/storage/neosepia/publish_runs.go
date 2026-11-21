@@ -12,6 +12,7 @@ import (
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
+	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
 // Admission checks all files and reserves atomic root installation before WAL
@@ -74,7 +75,7 @@ func (set *runSet) admitDecision(ctx context.Context, root *os.Root, decision ru
 			return nil, openErr
 		}
 		opened = append(opened, run)
-		used += uint64(unsafe.Sizeof(sstFile{})) + uint64(cap(run.index))
+		used += run.residentCost()
 	}
 	if rows != decision.MutationCount {
 		return nil, storage.ErrCorruptStorage
@@ -82,6 +83,71 @@ func (set *runSet) admitDecision(ctx context.Context, root *os.Root, decision ru
 	transferred := opened
 	opened = nil
 	return set.reserve(ctx, decision.Position, decision.CommitTS, transferred)
+}
+
+func (set *runSet) admitCoalescedDecision(ctx context.Context, root *os.Root, decision coalescedDecision, commitTSs []model.Timestamp, files []preparedRun, limits sstLimits, maxBytes uint64) (_ *runAdmission, err error) {
+	if err := limits.validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	set.mu.Lock()
+	closed := set.closed
+	set.mu.Unlock()
+	if closed {
+		return nil, storage.ErrClosed
+	}
+	if root == nil {
+		return nil, storage.ErrClosed
+	}
+	if len(files) == 0 {
+		return nil, storage.ErrCorruptStorage
+	}
+	if uint64(len(files)) > set.limits.MaxFiles {
+		return nil, columnar.ErrBatchBudget
+	}
+	pointerBytes := uint64(unsafe.Sizeof((*sstFile)(nil)))
+	if uint64(len(files)) > maxBytes/pointerBytes {
+		return nil, columnar.ErrBatchBudget
+	}
+	used := uint64(len(files)) * pointerBytes
+	scratchBytes := min(uint64(64<<10), (maxBytes-used)/2)
+	if scratchBytes == 0 || scratchBytes > uint64(math.MaxInt) {
+		return nil, columnar.ErrBatchBudget
+	}
+	used += scratchBytes
+	scratch := make([]byte, int(scratchBytes))
+	opened := make([]*sstFile, 0, len(files))
+	defer func() {
+		if opened != nil {
+			for _, file := range opened {
+				err = errors.Join(err, file.Close())
+			}
+		}
+	}()
+	var rows uint64
+	for index, descriptor := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if descriptor.Name != preparedRunName(decision.LastPosition, index) || descriptor.Rows == 0 || descriptor.Rows > decision.MutationCount-rows {
+			return nil, storage.ErrCorruptStorage
+		}
+		rows += descriptor.Rows
+		run, openErr := openPreparedRun(ctx, root, descriptor, limits, maxBytes-used, scratch)
+		if openErr != nil {
+			return nil, openErr
+		}
+		opened = append(opened, run)
+		used += run.residentCost()
+	}
+	if rows != decision.MutationCount {
+		return nil, storage.ErrCorruptStorage
+	}
+	transferred := opened
+	opened = nil
+	return set.reserveRange(ctx, decision.FirstPosition, decision.LastPosition, commitTSs, transferred)
 }
 
 func openPreparedRun(ctx context.Context, root *os.Root, descriptor preparedRun, limits sstLimits, maxIndexBytes uint64, scratch []byte) (_ *sstFile, err error) {

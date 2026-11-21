@@ -11,21 +11,32 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+var relationNamespaceKinds = [6]model.ObjectKind{
+	model.ObjectTable,
+	model.ObjectIndex,
+	model.ObjectSequence,
+	model.ObjectView,
+	model.ObjectMaterializedView,
+	model.ObjectCompositeRelation,
+}
+
+func isRelationNamespaceKind(kind model.ObjectKind) bool {
+	return (kind >= model.ObjectTable && kind <= model.ObjectMaterializedView) || kind == model.ObjectCompositeRelation
+}
+
 // Relation names share one SQL namespace even though their persisted keys retain
 // object kind. Keeping that encoding also preserves existing historical lookups.
-func namespaceVariants(name model.NamespaceName) ([5]model.NamespaceName, int) {
-	var names [5]model.NamespaceName
-	if name.Kind < model.ObjectTable || name.Kind > model.ObjectMaterializedView {
+func namespaceVariants(name model.NamespaceName) ([6]model.NamespaceName, int) {
+	var names [6]model.NamespaceName
+	if !isRelationNamespaceKind(name.Kind) {
 		names[0] = name
 		return names, 1
 	}
-	count := 0
-	for kind := model.ObjectTable; kind <= model.ObjectMaterializedView; kind++ {
+	for i, kind := range relationNamespaceKinds {
 		name.Kind = kind
-		names[count] = name
-		count++
+		names[i] = name
 	}
-	return names, count
+	return names, len(relationNamespaceKinds)
 }
 
 // NamespaceDependency protects a name against every conflicting relation kind.
@@ -78,7 +89,7 @@ func (s *Store) namespaceScanSpan(ctx context.Context, parent model.ObjectID, ki
 	// The accepted range must cover every real ObjectKind. Aggregates are
 	// ObjectRoutine (pg_proc namespace) and triggers are nested metadata, so
 	// neither is a standalone namespace kind.
-	if kind < model.ObjectSchema || kind > model.ObjectOperator {
+	if kind < model.ObjectSchema || kind > model.ObjectRole {
 		return storage.KeySpan{}, model.ErrInvalidDescriptor
 	}
 	const metadataBytes = uint64(unsafe.Sizeof(storage.KeyColumn{})) + uint64(unsafe.Sizeof(storage.KeySpan{})) + 2*uint64(unsafe.Sizeof(model.Value{})) + 18

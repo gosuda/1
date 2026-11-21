@@ -19,23 +19,23 @@ func TestLongTransactionCompletes(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer database.Close()
-	if _, err := database.Exec(ctx, "CREATE TABLE long_txn (id int PRIMARY KEY, v int)", 10000); err != nil {
+	if _, err := database.exec(ctx, "CREATE TABLE long_txn (id int PRIMARY KEY, v int)", 10000); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
-	if _, err := database.Exec(ctx, "BEGIN", 10000); err != nil {
+	if _, err := database.exec(ctx, "BEGIN", 10000); err != nil {
 		t.Fatalf("BEGIN: %v", err)
 	}
 	const statements, rows = 5, 200
 	for i := range statements {
 		statement := fmt.Sprintf("INSERT INTO long_txn SELECT g + %d, g FROM generate_series(1, %d) g", i*rows, rows)
-		if _, err := database.Exec(ctx, statement, 10000); err != nil {
+		if _, err := database.exec(ctx, statement, 10000); err != nil {
 			t.Fatalf("statement %d of %d: %v", i+1, statements, err)
 		}
 	}
-	if _, err := database.Exec(ctx, "COMMIT", 10000); err != nil {
+	if _, err := database.exec(ctx, "COMMIT", 10000); err != nil {
 		t.Fatalf("COMMIT: %v", err)
 	}
-	outcome, err := database.Exec(ctx, "SELECT count(*) FROM long_txn", 10000)
+	outcome, err := database.exec(ctx, "SELECT count(*) FROM long_txn", 10000)
 	if err != nil {
 		t.Fatalf("SELECT count(*): %v", err)
 	}

@@ -37,6 +37,7 @@ type namedPreparedStatement struct {
 	name              string
 	statement         string
 	searchPath        []string
+	currentRole       string
 	semantics         builtin.ResolveOptions
 	parameterLayouts  []model.TypeLayout
 	analysis          *Prepared

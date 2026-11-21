@@ -34,17 +34,23 @@ type limitCursor struct {
 func (l *limitCursor) Next(ctx context.Context, out *columnar.Batch) error {
 	out.Reset()
 	if l.closed || l.ended {
-		return io.EOF
-	}
-	if l.output != nil {
-		if err := l.output.Close(); err != nil {
-			return err
+		if l.output != nil {
+			err := l.output.Close()
+			l.output = nil
+			if err != nil {
+				return err
+			}
 		}
-		l.output = nil
+		return io.EOF
 	}
 	if l.remaining == 0 && l.boundary == nil {
 		l.ended = true
-		return eofAfter(l.input.Close())
+		var closeErr error
+		if l.output != nil {
+			closeErr = l.output.Close()
+			l.output = nil
+		}
+		return eofAfter(errors.Join(l.input.Close(), closeErr))
 	}
 	maxRows := batchRows(out, l.env)
 	l.source.MaxRows = maxRows
@@ -55,13 +61,22 @@ func (l *limitCursor) Next(ctx context.Context, out *columnar.Batch) error {
 	if err != nil {
 		if err == io.EOF {
 			l.ended = true
-			return eofAfter(l.input.Close())
+			var closeErr error
+			if l.output != nil {
+				closeErr = l.output.Close()
+				l.output = nil
+			}
+			return eofAfter(errors.Join(l.input.Close(), closeErr))
 		}
 		return err
 	}
-	l.output, err = builder(l.env, l.layouts)
-	if err != nil {
-		return err
+	if l.output == nil {
+		l.output, err = builder(l.env, l.layouts)
+		if err != nil {
+			return err
+		}
+	} else {
+		l.output.Reset()
 	}
 	for row := range l.source.Rows() {
 		if err = ctx.Err(); err != nil {
@@ -223,6 +238,13 @@ func (m *materializeCursor) fill(ctx context.Context) error {
 func (m *materializeCursor) Next(ctx context.Context, out *columnar.Batch) error {
 	out.Reset()
 	if m.closed || m.ended {
+		if m.output != nil {
+			err := m.output.Close()
+			m.output = nil
+			if err != nil {
+				return err
+			}
+		}
 		return io.EOF
 	}
 	if !m.ready {
@@ -230,16 +252,14 @@ func (m *materializeCursor) Next(ctx context.Context, out *columnar.Batch) error
 			return err
 		}
 	}
-	if m.output != nil {
-		if err := m.output.Close(); err != nil {
+	if m.output == nil {
+		var err error
+		m.output, err = builder(m.env, m.layouts)
+		if err != nil {
 			return err
 		}
-		m.output = nil
-	}
-	var err error
-	m.output, err = builder(m.env, m.layouts)
-	if err != nil {
-		return err
+	} else {
+		m.output.Reset()
 	}
 	maxRows := batchRows(out, m.env)
 	for m.output.Rows() < maxRows {
@@ -256,6 +276,11 @@ func (m *materializeCursor) Next(ctx context.Context, out *columnar.Batch) error
 		}
 	}
 	if m.output.Rows() == 0 && m.ended {
+		err := m.output.Close()
+		m.output = nil
+		if err != nil {
+			return err
+		}
 		return io.EOF
 	}
 	return m.output.Publish(out)

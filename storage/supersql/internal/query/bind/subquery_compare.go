@@ -139,7 +139,7 @@ func (b *binder) comparisonSubquery(s, child *scope, rel relation, left expressi
 			return expression{}, err
 		}
 		args[i] = pairs[i].left
-		effects = effects.Union(pairs[i].left.effects).Union(signatureEffects(pairs[i].signature))
+		effects = effects.Union(pairs[i].left.effects).Union(b.signatureEffects(pairs[i].signature, state.id))
 	}
 	if kind == ir.RowSubquery {
 		effects.MayError = true
@@ -208,7 +208,7 @@ func (b *binder) quantifiedArray(n *zpgparse.A_Expr, s *scope, name string, pos 
 	if n.Kind == zpgparse.A_Expr_Kind_AEXPR_OP_ALL {
 		kind = ir.AllSubquery
 	}
-	effects := left.effects.Union(array.effects).Union(signatureEffects(selected.signature))
+	effects := left.effects.Union(array.effects).Union(b.signatureEffects(selected.signature, state.id))
 	result := expression{typ: b.primitive(16), nullable: true, effects: effects, position: pos}
 	payload := ir.Scalar{Kind: ir.ArrayQuantified, SubqueryKind: kind, Signature: signature, Operator: selected.operator, Strict: selected.signature.Strict}
 	return b.addScalar(s, result, payload, []expression{left, array})

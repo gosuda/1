@@ -56,6 +56,7 @@ type routineExecutor struct {
 	controlAllowed  bool
 	routineDepth    int
 	options         *RoutineExecutionOptions
+	planCache       routineStatementCache
 }
 
 func attachRoutineExecution(ctx context.Context, owner *Transactions, transaction *txn.Transaction, view txn.ReadView, scope *preparedMutationScope, environment *exec.Environment, sourceCatalog catalogrel.Scanner, store *catalog.Store, execution PreparedExecution, options *RoutineExecutionOptions, dependencies []model.Dependency, nonAtomic bool) (context.Context, func() error, error) {
@@ -314,21 +315,15 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 	if !allowControl && routineTypedStatement(request.Statement) {
 		return executor.executeReenteredStatement(ctx, request)
 	}
-	var checkBatch func(context.Context, *columnar.Batch) error
-	hadReturning := true
-	if executor.options.RewriteStatement != nil {
-		var rewritten *zpgparse.RawStmt
-		rewritten, checkBatch, hadReturning, err = executor.options.RewriteStatement(ctx, request.Statement)
-		if err != nil {
-			return result, err
-		}
-		if rewritten != nil {
-			request.Statement = rewritten
-		}
-	}
 	parameterLayouts := make([]model.TypeLayout, len(request.Parameters))
-	for i := range request.Parameters {
-		parameterLayouts[i] = request.Parameters[i].Layout
+	exprParams := make([]expr.ParameterValue, len(request.Parameters))
+	for i, parameter := range request.Parameters {
+		parameterLayouts[i] = parameter.Layout
+		value := parameter.Value
+		if value.IsNull {
+			value.Type = parameter.Layout.Type.Storage
+		}
+		exprParams[i] = expr.ParameterValue{Number: uint32(i + 1), Layout: parameter.Layout, Value: value}
 	}
 	previousAllowed := executor.controlAllowed
 	executor.controlAllowed = previousAllowed && allowControl
@@ -339,116 +334,217 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 			executor.restoreSettings(beforeCurrent, beforeRetained)
 		}
 	}()
-	snapshot, err := executor.catalog.TransactionSnapshot(executor.view, catalog.BorrowReader)
-	if err != nil {
-		return result, err
-	}
-	var bound *bind.BoundStatement
-	var planning PrepareOptions
-	planning, err = executor.options.Planning(ctx, snapshot, executor.view, request.Statement, parameterLayouts)
-	if err == nil {
-		resources, searchPath := executor.semanticSettings()
-		planning.Normalize.Builtin = executor.environment.Builtin
-		planning.Bind.Builtin = executor.environment.Builtin
-		planning.Bind.CatalogRelations = executor.options.Capabilities.CatalogRelations
-		planning.Bind.Temporal = executor.environment.Temporal
-		planning.Bind.SearchPath = searchPath
-		planning.Optimize.WorkingMemory = min(planning.Optimize.WorkingMemory, uint64(resources.EffectiveWorkMemoryBytes))
-		boundRoutineStatementSource(&planning, request.Statement, executor.options.Limits.MaxProgramBytes)
-		bound, err = bind.Bind(ctx, request.Statement, snapshot, planning.Bind, parameterLayouts)
-	}
-	var inline *procedural.Program
-	var inlineDependencies []model.Dependency
-	if err == nil && bound != nil {
-		if command, ok := bound.Command().(bind.InlineRoutineCommand); ok {
-			inline, inlineDependencies, err = (procedural.Compiler{Limits: executor.options.Limits}).CompileInline(ctx, command.Statement, snapshot, planning.Bind)
+	resources, searchPath := executor.semanticSettings()
+	currentRole := executor.transactions.settings.CurrentRole()
+	catalogIdentity := readViewCatalogIdentity(executor.view)
+	tempVersion := executor.transactions.named.overlayVersion()
+	workingMemory := uint64(resources.EffectiveWorkMemoryBytes)
+	cacheKey, cacheable := makeRoutineStatementCacheKey(
+		request.Statement, allowControl, catalogIdentity, tempVersion,
+		searchPath, currentRole, executor.environment.Builtin, workingMemory, parameterLayouts,
+	)
+	var (
+		bound          *bind.BoundStatement
+		cachedPrepared *Prepared
+		cachedScanDeps []txn.ReadDependency
+		definitions    []procedural.Definition
+		hasScans       bool
+		hasCatalogScan bool
+		hasParams      bool
+		cacheHit       bool
+	)
+	if cacheable {
+		if entry, ok := executor.planCache.load(cacheKey); ok && entry.bound != nil && entry.bound.ProvisionalBindingsUsable(executor.transaction.PublicationOwner()) {
+			if entry.prepared == nil || entry.prepared.validatePublication(executor.transaction.PublicationOwner()) == nil {
+				bound = entry.bound
+				cachedPrepared = entry.prepared
+				cachedScanDeps = entry.scanDeps
+				definitions = entry.definitions
+				hasScans = entry.hasScans
+				hasCatalogScan = entry.hasCatalogScan
+				hasParams = entry.hasParams
+				cacheHit = true
+			}
 		}
 	}
-	closeErr := snapshot.Close()
-	if err != nil || closeErr != nil {
-		return result, errors.Join(err, closeErr)
-	}
-	if bound == nil {
-		return result, errPreparedInvocation
-	}
-	if inline == nil && bound.Command() != nil {
-		return result, settingError("0A000", "transaction and session commands are not allowed inside routines")
-	}
-	if allowControl && !bound.ProcedureCall() && inline == nil {
-		return result, procedural.ErrInvalidProgram
-	}
-	dependencies := bound.Dependencies()
-	dependencies = append(dependencies, inlineDependencies...)
-	definitions, err := loadRoutineDefinitions(ctx, executor.catalog, executor.view, executor.transactions.named.temporaryDescriptors(), dependencies, executor.options.Limits.MaxStatements)
-	if err != nil {
-		return result, err
-	}
-	if len(definitions) != 0 {
-		if err := executor.installDefinitions(ctx, definitions); err != nil {
+	if cacheHit {
+		if len(definitions) != 0 && !executor.hasAllDefinitions(definitions) {
+			if err := executor.installDefinitions(ctx, definitions); err != nil {
+				return result, err
+			}
+		}
+	} else {
+		snapshot, err := executor.catalog.TransactionSnapshot(executor.view, catalog.BorrowReader)
+		if err != nil {
 			return result, err
 		}
-	}
-	if inline != nil {
-		return inline.Execute(ctx, nil)
+		var planning PrepareOptions
+		planning, err = executor.options.Planning(ctx, snapshot, executor.view, request.Statement, parameterLayouts)
+		if err == nil {
+			planning.Normalize.Builtin = executor.environment.Builtin
+			planning.Bind.Builtin = executor.environment.Builtin
+			planning.Bind.CatalogRelations = executor.options.Capabilities.CatalogRelations
+			planning.Bind.Temporal = executor.environment.Temporal
+			planning.Bind.SearchPath = searchPath
+			planning.Bind.CurrentRole = currentRole
+			planning.Bind.SessionUser = executor.transactions.settings.SessionUser()
+			if resources.EffectiveWorkMemoryBytes > 0 && planning.Optimize.WorkingMemory > 0 {
+				planning.Optimize.WorkingMemory = workingMemory
+			}
+			boundRoutineStatementSource(&planning, request.Statement, executor.options.Limits.MaxProgramBytes)
+			bound, err = bind.Bind(ctx, request.Statement, snapshot, planning.Bind, parameterLayouts)
+		}
+		var inline *procedural.Program
+		var inlineDependencies []model.Dependency
+		if err == nil && bound != nil {
+			if command, ok := bound.Command().(bind.InlineRoutineCommand); ok {
+				inline, inlineDependencies, err = (procedural.Compiler{Limits: executor.options.Limits}).CompileInline(ctx, command.Statement, snapshot, planning.Bind)
+			}
+		}
+		closeErr := snapshot.Close()
+		if err != nil || closeErr != nil {
+			return result, errors.Join(err, closeErr)
+		}
+		if bound == nil {
+			return result, errPreparedInvocation
+		}
+		if inline == nil && bound.Command() != nil {
+			return result, settingError("0A000", "transaction and session commands are not allowed inside routines")
+		}
+		if allowControl && !bound.ProcedureCall() && inline == nil {
+			return result, procedural.ErrInvalidProgram
+		}
+		dependencies := bound.Dependencies()
+		dependencies = append(dependencies, inlineDependencies...)
+		definitions, err = loadRoutineDefinitions(ctx, executor.catalog, executor.view, executor.transactions.named.temporaryDescriptors(), dependencies, executor.options.Limits.MaxStatements)
+		if err != nil {
+			return result, err
+		}
+		if len(definitions) != 0 {
+			if err := executor.installDefinitions(ctx, definitions); err != nil {
+				return result, err
+			}
+		}
+		if inline != nil {
+			return inline.Execute(ctx, nil)
+		}
+		hasScans, hasCatalogScan, hasParams = boundRoutineGraphShape(bound)
 	}
 	query, err := executor.options.NewQuery(ctx)
 	if err != nil {
 		return result, err
 	}
 	defer func() { err = errors.Join(err, query.Close()) }()
-	resources := executor.resources()
+	resources = executor.resources()
 	if err := query.Constrain(resources.EffectiveWorkMemoryBytes, resources.EffectiveTempFileBytes); err != nil {
 		return result, err
 	}
-	// Binding ran under the frame view, whose declaration covers catalog
-	// discovery and the enclosing statement's own scans — never this body
-	// statement's data spans. Optimization negotiates access through real
-	// PlanScan calls, so the widened declaration must exist before planning;
-	// one derived view then covers both planning and execution.
-	reader, err := executor.openRoutineStatementView(ctx, bound, request.Statement, parameterLayouts)
-	if err != nil {
-		return result, err
+	var (
+		reader       txn.ReadView
+		borrowReader bool
+		prepared     *Prepared
+		derivedScans []txn.ReadDependency
+	)
+	closeReaderOnErr := func(runErr error) error {
+		if !borrowReader && reader != nil {
+			return errors.Join(runErr, reader.Close())
+		}
+		return runErr
 	}
-	planningSnapshot, err := executor.catalog.TransactionSnapshot(reader, catalog.BorrowReader)
-	if err != nil {
-		return result, errors.Join(err, reader.Close())
+	if cachedPrepared != nil && !hasScans && !hasCatalogScan && !preparedWrites(cachedPrepared) && len(boundRowLockPolicies(bound)) == 0 && bound.DependencyCount() == 0 {
+		// Pure expression/scalar statement cached for this exact catalog
+		// identity: reuse the compiled plan directly against the frame view.
+		prepared = cachedPrepared
+		reader = executor.view
+		borrowReader = true
+	} else if cachedPrepared != nil {
+		reader, err = executor.openRoutineStatementViewFromDeps(ctx, bound, cloneCatalogDependencies(cachedScanDeps))
+		if err != nil {
+			return result, err
+		}
+		if catalogIdentity != (txn.CatalogReadIdentity{}) && readViewCatalogIdentity(reader) == catalogIdentity && executor.transactions.named.overlayVersion() == tempVersion {
+			prepared = cachedPrepared
+		}
+	} else {
+		// Binding ran under the frame view, whose declaration covers catalog
+		// discovery and the enclosing statement's own scans — never this body
+		// statement's data spans. Optimization negotiates access through real
+		// PlanScan calls, so the widened declaration must exist before planning;
+		// one derived view then covers both planning and execution.
+		var trialPrepared *Prepared
+		reader, trialPrepared, derivedScans, err = executor.openRoutineStatementViewWithTrial(ctx, bound, request.Statement, parameterLayouts, exprParams)
+		if err != nil {
+			return result, err
+		}
+		if trialPrepared != nil && catalogIdentity != (txn.CatalogReadIdentity{}) && readViewCatalogIdentity(reader) == catalogIdentity && executor.transactions.named.overlayVersion() == tempVersion {
+			prepared = trialPrepared
+		}
 	}
-	var prepared *Prepared
-	planning, err = executor.options.Planning(ctx, planningSnapshot, reader, request.Statement, parameterLayouts)
-	if err == nil {
-		resources, searchPath := executor.semanticSettings()
-		planning.Normalize.Builtin = executor.environment.Builtin
-		planning.Bind.Builtin = executor.environment.Builtin
-		planning.Bind.CatalogRelations = executor.options.Capabilities.CatalogRelations
-		planning.Bind.Temporal = executor.environment.Temporal
-		planning.Bind.SearchPath = searchPath
-		planning.Optimize.WorkingMemory = min(planning.Optimize.WorkingMemory, uint64(resources.EffectiveWorkMemoryBytes))
-		boundRoutineStatementSource(&planning, request.Statement, executor.options.Limits.MaxProgramBytes)
-		prepared, err = prepareBound(ctx, bound, planning)
-	}
-	err = errors.Join(err, planningSnapshot.Close())
-	if err != nil {
-		return result, errors.Join(err, reader.Close())
+	if prepared == nil {
+		planningSnapshot, snapErr := executor.catalog.TransactionSnapshot(reader, catalog.BorrowReader)
+		if snapErr != nil {
+			return result, closeReaderOnErr(snapErr)
+		}
+		var planning PrepareOptions
+		planning, err = executor.options.Planning(ctx, planningSnapshot, reader, request.Statement, parameterLayouts)
+		if err == nil {
+			resources, searchPath = executor.semanticSettings()
+			planning.Normalize.Builtin = executor.environment.Builtin
+			planning.Bind.Builtin = executor.environment.Builtin
+			planning.Bind.CatalogRelations = executor.options.Capabilities.CatalogRelations
+			planning.Bind.Temporal = executor.environment.Temporal
+			planning.Bind.SearchPath = searchPath
+			planning.Bind.CurrentRole = currentRole
+			planning.Bind.SessionUser = executor.transactions.settings.SessionUser()
+			if resources.EffectiveWorkMemoryBytes > 0 && planning.Optimize.WorkingMemory > 0 {
+				planning.Optimize.WorkingMemory = uint64(resources.EffectiveWorkMemoryBytes)
+			}
+			if len(exprParams) != 0 {
+				planning.Optimize.Parameters = spanParameters(exprParams)
+			}
+			boundRoutineStatementSource(&planning, request.Statement, executor.options.Limits.MaxProgramBytes)
+			prepared, err = prepareBound(ctx, bound, planning)
+		}
+		err = errors.Join(err, planningSnapshot.Close())
+		if err != nil {
+			return result, closeReaderOnErr(err)
+		}
 	}
 	if prepared == nil || prepared.bound == nil || prepared.graph == nil {
-		return result, errors.Join(errPreparedInvocation, reader.Close())
+		return result, closeReaderOnErr(errPreparedInvocation)
+	}
+	if cacheable && !cacheHit {
+		entry := routineStatementCacheEntry{
+			key:            cacheKey,
+			bound:          bound,
+			definitions:    append([]procedural.Definition(nil), definitions...),
+			hasScans:       hasScans,
+			hasCatalogScan: hasCatalogScan,
+			hasParams:      hasParams,
+		}
+		// Cache the compiled Prepared plan only when it does not bake
+		// per-invocation parameter values into scan spans or storage
+		// predicates, uses no volatile statistics epochs, and matches the
+		// catalog identity under which the execution view opened.
+		if (!hasScans || !hasParams) && len(prepared.statistics) == 0 && readViewCatalogIdentity(reader) == catalogIdentity {
+			entry.prepared = prepared
+			entry.scanDeps = cloneCatalogDependencies(derivedScans)
+		}
+		executor.planCache.store(entry)
 	}
 	environment := executor.environment
 	environment.Query = query
 	environment.BorrowQuery = false
 	environment.Reader = reader
-	environment.BorrowReader = false
+	environment.BorrowReader = borrowReader
 	environment.Catalog, err = attachCatalogView(executor.environment.Catalog, reader)
 	if err != nil {
-		return result, errors.Join(err, reader.Close())
+		return result, closeReaderOnErr(err)
 	}
 	environment.Native.Database, _ = environment.Catalog.(model.DatabaseRuntime)
 	environment.Modify.Transaction = executor.scope
 	environment.Modify.Deferral = executor.transactions
-	environment.Parameters = make([]expr.ParameterValue, len(request.Parameters))
-	for i, parameter := range request.Parameters {
-		environment.Parameters[i] = expr.ParameterValue{Number: uint32(i + 1), Layout: parameter.Layout, Value: parameter.Value}
-	}
+	environment.Parameters = exprParams
 	portalContext := ctx
 	frame := executor.retainFrame()
 	defer func() { err = errors.Join(err, executor.releaseFrame(frame)) }()
@@ -461,13 +557,6 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 	}
 	defer func() { err = errors.Join(err, portal.Close()) }()
 	columns := prepared.Columns()
-	if checkBatch != nil {
-		if !hadReturning {
-			columns = nil
-		} else if len(columns) > 0 {
-			columns = columns[:len(columns)-1]
-		}
-	}
 	result.Columns = make([]model.TypeLayout, len(columns))
 	result.ColumnNames = make([]string, len(columns))
 	for i := range columns {
@@ -481,9 +570,6 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 	for {
 		remaining := request.MaxRows - len(result.Rows)
 		batchLimit := min(remaining+1, columnar.DefaultBatchSize)
-		if checkBatch != nil && !hadReturning {
-			batchLimit = columnar.DefaultBatchSize
-		}
 		batch := columnar.Batch{MaxRows: batchLimit}
 		nextErr := portal.Next(ctx, &batch)
 		if nextErr == io.EOF {
@@ -491,14 +577,6 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 		}
 		if nextErr != nil {
 			return result, nextErr
-		}
-		if checkBatch != nil {
-			if err := checkBatch(ctx, &batch); err != nil {
-				return result, err
-			}
-			if !hadReturning {
-				continue
-			}
 		}
 		for rowIndex := range batch.Rows() {
 			if len(result.Rows) >= request.MaxRows {
@@ -531,14 +609,14 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 	return result, nil
 }
 
-// openRoutineStatementView derives the read set for one bound routine-body
-// statement and opens the view covering it, mirroring the derived-dependency
-// path in runPreparedStatement: the enclosing declaration plus every access
-// path the bound statement's scans may negotiate, so optimization's PlanScan
-// probes and the portal's reads are both covered. Catalog layout coverage is
-// guaranteed before the view opens, matching the binding-view fallback.
-func (executor *routineExecutor) openRoutineStatementView(ctx context.Context, bound *bind.BoundStatement, statement *zpgparse.RawStmt, parameterLayouts []model.TypeLayout) (reader txn.ReadView, err error) {
-	scans, err := executor.transactions.statementScanDependencies(ctx, executor.view, bound, executor.execution, func(ctx context.Context, view txn.ReadView, builtins builtin.ResolveOptions) (*catalog.CatalogSnapshot, PrepareOptions, error) {
+// openRoutineStatementViewWithTrial derives the read set for one bound
+// routine-body statement (passing runtime parameter values so scan spans and
+// locks narrow), opens the view covering it, and returns the trial-compiled
+// Prepared plan when eligible for reuse without double-planning.
+func (executor *routineExecutor) openRoutineStatementViewWithTrial(ctx context.Context, bound *bind.BoundStatement, statement *zpgparse.RawStmt, parameterLayouts []model.TypeLayout, parameters []expr.ParameterValue) (reader txn.ReadView, trialPrepared *Prepared, scans []txn.ReadDependency, err error) {
+	execution := executor.execution
+	execution.Environment.Parameters = parameters
+	scans, trialPrepared, err = executor.transactions.statementScanDependenciesWithTrial(ctx, executor.view, bound, execution, func(ctx context.Context, view txn.ReadView, builtins builtin.ResolveOptions) (*catalog.CatalogSnapshot, PrepareOptions, error) {
 		snapshot, err := executor.catalog.TransactionSnapshot(view, catalog.BorrowReader)
 		if err != nil {
 			return nil, PrepareOptions{}, err
@@ -547,17 +625,53 @@ func (executor *routineExecutor) openRoutineStatementView(ctx context.Context, b
 		if err != nil {
 			return nil, PrepareOptions{}, errors.Join(err, snapshot.Close())
 		}
+		resources, searchPath := executor.semanticSettings()
+		plan.Normalize.Builtin = executor.environment.Builtin
+		plan.Bind.Builtin = executor.environment.Builtin
+		plan.Bind.CatalogRelations = executor.options.Capabilities.CatalogRelations
+		plan.Bind.Temporal = executor.environment.Temporal
+		plan.Bind.SearchPath = searchPath
+		plan.Bind.CurrentRole = executor.transactions.settings.CurrentRole()
+		plan.Bind.SessionUser = executor.transactions.settings.SessionUser()
+		if resources.EffectiveWorkMemoryBytes > 0 && plan.Optimize.WorkingMemory > 0 {
+			plan.Optimize.WorkingMemory = uint64(resources.EffectiveWorkMemoryBytes)
+		}
+		boundRoutineStatementSource(&plan, statement, executor.options.Limits.MaxProgramBytes)
 		return snapshot, plan, nil
 	}, executor.environment.Builtin)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
+	reader, err = executor.openRoutineStatementViewFromDeps(ctx, bound, scans)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return reader, trialPrepared, scans, nil
+}
+
+func (executor *routineExecutor) openRoutineStatementViewFromDeps(ctx context.Context, bound *bind.BoundStatement, scans []txn.ReadDependency) (txn.ReadView, error) {
 	dependencies := append(slices.Clone(executor.execution.Dependencies), scans...)
 	if len(catalogReadDependencies(executor.catalog, dependencies)) == 0 {
 		dependencies = append(catalogLayoutDependencies(executor.catalog), dependencies...)
 	}
 	dependencies = bindScanOccurrences(bound, dependencies)
 	return executor.transaction.ReadViewForRowLocks(ctx, dependencies, boundRowLockPolicies(bound))
+}
+
+func (executor *routineExecutor) hasAllDefinitions(required []procedural.Definition) bool {
+	for _, needed := range required {
+		found := false
+		for _, installed := range executor.definitions {
+			if installed.Object == needed.Object || installed.ID == needed.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func boundRoutineStatementSource(planning *PrepareOptions, statement *zpgparse.RawStmt, maximum uint64) {
@@ -798,14 +912,14 @@ func (executor *routineExecutor) Report(ctx context.Context, warning model.Error
 
 func (executor *routineExecutor) settingSnapshot() (current, retained settingValues) {
 	executor.transactions.settingMu.Lock()
-	current, retained = executor.transactions.settings.current, executor.transactions.settings.retained
+	current, retained = executor.transactions.settings.routineSettingsSnapshot()
 	executor.transactions.settingMu.Unlock()
 	return current, retained
 }
 
 func (executor *routineExecutor) restoreSettings(current, retained settingValues) {
 	executor.transactions.settingMu.Lock()
-	executor.transactions.settings.current, executor.transactions.settings.retained = current, retained
+	executor.transactions.settings.restoreRoutineSettings(current, retained)
 	executor.transactions.settingMu.Unlock()
 }
 

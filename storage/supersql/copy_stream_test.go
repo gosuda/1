@@ -43,7 +43,7 @@ func TestCopyCallerStreams(t *testing.T) {
 		`COPY ct TO '/tmp/data'`,
 		`COPY ct FROM PROGRAM 'cat /tmp/data'`,
 	} {
-		_, err = database.Exec(ctx, statement, 0)
+		_, err = database.exec(ctx, statement, 0)
 		if code := sqlStateOf(err); code != "0A000" {
 			t.Fatalf("%q: expected SQLSTATE 0A000, got %q (%v)", statement, code, err)
 		}

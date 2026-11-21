@@ -22,7 +22,11 @@ type runGeneration struct {
 	activeFiles    []*sstFile
 	inactiveFiles  []*sstFile
 	levels         [MaxLevels][]*sstFile
+	byTarget       map[objectGeneration][]*sstFile
+	byTargetLevels map[objectGeneration][MaxLevels][]*sstFile
 	position       uint64
+	firstPosition  uint64
+	commitTSs      []model.Timestamp
 	timestamp      model.Timestamp
 	baseGeneration uint64
 	references     uint64
@@ -40,6 +44,8 @@ type runSet struct {
 	bytes, files, pins uint64
 	closed             bool
 	reservation        *runAdmission
+	fds                *fdPool
+	blockCache         *paxBlockCache
 }
 
 type runPin struct {
@@ -62,7 +68,13 @@ func newRunSet(limits runSetLimits) (*runSet, error) {
 	if limits.MaxBytes < fixed || limits.MaxFiles == 0 || limits.MaxPins == 0 {
 		return nil, columnar.ErrBatchBudget
 	}
-	return &runSet{limits: limits, bytes: fixed}, nil
+	cacheBytes := min(limits.MaxBytes, defaultBlockCacheBytes)
+	return &runSet{
+		limits:     limits,
+		bytes:      fixed,
+		fds:        newFDPool(defaultMaxOpenFDs),
+		blockCache: newPAXBlockCache(cacheBytes),
+	}, nil
 }
 
 // publish consumes files on every return; durable writers reserve before WAL.
@@ -78,6 +90,10 @@ func (set *runSet) publish(ctx context.Context, position uint64, timestamp model
 // reserve consumes files on every return. Charging the reservation under mu
 // prevents new snapshot pins from consuming its installation capacity.
 func (set *runSet) reserve(ctx context.Context, position uint64, timestamp model.Timestamp, files []*sstFile) (_ *runAdmission, err error) {
+	return set.reserveRange(ctx, position, position, []model.Timestamp{timestamp}, files)
+}
+
+func (set *runSet) reserveRange(ctx context.Context, firstPosition, position uint64, commitTSs []model.Timestamp, files []*sstFile) (_ *runAdmission, err error) {
 	clear(files[len(files):cap(files)])
 	set.mu.Lock()
 	defer set.mu.Unlock()
@@ -99,14 +115,21 @@ func (set *runSet) reserve(ctx context.Context, position uint64, timestamp model
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if position == 0 || timestamp <= 0 || len(files) == 0 {
+	if firstPosition == 0 || position < firstPosition || uint64(len(commitTSs)) != position-firstPosition+1 || len(files) == 0 {
 		return nil, storage.ErrInvalidMutation
 	}
-	if set.head != nil {
-		if position <= set.head.position || timestamp <= set.head.timestamp {
+	for i, ts := range commitTSs {
+		if ts <= 0 || (i > 0 && ts <= commitTSs[i-1]) {
 			return nil, storage.ErrInvalidMutation
 		}
-		if position-set.head.position != 1 {
+	}
+	firstTS := commitTSs[0]
+	timestamp := commitTSs[len(commitTSs)-1]
+	if set.head != nil {
+		if firstPosition <= set.head.position || firstTS <= set.head.timestamp {
+			return nil, storage.ErrInvalidMutation
+		}
+		if firstPosition-set.head.position != 1 {
 			return nil, storage.ErrInvalidMutation
 		}
 	}
@@ -132,19 +155,30 @@ func (set *runSet) reserve(ctx context.Context, position uint64, timestamp model
 		if file == nil {
 			return nil, storage.ErrCorruptStorage
 		}
-		file.mu.RLock()
-		closed := file.file == nil
-		cost := uint64(unsafe.Sizeof(sstFile{})) + uint64(cap(file.index)) + uint64(cap(file.descriptor.LowerKey)+cap(file.descriptor.UpperKey))
-		file.mu.RUnlock()
-		if closed {
+		if file.isClosed() {
 			return nil, storage.ErrClosed
 		}
+		cost := file.residentCost()
 		if cost > remaining-bytes {
 			return nil, columnar.ErrBatchBudget
 		}
 		bytes += cost
 	}
-	generation := &runGeneration{parent: set.head, files: files, position: position, timestamp: timestamp, references: 1, bytes: bytes}
+	for _, file := range files {
+		file.attachRuntime(set.fds, set.blockCache)
+	}
+	tsCopy := make([]model.Timestamp, len(commitTSs))
+	copy(tsCopy, commitTSs)
+	generation := &runGeneration{
+		parent:        set.head,
+		files:         files,
+		position:      position,
+		firstPosition: firstPosition,
+		commitTSs:     tsCopy,
+		timestamp:     timestamp,
+		references:    1,
+		bytes:         bytes,
+	}
 	generation.indexTiers()
 	if err := generation.validateLevels(ctx); err != nil {
 		return nil, err
@@ -281,13 +315,11 @@ func (pin *runPin) visit(ctx context.Context, target storage.ObjectRef, visit fu
 	if pin.closed {
 		return storage.ErrClosed
 	}
+	key := targetGeneration(target)
 	for generation := pin.generation; generation != nil; generation = generation.parent {
-		for _, file := range generation.files {
+		for _, file := range generation.byTarget[key] {
 			if err := ctx.Err(); err != nil {
 				return err
-			}
-			if file.target.ObjectID != target.ObjectID || file.target.Generation != target.Generation {
-				continue
 			}
 			if err := visit(file); err != nil {
 				return err
@@ -334,7 +366,14 @@ func (set *runSet) Close() error {
 	if set.reservation != nil {
 		err = set.reservation.closeLocked()
 	}
-	return errors.Join(err, set.releaseLocked(generation))
+	err = errors.Join(err, set.releaseLocked(generation))
+	if set.blockCache != nil {
+		set.blockCache.Clear()
+	}
+	if set.pins == 0 && set.fds != nil {
+		err = errors.Join(err, set.fds.Close())
+	}
+	return err
 }
 
 func (set *runSet) releaseLocked(generation *runGeneration) error {
@@ -354,8 +393,14 @@ func (set *runSet) releaseLocked(generation *runGeneration) error {
 		generation.activeFiles = nil
 		generation.inactiveFiles = nil
 		generation.levels = [MaxLevels][]*sstFile{}
+		generation.byTarget = nil
+		generation.byTargetLevels = nil
+		generation.commitTSs = nil
 		generation.parent = nil
 		generation = parent
+	}
+	if set.closed && set.pins == 0 && set.head == nil && set.fds != nil {
+		err = errors.Join(err, set.fds.Close())
 	}
 	return err
 }

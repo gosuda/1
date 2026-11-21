@@ -5,10 +5,12 @@ package pgx
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -30,6 +32,79 @@ var (
 	// ErrTxCommitRollback occurs when a commit fails and the transaction is rolled back.
 	ErrTxCommitRollback = errors.New("pgx: commit unexpectedly resulted in rollback")
 )
+
+// PgError represents a PostgreSQL server error compatible with pgconn.PgError.
+type PgError struct {
+	Severity       string
+	Code           string
+	Message        string
+	Detail         string
+	Hint           string
+	Position       int32
+	ConstraintName string
+	TableName      string
+	ColumnName     string
+	cause          error
+}
+
+// Error returns the formatted PostgreSQL diagnostic string.
+func (e *PgError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Severity != "" && e.Code != "" {
+		return fmt.Sprintf("%s: %s (SQLSTATE %s)", e.Severity, e.Message, e.Code)
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.cause != nil {
+		return e.cause.Error()
+	}
+	return e.Code
+}
+
+// Unwrap returns the underlying error wrapped by this PgError.
+func (e *PgError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+// SQLState returns the five-character PostgreSQL SQLSTATE code.
+func (e *PgError) SQLState() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
+func wrapPgError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var existing *PgError
+	if errors.As(err, &existing) {
+		return err
+	}
+	var sqlErr *supersql.Error
+	if !errors.As(err, &sqlErr) {
+		return err
+	}
+	return &PgError{
+		Severity:       "ERROR",
+		Code:           sqlErr.Code,
+		Message:        sqlErr.Message,
+		Detail:         sqlErr.Detail,
+		Hint:           sqlErr.Hint,
+		Position:       int32(sqlErr.Position),
+		ConstraintName: sqlErr.Constraint,
+		TableName:      sqlErr.Table,
+		ColumnName:     sqlErr.Column,
+		cause:          err,
+	}
+}
 
 // CommandTag is the result tag returned by an Exec command.
 type CommandTag struct {
@@ -59,11 +134,15 @@ func newCommandTagFromResult(res sql.Result, defaultVerb string) CommandTag {
 			return CommandTag{s: tag, rowsAffected: rows}
 		}
 	}
-	verb := strings.ToUpper(strings.TrimSpace(defaultVerb))
+	return formatVerbCommandTag(defaultVerb, rows)
+}
+
+func formatVerbCommandTag(verb string, rows int64) CommandTag {
+	verb = strings.ToUpper(strings.TrimSpace(verb))
 	switch verb {
 	case "INSERT":
 		return CommandTag{s: fmt.Sprintf("INSERT 0 %d", rows), rowsAffected: rows}
-	case "UPDATE", "DELETE", "SELECT", "MOVE", "FETCH", "COPY":
+	case "UPDATE", "DELETE", "SELECT", "MOVE", "FETCH", "COPY", "MERGE":
 		return CommandTag{s: fmt.Sprintf("%s %d", verb, rows), rowsAffected: rows}
 	default:
 		return CommandTag{s: verb, rowsAffected: rows}
@@ -333,17 +412,186 @@ func prepareQueryAndArgs(ctx context.Context, conn *Conn, query string, args []a
 	return query, args, nil
 }
 
-func firstKeyword(sqlText string) string {
-	sqlText = strings.TrimSpace(sqlText)
-	if sqlText == "" {
-		return ""
+// skipSQLSpaceAndComments advances pos past whitespace, line comments (--),
+// and nested block comments (/* ... */).
+func skipSQLSpaceAndComments(s string, pos int) int {
+	n := len(s)
+	for pos < n {
+		if unicode.IsSpace(rune(s[pos])) {
+			pos++
+			continue
+		}
+		if s[pos] == '-' && pos+1 < n && s[pos+1] == '-' {
+			pos += 2
+			for pos < n && s[pos] != '\n' {
+				pos++
+			}
+			continue
+		}
+		if s[pos] == '/' && pos+1 < n && s[pos+1] == '*' {
+			depth := 1
+			pos += 2
+			for pos < n && depth > 0 {
+				if s[pos] == '/' && pos+1 < n && s[pos+1] == '*' {
+					depth++
+					pos += 2
+					continue
+				}
+				if s[pos] == '*' && pos+1 < n && s[pos+1] == '/' {
+					depth--
+					pos += 2
+					continue
+				}
+				pos++
+			}
+			continue
+		}
+		break
 	}
-	for i := 0; i < len(sqlText); i++ {
-		if unicode.IsSpace(rune(sqlText[i])) || sqlText[i] == ';' || sqlText[i] == '(' {
-			return strings.ToUpper(sqlText[:i])
+	return pos
+}
+
+// nextSQLWord reads the next SQL token (word, punctuation, or skipped literal)
+// starting at pos. It returns the uppercased word (or single punctuation byte)
+// and the position immediately following the token.
+func nextSQLWord(s string, pos int) (tok string, next int) {
+	pos = skipSQLSpaceAndComments(s, pos)
+	n := len(s)
+	if pos >= n {
+		return "", n
+	}
+	ch := s[pos]
+	// Single-quoted string literal
+	if ch == '\'' {
+		pos++
+		for pos < n {
+			if s[pos] == '\'' {
+				pos++
+				if pos < n && s[pos] == '\'' {
+					pos++
+					continue
+				}
+				break
+			}
+			pos++
+		}
+		return "'", pos
+	}
+	// Double-quoted identifier
+	if ch == '"' {
+		start := pos
+		pos++
+		for pos < n {
+			if s[pos] == '"' {
+				pos++
+				if pos < n && s[pos] == '"' {
+					pos++
+					continue
+				}
+				break
+			}
+			pos++
+		}
+		return s[start:pos], pos
+	}
+	// Dollar-quoted literal $tag$...$tag$
+	if ch == '$' && pos+1 < n && (s[pos+1] == '$' || unicode.IsLetter(rune(s[pos+1])) || s[pos+1] == '_') {
+		if endTag := strings.IndexByte(s[pos+1:], '$'); endTag >= 0 {
+			tag := s[pos : pos+1+endTag+1]
+			pos += len(tag)
+			if closeIdx := strings.Index(s[pos:], tag); closeIdx >= 0 {
+				pos += closeIdx + len(tag)
+			} else {
+				pos = n
+			}
+			return "$", pos
 		}
 	}
-	return strings.ToUpper(sqlText)
+	if unicode.IsLetter(rune(ch)) || ch == '_' {
+		start := pos
+		pos++
+		for pos < n && (unicode.IsLetter(rune(s[pos])) || unicode.IsDigit(rune(s[pos])) || s[pos] == '_' || s[pos] == '$') {
+			pos++
+		}
+		return strings.ToUpper(s[start:pos]), pos
+	}
+	return string(ch), pos + 1
+}
+
+func skipBalancedParens(s string, pos int) int {
+	depth := 1
+	for pos < len(s) && depth > 0 {
+		tok, next := nextSQLWord(s, pos)
+		pos = next
+		switch tok {
+		case "(":
+			depth++
+		case ")":
+			depth--
+		case "":
+			return pos
+		}
+	}
+	return pos
+}
+
+func parseStatementVerb(sqlText string) string {
+	verb, pos := nextSQLWord(sqlText, 0)
+	if verb == "" {
+		return ""
+	}
+	if verb == "WITH" {
+		// Advance past WITH [RECURSIVE] cte1 [(cols)] AS [NOT] [MATERIALIZED] (...) [, ...]
+		tok, next := nextSQLWord(sqlText, pos)
+		if tok == "RECURSIVE" {
+			pos = next
+		}
+		for pos < len(sqlText) {
+			tok, next = nextSQLWord(sqlText, pos)
+			pos = next
+			if tok == "" {
+				break
+			}
+			if tok == "(" {
+				pos = skipBalancedParens(sqlText, pos)
+				continue
+			}
+			// After closing a CTE body, look for a top-level statement keyword.
+			switch tok {
+			case "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE":
+				if tok == "VALUES" || tok == "TABLE" {
+					return "SELECT"
+				}
+				return tok
+			}
+		}
+		return "SELECT"
+	}
+	switch verb {
+	case "VALUES", "TABLE":
+		return "SELECT"
+	case "CREATE", "ALTER", "DROP":
+		obj, next := nextSQLWord(sqlText, pos)
+		for obj == "OR" || obj == "REPLACE" || obj == "TEMP" || obj == "TEMPORARY" || obj == "UNLOGGED" || obj == "UNIQUE" || obj == "RECURSIVE" {
+			if obj == "OR" {
+				// skip following REPLACE
+				_, next = nextSQLWord(sqlText, next)
+			}
+			obj, next = nextSQLWord(sqlText, next)
+		}
+		if obj == "MATERIALIZED" {
+			w2, _ := nextSQLWord(sqlText, next)
+			if w2 == "VIEW" {
+				return verb + " MATERIALIZED VIEW"
+			}
+		}
+		if obj != "" && unicode.IsLetter(rune(obj[0])) {
+			return verb + " " + obj
+		}
+		return verb
+	default:
+		return verb
+	}
 }
 
 // Identifier represents a PostgreSQL schema/table/column identifier path.
@@ -365,6 +613,117 @@ type PoolConfig struct {
 	MinConns        int32
 	MaxConnLifetime time.Duration
 	MaxConnIdleTime time.Duration
+	BeforeConnect   func(context.Context, *PoolConfig) error
+	AfterConnect    func(context.Context, *Conn) error
+	BeforeAcquire   func(context.Context, *Conn) bool
+	AfterRelease    func(*Conn) bool
+}
+
+// hookConnector wraps a driver.Connector to support PoolConfig lifecycle hooks.
+type hookConnector struct {
+	base          driver.Connector
+	cfg           PoolConfig
+	beforeConnect func(context.Context, *PoolConfig) error
+}
+
+func (hc *hookConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if hc.beforeConnect != nil {
+		cfgCopy := hc.cfg
+		if err := hc.beforeConnect(ctx, &cfgCopy); err != nil {
+			return nil, err
+		}
+	}
+	raw, err := hc.base.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conn := &hookConn{inner: raw}
+	conn.isNew.Store(true)
+	return conn, nil
+}
+
+func (hc *hookConnector) Driver() driver.Driver {
+	return hc.base.Driver()
+}
+
+type hookConn struct {
+	inner     driver.Conn
+	isNew     atomic.Bool
+	discarded atomic.Bool
+}
+
+func (c *hookConn) Prepare(query string) (driver.Stmt, error) {
+	return c.inner.Prepare(query)
+}
+
+func (c *hookConn) Close() error {
+	return c.inner.Close()
+}
+
+func (c *hookConn) Begin() (driver.Tx, error) {
+	return c.inner.Begin()
+}
+
+func (c *hookConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if pc, ok := c.inner.(driver.ConnPrepareContext); ok {
+		return pc.PrepareContext(ctx, query)
+	}
+	return c.inner.Prepare(query)
+}
+
+func (c *hookConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if bt, ok := c.inner.(driver.ConnBeginTx); ok {
+		return bt.BeginTx(ctx, opts)
+	}
+	return c.inner.Begin()
+}
+
+func (c *hookConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if ec, ok := c.inner.(driver.ExecerContext); ok {
+		return ec.ExecContext(ctx, query, args)
+	}
+	return nil, driver.ErrSkip
+}
+
+func (c *hookConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if qc, ok := c.inner.(driver.QueryerContext); ok {
+		return qc.QueryContext(ctx, query, args)
+	}
+	return nil, driver.ErrSkip
+}
+
+func (c *hookConn) Ping(ctx context.Context) error {
+	if p, ok := c.inner.(driver.Pinger); ok {
+		return p.Ping(ctx)
+	}
+	return nil
+}
+
+func (c *hookConn) ResetSession(ctx context.Context) error {
+	if c.discarded.Load() {
+		return driver.ErrBadConn
+	}
+	if sr, ok := c.inner.(driver.SessionResetter); ok {
+		return sr.ResetSession(ctx)
+	}
+	return nil
+}
+
+func (c *hookConn) IsValid() bool {
+	if c.discarded.Load() {
+		return false
+	}
+	if v, ok := c.inner.(driver.Validator); ok {
+		return v.IsValid()
+	}
+	return true
+}
+
+func (c *hookConn) CheckNamedValue(nv *driver.NamedValue) error {
+	if nvc, ok := c.inner.(driver.NamedValueChecker); ok {
+		return nvc.CheckNamedValue(nv)
+	}
+	return driver.ErrSkip
 }
 
 // PoolStat reports connection pool statistics compatible with pgxpool.Stat.
@@ -378,10 +737,13 @@ func (s PoolStat) IdleConns() int32     { return int32(s.stats.Idle) }
 
 // Pool is a concurrency-safe connection pool compatible with pgxpool.Pool.
 type Pool struct {
-	connector   *supersql.Connector
-	db          *sql.DB
+	connector     *supersql.Connector
+	db            *sql.DB
 	ownsConnector bool
-	closed      atomic.Bool
+	closed        atomic.Bool
+	afterConnect  func(context.Context, *Conn) error
+	beforeAcquire func(context.Context, *Conn) bool
+	afterRelease  func(*Conn) bool
 }
 
 // OpenPool opens a supersql database and returns a Pool over it.
@@ -389,14 +751,28 @@ func OpenPool(ctx context.Context, opts supersql.OpenOptions) (*Pool, error) {
 	return OpenPoolWithConfig(ctx, PoolConfig{OpenOptions: opts})
 }
 
-// OpenPoolWithConfig opens a supersql database with pool sizing configuration.
+// OpenPoolWithConfig opens a supersql database with pool sizing and lifecycle hooks.
 func OpenPoolWithConfig(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	connector, err := supersql.OpenConnector(ctx, cfg.OpenOptions)
 	if err != nil {
-		return nil, err
+		return nil, wrapPgError(err)
 	}
-	pool := NewPoolFromConnector(connector)
-	pool.ownsConnector = true
+	var dbConnector driver.Connector = connector
+	if cfg.BeforeConnect != nil || cfg.AfterConnect != nil || cfg.BeforeAcquire != nil || cfg.AfterRelease != nil {
+		dbConnector = &hookConnector{
+			base:          connector,
+			cfg:           cfg,
+			beforeConnect: cfg.BeforeConnect,
+		}
+	}
+	pool := &Pool{
+		connector:     connector,
+		db:            sql.OpenDB(dbConnector),
+		ownsConnector: true,
+		afterConnect:  cfg.AfterConnect,
+		beforeAcquire: cfg.BeforeAcquire,
+		afterRelease:  cfg.AfterRelease,
+	}
 	if cfg.MaxConns > 0 {
 		pool.db.SetMaxOpenConns(int(cfg.MaxConns))
 	}
@@ -459,17 +835,47 @@ func (p *Pool) Stat() PoolStat {
 
 // Ping verifies the pool can acquire a session and communicate with the engine.
 func (p *Pool) Ping(ctx context.Context) error {
-	return p.db.PingContext(ctx)
+	return wrapPgError(p.db.PingContext(ctx))
 }
 
 // Acquire checks out an isolated session connection from the pool.
 func (p *Pool) Acquire(ctx context.Context) (*PoolConn, error) {
-	sqlConn, err := p.db.Conn(ctx)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < 4; attempt++ {
+		sqlConn, err := p.db.Conn(ctx)
+		if err != nil {
+			return nil, wrapPgError(err)
+		}
+		c := &Conn{sqlConn: sqlConn, pool: p}
+		var hc *hookConn
+		if p.afterConnect != nil || p.beforeAcquire != nil || p.afterRelease != nil {
+			_ = sqlConn.Raw(func(driverConn any) error {
+				hc, _ = driverConn.(*hookConn)
+				return nil
+			})
+		}
+		isNew := hc != nil && hc.isNew.CompareAndSwap(true, false)
+		if isNew && p.afterConnect != nil {
+			if err := p.afterConnect(ctx, c); err != nil {
+				if hc != nil {
+					hc.discarded.Store(true)
+				}
+				_ = sqlConn.Close()
+				return nil, wrapPgError(err)
+			}
+		}
+		if p.beforeAcquire != nil && !p.beforeAcquire(ctx, c) {
+			if hc != nil {
+				hc.discarded.Store(true)
+			}
+			_ = sqlConn.Close()
+			if !isNew && ctx.Err() == nil {
+				continue
+			}
+			return nil, errors.New("pgx: connection rejected by BeforeAcquire")
+		}
+		return &PoolConn{conn: c}, nil
 	}
-	c := &Conn{sqlConn: sqlConn, pool: p}
-	return &PoolConn{conn: c}, nil
+	return nil, errors.New("pgx: connection rejected by BeforeAcquire")
 }
 
 // AcquireFunc acquires a connection, runs fn, and releases the connection.
@@ -497,7 +903,7 @@ func (p *Pool) Exec(ctx context.Context, sqlText string, arguments ...any) (Comm
 func (p *Pool) Query(ctx context.Context, sqlText string, args ...any) (Rows, error) {
 	pc, err := p.Acquire(ctx)
 	if err != nil {
-		return &pgxRows{err: err, closed: true}, err
+		return newClosedErrorRows(nil, err), err
 	}
 	rows, err := pc.conn.queryWithRelease(ctx, pc.Release, sqlText, args...)
 	if err != nil {
@@ -538,19 +944,13 @@ func (p *Pool) BeginFunc(ctx context.Context, fn func(Tx) error) error {
 	return BeginFunc(ctx, p, fn)
 }
 
-// SendBatch sends a batch of queries over a pooled connection.
+// SendBatch sends a batch of queries over a pooled connection inside an implicit transaction.
 func (p *Pool) SendBatch(ctx context.Context, b *Batch) BatchResults {
 	pc, err := p.Acquire(ctx)
 	if err != nil {
-		return &batchResults{err: err, closed: true}
+		return &batchResults{err: wrapPgError(err), closed: true}
 	}
-	return &batchResults{
-		ctx:     ctx,
-		execer:  pc.conn,
-		conn:    pc.conn,
-		batch:   b,
-		release: pc.Release,
-	}
+	return pc.conn.sendBatchWithRelease(ctx, b, pc.Release)
 }
 
 // CopyFrom performs a bulk insert of rows into tableName on an acquired connection.
@@ -575,6 +975,16 @@ func (pc *PoolConn) Release() {
 		return
 	}
 	if pc.conn != nil && pc.conn.sqlConn != nil {
+		if pc.conn.pool != nil && pc.conn.pool.afterRelease != nil {
+			if !pc.conn.pool.afterRelease(pc.conn) {
+				_ = pc.conn.sqlConn.Raw(func(driverConn any) error {
+					if hc, ok := driverConn.(*hookConn); ok {
+						hc.discarded.Store(true)
+					}
+					return nil
+				})
+			}
+		}
 		_ = pc.conn.sqlConn.Close()
 	}
 }
@@ -662,19 +1072,19 @@ func (c *Conn) Close(ctx context.Context) error {
 	if c.ownsPool && c.pool != nil {
 		c.pool.Close()
 	}
-	return err
+	return wrapPgError(err)
 }
 
 // Ping verifies the connection is alive.
 func (c *Conn) Ping(ctx context.Context) error {
-	return c.sqlConn.PingContext(ctx)
+	return wrapPgError(c.sqlConn.PingContext(ctx))
 }
 
 // Prepare registers a named prepared query on this session.
 func (c *Conn) Prepare(ctx context.Context, name, sqlText string) error {
 	stmt, err := c.sqlConn.PrepareContext(ctx, sqlText)
 	if err != nil {
-		return err
+		return wrapPgError(err)
 	}
 	_ = stmt.Close()
 	c.mu.Lock()
@@ -682,6 +1092,28 @@ func (c *Conn) Prepare(ctx context.Context, name, sqlText string) error {
 		c.prepared = make(map[string]string)
 	}
 	c.prepared[name] = sqlText
+	c.mu.Unlock()
+	return nil
+}
+
+// Deallocate removes a named prepared query from this session.
+func (c *Conn) Deallocate(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.prepared, name)
+	c.mu.Unlock()
+	return nil
+}
+
+// DeallocateAll removes all named prepared queries from this session.
+func (c *Conn) DeallocateAll(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	clear(c.prepared)
 	c.mu.Unlock()
 	return nil
 }
@@ -702,13 +1134,13 @@ func (c *Conn) Exec(ctx context.Context, sqlText string, arguments ...any) (Comm
 	sqlText = c.resolvePrepared(sqlText)
 	rewritten, args, err := prepareQueryAndArgs(ctx, c, sqlText, arguments)
 	if err != nil {
-		return CommandTag{}, err
+		return CommandTag{}, wrapPgError(err)
 	}
 	res, err := c.sqlConn.ExecContext(ctx, rewritten, args...)
 	if err != nil {
-		return CommandTag{}, err
+		return CommandTag{}, wrapPgError(err)
 	}
-	return newCommandTagFromResult(res, firstKeyword(rewritten)), nil
+	return newCommandTagFromResult(res, parseStatementVerb(rewritten)), nil
 }
 
 // Query executes a query and returns streaming Rows.
@@ -720,13 +1152,15 @@ func (c *Conn) queryWithRelease(ctx context.Context, release func(), sqlText str
 	sqlText = c.resolvePrepared(sqlText)
 	rewritten, args, err := prepareQueryAndArgs(ctx, c, sqlText, arguments)
 	if err != nil {
-		return &pgxRows{err: err, closed: true, conn: c}, err
+		err = wrapPgError(err)
+		return newClosedErrorRows(c, err), err
 	}
 	sqlRows, err := c.sqlConn.QueryContext(ctx, rewritten, args...)
 	if err != nil {
-		return &pgxRows{err: err, closed: true, conn: c}, err
+		err = wrapPgError(err)
+		return newClosedErrorRows(c, err), err
 	}
-	return newPgxRows(c, sqlRows, release, firstKeyword(rewritten)), nil
+	return newPgxRows(c, sqlRows, release, parseStatementVerb(rewritten)), nil
 }
 
 // QueryRow executes a query expected to return at most one row.
@@ -745,16 +1179,63 @@ func (c *Conn) BeginTx(ctx context.Context, txOptions TxOptions) (Tx, error) {
 	return c.beginTxInternal(ctx, txOptions, nil)
 }
 
+func (txOptions TxOptions) beginSQL() (string, error) {
+	var parts []string
+	parts = append(parts, "BEGIN")
+	switch txOptions.IsoLevel {
+	case "":
+	case Serializable:
+		parts = append(parts, "ISOLATION LEVEL SERIALIZABLE")
+	case RepeatableRead:
+		parts = append(parts, "ISOLATION LEVEL REPEATABLE READ")
+	case ReadCommitted:
+		parts = append(parts, "ISOLATION LEVEL READ COMMITTED")
+	case ReadUncommitted:
+		parts = append(parts, "ISOLATION LEVEL READ UNCOMMITTED")
+	default:
+		return "", fmt.Errorf("pgx: unknown isolation level %q", txOptions.IsoLevel)
+	}
+	switch txOptions.AccessMode {
+	case "":
+	case ReadWrite:
+		parts = append(parts, "READ WRITE")
+	case ReadOnly:
+		parts = append(parts, "READ ONLY")
+	default:
+		return "", fmt.Errorf("pgx: unknown access mode %q", txOptions.AccessMode)
+	}
+	switch txOptions.DeferrableMode {
+	case "":
+	case Deferrable:
+		parts = append(parts, "DEFERRABLE")
+	case NotDeferrable:
+		parts = append(parts, "NOT DEFERRABLE")
+	default:
+		return "", fmt.Errorf("pgx: unknown deferrable mode %q", txOptions.DeferrableMode)
+	}
+	return strings.Join(parts, " "), nil
+}
+
 func (c *Conn) beginTxInternal(ctx context.Context, txOptions TxOptions, release func()) (Tx, error) {
 	if txOptions.BeginQuery != "" {
 		if _, err := c.sqlConn.ExecContext(ctx, txOptions.BeginQuery); err != nil {
+			return nil, wrapPgError(err)
+		}
+		return &pgxTx{conn: c, rawBegin: true, release: release}, nil
+	}
+	if txOptions.DeferrableMode != "" {
+		beginSQL, err := txOptions.beginSQL()
+		if err != nil {
 			return nil, err
+		}
+		if _, err := c.sqlConn.ExecContext(ctx, beginSQL); err != nil {
+			return nil, wrapPgError(err)
 		}
 		return &pgxTx{conn: c, rawBegin: true, release: release}, nil
 	}
 	sqlTx, err := c.sqlConn.BeginTx(ctx, txOptions.toSQLTxOptions())
 	if err != nil {
-		return nil, err
+		return nil, wrapPgError(err)
 	}
 	return &pgxTx{conn: c, sqlTx: sqlTx, release: release}, nil
 }
@@ -764,13 +1245,37 @@ func (c *Conn) BeginFunc(ctx context.Context, fn func(Tx) error) error {
 	return BeginFunc(ctx, c, fn)
 }
 
-// SendBatch sends a batch of queries on this connection.
+// SendBatch sends a batch of queries on this connection inside an implicit transaction.
 func (c *Conn) SendBatch(ctx context.Context, b *Batch) BatchResults {
+	return c.sendBatchWithRelease(ctx, b, nil)
+}
+
+func (c *Conn) sendBatchWithRelease(ctx context.Context, b *Batch, release func()) BatchResults {
+	tx, err := c.beginTxInternal(ctx, TxOptions{}, nil)
+	if err != nil {
+		// If the connection is already inside a manual BEGIN block (SQLSTATE 25001),
+		// run the batch inside the active transaction without starting a new one.
+		if supersql.SQLState(err) == "25001" {
+			return &batchResults{
+				ctx:     ctx,
+				execer:  c,
+				conn:    c,
+				batch:   b,
+				release: release,
+			}
+		}
+		if release != nil {
+			release()
+		}
+		return &batchResults{err: wrapPgError(err), closed: true}
+	}
 	return &batchResults{
-		ctx:    ctx,
-		execer: c,
-		conn:   c,
-		batch:  b,
+		ctx:        ctx,
+		execer:     tx,
+		implicitTx: tx,
+		conn:       c,
+		batch:      b,
+		release:    release,
 	}
 }
 
@@ -782,7 +1287,7 @@ func (c *Conn) CopyFrom(ctx context.Context, tableName Identifier, columnNames [
 		total = n
 		return err
 	})
-	return total, err
+	return total, wrapPgError(err)
 }
 
 // Tx represents a database transaction or nested savepoint transaction.
@@ -847,13 +1352,13 @@ func (tx *pgxTx) Commit(ctx context.Context) error {
 	}
 	if tx.savepoint != "" {
 		_, err := tx.execUnderlying(ctx, "RELEASE SAVEPOINT "+tx.savepoint)
-		return err
+		return wrapPgError(err)
 	}
 	if tx.rawBegin {
 		_, err := tx.conn.Exec(ctx, "COMMIT")
-		return err
+		return wrapPgError(err)
 	}
-	return tx.sqlTx.Commit()
+	return wrapPgError(tx.sqlTx.Commit())
 }
 
 func (tx *pgxTx) Rollback(ctx context.Context) error {
@@ -863,18 +1368,22 @@ func (tx *pgxTx) Rollback(ctx context.Context) error {
 	if tx.release != nil {
 		defer tx.release()
 	}
+	rollbackCtx := context.Background()
+	if ctx != nil {
+		rollbackCtx = context.WithoutCancel(ctx)
+	}
 	if tx.savepoint != "" {
-		if _, err := tx.execUnderlying(ctx, "ROLLBACK TO SAVEPOINT "+tx.savepoint); err != nil {
-			return err
+		if _, err := tx.execUnderlying(rollbackCtx, "ROLLBACK TO SAVEPOINT "+tx.savepoint); err != nil {
+			return wrapPgError(err)
 		}
-		_, err := tx.execUnderlying(ctx, "RELEASE SAVEPOINT "+tx.savepoint)
-		return err
+		_, err := tx.execUnderlying(rollbackCtx, "RELEASE SAVEPOINT "+tx.savepoint)
+		return wrapPgError(err)
 	}
 	if tx.rawBegin {
-		_, err := tx.conn.Exec(ctx, "ROLLBACK")
-		return err
+		_, err := tx.conn.Exec(rollbackCtx, "ROLLBACK")
+		return wrapPgError(err)
 	}
-	return tx.sqlTx.Rollback()
+	return wrapPgError(tx.sqlTx.Rollback())
 }
 
 func (tx *pgxTx) Prepare(ctx context.Context, name, sqlText string) error {
@@ -888,14 +1397,14 @@ func (tx *pgxTx) execUnderlying(ctx context.Context, sqlText string, arguments .
 	sqlText = tx.conn.resolvePrepared(sqlText)
 	rewritten, args, err := prepareQueryAndArgs(ctx, tx.conn, sqlText, arguments)
 	if err != nil {
-		return CommandTag{}, err
+		return CommandTag{}, wrapPgError(err)
 	}
 	if tx.sqlTx != nil {
 		res, err := tx.sqlTx.ExecContext(ctx, rewritten, args...)
 		if err != nil {
-			return CommandTag{}, err
+			return CommandTag{}, wrapPgError(err)
 		}
-		return newCommandTagFromResult(res, firstKeyword(rewritten)), nil
+		return newCommandTagFromResult(res, parseStatementVerb(rewritten)), nil
 	}
 	return tx.conn.Exec(ctx, rewritten, args...)
 }
@@ -909,19 +1418,21 @@ func (tx *pgxTx) Exec(ctx context.Context, sqlText string, arguments ...any) (Co
 
 func (tx *pgxTx) Query(ctx context.Context, sqlText string, arguments ...any) (Rows, error) {
 	if tx.closed.Load() {
-		return &pgxRows{err: ErrTxClosed, closed: true, conn: tx.conn}, ErrTxClosed
+		return newClosedErrorRows(tx.conn, ErrTxClosed), ErrTxClosed
 	}
 	sqlText = tx.conn.resolvePrepared(sqlText)
 	rewritten, args, err := prepareQueryAndArgs(ctx, tx.conn, sqlText, arguments)
 	if err != nil {
-		return &pgxRows{err: err, closed: true, conn: tx.conn}, err
+		err = wrapPgError(err)
+		return newClosedErrorRows(tx.conn, err), err
 	}
 	if tx.sqlTx != nil {
 		sqlRows, err := tx.sqlTx.QueryContext(ctx, rewritten, args...)
 		if err != nil {
-			return &pgxRows{err: err, closed: true, conn: tx.conn}, err
+			err = wrapPgError(err)
+			return newClosedErrorRows(tx.conn, err), err
 		}
-		return newPgxRows(tx.conn, sqlRows, nil, firstKeyword(rewritten)), nil
+		return newPgxRows(tx.conn, sqlRows, nil, parseStatementVerb(rewritten)), nil
 	}
 	return tx.conn.Query(ctx, rewritten, args...)
 }
@@ -947,7 +1458,7 @@ func (tx *pgxTx) CopyFrom(ctx context.Context, tableName Identifier, columnNames
 		total = n
 		return err
 	})
-	return total, err
+	return total, wrapPgError(err)
 }
 
 // BeginFunc begins a transaction on db and executes fn.
@@ -1003,16 +1514,131 @@ type pgxRows struct {
 	fields    []FieldDescription
 	rowCount  int64
 	err       error
-	closed    bool
+	closed    atomic.Bool
 	lastVals  []any
 	hasValues bool
 }
 
+func newClosedErrorRows(conn *Conn, err error) *pgxRows {
+	r := &pgxRows{conn: conn, err: wrapPgError(err)}
+	r.closed.Store(true)
+	return r
+}
+
+func pgTypeNameToOID(typeName string) uint32 {
+	name := strings.ToUpper(strings.TrimSpace(typeName))
+	if strings.HasPrefix(name, "OID(") && strings.HasSuffix(name, ")") {
+		if parsed, err := strconv.ParseUint(name[4:len(name)-1], 10, 32); err == nil {
+			return uint32(parsed)
+		}
+	}
+	switch name {
+	case "BOOL", "BOOLEAN":
+		return 16
+	case "BYTEA":
+		return 17
+	case "CHAR":
+		return 18
+	case "NAME":
+		return 19
+	case "INT8", "BIGINT":
+		return 20
+	case "INT2", "SMALLINT":
+		return 21
+	case "INT4", "INTEGER", "INT":
+		return 23
+	case "TEXT":
+		return 25
+	case "OID":
+		return 26
+	case "JSON":
+		return 114
+	case "FLOAT4", "REAL":
+		return 700
+	case "FLOAT8", "DOUBLE PRECISION":
+		return 701
+	case "UNKNOWN":
+		return 705
+	case "_BOOL":
+		return 1000
+	case "_BYTEA":
+		return 1001
+	case "_CHAR":
+		return 1002
+	case "_NAME":
+		return 1003
+	case "_INT2":
+		return 1005
+	case "_INT4":
+		return 1007
+	case "_TEXT":
+		return 1009
+	case "_BPCHAR":
+		return 1014
+	case "_VARCHAR":
+		return 1015
+	case "_INT8":
+		return 1016
+	case "_FLOAT4":
+		return 1021
+	case "_FLOAT8":
+		return 1022
+	case "_OID":
+		return 1028
+	case "BPCHAR", "CHARACTER":
+		return 1042
+	case "VARCHAR", "CHARACTER VARYING":
+		return 1043
+	case "DATE":
+		return 1082
+	case "TIME", "TIME WITHOUT TIME ZONE":
+		return 1083
+	case "TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE":
+		return 1114
+	case "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE":
+		return 1184
+	case "INTERVAL":
+		return 1186
+	case "_NUMERIC":
+		return 1231
+	case "TIMETZ", "TIME WITH TIME ZONE":
+		return 1266
+	case "BIT":
+		return 1560
+	case "VARBIT", "BIT VARYING":
+		return 1562
+	case "NUMERIC", "DECIMAL":
+		return 1700
+	case "UUID":
+		return 2950
+	case "_UUID":
+		return 2951
+	case "JSONB":
+		return 3802
+	case "_JSONB":
+		return 3807
+	default:
+		return 25
+	}
+}
+
 func newPgxRows(conn *Conn, sqlRows *sql.Rows, release func(), verb string) *pgxRows {
-	cols, _ := sqlRows.Columns()
-	fields := make([]FieldDescription, len(cols))
-	for i, name := range cols {
-		fields[i] = FieldDescription{Name: name, DataTypeOID: 25, TypeModifier: -1}
+	var fields []FieldDescription
+	if colTypes, err := sqlRows.ColumnTypes(); err == nil && len(colTypes) > 0 {
+		fields = make([]FieldDescription, len(colTypes))
+		for i, ct := range colTypes {
+			fields[i] = FieldDescription{
+				Name:         ct.Name(),
+				DataTypeOID:  pgTypeNameToOID(ct.DatabaseTypeName()),
+				TypeModifier: -1,
+			}
+		}
+	} else {
+		cols, _ := sqlRows.Columns()
+		fields = make([]FieldDescription, len(cols))
+		for i, name := range cols {
+			fields[i] = FieldDescription{Name: name, DataTypeOID: 25, TypeModifier: -1}
+		}
 	}
 	return &pgxRows{
 		conn:    conn,
@@ -1026,16 +1652,15 @@ func newPgxRows(conn *Conn, sqlRows *sql.Rows, release func(), verb string) *pgx
 func (r *pgxRows) Conn() *Conn { return r.conn }
 
 func (r *pgxRows) Close() {
-	if r.closed {
+	if !r.closed.CompareAndSwap(false, true) {
 		return
 	}
-	r.closed = true
 	if r.sqlRows != nil {
 		if err := r.sqlRows.Close(); err != nil && r.err == nil {
-			r.err = err
+			r.err = wrapPgError(err)
 		}
 		if err := r.sqlRows.Err(); err != nil && r.err == nil {
-			r.err = err
+			r.err = wrapPgError(err)
 		}
 	}
 	if r.release != nil {
@@ -1049,7 +1674,7 @@ func (r *pgxRows) Err() error {
 		return r.err
 	}
 	if r.sqlRows != nil {
-		return r.sqlRows.Err()
+		return wrapPgError(r.sqlRows.Err())
 	}
 	return nil
 }
@@ -1059,10 +1684,7 @@ func (r *pgxRows) CommandTag() CommandTag {
 	if verb == "" {
 		verb = "SELECT"
 	}
-	return CommandTag{
-		s:            fmt.Sprintf("%s %d", verb, r.rowCount),
-		rowsAffected: r.rowCount,
-	}
+	return formatVerbCommandTag(verb, r.rowCount)
 }
 
 func (r *pgxRows) FieldDescriptions() []FieldDescription {
@@ -1070,7 +1692,7 @@ func (r *pgxRows) FieldDescriptions() []FieldDescription {
 }
 
 func (r *pgxRows) Next() bool {
-	if r.closed || r.sqlRows == nil {
+	if r.closed.Load() || r.sqlRows == nil {
 		return false
 	}
 	r.hasValues = false
@@ -1097,8 +1719,8 @@ func (r *pgxRows) Values() ([]any, error) {
 		ptrs[i] = &raw[i]
 	}
 	if err := r.sqlRows.Scan(ptrs...); err != nil {
-		r.err = err
-		return nil, err
+		r.err = wrapPgError(err)
+		return nil, r.err
 	}
 	r.lastVals = raw
 	r.hasValues = true
@@ -1147,8 +1769,8 @@ func (r *pgxRows) Scan(dest ...any) error {
 	}
 	if !needsCustom {
 		if err := r.sqlRows.Scan(dest...); err != nil {
-			r.err = err
-			return err
+			r.err = wrapPgError(err)
+			return r.err
 		}
 		return nil
 	}
@@ -1177,19 +1799,21 @@ func (r *pgxRow) Scan(dest ...any) error {
 	}
 	defer r.rows.Close()
 	if err := r.rows.Err(); err != nil {
-		return err
+		return wrapPgError(err)
 	}
 	if !r.rows.Next() {
 		if err := r.rows.Err(); err != nil {
-			return err
+			return wrapPgError(err)
 		}
 		return ErrNoRows
 	}
 	if err := r.rows.Scan(dest...); err != nil {
-		return err
+		return wrapPgError(err)
 	}
-	return r.rows.Err()
+	return wrapPgError(r.rows.Err())
 }
+
+var byteSliceType = reflect.TypeFor[[]byte]()
 
 func isCustomScanDest(d any) bool {
 	if d == nil {
@@ -1199,15 +1823,24 @@ func isCustomScanDest(d any) bool {
 		return false
 	}
 	switch d.(type) {
-	case *[]string, *[]int, *[]int64, *[]int32, *[]int16, *[]float64, *[]bool,
-		*[16]byte, *json.RawMessage, *map[string]any, *[]any:
+	case *[16]byte, *json.RawMessage, *map[string]any, *[]any,
+		*uint, *uint8, *uint16, *uint32, *uint64, *int8, *int16, *int32:
 		return true
 	}
 	rv := reflect.ValueOf(d)
-	if rv.Kind() == reflect.Pointer && rv.Elem().Kind() == reflect.Struct {
-		if _, isTime := d.(*time.Time); !isTime {
-			return true
-		}
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return false
+	}
+	elem := rv.Elem()
+	switch elem.Kind() {
+	case reflect.Slice:
+		return elem.Type() != byteSliceType
+	case reflect.Struct:
+		_, isTime := d.(*time.Time)
+		return !isTime
+	case reflect.Pointer:
+		inner := elem.Type().Elem()
+		return inner.Kind() == reflect.Slice && inner != byteSliceType
 	}
 	return false
 }
@@ -1248,12 +1881,18 @@ func assignScanValue(src any, dest any) error {
 		if err != nil {
 			return err
 		}
+		if strconv.IntSize == 32 && (v < math.MinInt32 || v > math.MaxInt32) {
+			return fmt.Errorf("value %d overflows int", v)
+		}
 		*d = int(v)
 		return nil
 	case *int32:
 		v, err := toInt64(src)
 		if err != nil {
 			return err
+		}
+		if v < math.MinInt32 || v > math.MaxInt32 {
+			return fmt.Errorf("value %d overflows int32", v)
 		}
 		*d = int32(v)
 		return nil
@@ -1262,6 +1901,9 @@ func assignScanValue(src any, dest any) error {
 		if err != nil {
 			return err
 		}
+		if v < math.MinInt16 || v > math.MaxInt16 {
+			return fmt.Errorf("value %d overflows int16", v)
+		}
 		*d = int16(v)
 		return nil
 	case *int8:
@@ -1269,28 +1911,57 @@ func assignScanValue(src any, dest any) error {
 		if err != nil {
 			return err
 		}
+		if v < math.MinInt8 || v > math.MaxInt8 {
+			return fmt.Errorf("value %d overflows int8", v)
+		}
 		*d = int8(v)
 		return nil
 	case *uint64:
-		v, err := toInt64(src)
+		v, err := toUint64(src)
 		if err != nil {
 			return err
 		}
-		*d = uint64(v)
+		*d = v
 		return nil
 	case *uint:
-		v, err := toInt64(src)
+		v, err := toUint64(src)
 		if err != nil {
 			return err
+		}
+		if v > uint64(^uint(0)) {
+			return fmt.Errorf("value %d overflows uint", v)
 		}
 		*d = uint(v)
 		return nil
 	case *uint32:
-		v, err := toInt64(src)
+		v, err := toUint64(src)
 		if err != nil {
 			return err
 		}
+		if v > math.MaxUint32 {
+			return fmt.Errorf("value %d overflows uint32", v)
+		}
 		*d = uint32(v)
+		return nil
+	case *uint16:
+		v, err := toUint64(src)
+		if err != nil {
+			return err
+		}
+		if v > math.MaxUint16 {
+			return fmt.Errorf("value %d overflows uint16", v)
+		}
+		*d = uint16(v)
+		return nil
+	case *uint8:
+		v, err := toUint64(src)
+		if err != nil {
+			return err
+		}
+		if v > math.MaxUint8 {
+			return fmt.Errorf("value %d overflows uint8", v)
+		}
+		*d = uint8(v)
 		return nil
 	case *float64:
 		v, err := toFloat64(src)
@@ -1333,138 +2004,32 @@ func assignScanValue(src any, dest any) error {
 		if src == nil {
 			return errors.New("cannot scan NULL into *time.Time")
 		}
-		switch t := src.(type) {
-		case time.Time:
-			*d = t
-			return nil
-		case string:
-			for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999Z07:00", "2006-01-02 15:04:05.999999999", "2006-01-02"} {
-				if parsed, err := time.Parse(layout, t); err == nil {
-					*d = parsed
-					return nil
-				}
-			}
-			return fmt.Errorf("cannot parse %q as time.Time", t)
-		default:
-			return fmt.Errorf("cannot scan %T into *time.Time", src)
+		parsed, err := parseTimeValue(src)
+		if err != nil {
+			return err
 		}
+		*d = parsed
+		return nil
 	case *[16]byte:
 		if src == nil {
 			return errors.New("cannot scan NULL into *[16]byte")
 		}
 		return parseUUIDInto(src, d)
-	case *[]string:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral( fmt.Sprint(src) )
-		if err != nil {
-			return err
-		}
-		*d = elems
-		return nil
-	case *[]int64:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral(fmt.Sprint(src))
-		if err != nil {
-			return err
-		}
-		out := make([]int64, len(elems))
-		for i, e := range elems {
-			v, err := strconv.ParseInt(e, 10, 64)
-			if err != nil {
-				return err
-			}
-			out[i] = v
-		}
-		*d = out
-		return nil
-	case *[]int:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral(fmt.Sprint(src))
-		if err != nil {
-			return err
-		}
-		out := make([]int, len(elems))
-		for i, e := range elems {
-			v, err := strconv.Atoi(e)
-			if err != nil {
-				return err
-			}
-			out[i] = v
-		}
-		*d = out
-		return nil
-	case *[]int32:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral(fmt.Sprint(src))
-		if err != nil {
-			return err
-		}
-		out := make([]int32, len(elems))
-		for i, e := range elems {
-			v, err := strconv.ParseInt(e, 10, 32)
-			if err != nil {
-				return err
-			}
-			out[i] = int32(v)
-		}
-		*d = out
-		return nil
-	case *[]float64:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral(fmt.Sprint(src))
-		if err != nil {
-			return err
-		}
-		out := make([]float64, len(elems))
-		for i, e := range elems {
-			v, err := strconv.ParseFloat(e, 64)
-			if err != nil {
-				return err
-			}
-			out[i] = v
-		}
-		*d = out
-		return nil
-	case *[]bool:
-		if src == nil {
-			*d = nil
-			return nil
-		}
-		elems, err := parsePGArrayLiteral(fmt.Sprint(src))
-		if err != nil {
-			return err
-		}
-		out := make([]bool, len(elems))
-		for i, e := range elems {
-			v, err := toBool(e)
-			if err != nil {
-				return err
-			}
-			out[i] = v
-		}
-		*d = out
-		return nil
 	case *json.RawMessage:
 		if src == nil {
 			*d = nil
 			return nil
 		}
-		*d = json.RawMessage(fmt.Sprint(src))
+		switch s := src.(type) {
+		case []byte:
+			cp := make([]byte, len(s))
+			copy(cp, s)
+			*d = json.RawMessage(cp)
+		case string:
+			*d = json.RawMessage(s)
+		default:
+			*d = json.RawMessage(fmt.Sprint(src))
+		}
 		return nil
 	case *map[string]any:
 		if src == nil {
@@ -1477,7 +2042,16 @@ func assignScanValue(src any, dest any) error {
 			*d = nil
 			return nil
 		}
-		return json.Unmarshal([]byte(fmt.Sprint(src)), d)
+		raw := strings.TrimSpace(fmt.Sprint(src))
+		if strings.HasPrefix(raw, "{") {
+			node, err := parsePGArrayTree(raw)
+			if err != nil {
+				return err
+			}
+			*d = pgArrayNodeToAnySlice(node)
+			return nil
+		}
+		return json.Unmarshal([]byte(raw), d)
 	}
 
 	rv := reflect.ValueOf(dest)
@@ -1499,6 +2073,22 @@ func assignScanValue(src any, dest any) error {
 		}
 		elem.Set(ptr)
 		return nil
+	}
+	if elem.Kind() == reflect.Slice && elem.Type() != byteSliceType {
+		var literal string
+		switch s := src.(type) {
+		case string:
+			literal = s
+		case []byte:
+			literal = string(s)
+		default:
+			literal = fmt.Sprint(s)
+		}
+		root, err := parsePGArrayTree(literal)
+		if err != nil {
+			return err
+		}
+		return assignPGArrayNode(root, elem)
 	}
 	if elem.Kind() == reflect.Struct {
 		return json.Unmarshal([]byte(fmt.Sprint(src)), dest)
@@ -1526,12 +2116,78 @@ func toInt64(src any) (int64, error) {
 		return int64(v), nil
 	case int32:
 		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case uint64:
+		if v > math.MaxInt64 {
+			return 0, fmt.Errorf("uint64 value %d overflows int64", v)
+		}
+		return int64(v), nil
 	case string:
 		return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	case []byte:
 		return strconv.ParseInt(strings.TrimSpace(string(v)), 10, 64)
 	default:
 		return 0, fmt.Errorf("cannot scan %T as int64", src)
+	}
+}
+
+func toUint64(src any) (uint64, error) {
+	if src == nil {
+		return 0, errors.New("cannot scan NULL into unsigned integer")
+	}
+	switch v := src.(type) {
+	case uint64:
+		return v, nil
+	case uint:
+		return uint64(v), nil
+	case uint32:
+		return uint64(v), nil
+	case uint16:
+		return uint64(v), nil
+	case uint8:
+		return uint64(v), nil
+	case int64:
+		if v < 0 {
+			return 0, fmt.Errorf("cannot scan negative value %d into unsigned integer", v)
+		}
+		return uint64(v), nil
+	case int:
+		if v < 0 {
+			return 0, fmt.Errorf("cannot scan negative value %d into unsigned integer", v)
+		}
+		return uint64(v), nil
+	case int32:
+		if v < 0 {
+			return 0, fmt.Errorf("cannot scan negative value %d into unsigned integer", v)
+		}
+		return uint64(v), nil
+	case int16:
+		if v < 0 {
+			return 0, fmt.Errorf("cannot scan negative value %d into unsigned integer", v)
+		}
+		return uint64(v), nil
+	case int8:
+		if v < 0 {
+			return 0, fmt.Errorf("cannot scan negative value %d into unsigned integer", v)
+		}
+		return uint64(v), nil
+	case string:
+		s := strings.TrimSpace(v)
+		if strings.HasPrefix(s, "-") {
+			return 0, fmt.Errorf("cannot scan negative value %q into unsigned integer", s)
+		}
+		return strconv.ParseUint(s, 10, 64)
+	case []byte:
+		s := strings.TrimSpace(string(v))
+		if strings.HasPrefix(s, "-") {
+			return 0, fmt.Errorf("cannot scan negative value %q into unsigned integer", s)
+		}
+		return strconv.ParseUint(s, 10, 64)
+	default:
+		return 0, fmt.Errorf("cannot scan %T as uint64", src)
 	}
 }
 
@@ -1545,6 +2201,8 @@ func toFloat64(src any) (float64, error) {
 	case float32:
 		return float64(v), nil
 	case int64:
+		return float64(v), nil
+	case int:
 		return float64(v), nil
 	case string:
 		return strconv.ParseFloat(strings.TrimSpace(v), 64)
@@ -1571,6 +2229,8 @@ func toBool(src any) (bool, error) {
 		default:
 			return false, fmt.Errorf("cannot parse %q as bool", v)
 		}
+	case []byte:
+		return toBool(string(v))
 	default:
 		return false, fmt.Errorf("cannot scan %T as bool", src)
 	}
@@ -1607,51 +2267,165 @@ func parseUUIDString(s string, dest *[16]byte) error {
 	return nil
 }
 
-func parsePGArrayLiteral(s string) ([]string, error) {
-	s = strings.TrimSpace(s)
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return nil, fmt.Errorf("invalid PostgreSQL array literal %q", s)
+type pgArrayNode struct {
+	isArray  bool
+	isNull   bool
+	text     string
+	elements []pgArrayNode
+}
+
+// parsePGArrayTree parses a PostgreSQL array literal (including optional
+// dimension prefixes like [1:2][1:2]=, nested braces for multi-dimensional
+// arrays, quoted strings with escapes, and unquoted NULL vs quoted "NULL").
+func parsePGArrayTree(raw string) (pgArrayNode, error) {
+	s := strings.TrimSpace(raw)
+	// Strip optional dimension prefix such as [1:2][1:3]={...}
+	if strings.HasPrefix(s, "[") {
+		eq := strings.IndexByte(s, '=')
+		if eq < 0 {
+			return pgArrayNode{}, fmt.Errorf("invalid PostgreSQL array literal %q", raw)
+		}
+		s = strings.TrimSpace(s[eq+1:])
 	}
-	inner := s[1 : len(s)-1]
-	if inner == "" {
-		return []string{}, nil
+	if len(s) < 2 || s[0] != '{' {
+		return pgArrayNode{}, fmt.Errorf("invalid PostgreSQL array literal %q", raw)
 	}
-	var out []string
-	i := 0
-	n := len(inner)
-	for i < n {
-		if inner[i] == '"' {
-			i++
+	node, next, err := parsePGArraySub(s, 0)
+	if err != nil {
+		return pgArrayNode{}, err
+	}
+	if strings.TrimSpace(s[next:]) != "" {
+		return pgArrayNode{}, fmt.Errorf("invalid PostgreSQL array literal %q: trailing characters", raw)
+	}
+	return node, nil
+}
+
+func parsePGArraySub(s string, pos int) (pgArrayNode, int, error) {
+	n := len(s)
+	if pos >= n || s[pos] != '{' {
+		return pgArrayNode{}, pos, fmt.Errorf("expected '{' in array literal %q at %d", s, pos)
+	}
+	pos++
+	node := pgArrayNode{isArray: true}
+	if pos < n && s[pos] == '}' {
+		return node, pos + 1, nil
+	}
+	for pos < n {
+		switch s[pos] {
+		case '{':
+			child, next, err := parsePGArraySub(s, pos)
+			if err != nil {
+				return pgArrayNode{}, pos, err
+			}
+			node.elements = append(node.elements, child)
+			pos = next
+		case '"':
+			pos++
 			var elem strings.Builder
-			for i < n {
-				if inner[i] == '\\' && i+1 < n {
-					i++
-					elem.WriteByte(inner[i])
-					i++
+			closed := false
+			for pos < n {
+				if s[pos] == '\\' && pos+1 < n {
+					pos++
+					elem.WriteByte(s[pos])
+					pos++
 					continue
 				}
-				if inner[i] == '"' {
-					i++
+				if s[pos] == '"' {
+					pos++
+					closed = true
 					break
 				}
-				elem.WriteByte(inner[i])
-				i++
+				elem.WriteByte(s[pos])
+				pos++
 			}
-			out = append(out, elem.String())
-			if i < n && inner[i] == ',' {
-				i++
+			if !closed {
+				return pgArrayNode{}, pos, fmt.Errorf("unterminated quoted element in array literal %q", s)
 			}
-		} else {
-			start := i
-			for i < n && inner[i] != ',' {
-				i++
+			node.elements = append(node.elements, pgArrayNode{text: elem.String()})
+		default:
+			start := pos
+			for pos < n && s[pos] != ',' && s[pos] != '}' {
+				pos++
 			}
-			token := inner[start:i]
-			out = append(out, token)
-			if i < n && inner[i] == ',' {
-				i++
+			token := s[start:pos]
+			if strings.EqualFold(token, "NULL") {
+				node.elements = append(node.elements, pgArrayNode{isNull: true})
+			} else {
+				node.elements = append(node.elements, pgArrayNode{text: token})
 			}
 		}
+		if pos >= n {
+			return pgArrayNode{}, pos, fmt.Errorf("unterminated array literal %q", s)
+		}
+		if s[pos] == ',' {
+			pos++
+			continue
+		}
+		if s[pos] == '}' {
+			return node, pos + 1, nil
+		}
+		return pgArrayNode{}, pos, fmt.Errorf("unexpected character %q in array literal %q", s[pos], s)
+	}
+	return pgArrayNode{}, pos, fmt.Errorf("unterminated array literal %q", s)
+}
+
+func assignPGArrayNode(node pgArrayNode, sliceVal reflect.Value) error {
+	if !node.isArray {
+		return fmt.Errorf("cannot scan scalar %q into %s", node.text, sliceVal.Type())
+	}
+	elemType := sliceVal.Type().Elem()
+	out := reflect.MakeSlice(sliceVal.Type(), len(node.elements), len(node.elements))
+	for i, child := range node.elements {
+		slot := out.Index(i)
+		if child.isArray {
+			if elemType.Kind() != reflect.Slice || elemType == byteSliceType {
+				return fmt.Errorf("cannot scan nested array into %s", elemType)
+			}
+			if err := assignPGArrayNode(child, slot); err != nil {
+				return err
+			}
+			continue
+		}
+		var scalar any
+		if !child.isNull {
+			scalar = child.text
+		}
+		if err := assignScanValue(scalar, slot.Addr().Interface()); err != nil {
+			return fmt.Errorf("array element %d: %w", i, err)
+		}
+	}
+	sliceVal.Set(out)
+	return nil
+}
+
+func pgArrayNodeToAnySlice(node pgArrayNode) []any {
+	out := make([]any, len(node.elements))
+	for i, child := range node.elements {
+		if child.isArray {
+			out[i] = pgArrayNodeToAnySlice(child)
+		} else if child.isNull {
+			out[i] = nil
+		} else {
+			out[i] = child.text
+		}
+	}
+	return out
+}
+
+func parsePGArrayLiteral(s string) ([]string, error) {
+	tree, err := parsePGArrayTree(s)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(tree.elements))
+	for i, child := range tree.elements {
+		if child.isArray {
+			return nil, fmt.Errorf("cannot scan multi-dimensional array into []string")
+		}
+		if child.isNull {
+			return nil, errors.New("cannot scan NULL array element into string")
+		}
+		out[i] = child.text
 	}
 	return out, nil
 }
@@ -1725,17 +2499,31 @@ type BatchResults interface {
 }
 
 type batchResults struct {
-	ctx     context.Context
-	execer  queryExecer
-	conn    *Conn
-	batch   *Batch
-	release func()
-	idx     int
-	err     error
-	closed  bool
+	ctx        context.Context
+	execer     queryExecer
+	implicitTx Tx
+	conn       *Conn
+	batch      *Batch
+	release    func()
+	activeRows Rows
+	idx        int
+	err        error
+	closed     bool
+}
+
+func (br *batchResults) finishActiveRows() {
+	if br.activeRows == nil {
+		return
+	}
+	br.activeRows.Close()
+	if err := br.activeRows.Err(); err != nil && br.err == nil {
+		br.err = wrapPgError(err)
+	}
+	br.activeRows = nil
 }
 
 func (br *batchResults) nextItem() (*QueuedQuery, error) {
+	br.finishActiveRows()
 	if br.err != nil {
 		return nil, br.err
 	}
@@ -1757,6 +2545,7 @@ func (br *batchResults) Exec() (CommandTag, error) {
 	}
 	ct, err := br.execer.Exec(br.ctx, item.SQL, item.Arguments...)
 	if err != nil {
+		err = wrapPgError(err)
 		br.err = err
 	}
 	return ct, err
@@ -1765,13 +2554,16 @@ func (br *batchResults) Exec() (CommandTag, error) {
 func (br *batchResults) Query() (Rows, error) {
 	item, err := br.nextItem()
 	if err != nil {
-		return &pgxRows{err: err, closed: true, conn: br.conn}, err
+		return newClosedErrorRows(br.conn, err), err
 	}
 	rows, err := br.execer.Query(br.ctx, item.SQL, item.Arguments...)
 	if err != nil {
+		err = wrapPgError(err)
 		br.err = err
+		return rows, err
 	}
-	return rows, err
+	br.activeRows = rows
+	return rows, nil
 }
 
 func (br *batchResults) QueryRow() Row {
@@ -1790,18 +2582,34 @@ func (br *batchResults) Close() error {
 			br.release = nil
 		}
 	}()
+	br.finishActiveRows()
 	for br.batch != nil && br.idx < len(br.batch.items) && br.err == nil {
 		item := br.batch.items[br.idx]
 		if item.fn != nil {
 			if err := item.fn(br); err != nil {
-				br.err = err
+				br.err = wrapPgError(err)
 				break
 			}
+			br.finishActiveRows()
 		} else {
 			if _, err := br.Exec(); err != nil {
-				br.err = err
+				br.err = wrapPgError(err)
 				break
 			}
+		}
+	}
+	br.finishActiveRows()
+	if br.implicitTx != nil {
+		tx := br.implicitTx
+		br.implicitTx = nil
+		if br.err != nil {
+			rollbackCtx := context.Background()
+			if br.ctx != nil {
+				rollbackCtx = context.WithoutCancel(br.ctx)
+			}
+			_ = tx.Rollback(rollbackCtx)
+		} else if err := tx.Commit(br.ctx); err != nil {
+			br.err = wrapPgError(err)
 		}
 	}
 	return br.err

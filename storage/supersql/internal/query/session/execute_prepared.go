@@ -40,9 +40,8 @@ type RoutineExecutionOptions struct {
 	Planning         func(context.Context, *catalog.CatalogSnapshot, storage.SnapshotReader, *zpgparse.RawStmt, []model.TypeLayout) (PrepareOptions, error)
 	NewQuery         func(context.Context) (*runtime.Query, error)
 	Report           func(context.Context, model.Error)
-	Limits           procedural.Limits
-	Capabilities     RoutineTransactionCapabilities
-	RewriteStatement func(ctx context.Context, raw *zpgparse.RawStmt) (*zpgparse.RawStmt, func(ctx context.Context, batch *columnar.Batch) error, bool, error)
+	Limits       procedural.Limits
+	Capabilities RoutineTransactionCapabilities
 }
 
 // SchemaCommandExecution borrows one binding snapshot and copies the parser's
@@ -211,7 +210,7 @@ func (transactions *Transactions) runExecution(ctx context.Context, execution st
 		if err := rejectPreparedEnvironment(options.Environment, nil); err != nil {
 			return result, transactions.fail(err)
 		}
-		return transactions.runCommand(operation, execution.prepared, consume)
+		return transactions.runCommand(operation, execution.prepared, options.Catalog, consume)
 	}
 	result, err = transactions.runPlanExecution(operation, execution, options, consume, &transferred)
 	return result, err
@@ -269,7 +268,7 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 		return result, transactions.fail(err)
 	}
 	completed := false
-	beforeSettings := *transactions.settings
+	beforeSettings := transactions.settings.snapshotState()
 	deferredMark := len(transactions.deferredTriggers)
 	deferredConstraintMark := len(transactions.deferredConstraints)
 	deferredConstraintBytes := transactions.deferredConstraintBytes
@@ -314,10 +313,7 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 	completed = true
 	if err != nil {
 		if transactions.generation == invocationGeneration {
-			transactions.settings.current = beforeSettings.current
-			transactions.settings.retained = beforeSettings.retained
-			transactions.settings.customCurrent = beforeSettings.customCurrent
-			transactions.settings.customRetained = beforeSettings.customRetained
+			transactions.settings.restoreStatementSettings(beforeSettings)
 		}
 		result.RowsAffected = 0
 		transactions.markFailed(err)
@@ -524,10 +520,13 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 		if bindErr != nil {
 			return 0, bindErr
 		}
+		trialIdentity := readViewCatalogIdentity(bindingView)
+		trialTemporary := owner.named.overlayVersion()
+		var trialPrepared *Prepared
 		bound, bindErr := execution.bind(ctx, bindingView, environment.Builtin)
 		if bindErr == nil && deriveDependencies {
 			var scans []txn.ReadDependency
-			scans, bindErr = owner.statementScanDependencies(ctx, bindingView, bound, options, options.planningOptions, environment.Builtin)
+			scans, trialPrepared, bindErr = owner.statementScanDependenciesWithTrial(ctx, bindingView, bound, options, options.planningOptions, environment.Builtin)
 			if bindErr == nil {
 				dependencies := append(slices.Clone(options.Dependencies), scans...)
 				if len(catalogReadDependencies(options.Catalog, dependencies)) == 0 {
@@ -553,9 +552,14 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 		if err != nil {
 			return 0, err
 		}
-		prepared, err = execution.prepareBound(ctx, view, environment.Builtin, bound)
-		if err != nil {
-			return 0, errors.Join(err, view.Close())
+		if trialPrepared != nil && owner.historical == 0 && trialIdentity != (txn.CatalogReadIdentity{}) && readViewCatalogIdentity(view) == trialIdentity && owner.named.overlayVersion() == trialTemporary {
+			prepared = trialPrepared
+			owner.statementTypes = prepared.builtins.Types
+		} else {
+			prepared, err = execution.prepareBound(ctx, view, environment.Builtin, bound)
+			if err != nil {
+				return 0, errors.Join(err, view.Close())
+			}
 		}
 		if prepared == nil || prepared.bound == nil || prepared.graph == nil {
 			return 0, errors.Join(errPreparedInvocation, view.Close())
@@ -590,44 +594,10 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 	environment.Builtin.Types = prepared.builtins.Types
 	environment.Builtin.InformationSchemaFunctions = prepared.builtins.InformationSchemaFunctions
 	environment.Builtin.InformationSchemaTypes = prepared.builtins.InformationSchemaTypes
-	if parameters := environment.Parameters; len(parameters) != 0 {
-		// The bound statement's parameter list is authoritative: callers may
-		// supply values without layouts and let binding infer them. NULL values
-		// carry no storage tag of their own, so they adopt the bound storage.
-		// Text-format values whose storage does not match the bound layout are
-		// coerced through the type's input function, matching PostgreSQL's
-		// wire-protocol text parameter handling.
-		bound := prepared.bound.Parameters()
-		reconciled := make([]expr.ParameterValue, len(parameters))
-		for index, parameter := range parameters {
-			if parameter.Number == 0 || uint64(parameter.Number) > uint64(len(bound)) {
-				return 0, settingError("42P02", "parameter number out of range")
-			}
-			layout := bound[parameter.Number-1]
-			value := parameter.Value
-			if value.IsNull {
-				// NULLs carry no payload; they adopt the bound storage tag.
-				value.Type = layout.Type.Storage
-			}
-			if value.Type != layout.Type.Storage {
-				if value.Type != model.TypeString {
-					// Storage tags identify the value's physical units, so a
-					// mismatched non-text payload cannot be reinterpreted
-					// safely; callers must declare the layout the value
-					// actually encodes.
-					return 0, settingError("42804", "parameter storage does not match the bound type")
-				}
-				codec, coerceErr := builtin.ResolveTypeTextCodec(ctx, layout, environment.Builtin, environment.Limits.ParameterBytes)
-				if coerceErr != nil {
-					return 0, coerceErr
-				}
-				output := min(environment.Limits.Expressions.MaxOutputBytes, uint64(math.MaxInt64))
-				budget := builtin.CallBudget{MemoryBytes: environment.Limits.Expressions.MaxStateBytes, OutputBytes: int64(output)}
-				if value, coerceErr = codec.Input(ctx, []model.Value{value}, budget); coerceErr != nil {
-					return 0, coerceErr
-				}
-			}
-			reconciled[index] = expr.ParameterValue{Number: parameter.Number, Layout: layout, Value: value}
+	if len(environment.Parameters) != 0 {
+		reconciled, paramErr := reconcileBoundParameters(ctx, prepared.bound, environment.Parameters, environment.Builtin, environment.Limits)
+		if paramErr != nil {
+			return 0, paramErr
 		}
 		environment.Parameters = reconciled
 	}
@@ -810,3 +780,46 @@ func validatePreparedDependencies(ctx context.Context, prepared *Prepared, store
 	}
 	return validatePreparedIndexes(ctx, prepared, snapshot)
 }
+
+// reconcileBoundParameters aligns caller-supplied parameter values with the
+// bound statement's authoritative parameter layouts: NULLs adopt the bound
+// storage tag and text-format values are coerced through the type's input codec.
+func reconcileBoundParameters(ctx context.Context, bound *bind.BoundStatement, parameters []expr.ParameterValue, builtins builtin.ResolveOptions, limits exec.Limits) ([]expr.ParameterValue, error) {
+	if bound == nil || len(parameters) == 0 {
+		return nil, nil
+	}
+	declared := bound.Parameters()
+	reconciled := make([]expr.ParameterValue, len(parameters))
+	for index, parameter := range parameters {
+		if parameter.Number == 0 || uint64(parameter.Number) > uint64(len(declared)) {
+			return nil, settingError("42P02", "parameter number out of range")
+		}
+		layout := declared[parameter.Number-1]
+		value := parameter.Value
+		if value.IsNull {
+			// NULLs carry no payload; they adopt the bound storage tag.
+			value.Type = layout.Type.Storage
+		}
+		if value.Type != layout.Type.Storage {
+			if value.Type != model.TypeString {
+				// Storage tags identify the value's physical units, so a
+				// mismatched non-text payload cannot be reinterpreted
+				// safely; callers must declare the layout the value
+				// actually encodes.
+				return nil, settingError("42804", "parameter storage does not match the bound type")
+			}
+			codec, coerceErr := builtin.ResolveTypeTextCodec(ctx, layout, builtins, limits.ParameterBytes)
+			if coerceErr != nil {
+				return nil, coerceErr
+			}
+			output := min(limits.Expressions.MaxOutputBytes, uint64(math.MaxInt64))
+			budget := builtin.CallBudget{MemoryBytes: limits.Expressions.MaxStateBytes, OutputBytes: int64(output)}
+			if value, coerceErr = codec.Input(ctx, []model.Value{value}, budget); coerceErr != nil {
+				return nil, coerceErr
+			}
+		}
+		reconciled[index] = expr.ParameterValue{Number: parameter.Number, Layout: layout, Value: value}
+	}
+	return reconciled, nil
+}
+

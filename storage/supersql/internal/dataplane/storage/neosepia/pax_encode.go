@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"math/bits"
 	"unsafe"
@@ -107,69 +108,87 @@ type encVisibility struct {
 }
 
 func encodeBlock(ctx context.Context, target storage.ObjectRef, versions blockVersions, batch *columnar.Batch, columnIDs []model.ColumnID, limits blockLimits) ([]byte, error) {
+	data, _, err := encodeBlockInternal(ctx, target, versions, batch, columnIDs, limits, false)
+	return data, err
+}
+
+func encodeBlockWithBlobs(ctx context.Context, target storage.ObjectRef, versions blockVersions, batch *columnar.Batch, columnIDs []model.ColumnID, limits blockLimits) ([]byte, []toastBlob, error) {
+	return encodeBlockInternal(ctx, target, versions, batch, columnIDs, limits, true)
+}
+
+func encodeBlockInternal(ctx context.Context, target storage.ObjectRef, versions blockVersions, batch *columnar.Batch, columnIDs []model.ColumnID, limits blockLimits, allowLOB bool) ([]byte, []toastBlob, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if limits.MaxRows <= 0 || limits.MaxBytes == 0 || limits.MaxDecodedBytes == 0 ||
 		limits.MaxBytes > uint64(math.MaxInt) || limits.MaxDecodedBytes > uint64(math.MaxInt) {
-		return nil, fmt.Errorf("pax encode: invalid block limits %+v: %w", limits, errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: invalid block limits %+v: %w", limits, errPAXEncode)
 	}
 	if err := target.Validate(); err != nil {
-		return nil, fmt.Errorf("pax encode: invalid target: %w: %w", err, errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: invalid target: %w: %w", err, errPAXEncode)
 	}
 	if batch == nil {
-		return nil, fmt.Errorf("pax encode: nil batch: %w", errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: nil batch: %w", errPAXEncode)
 	}
 	if batch.Selection != nil {
-		return nil, fmt.Errorf("pax encode: batch must have no selection: %w", errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: batch must have no selection: %w", errPAXEncode)
 	}
 	rows := batch.Length
 	if rows <= 0 {
-		return nil, fmt.Errorf("pax encode: block must be nonempty: %w", errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: block must be nonempty: %w", errPAXEncode)
 	}
 	if rows > limits.MaxRows {
-		return nil, fmt.Errorf("pax encode: %d rows exceed MaxRows %d: %w", rows, limits.MaxRows, columnar.ErrBatchBudget)
+		return nil, nil, fmt.Errorf("pax encode: %d rows exceed MaxRows %d: %w", rows, limits.MaxRows, columnar.ErrBatchBudget)
 	}
 	if uint64(rows) > math.MaxUint32 {
-		return nil, fmt.Errorf("pax encode: %d rows exceed uint32 range: %w", rows, columnar.ErrBatchBudget)
+		return nil, nil, fmt.Errorf("pax encode: %d rows exceed uint32 range: %w", rows, columnar.ErrBatchBudget)
 	}
 	if len(batch.Columns) != len(columnIDs) {
-		return nil, fmt.Errorf("pax encode: %d columns do not match %d column IDs: %w", len(batch.Columns), len(columnIDs), errPAXEncode)
+		return nil, nil, fmt.Errorf("pax encode: %d columns do not match %d column IDs: %w", len(batch.Columns), len(columnIDs), errPAXEncode)
 	}
 	if len(columnIDs) > math.MaxUint32 {
-		return nil, fmt.Errorf("pax encode: %d columns exceed uint32 range: %w", len(columnIDs), columnar.ErrBatchBudget)
+		return nil, nil, fmt.Errorf("pax encode: %d columns exceed uint32 range: %w", len(columnIDs), columnar.ErrBatchBudget)
 	}
 	for i, id := range columnIDs {
 		if id == 0 {
-			return nil, fmt.Errorf("pax encode: root column ID must be nonzero: %w", errPAXEncode)
+			return nil, nil, fmt.Errorf("pax encode: root column ID must be nonzero: %w", errPAXEncode)
 		}
 		if i > 0 && id <= columnIDs[i-1] {
-			return nil, fmt.Errorf("pax encode: column IDs must be strictly increasing: %w", errPAXEncode)
+			return nil, nil, fmt.Errorf("pax encode: column IDs must be strictly increasing: %w", errPAXEncode)
 		}
 	}
 	budget := &encBudget{limit: limits.MaxDecodedBytes}
 	vis, err := encValidateVersions(ctx, versions, rows, budget)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	var blobs []toastBlob
+	var blobSink *[]toastBlob
+	if allowLOB {
+		blobSink = &blobs
 	}
 	nodes := make([]*encNode, len(batch.Columns))
 	for i := range batch.Columns {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		vec := &batch.Columns[i]
 		if vec.Type.ID == 0 || !vec.Type.Storage.Valid() {
-			return nil, fmt.Errorf("pax encode: column %d has invalid type identity: %w", columnIDs[i], errPAXEncode)
+			return nil, nil, fmt.Errorf("pax encode: column %d has invalid type identity: %w", columnIDs[i], errPAXEncode)
 		}
 		if err := vec.Validate(); err != nil {
-			return nil, fmt.Errorf("pax encode: column %d invalid vector: %w: %w", columnIDs[i], err, errPAXEncode)
+			return nil, nil, fmt.Errorf("pax encode: column %d invalid vector: %w: %w", columnIDs[i], err, errPAXEncode)
 		}
-		nodes[i], err = encEncodeNode(ctx, vec, rows, columnIDs[i], budget, 0)
+		nodes[i], err = encEncodeNode(ctx, vec, rows, columnIDs[i], budget, blobSink, 0)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return encAssemble(ctx, target, vis, nodes, rows, limits)
+	out, err := encAssemble(ctx, target, vis, nodes, rows, limits)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, blobs, nil
 }
 
 // encAbsentVector reports a zero Vector, the contract's marker for absent
@@ -327,7 +346,7 @@ func encLaneData(vec *columnar.Vector, row int) []byte {
 	return vec.Data[r.Offset : uint64(r.Offset)+uint64(r.Length)]
 }
 
-func encEncodeNode(ctx context.Context, vec *columnar.Vector, rows int, colID model.ColumnID, budget *encBudget, depth int) (*encNode, error) {
+func encEncodeNode(ctx context.Context, vec *columnar.Vector, rows int, colID model.ColumnID, budget *encBudget, blobs *[]toastBlob, depth int) (*encNode, error) {
 	if depth > encMaxDepth {
 		return nil, fmt.Errorf("pax encode: nesting depth exceeds %d: %w", encMaxDepth, errPAXEncode)
 	}
@@ -373,7 +392,7 @@ func encEncodeNode(ctx context.Context, vec *columnar.Vector, rows int, colID mo
 			}
 		}
 	}
-	body, err := encEncodeBody(ctx, vec, rows, n, budget, depth)
+	body, err := encEncodeBody(ctx, vec, rows, n, budget, blobs, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +411,7 @@ func encEncodeNode(ctx context.Context, vec *columnar.Vector, rows int, colID mo
 	return n, nil
 }
 
-func encEncodeBody(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, depth int) ([]byte, error) {
+func encEncodeBody(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, blobs *[]toastBlob, depth int) ([]byte, error) {
 	switch vec.Type.Storage {
 	case model.TypeInt64, model.TypeTimestamp, model.TypeBoolean:
 		return encEncodeIntegers(ctx, vec, rows, n, budget)
@@ -401,13 +420,13 @@ func encEncodeBody(ctx context.Context, vec *columnar.Vector, rows int, n *encNo
 	case model.TypeInterval:
 		return encEncodeInterval(ctx, vec, rows, budget)
 	case model.TypeString, model.TypeBytes, model.TypeJSONB, model.TypeUUID, model.TypeNumeric:
-		return encEncodeVarBytes(ctx, vec, rows, n, budget)
+		return encEncodeVarBytes(ctx, vec, rows, n, budget, blobs)
 	case model.TypeVectorF32:
 		return encEncodeVectorF32(ctx, vec, rows, budget)
 	case model.TypeArray:
-		return encEncodeArray(ctx, vec, rows, n, budget, depth)
+		return encEncodeArray(ctx, vec, rows, n, budget, blobs, depth)
 	case model.TypeComposite:
-		return encEncodeComposite(ctx, vec, rows, n, budget, depth)
+		return encEncodeComposite(ctx, vec, rows, n, budget, blobs, depth)
 	default:
 		return nil, fmt.Errorf("pax encode: unsupported storage type %d: %w", vec.Type.Storage, errPAXEncode)
 	}
@@ -495,9 +514,21 @@ func encCheckAllRanges(ranges []columnar.Range, rows, size int) error {
 	return nil
 }
 
-func encEncodeVarBytes(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget) ([]byte, error) {
+func encEncodeVarBytes(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, blobs *[]toastBlob) ([]byte, error) {
 	if err := encCheckAllRanges(vec.Ranges, rows, len(vec.Data)); err != nil {
 		return nil, err
+	}
+	if blobs != nil {
+		hasLOB := false
+		for r := 0; r < rows; r++ {
+			if !vec.IsNull(r) && vec.Ranges[r].Length > toastThreshold {
+				hasLOB = true
+				break
+			}
+		}
+		if hasLOB {
+			return encEncodeLOB(ctx, vec, rows, n, budget, blobs)
+		}
 	}
 	plainSize := uint64(rows) * 4
 	for r := 0; r < rows; r++ {
@@ -622,6 +653,70 @@ func encEncodeVarBytes(ctx context.Context, vec *columnar.Vector, rows int, n *e
 	return body, nil
 }
 
+func encEncodeLOB(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, blobs *[]toastBlob) ([]byte, error) {
+	var bodySize uint64
+	for r := 0; r < rows; r++ {
+		if r&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if vec.IsNull(r) {
+			bodySize += 5
+			continue
+		}
+		length := uint64(vec.Ranges[r].Length)
+		if length > toastThreshold {
+			bodySize += 13
+		} else {
+			var ok bool
+			bodySize, ok = encAddOk(bodySize, 5+length)
+			if !ok || bodySize > math.MaxUint32 {
+				return nil, fmt.Errorf("pax encode: LOB body exceeds uint32 range: %w", columnar.ErrBatchBudget)
+			}
+		}
+	}
+	if err := budget.charge(bodySize); err != nil {
+		return nil, err
+	}
+	body := make([]byte, 0, bodySize)
+	var buf [12]byte
+	for r := 0; r < rows; r++ {
+		if r&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if vec.IsNull(r) {
+			body = append(body, 0, 0, 0, 0, 0)
+			continue
+		}
+		data := encLaneData(vec, r)
+		if len(data) > toastThreshold {
+			if uint64(len(*blobs)) >= math.MaxUint32 {
+				return nil, columnar.ErrBatchBudget
+			}
+			blobIdx := uint32(len(*blobs))
+			crc := crc32.ChecksumIEEE(data)
+			owned := make([]byte, len(data))
+			copy(owned, data)
+			*blobs = append(*blobs, toastBlob{data: owned, crc: crc})
+			body = append(body, 1)
+			binary.LittleEndian.PutUint32(buf[0:4], blobIdx)
+			binary.LittleEndian.PutUint32(buf[4:8], uint32(len(data)))
+			binary.LittleEndian.PutUint32(buf[8:12], crc)
+			body = append(body, buf[:]...)
+		} else {
+			body = append(body, 0)
+			binary.LittleEndian.PutUint32(buf[0:4], uint32(len(data)))
+			body = append(body, buf[:4]...)
+			body = append(body, data...)
+		}
+	}
+	n.encoding = encodingLOB
+	return body, nil
+}
+
 func encEncodeDictionary(ctx context.Context, vec *columnar.Vector, dict []uint32, codes []uint32, rows, width int, n *encNode, budget *encBudget) ([]byte, error) {
 	bitsTotal, ok := encMulOk(uint64(rows), uint64(width))
 	if !ok {
@@ -741,7 +836,7 @@ func encEncodeVectorF32(ctx context.Context, vec *columnar.Vector, rows int, bud
 	return body, nil
 }
 
-func encEncodeArray(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, depth int) ([]byte, error) {
+func encEncodeArray(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, blobs *[]toastBlob, depth int) ([]byte, error) {
 	if len(vec.Children) != 1 {
 		return nil, fmt.Errorf("pax encode: array node has %d children: %w", len(vec.Children), errPAXEncode)
 	}
@@ -830,7 +925,7 @@ func encEncodeArray(ctx context.Context, vec *columnar.Vector, rows int, n *encN
 	// child fragment; align the fragment start so the absolute child
 	// descriptor (n.abs + bitmap + len(body) + pad) is 8-aligned.
 	prefix := len(body)
-	encoded, err := encEncodeChildren(ctx, vec.Children, []int{child.Length}, n, budget, depth, prefix)
+	encoded, err := encEncodeChildren(ctx, vec.Children, []int{child.Length}, n, budget, blobs, depth, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -838,7 +933,7 @@ func encEncodeArray(ctx context.Context, vec *columnar.Vector, rows int, n *encN
 	return body, nil
 }
 
-func encEncodeComposite(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, depth int) ([]byte, error) {
+func encEncodeComposite(ctx context.Context, vec *columnar.Vector, rows int, n *encNode, budget *encBudget, blobs *[]toastBlob, depth int) ([]byte, error) {
 	for i := range vec.Children {
 		if vec.Children[i].Length != rows {
 			return nil, fmt.Errorf("pax encode: composite child %d has %d rows, want %d: %w", i, vec.Children[i].Length, rows, errPAXEncode)
@@ -851,7 +946,7 @@ func encEncodeComposite(ctx context.Context, vec *columnar.Vector, rows int, n *
 	if err := budget.chargeMul(uint64(len(vec.Children)), paxColumnSize); err != nil {
 		return nil, err
 	}
-	encoded, err := encEncodeChildren(ctx, vec.Children, childRows, n, budget, depth, 0)
+	encoded, err := encEncodeChildren(ctx, vec.Children, childRows, n, budget, blobs, depth, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -861,7 +956,7 @@ func encEncodeComposite(ctx context.Context, vec *columnar.Vector, rows int, n *
 // encEncodeChildren encodes child nodes and positions their descriptor table
 // and payloads so every absolute offset is 8-aligned. prefix is the number
 // of parent-body bytes before this fragment (NULL bitmap plus fixed fields).
-func encEncodeChildren(ctx context.Context, children []columnar.Vector, childRows []int, n *encNode, budget *encBudget, depth int, prefix int) ([]byte, error) {
+func encEncodeChildren(ctx context.Context, children []columnar.Vector, childRows []int, n *encNode, budget *encBudget, blobs *[]toastBlob, depth int, prefix int) ([]byte, error) {
 	nodes := make([]*encNode, len(children))
 	for i := range children {
 		if err := ctx.Err(); err != nil {
@@ -874,7 +969,7 @@ func encEncodeChildren(ctx context.Context, children []columnar.Vector, childRow
 		if err := child.Validate(); err != nil {
 			return nil, fmt.Errorf("pax encode: nested child %d invalid vector: %w: %w", i, err, errPAXEncode)
 		}
-		node, err := encEncodeNode(ctx, child, childRows[i], 0, budget, depth+1)
+		node, err := encEncodeNode(ctx, child, childRows[i], 0, budget, blobs, depth+1)
 		if err != nil {
 			return nil, err
 		}

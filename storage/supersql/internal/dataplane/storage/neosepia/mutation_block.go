@@ -126,44 +126,59 @@ func (b *mutationBlockBuilder) Rows() int {
 }
 
 func (b *mutationBlockBuilder) Flush(ctx context.Context) ([]byte, error) {
+	data, _, err := b.flushInternal(ctx, false)
+	return data, err
+}
+
+func (b *mutationBlockBuilder) FlushWithBlobs(ctx context.Context) ([]byte, []toastBlob, error) {
+	return b.flushInternal(ctx, true)
+}
+
+func (b *mutationBlockBuilder) flushInternal(ctx context.Context, allowLOB bool) ([]byte, []toastBlob, error) {
 	if b.builder == nil {
-		return nil, storage.ErrClosed
+		return nil, nil, storage.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	count := b.builder.Rows()
 	if count == 0 {
-		return nil, storage.ErrBatchEmpty
+		return nil, nil, storage.ErrBatchEmpty
 	}
 	fixed := uint64(count)*(4+8+8+uint64(unsafe.Sizeof(storage.MutationOp(0)))) + uint64(len(b.values))*uint64(unsafe.Sizeof(columnar.Vector{}))
 	if fixed > b.limits.SortBytes {
-		return nil, columnar.ErrBatchBudget
+		return nil, nil, columnar.ErrBatchBudget
 	}
 	var batch columnar.Batch
 	if err := b.builder.Publish(&batch); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	order := make([]uint32, count)
 	for i := range order {
 		order[i] = uint32(i)
 	}
-	keys := &batch.Columns[0]
-	slices.SortFunc(order, func(a, bIndex uint32) int {
-		aRange, bRange := keys.Ranges[a], keys.Ranges[bIndex]
-		aKey := keys.Data[aRange.Offset : aRange.Offset+aRange.Length]
-		bKey := keys.Data[bRange.Offset : bRange.Offset+bRange.Length]
-		if order := bytes.Compare(aKey, bKey); order != 0 {
-			return order
+	var sorted columnar.Batch
+	if count == 1 {
+		sorted = batch
+	} else {
+		keys := &batch.Columns[0]
+		slices.SortFunc(order, func(a, bIndex uint32) int {
+			aRange, bRange := keys.Ranges[a], keys.Ranges[bIndex]
+			aKey := keys.Data[aRange.Offset : aRange.Offset+aRange.Length]
+			bKey := keys.Data[bRange.Offset : bRange.Offset+bRange.Length]
+			if order := bytes.Compare(aKey, bKey); order != 0 {
+				return order
+			}
+			return cmp.Compare(b.ordinals[bIndex], b.ordinals[a])
+		})
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
 		}
-		return cmp.Compare(b.ordinals[bIndex], b.ordinals[a])
-	})
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	sorted, _, err := permuteBlock(ctx, &batch, order, b.limits.SortBytes-fixed)
-	if err != nil {
-		return nil, err
+		var err error
+		sorted, _, err = permuteBlock(ctx, &batch, order, b.limits.SortBytes-fixed)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	versions := blockVersions{Keys: sorted.Columns[0], EndKeys: sorted.Columns[1], CommitTS: make([]model.Timestamp, count), Ordinals: make([]uint64, count), Kinds: make([]storage.MutationOp, count)}
 	for i, lane := range order {
@@ -172,14 +187,14 @@ func (b *mutationBlockBuilder) Flush(ctx context.Context) ([]byte, error) {
 		versions.Kinds[i] = b.kinds[lane]
 	}
 	payload := columnar.Batch{Length: count, Columns: sorted.Columns[2:]}
-	data, err := encodeBlock(ctx, b.layout.Target, versions, &payload, b.columns, b.limits.Block)
+	data, blobs, err := encodeBlockInternal(ctx, b.layout.Target, versions, &payload, b.columns, b.limits.Block, allowLOB)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	b.builder.Reset()
 	b.ordinals = b.ordinals[:0]
 	b.kinds = b.kinds[:0]
-	return data, nil
+	return data, blobs, nil
 }
 
 func (b *mutationBlockBuilder) Close() error {

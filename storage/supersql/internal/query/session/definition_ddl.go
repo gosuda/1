@@ -92,6 +92,8 @@ func ExecuteDefinitionCommand(ctx context.Context, transactions *Transactions, n
 			return settingError("25006", "cannot execute definition DDL in a read-only transaction")
 		}
 		options.Binding.Bind.SearchPath = declarationSearchPath(transactions.settings.SearchPath(), options.Binding.SchemaContext)
+		options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 		options.Binding.Owner = transactions.settings.Principal().OID()
 		options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = transactions.temporal

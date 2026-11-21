@@ -8,6 +8,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
@@ -51,6 +52,11 @@ type indexSchedulerJob struct {
 	retainedErr     error
 }
 
+type indexJobBackoff struct {
+	failures int
+	nextAt   time.Time
+}
+
 // IndexJobScheduler borrows every collaborator in Runner, including an already
 // restored protection registry. Only Run starts workers; it may be called once.
 // MaxRunning bounds both workers and retained failed owners, not job history.
@@ -62,9 +68,10 @@ type indexSchedulerJob struct {
 // only then close the registry and backend. Cancel is the only method that writes
 // cancellation intent; stopping Run or Wait never cancels a durable job.
 type IndexJobScheduler struct {
-	options IndexJobSchedulerOptions
-	life    context.Context
-	stop    context.CancelFunc
+	options        IndexJobSchedulerOptions
+	life           context.Context
+	stop           context.CancelFunc
+	unregisterWake func()
 
 	// gate serializes journal admission and slot ownership, never worker execution.
 	gate    chan struct{}
@@ -79,6 +86,8 @@ type IndexJobScheduler struct {
 	runCancel context.CancelFunc
 	runDone   chan struct{}
 	runErr    error
+	doneCh    chan struct{}
+	backoffs  map[JobID]indexJobBackoff
 }
 
 // NewIndexJobScheduler allocates bounded bookkeeping without starting goroutines.
@@ -102,20 +111,33 @@ func NewIndexJobScheduler(ctx context.Context, options IndexJobSchedulerOptions)
 		return nil, err
 	}
 	life, stop := context.WithCancel(ctx)
-	return &IndexJobScheduler{
-		options: options,
-		life:    life,
-		stop:    stop,
-		gate:    make(chan struct{}, 1),
-		wake:    make(chan struct{}, 1),
-		slots:   make([]*indexSchedulerJob, 0, options.MaxRunning),
-	}, nil
+	scheduler := &IndexJobScheduler{
+		options:  options,
+		life:     life,
+		stop:     stop,
+		gate:     make(chan struct{}, 1),
+		wake:     make(chan struct{}, 1),
+		slots:    make([]*indexSchedulerJob, 0, options.MaxRunning),
+		doneCh:   make(chan struct{}),
+		backoffs: make(map[JobID]indexJobBackoff),
+	}
+	scheduler.unregisterWake = options.Runner.Jobs.registerWake(scheduler.Wake)
+	return scheduler, nil
 }
 
-// Run rescans the durable journal immediately and after each poll or completion.
-// Infrastructure, unsupported-job and cleanup failures stop admission and join
-// workers. Durable failed/canceled jobs remain observable through Status/Wait and
-// do not stop unrelated jobs. Unknown outcomes retain their concrete runner.
+// Wake signals the scheduler's background loop to scan for newly submitted or
+// retry-ready jobs immediately instead of waiting for PollInterval.
+func (s *IndexJobScheduler) Wake() {
+	if s == nil {
+		return
+	}
+	s.notify()
+}
+
+// Run rescans the durable journal immediately and after each poll, wake, or
+// completion. Fatal corruption, closed-context, and unsettled-ownership errors
+// stop admission and join workers. Per-job transient failures and retry
+// exhaustion back off that job individually without terminating the scheduler.
 func (s *IndexJobScheduler) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -154,15 +176,38 @@ func (s *IndexJobScheduler) Run(ctx context.Context) error {
 func (s *IndexJobScheduler) poll(ctx context.Context) error {
 	ticker := time.NewTicker(s.options.PollInterval)
 	defer ticker.Stop()
+	var backoffTimer *time.Timer
+	stopBackoff := func() {
+		if backoffTimer != nil {
+			if !backoffTimer.Stop() {
+				select {
+				case <-backoffTimer.C:
+				default:
+				}
+			}
+			backoffTimer = nil
+		}
+	}
+	defer stopBackoff()
 	for {
 		if err := s.scan(ctx); err != nil {
 			return err
+		}
+		stopBackoff()
+		var backoffC <-chan time.Time
+		if wait, ok := s.nextBackoffWait(time.Now()); ok {
+			if wait <= 0 {
+				continue
+			}
+			backoffTimer = time.NewTimer(wait)
+			backoffC = backoffTimer.C
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 		case <-s.wake:
+		case <-backoffC:
 		}
 	}
 }
@@ -186,19 +231,31 @@ func (s *IndexJobScheduler) scan(ctx context.Context) (err error) {
 		return err
 	}
 	defer func() { err = errors.Join(err, view.Close()) }()
-	return s.options.Runner.Jobs.Scan(ctx, view, func(job Job) error {
+	now := time.Now()
+	var seenActive map[JobID]struct{}
+	if s.hasBackoffs() {
+		seenActive = make(map[JobID]struct{})
+	}
+	scanErr := s.options.Runner.Jobs.Scan(ctx, view, func(job Job) error {
 		if job.Terminal() {
 			return nil
+		}
+		if seenActive != nil {
+			seenActive[job.ID] = struct{}{}
 		}
 		if err := s.checkExecution(); err != nil {
 			return err
 		}
-		if len(s.slots) == s.options.MaxRunning || s.occupied(job.ID, job.TableID) {
+		if len(s.slots) == s.options.MaxRunning || s.occupied(job.ID, job.TableID) || s.isBackedOff(job.ID, now) {
 			return nil
 		}
 		runner, err := NewIndexJobRunner(ctx, job.ID, s.options.Runner)
 		if err != nil {
-			return indexSchedulerError(job.ID, err)
+			if ctx.Err() != nil || indexSchedulerFatal(err) {
+				return indexSchedulerError(job.ID, err)
+			}
+			s.recordBackoff(job.ID, now)
+			return nil
 		}
 		slot := &indexSchedulerJob{id: job.ID, table: job.TableID, runner: runner, running: true}
 		s.slots = append(s.slots, slot)
@@ -206,6 +263,10 @@ func (s *IndexJobScheduler) scan(ctx context.Context) (err error) {
 		go s.runJob(ctx, slot)
 		return nil
 	})
+	if scanErr == nil && seenActive != nil {
+		s.pruneBackoffs(seenActive)
+	}
+	return scanErr
 }
 
 func (s *IndexJobScheduler) runJob(ctx context.Context, slot *indexSchedulerJob) {
@@ -227,19 +288,30 @@ func (s *IndexJobScheduler) runJob(ctx context.Context, slot *indexSchedulerJob)
 	s.notify()
 }
 
-// finish requires gate and an idle runner. A failed Close preserves the concrete
-// owner in its slot so neither a rescan nor a new Cancel can replace it.
+// finish requires gate and an idle runner. A failed Close or unsettled commit
+// preserves the concrete owner in its slot so neither a rescan nor a new Cancel
+// can replace it. Transient or per-job non-fatal errors retire the slot and
+// back off that job individually instead of terminating the scheduler.
 func (s *IndexJobScheduler) finish(slot *indexSchedulerJob, operationErr error) error {
 	closeErr := slot.runner.Close()
 	err := errors.Join(operationErr, closeErr)
-	if closeErr != nil || errors.Is(operationErr, storage.ErrCommitIndeterminate) || errors.Is(operationErr, errIndexRunnerProtectionPending) {
+	unsettled := closeErr != nil || errors.Is(operationErr, storage.ErrCommitIndeterminate) || errors.Is(operationErr, errIndexRunnerProtectionPending)
+	if unsettled {
 		slot.retainedErr = err
+		s.clearBackoff(slot.id)
+		s.fail(indexSchedulerError(slot.id, err))
 	} else {
 		s.retire(slot)
+		if err == nil {
+			s.clearBackoff(slot.id)
+		} else if indexSchedulerFatal(err) {
+			s.clearBackoff(slot.id)
+			s.fail(indexSchedulerError(slot.id, err))
+		} else {
+			s.recordBackoff(slot.id, time.Now())
+		}
 	}
-	if err != nil {
-		s.fail(indexSchedulerError(slot.id, err))
-	}
+	s.broadcastDone()
 	return err
 }
 
@@ -261,6 +333,9 @@ func (s *IndexJobScheduler) fail(err error) {
 // manager, policy, or journal capabilities. Its error describes retained owners;
 // the caller must also collect Run's execution error before closing the backend.
 func (s *IndexJobScheduler) Close() error {
+	if s.unregisterWake != nil {
+		s.unregisterWake()
+	}
 	s.mu.Lock()
 	s.closed = true
 	s.stopping = true
@@ -333,6 +408,90 @@ func (s *IndexJobScheduler) notify() {
 	}
 }
 
+func (s *IndexJobScheduler) doneChannel() <-chan struct{} {
+	s.mu.Lock()
+	ch := s.doneCh
+	s.mu.Unlock()
+	return ch
+}
+
+func (s *IndexJobScheduler) broadcastDone() {
+	s.mu.Lock()
+	close(s.doneCh)
+	s.doneCh = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *IndexJobScheduler) hasBackoffs() bool {
+	s.mu.Lock()
+	has := len(s.backoffs) > 0
+	s.mu.Unlock()
+	return has
+}
+
+func (s *IndexJobScheduler) isBackedOff(id JobID, now time.Time) bool {
+	s.mu.Lock()
+	entry, ok := s.backoffs[id]
+	s.mu.Unlock()
+	return ok && now.Before(entry.nextAt)
+}
+
+func (s *IndexJobScheduler) recordBackoff(id JobID, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.backoffs[id]
+	entry.failures++
+	delay := s.options.Runner.RetryDelay
+	maxDelay := s.options.Runner.MaxRetryDelay
+	for attempt := 1; attempt < entry.failures && delay < maxDelay; attempt++ {
+		if delay > maxDelay/2 {
+			delay = maxDelay
+		} else {
+			delay *= 2
+		}
+	}
+	entry.nextAt = now.Add(delay)
+	s.backoffs[id] = entry
+}
+
+func (s *IndexJobScheduler) clearBackoff(id JobID) {
+	s.mu.Lock()
+	delete(s.backoffs, id)
+	s.mu.Unlock()
+}
+
+func (s *IndexJobScheduler) pruneBackoffs(active map[JobID]struct{}) {
+	s.mu.Lock()
+	for id := range s.backoffs {
+		if _, ok := active[id]; !ok {
+			delete(s.backoffs, id)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *IndexJobScheduler) nextBackoffWait(now time.Time) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.backoffs) == 0 {
+		return 0, false
+	}
+	var earliest time.Time
+	for _, entry := range s.backoffs {
+		if earliest.IsZero() || entry.nextAt.Before(earliest) {
+			earliest = entry.nextAt
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	wait := earliest.Sub(now)
+	if wait < 0 {
+		wait = 0
+	}
+	return wait, true
+}
+
 func (s *IndexJobScheduler) occupied(id JobID, table model.ObjectID) bool {
 	for _, slot := range s.slots {
 		if slot.id == id || slot.table == table {
@@ -367,6 +526,22 @@ func indexSchedulerError(id JobID, err error) error {
 		return nil
 	}
 	return &IndexJobSchedulerError{ID: id, Cause: err}
+}
+
+// indexSchedulerFatal reserves scheduler termination strictly for unrecoverable
+// storage/catalog/journal corruption, closed runtime, or unsettled ownership.
+func indexSchedulerFatal(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, storage.ErrCorruptStorage) ||
+		errors.Is(err, catalog.ErrCorruptCatalog) ||
+		errors.Is(err, ErrJobRecord) ||
+		errors.Is(err, ErrJobProtectionNotReady) ||
+		errors.Is(err, storage.ErrInvalidScanPlan) ||
+		errors.Is(err, storage.ErrClosed) ||
+		errors.Is(err, storage.ErrCommitIndeterminate) ||
+		errors.Is(err, errIndexRunnerProtectionPending)
 }
 
 // errors.Is alone would also accept cancellation joined with a cleanup failure.

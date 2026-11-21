@@ -145,8 +145,12 @@ func (cursor *paxScanCursor) Next(ctx context.Context, out *columnar.Batch) (err
 	if out.MaxRows > 0 {
 		maximum = min(maximum, out.MaxRows)
 	}
+	pruned := false
 	if err := cursor.collect(ctx, maximum); err != nil {
-		return err
+		if err != errBlockZonePruned {
+			return err
+		}
+		pruned = true
 	}
 	if cursor.lease != nil {
 		key, _, _, _, _, keyErr := cursor.lease.block.Version(0)
@@ -156,6 +160,9 @@ func (cursor *paxScanCursor) Next(ctx context.Context, out *columnar.Batch) (err
 		cursor.blockUnit = samplingUnit(cursor.spec.Target, key)
 	}
 	if cursor.lease == nil && cursor.ownBatch.Length == 0 {
+		if pruned {
+			return cursor.publishEmpty(out)
+		}
 		return io.EOF
 	}
 	cursor.filter.Length = cursor.rows()
@@ -236,6 +243,9 @@ func (cursor *paxScanCursor) collect(ctx context.Context, maximum int) error {
 			if err == io.EOF {
 				cursor.finished = true
 				break
+			}
+			if err == errBlockZonePruned {
+				return errBlockZonePruned
 			}
 			if err != nil {
 				return err

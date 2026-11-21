@@ -712,17 +712,13 @@ func (c *invocation) node(id physical.NodeID, node physical.NodeSpec, layouts []
 				return nil, err
 			}
 		}
+		if node.Algorithm == physical.TopK {
+			return c.topK(children[0], node, input, layouts, offset, count)
+		}
 		cursor := &limitCursor{input: children[0], env: &p.env, layouts: layouts, offset: offset, remaining: count, withTies: node.Limit.WithTies, source: columnar.Batch{Columns: make([]columnar.Vector, 0, len(input))}}
 		if node.Limit.WithTies {
 			var err error
 			cursor.keys, cursor.keyColumns, err = c.orderColumns(node.Delivered.Ordering, node.Output, layouts)
-			if err != nil {
-				return nil, err
-			}
-		}
-		if node.Algorithm == physical.TopK {
-			var err error
-			cursor.input, err = c.sort(children[0], node, input, layouts)
 			if err != nil {
 				return nil, err
 			}

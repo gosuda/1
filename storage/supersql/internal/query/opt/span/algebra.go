@@ -165,6 +165,37 @@ func (e *extractor) sameEndpoint(index int, a, b endpoint) bool {
 	return a.set == b.set && (!a.set || (a.inclusive == b.inclusive && e.compare(index, a.value, b.value) == 0))
 }
 
+func (e *extractor) hasUnorderedEnumSpans(terms []term) bool {
+	if len(terms) <= 1 {
+		return false
+	}
+	for i, isEnum := range e.keyEnum {
+		if !isEnum {
+			continue
+		}
+		var seen bool
+		var first int64
+		for _, t := range terms {
+			if !e.step() {
+				return true
+			}
+			for _, ep := range [2]endpoint{t[i].lower, t[i].upper} {
+				if !ep.set || ep.value.IsNull {
+					continue
+				}
+				if !seen {
+					seen, first = true, ep.value.IntVal
+					continue
+				}
+				if ep.value.IntVal != first {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (e *extractor) result(predicate ir.ScalarID, f fact) Result {
 	out := Result{Widened: f.widened}
 	if f.empty() {
@@ -174,7 +205,10 @@ func (e *extractor) result(predicate ir.ScalarID, f fact) Result {
 	if !f.exact {
 		out.Residual = predicate
 	}
-	if f.unrestricted {
+	if f.unrestricted || e.hasUnorderedEnumSpans(f.terms) {
+		if !f.unrestricted {
+			out.Residual = predicate
+		}
 		if !e.charge(1, uint64(unsafe.Sizeof(storage.KeySpan{}))) {
 			return Result{}
 		}

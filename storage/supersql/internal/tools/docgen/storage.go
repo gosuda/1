@@ -137,11 +137,28 @@ func collectStorageConstants(g *generator) ([][]string, error) {
 		constants, ok := byFile[entry.file]
 		if !ok {
 			file, err := g.parse(entry.file)
-			if err != nil {
+			if err != nil && entry.file == "open.go" {
+				// Root package may be decomposed across multiple files (e.g. options.go).
+				rootFiles, dirErr := g.dirFiles("", false)
+				if dirErr != nil {
+					return nil, dirErr
+				}
+				var all []constSpec
+				for _, rel := range rootFiles {
+					parsed, parseErr := g.parse(rel)
+					if parseErr != nil {
+						return nil, parseErr
+					}
+					all = append(all, g.fileConstants(rel, parsed)...)
+				}
+				constants = all
+				byFile[entry.file] = constants
+			} else if err != nil {
 				return nil, err
+			} else {
+				constants = g.fileConstants(entry.file, file)
+				byFile[entry.file] = constants
 			}
-			constants = g.fileConstants(entry.file, file)
-			byFile[entry.file] = constants
 		}
 		constant, found := findConst(constants, entry.name)
 		if !found {

@@ -37,10 +37,12 @@ func (runs *compactedRuns) retainFragments(ctx context.Context, work levelCompac
 }
 
 func (runs *compactedRuns) linkFragment(file *sstFile, lower, upper []byte) error {
-	if uint64(len(runs.files)) >= runs.limits.MaxRuns {
+	if uint64(len(runs.files)+len(runs.writers)) >= runs.limits.MaxRuns {
 		return columnar.ErrBatchBudget
 	}
-	name := fmt.Sprintf("f-%s-%08x.active.sst", runs.taskID[:min(16, len(runs.taskID))], len(runs.files))
+	seq := runs.nextFile
+	runs.nextFile++
+	name := fmt.Sprintf("f-%s-%08x.active.sst", runs.taskID[:min(16, len(runs.taskID))], seq)
 	if err := runs.reserveFile(name); err != nil {
 		return err
 	}

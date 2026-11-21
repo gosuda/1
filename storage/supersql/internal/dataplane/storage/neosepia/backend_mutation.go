@@ -1,9 +1,12 @@
 package neosepia
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"math"
+	"os"
+	"slices"
 
 	"github.com/gosuda/supersql-alpha/clock"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
@@ -11,6 +14,386 @@ import (
 )
 
 func (backend *Backend) ApplyMutations(ctx context.Context, batch storage.MutationBatch) (storage.ApplyResult, error) {
+	if !memtableEnabled(backend.limits) {
+		return backend.applyMutationDirect(ctx, batch)
+	}
+	// Pre-validate batch outside locks so concurrent callers hash in parallel.
+	validated, err := validateMutationBatch(ctx, batch)
+	if err != nil {
+		return storage.ApplyResult{}, err
+	}
+	return backend.applyMutationGrouped(ctx, batch, validated)
+}
+
+func (backend *Backend) applyMutationGrouped(ctx context.Context, batch storage.MutationBatch, validated validatedMutationBatch) (storage.ApplyResult, error) {
+	req := &groupCommitReq{
+		ctx:       ctx,
+		batch:     batch,
+		validated: validated,
+		done:      make(chan struct{}),
+	}
+	backend.groupMu.Lock()
+	backend.groupQueue = append(backend.groupQueue, req)
+	isLeader := !backend.groupActive
+	if isLeader {
+		backend.groupActive = true
+	}
+	backend.groupMu.Unlock()
+
+	if isLeader {
+		backend.runGroupCommitLeader()
+		return req.result, req.err
+	}
+	select {
+	case <-req.done:
+		return req.result, req.err
+	case <-ctx.Done():
+		backend.groupMu.Lock()
+		for i, queued := range backend.groupQueue {
+			if queued == req {
+				backend.groupQueue = append(backend.groupQueue[:i], backend.groupQueue[i+1:]...)
+				backend.groupMu.Unlock()
+				return storage.ApplyResult{}, ctx.Err()
+			}
+		}
+		backend.groupMu.Unlock()
+		// Leader already claimed this request; wait for its exact durable outcome.
+		<-req.done
+		return req.result, req.err
+	}
+}
+
+func (backend *Backend) runGroupCommitLeader() {
+	for {
+		backend.groupMu.Lock()
+		if len(backend.groupQueue) == 0 {
+			backend.groupActive = false
+			backend.groupMu.Unlock()
+			return
+		}
+		n := min(len(backend.groupQueue), maxGroupCommitBatch)
+		group := make([]*groupCommitReq, n)
+		copy(group, backend.groupQueue[:n])
+		copy(backend.groupQueue, backend.groupQueue[n:])
+		clear(backend.groupQueue[len(backend.groupQueue)-n:])
+		backend.groupQueue = backend.groupQueue[:len(backend.groupQueue)-n]
+		backend.groupMu.Unlock()
+
+		backend.processCommitGroup(group)
+		for _, req := range group {
+			close(req.done)
+		}
+	}
+}
+
+func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
+	backend.commitMu.Lock()
+	defer backend.commitMu.Unlock()
+
+	backend.mu.Lock()
+	hasFault := backend.commitFault != nil
+	backend.mu.Unlock()
+	if hasFault {
+		for _, req := range group {
+			req.result, req.err = backend.commitOneMemtable(req.ctx, req.batch, req.validated)
+		}
+		return
+	}
+
+	// Sort concurrent commit requests by CommitTS ascending so concurrent writers
+	// arriving slightly out of timestamp order commit cleanly in strict order.
+	if len(group) > 1 {
+		slices.SortStableFunc(group, func(a, b *groupCommitReq) int {
+			return cmp.Compare(a.batch.CommitTS, b.batch.CommitTS)
+		})
+	}
+
+	backend.mu.Lock()
+	if backend.closed {
+		backend.mu.Unlock()
+		for _, req := range group {
+			req.err = storage.ErrClosed
+		}
+		return
+	}
+	staged := make([]stagedGroupCommit, 0, len(group))
+	stagingTxns := backend.transactions
+	nextPos := backend.frontier.LogPosition
+	minTS := backend.closedTimestamp()
+	activeLeap := backend.state.Scales[len(backend.state.Scales)-1].Scale.LeapHistoryID
+
+	for _, req := range group {
+		if err := req.ctx.Err(); err != nil {
+			req.err = err
+			continue
+		}
+		id := recoveryTxnID(req.batch.TxID)
+		if previous, found := stagingTxns.Get(id); found {
+			if previous.Identity != req.validated.identity {
+				req.err = storage.ErrTxnIDReused
+			} else {
+				req.result = previous.Result
+			}
+			continue
+		}
+		if backend.pending != nil {
+			if backend.pendingTxnIDMismatch(req.batch.TxID, req.validated.identity) {
+				req.err = storage.ErrTxnIDReused
+			} else {
+				req.err = storage.ErrCommitIndeterminate
+			}
+			continue
+		}
+		if backend.metadataUncertain {
+			req.err = storage.ErrCommitIndeterminate
+			continue
+		}
+		if req.batch.CommitTS <= minTS || nextPos == math.MaxUint64 {
+			req.err = storage.ErrInvalidMutation
+			continue
+		}
+		if req.batch.Epoch.LeapHistory != activeLeap || req.batch.Epoch.Assurance == ([16]byte{}) || req.batch.Epoch.Config == ([32]byte{}) {
+			req.err = clock.ErrClockEpochChanged
+			continue
+		}
+		position := nextPos + 1
+		result := storage.ApplyResult{
+			AppliedCount: req.batch.Count(),
+			CommitTS:     req.batch.CommitTS,
+			ChecksumCRC:  req.batch.ChecksumCRC,
+			LogPosition:  position,
+		}
+		updatedTxns, _, err := stagingTxns.Set(id, transactionRecord{Identity: req.validated.identity, Result: result}, backend.limits.IdentityBytes-stagingTxns.NodeBytes())
+		if err != nil {
+			req.err = err
+			continue
+		}
+		stagingTxns = updatedTxns
+		nextPos = position
+		minTS = req.batch.CommitTS
+		staged = append(staged, stagedGroupCommit{
+			req:      req,
+			position: position,
+			decision: runDecision{
+				Position:      position,
+				TxID:          req.batch.TxID,
+				CommitTS:      req.batch.CommitTS,
+				Identity:      req.validated.identity,
+				MutationCount: req.batch.Count(),
+			},
+			result:       result,
+			transactions: stagingTxns,
+		})
+	}
+	if len(staged) == 0 {
+		backend.mu.Unlock()
+		return
+	}
+	commitsRoot := backend.directory.commits
+	walBytes := backend.limits.WALBytes
+	rowBytes := backend.limits.RowBytes
+	backend.mu.Unlock()
+
+	// Write & fsync all staged WAL segments with ONE single directory sync!
+	linked, walErr := writeCommitGroup(context.Background(), commitsRoot, staged, walBytes)
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+
+	if walErr != nil {
+		if linked == 0 && !errors.Is(walErr, storage.ErrCommitIndeterminate) {
+			for _, item := range staged {
+				item.req.err = walErr
+			}
+			return
+		}
+		// One or more segments may have been linked on disk. Record ONLY the
+		// prefix whose publication was attempted, each with its own cumulative
+		// transaction tree snapshot (never attaching unlinked siblings), and
+		// mark metadata uncertain until ResolveCommit reconciles disk state.
+		uncertain := min(linked+1, len(staged))
+		backend.pending = buildPendingChain(staged[:uncertain])
+		if linked > 0 {
+			backend.metadataUncertain = true
+		}
+		for _, item := range staged {
+			item.req.err = errors.Join(storage.ErrCommitIndeterminate, walErr)
+		}
+		return
+	}
+
+	// Stage every durably WAL-committed batch into the in-memory memtable.
+	for i, item := range staged {
+		if err := backend.memtable.stageBatch(context.Background(), item.decision, item.req.batch.Epoch, item.req.batch, rowBytes); err != nil {
+			// WAL segments staged[i:] are already durable on disk; record them
+			// as pending and mark metadata uncertain so no subsequent commit
+			// can reuse their LogPosition and ResolveCommit can recover them.
+			backend.pending = buildPendingChain(staged[i:])
+			backend.metadataUncertain = true
+			for j := i; j < len(staged); j++ {
+				staged[j].req.err = errors.Join(storage.ErrCommitIndeterminate, err)
+			}
+			return
+		}
+		id := recoveryTxnID(item.req.batch.TxID)
+		updated, _, setErr := backend.transactions.Set(id, transactionRecord{Identity: item.decision.Identity, Result: item.result}, backend.limits.IdentityBytes-backend.transactions.NodeBytes())
+		if setErr != nil {
+			backend.pending = buildPendingChain(staged[i:])
+			backend.metadataUncertain = true
+			for j := i; j < len(staged); j++ {
+				staged[j].req.err = errors.Join(storage.ErrCommitIndeterminate, setErr)
+			}
+			return
+		}
+		backend.transactions = updated
+		backend.frontier = recoveredPosition{LogPosition: item.result.LogPosition, CommitTS: item.result.CommitTS}
+		backend.publishedEpoch = item.req.batch.Epoch
+		item.req.result = item.result
+	}
+
+	if backend.memtable.shouldFlush(backend.limits) {
+		if err := backend.flushMemtableLocked(context.Background(), 0); err != nil {
+			// Data is already durable in WAL and visible in memtable; keep memtable
+			// intact so a subsequent flush/compaction can retry cleanly.
+			_ = err
+		}
+	}
+}
+
+func (backend *Backend) commitOneMemtable(ctx context.Context, batch storage.MutationBatch, validated validatedMutationBatch) (storage.ApplyResult, error) {
+	backend.mu.Lock()
+	if backend.closed {
+		backend.mu.Unlock()
+		return storage.ApplyResult{}, storage.ErrClosed
+	}
+	id := recoveryTxnID(batch.TxID)
+	if previous, found := backend.transactions.Get(id); found {
+		backend.mu.Unlock()
+		if previous.Identity != validated.identity {
+			return storage.ApplyResult{}, storage.ErrTxnIDReused
+		}
+		return previous.Result, nil
+	}
+	if backend.pending != nil {
+		same := backend.pendingTxnIDMismatch(batch.TxID, validated.identity)
+		backend.mu.Unlock()
+		if same {
+			return storage.ApplyResult{}, storage.ErrTxnIDReused
+		}
+		return storage.ApplyResult{}, storage.ErrCommitIndeterminate
+	}
+	if backend.metadataUncertain {
+		backend.mu.Unlock()
+		return storage.ApplyResult{}, storage.ErrCommitIndeterminate
+	}
+	if batch.CommitTS <= backend.closedTimestamp() || backend.frontier.LogPosition == math.MaxUint64 {
+		backend.mu.Unlock()
+		return storage.ApplyResult{}, storage.ErrInvalidMutation
+	}
+	active := backend.state.Scales[len(backend.state.Scales)-1]
+	if batch.Epoch.LeapHistory != active.Scale.LeapHistoryID || batch.Epoch.Assurance == ([16]byte{}) || batch.Epoch.Config == ([32]byte{}) {
+		backend.mu.Unlock()
+		return storage.ApplyResult{}, clock.ErrClockEpochChanged
+	}
+	position := backend.frontier.LogPosition + 1
+	result := storage.ApplyResult{AppliedCount: batch.Count(), CommitTS: batch.CommitTS, ChecksumCRC: batch.ChecksumCRC, LogPosition: position}
+	transactions, _, err := backend.transactions.Set(id, transactionRecord{Identity: validated.identity, Result: result}, backend.limits.IdentityBytes-backend.transactions.NodeBytes())
+	if err != nil {
+		backend.mu.Unlock()
+		return storage.ApplyResult{}, err
+	}
+	decision := runDecision{Position: position, TxID: batch.TxID, CommitTS: batch.CommitTS, Identity: validated.identity, MutationCount: batch.Count()}
+	commitsRoot := backend.directory.commits
+	walBytes := backend.limits.WALBytes
+	commitFault := backend.commitFault
+	backend.mu.Unlock()
+
+	walRes, err := writeCommit(ctx, commitsRoot, position, batch, validated.identity, walBytes, commitFault)
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if err != nil && !errors.Is(err, storage.ErrCommitIndeterminate) {
+		return storage.ApplyResult{}, err
+	}
+	batchCopy := batch
+	backend.pending = &pendingCommit{decision: decision, epoch: batch.Epoch, transactions: transactions, batch: &batchCopy}
+	if err != nil {
+		return storage.ApplyResult{}, err
+	}
+	if err := backend.publishMemtableCommit(ctx, walRes, batch); err != nil {
+		return storage.ApplyResult{}, errors.Join(storage.ErrCommitIndeterminate, err)
+	}
+	return walRes, nil
+}
+
+func (backend *Backend) publishMemtableCommit(ctx context.Context, result storage.ApplyResult, batch storage.MutationBatch) error {
+	pending := backend.pending
+	expected, found := pending.transactions.Get(recoveryTxnID(pending.decision.TxID))
+	if !found || result != expected.Result {
+		return storage.ErrCorruptStorage
+	}
+	if backend.commitFault != nil {
+		if err := backend.commitFault(commitBeforeReaderPublication); err != nil {
+			return err
+		}
+	}
+	if err := backend.memtable.stageBatch(ctx, pending.decision, pending.epoch, batch, backend.limits.RowBytes); err != nil {
+		backend.metadataUncertain = true
+		return err
+	}
+	backend.frontier = recoveredPosition{LogPosition: result.LogPosition, CommitTS: result.CommitTS}
+	backend.publishedEpoch = pending.epoch
+	backend.transactions = pending.transactions
+	backend.pending = pending.next
+	if backend.memtable.shouldFlush(backend.limits) {
+		_ = backend.flushMemtableLocked(context.WithoutCancel(ctx), 0)
+	}
+	if backend.commitFault != nil {
+		return backend.commitFault(commitReaderPublished)
+	}
+	return nil
+}
+
+func buildPendingChain(items []stagedGroupCommit) *pendingCommit {
+	var head, tail *pendingCommit
+	for i := range items {
+		item := items[i]
+		batchCopy := item.req.batch
+		node := &pendingCommit{
+			decision:     item.decision,
+			epoch:        item.req.batch.Epoch,
+			transactions: item.transactions,
+			batch:        &batchCopy,
+		}
+		if head == nil {
+			head = node
+			tail = node
+		} else {
+			tail.next = node
+			tail = node
+		}
+	}
+	return head
+}
+
+func (backend *Backend) hasPendingTxn(id model.TxnID) bool {
+	for p := backend.pending; p != nil; p = p.next {
+		if p.decision.TxID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (backend *Backend) pendingTxnIDMismatch(id model.TxnID, identity [32]byte) bool {
+	for p := backend.pending; p != nil; p = p.next {
+		if p.decision.TxID == id && p.decision.Identity != identity {
+			return true
+		}
+	}
+	return false
+}
+
+func (backend *Backend) applyMutationDirect(ctx context.Context, batch storage.MutationBatch) (storage.ApplyResult, error) {
 	backend.commitMu.Lock()
 	defer backend.commitMu.Unlock()
 	backend.mu.Lock()
@@ -32,7 +415,7 @@ func (backend *Backend) ApplyMutations(ctx context.Context, batch storage.Mutati
 		return previous.Result, nil
 	}
 	if backend.pending != nil {
-		same := backend.pending.decision.TxID == batch.TxID && backend.pending.decision.Identity != validated.identity
+		same := backend.pendingTxnIDMismatch(batch.TxID, validated.identity)
 		backend.mu.Unlock()
 		if same {
 			return storage.ApplyResult{}, storage.ErrTxnIDReused
@@ -129,7 +512,53 @@ func (backend *Backend) ResolveCommit(ctx context.Context, id model.TxnID) (stor
 			return storage.CommitResolution{}, err
 		}
 	}
-	if backend.pending == nil || backend.pending.decision.TxID != id {
+	if backend.pending == nil || !backend.hasPendingTxn(id) {
+		return storage.CommitResolution{State: storage.CommitNotCommitted}, nil
+	}
+	if backend.pending.admission == nil {
+		// Pending memtable commit (single or group chain): WAL segments
+		// commits/<pos>.wal are the commit decisions. Reconcile in strict
+		// LogPosition order from the head of the pending chain.
+		for backend.pending != nil && backend.pending.admission == nil {
+			head := backend.pending
+			record, err := openCommit(ctx, backend.directory.commits, head.decision.Position, backend.limits.recovery().Batch)
+			if errors.Is(err, os.ErrNotExist) {
+				if err := ctx.Err(); err != nil {
+					return storage.CommitResolution{}, err
+				}
+				if err := syncCommitDirectory(backend.directory.commits); err != nil {
+					return storage.CommitResolution{}, err
+				}
+				// Group commits link strictly in ascending LogPosition order,
+				// so once a position is absent on disk no subsequent segment
+				// in the chain was linked either.
+				backend.pending = nil
+				break
+			}
+			if err != nil {
+				return storage.CommitResolution{}, err
+			}
+			if record.Batch.TxID != head.decision.TxID || record.Identity != head.decision.Identity ||
+				record.Result.CommitTS != head.decision.CommitTS || record.Result.AppliedCount != head.decision.MutationCount {
+				_ = record.Close()
+				return storage.CommitResolution{}, storage.ErrCorruptStorage
+			}
+			if err := syncCommitDirectory(backend.directory.commits); err != nil {
+				_ = record.Close()
+				return storage.CommitResolution{}, err
+			}
+			pubErr := backend.publishMemtableCommit(ctx, record.Result, record.Batch)
+			closeErr := record.Close()
+			if err := errors.Join(pubErr, closeErr); err != nil {
+				if head.decision.TxID == id {
+					return storage.CommitResolution{State: storage.CommitCommitted, Result: record.Result}, err
+				}
+				return storage.CommitResolution{}, err
+			}
+		}
+		if previous, found := backend.transactions.Get(recoveryTxnID(id)); found {
+			return storage.CommitResolution{State: storage.CommitCommitted, Result: previous.Result}, nil
+		}
 		return storage.CommitResolution{State: storage.CommitNotCommitted}, nil
 	}
 	resolution, _, err := resolveMutationRuns(ctx, backend.directory, backend.pending.decision, backend.limits.preparation(), backend.limits.recovery().Batch)

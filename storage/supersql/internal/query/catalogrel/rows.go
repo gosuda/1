@@ -50,15 +50,11 @@ func generateRows(ctx context.Context, snapshot Snapshot, view ReadView, relatio
 		}
 		return emitCatalogRow(relation, emit, fields...)
 	case IDPgRoles:
-		return emitCatalogRow(relation, emit,
-			fv("rolname", stringValue(options.Database.RoleName)), fv("rolsuper", boolValue(options.Database.RoleSuperuser)), fv("rolinherit", boolValue(options.Database.RoleInherit)),
-			fv("rolcreaterole", boolValue(options.Database.RoleCreateRole)), fv("rolcreatedb", boolValue(options.Database.RoleCreateDB)), fv("rolcanlogin", boolValue(options.Database.RoleCanLogin)),
-			fv("rolreplication", boolValue(options.Database.RoleReplication)), fv("rolconnlimit", intValue(int64(options.Database.RoleConnectionLimit))),
-			fv("rolbypassrls", boolValue(options.Database.RoleBypassRLS)), fv("oid", oidValue(options.Database.RoleOID)))
+		return emitRoles(ctx, snapshot, relation, options, emit)
 	case IDPgUser:
-		return emitCatalogRow(relation, emit,
-			fv("usename", stringValue(options.Database.RoleName)), fv("usesysid", oidValue(options.Database.RoleOID)), fv("usecreatedb", boolValue(options.Database.RoleCreateDB)),
-			fv("usesuper", boolValue(options.Database.RoleSuperuser)), fv("userepl", boolValue(options.Database.RoleReplication)), fv("usebypassrls", boolValue(options.Database.RoleBypassRLS)))
+		return emitUsers(ctx, snapshot, relation, options, emit)
+	case IDPgPolicies:
+		return emitPolicies(ctx, snapshot, relation, options, emit)
 	case IDPgNamespace:
 		return emitNamespaces(ctx, snapshot, relation, options, emit)
 	case IDPgClass:
@@ -315,6 +311,122 @@ func descriptorLimits(options SourceOptions) model.DescriptorLimits {
 	}
 }
 
+func emitRoles(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
+	if err := emitCatalogRow(relation, emit,
+		fv("rolname", stringValue(options.Database.RoleName)), fv("rolsuper", boolValue(options.Database.RoleSuperuser)), fv("rolinherit", boolValue(options.Database.RoleInherit)),
+		fv("rolcreaterole", boolValue(options.Database.RoleCreateRole)), fv("rolcreatedb", boolValue(options.Database.RoleCreateDB)), fv("rolcanlogin", boolValue(options.Database.RoleCanLogin)),
+		fv("rolreplication", boolValue(options.Database.RoleReplication)), fv("rolconnlimit", intValue(int64(options.Database.RoleConnectionLimit))),
+		fv("rolbypassrls", boolValue(options.Database.RoleBypassRLS)), fv("oid", oidValue(options.Database.RoleOID))); err != nil {
+		return err
+	}
+	if snapshot == nil {
+		return nil
+	}
+	count := uint64(0)
+	return snapshot.ScanNamespace(ctx, 0, model.ObjectRole, func(published catalog.PublishedDescriptor) error {
+		count++
+		if count > options.MaxDescriptors {
+			return &model.Error{Code: "54000", Message: "catalog descriptor budget exceeded"}
+		}
+		descriptor := published.Descriptor
+		if descriptor == nil || descriptor.State() != model.StatePublic {
+			return nil
+		}
+		name := descriptor.Name().Name
+		if strings.EqualFold(name, options.Database.RoleName) {
+			return nil
+		}
+		role, ok := descriptor.Role()
+		if !ok {
+			return &model.Error{Code: "XX000", Message: "role descriptor metadata is unavailable", Detail: name}
+		}
+		return emitCatalogRow(relation, emit,
+			fv("rolname", stringValue(name)),
+			fv("rolsuper", boolValue(role.Superuser)),
+			fv("rolinherit", boolValue(true)),
+			fv("rolcreaterole", boolValue(role.Superuser)),
+			fv("rolcreatedb", boolValue(role.Superuser)),
+			fv("rolcanlogin", boolValue(true)),
+			fv("rolreplication", boolValue(false)),
+			fv("rolconnlimit", intValue(-1)),
+			fv("rolbypassrls", boolValue(role.BypassRLS)),
+			fv("oid", oidValue(descriptor.OID())))
+	})
+}
+
+func emitUsers(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
+	if err := emitCatalogRow(relation, emit,
+		fv("usename", stringValue(options.Database.RoleName)), fv("usesysid", oidValue(options.Database.RoleOID)), fv("usecreatedb", boolValue(options.Database.RoleCreateDB)),
+		fv("usesuper", boolValue(options.Database.RoleSuperuser)), fv("userepl", boolValue(options.Database.RoleReplication)), fv("usebypassrls", boolValue(options.Database.RoleBypassRLS))); err != nil {
+		return err
+	}
+	if snapshot == nil {
+		return nil
+	}
+	count := uint64(0)
+	return snapshot.ScanNamespace(ctx, 0, model.ObjectRole, func(published catalog.PublishedDescriptor) error {
+		count++
+		if count > options.MaxDescriptors {
+			return &model.Error{Code: "54000", Message: "catalog descriptor budget exceeded"}
+		}
+		descriptor := published.Descriptor
+		if descriptor == nil || descriptor.State() != model.StatePublic {
+			return nil
+		}
+		name := descriptor.Name().Name
+		if strings.EqualFold(name, options.Database.RoleName) {
+			return nil
+		}
+		role, ok := descriptor.Role()
+		if !ok {
+			return &model.Error{Code: "XX000", Message: "role descriptor metadata is unavailable", Detail: name}
+		}
+		return emitCatalogRow(relation, emit,
+			fv("usename", stringValue(name)),
+			fv("usesysid", oidValue(descriptor.OID())),
+			fv("usecreatedb", boolValue(role.Superuser)),
+			fv("usesuper", boolValue(role.Superuser)),
+			fv("userepl", boolValue(false)),
+			fv("usebypassrls", boolValue(role.BypassRLS)))
+	})
+}
+
+func emitPolicies(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
+	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
+		if object.spec.Table == nil || len(object.spec.Table.Policies) == 0 {
+			return nil
+		}
+		for _, policy := range object.spec.Table.Policies {
+			permissive := "RESTRICTIVE"
+			if policy.Permissive {
+				permissive = "PERMISSIVE"
+			}
+			roles := policy.Roles
+			if len(roles) == 0 {
+				roles = []string{"public"}
+			}
+			fields := []fieldValue{
+				fv("schemaname", stringValue(object.schema.name)),
+				fv("tablename", stringValue(object.spec.Name.Name)),
+				fv("policyname", stringValue(policy.Name)),
+				fv("permissive", stringValue(permissive)),
+				fv("roles", stringArray(roles)),
+				fv("cmd", stringValue(policy.Command)),
+			}
+			if policy.Using != nil && policy.Using.SQL != "" {
+				fields = append(fields, fv("qual", stringValue(policy.Using.SQL)))
+			}
+			if policy.WithCheck != nil && policy.WithCheck.SQL != "" {
+				fields = append(fields, fv("with_check", stringValue(policy.WithCheck.SQL)))
+			}
+			if err := emitCatalogRow(relation, emit, fields...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func emitNamespaces(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
 	if err := emitCatalogRow(relation, emit, fv("oid", oidValue(11)), fv("nspname", stringValue("pg_catalog")), fv("nspowner", oidValue(10))); err != nil {
 		return err
@@ -362,7 +474,7 @@ func emitClasses(ctx context.Context, snapshot Snapshot, view ReadView, relation
 		if system.Namespace == "information_schema" {
 			namespace = informationSchema.OID
 		}
-		if err := emitClassRow(relation, emit, oid, system.Name, namespace, 10, relationTypeOID(system, options), 0, kind, 'p', -1, len(system.Columns), 0, false, false, false, false, true, "", nil); err != nil {
+		if err := emitClassRow(relation, emit, oid, system.Name, namespace, 10, relationTypeOID(system, options), 0, kind, 'p', -1, len(system.Columns), 0, false, false, false, false, false, false, true, "", nil); err != nil {
 			return err
 		}
 	}
@@ -374,7 +486,7 @@ func emitClasses(ctx context.Context, snapshot Snapshot, view ReadView, relation
 		if err != nil {
 			return err
 		}
-		hasIndexes, hasTriggers, hasSubclass, isPartition := false, false, false, false
+		hasIndexes, hasTriggers, hasSubclass, rowSecurity, forceRowSecurity, isPartition := false, false, false, false, false, false
 		populated := true
 		persistence := byte('p')
 		partitionBound := ""
@@ -385,6 +497,8 @@ func emitClasses(ctx context.Context, snapshot Snapshot, view ReadView, relation
 			hasIndexes = len(object.spec.Table.Indexes) != 0
 			hasTriggers = len(object.spec.Table.Triggers) != 0
 			hasSubclass = object.spec.Table.InheritanceChildren != 0
+			rowSecurity = object.spec.Table.RowSecurity
+			forceRowSecurity = object.spec.Table.ForceRowSecurity
 			isPartition = object.spec.Table.PartitionBound != nil
 			if object.spec.Table.PartitionBound != nil {
 				partitionBound = object.spec.Table.PartitionBound.Definition
@@ -490,7 +604,7 @@ func emitClasses(ctx context.Context, snapshot Snapshot, view ReadView, relation
 		if object.spec.Table != nil && object.spec.Table.PartitionStrategy != 0 {
 			kind = 'p'
 		}
-		return emitClassRow(relation, emit, object.spec.OID, object.spec.Name.Name, object.schema.oid, owner, relationType, ofType, kind, persistence, estimatedRows, columnCount, checks, hasIndexes, hasTriggers, hasSubclass, isPartition, populated, partitionBound, relationOptions)
+		return emitClassRow(relation, emit, object.spec.OID, object.spec.Name.Name, object.schema.oid, owner, relationType, ofType, kind, persistence, estimatedRows, columnCount, checks, hasIndexes, hasTriggers, hasSubclass, rowSecurity, forceRowSecurity, isPartition, populated, partitionBound, relationOptions)
 	})
 }
 
@@ -533,7 +647,7 @@ func resolvedCompositeTypeOID(ctx context.Context, snapshot Snapshot, options So
 	return spec.OID, nil
 }
 
-func emitClassRow(relation Relation, emit rowEmitter, oid model.OID, name string, namespace, owner, relationType, ofType model.OID, kind, persistence byte, estimatedRows float64, columns, checks int, hasIndexes, hasTriggers, hasSubclass, isPartition, populated bool, partitionBound string, relationOptions []string) error {
+func emitClassRow(relation Relation, emit rowEmitter, oid model.OID, name string, namespace, owner, relationType, ofType model.OID, kind, persistence byte, estimatedRows float64, columns, checks int, hasIndexes, hasTriggers, hasSubclass, rowSecurity, forceRowSecurity, isPartition, populated bool, partitionBound string, relationOptions []string) error {
 	accessMethod := model.OID(0)
 	if kind == 'i' {
 		accessMethod = 403
@@ -543,7 +657,7 @@ func emitClassRow(relation Relation, emit rowEmitter, oid model.OID, name string
 		fv("reloftype", oidValue(ofType)), fv("relowner", oidValue(owner)), fv("relam", oidValue(accessMethod)), fv("reltuples", floatValue(estimatedRows)),
 		fv("relhasindex", boolValue(hasIndexes)), fv("relisshared", boolValue(false)), fv("relpersistence", charValue(persistence)), fv("relkind", charValue(kind)),
 		fv("relnatts", intValue(int64(columns))), fv("relchecks", intValue(int64(checks))), fv("relhasrules", boolValue(false)), fv("relhastriggers", boolValue(hasTriggers)),
-		fv("relhassubclass", boolValue(hasSubclass)), fv("relrowsecurity", boolValue(false)), fv("relforcerowsecurity", boolValue(false)), fv("relispopulated", boolValue(populated)),
+		fv("relhassubclass", boolValue(hasSubclass)), fv("relrowsecurity", boolValue(rowSecurity)), fv("relforcerowsecurity", boolValue(forceRowSecurity)), fv("relispopulated", boolValue(populated)),
 		fv("relispartition", boolValue(isPartition)),
 	}
 	if len(relationOptions) != 0 {

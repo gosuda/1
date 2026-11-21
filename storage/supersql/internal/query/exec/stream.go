@@ -73,18 +73,23 @@ type valuesCursor struct {
 func (v *valuesCursor) Next(ctx context.Context, out *columnar.Batch) error {
 	out.Reset()
 	if v.closed || v.next == v.rows {
+		if v.output != nil {
+			err := v.output.Close()
+			v.output = nil
+			if err != nil {
+				return err
+			}
+		}
 		return io.EOF
 	}
-	if v.output != nil {
-		if err := v.output.Close(); err != nil {
+	var err error
+	if v.output == nil {
+		v.output, err = builder(v.env, v.layouts)
+		if err != nil {
 			return err
 		}
-		v.output = nil
-	}
-	var err error
-	v.output, err = builder(v.env, v.layouts)
-	if err != nil {
-		return err
+	} else {
+		v.output.Reset()
 	}
 	limit := batchRows(out, v.env)
 	for v.next < v.rows && v.output.Rows() < limit {

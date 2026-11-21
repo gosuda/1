@@ -42,6 +42,12 @@ type mutationLogFile interface {
 	Close() error
 }
 
+type mutationLogRef struct {
+	offset uint64
+	size   uint64
+	serial uint64
+}
+
 type mutationLog struct {
 	mu                                                       sync.Mutex
 	limits                                                   mutationLogLimits
@@ -50,7 +56,7 @@ type mutationLog struct {
 	file                                                     mutationLogFile
 	path                                                     string
 	count, bytes, ordinal, lastFrame, lastSerial, nextSerial uint64
-	cursors                                                  uint64
+	cursors, pins                                            uint64
 	sealed, closed                                           bool
 	failure, cleanupError                                    error
 }
@@ -192,6 +198,57 @@ func (l *mutationLog) append(ctx context.Context, mutations []storage.Mutation) 
 	return nil
 }
 
+func (l *mutationLog) appendOne(ctx context.Context, mutation storage.Mutation) (mutationLogRef, mutationLogPosition, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.mutable(); err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, err
+	}
+	if l.nextSerial == math.MaxUint64 || l.count == math.MaxUint64 {
+		return mutationLogRef{}, mutationLogPosition{}, errMutationLogBudget
+	}
+	var scratch uint64
+	if len(mutation.ColumnIDs) > 64 {
+		if uint64(len(mutation.ColumnIDs)) > (l.limits.MemoryBytes-l.memoryOverhead)/4 {
+			return mutationLogRef{}, mutationLogPosition{}, errMutationLogBudget
+		}
+		scratch = uint64(len(mutation.ColumnIDs)) * 4
+	}
+	if err := l.reserve(ctx, l.bytes, scratch); err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, err
+	}
+	if mutation.Ordinal <= l.ordinal || !normalizedLogOperation(mutation.Op) {
+		return mutationLogRef{}, mutationLogPosition{}, storage.ErrUnnormalizedBatch
+	}
+	size, err := l.mutationSize(mutation)
+	if err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, err
+	}
+	frameBytes := size + mutationLogHeaderBytes
+	if frameBytes > math.MaxInt64-l.bytes {
+		return mutationLogRef{}, mutationLogPosition{}, errMutationLogBudget
+	}
+	total := l.bytes + frameBytes
+	if err := l.reserve(ctx, total, scratch); err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, err
+	}
+	prefix := l.position()
+	size, err = l.mutationSize(mutation)
+	if err == nil {
+		err = l.writeFrame(ctx, mutation, size)
+	}
+	if err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, errors.Join(err, l.restore(prefix))
+	}
+	if err := ctx.Err(); err != nil {
+		return mutationLogRef{}, mutationLogPosition{}, errors.Join(err, l.restore(prefix))
+	}
+	return mutationLogRef{offset: l.lastFrame, size: size, serial: l.lastSerial}, prefix, nil
+}
+
 func (l *mutationLog) reserve(ctx context.Context, total, scratch uint64) error {
 	if l.file != nil {
 		if total > l.limits.SpillBytes {
@@ -298,15 +355,7 @@ func (w *mutationLogWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func (l *mutationLog) rollback(ctx context.Context, position mutationLogPosition) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if err := l.mutable(); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+func (l *mutationLog) validatePositionLocked(position mutationLogPosition) error {
 	if position.owner != l || position.count > l.count || position.bytes > l.bytes {
 		return errMutationLogPosition
 	}
@@ -324,6 +373,33 @@ func (l *mutationLog) rollback(ctx context.Context, position mutationLogPosition
 		}
 	} else if position.bytes != 0 || position.ordinal != 0 || position.serial != 0 {
 		return errMutationLogPosition
+	}
+	return nil
+}
+
+func (l *mutationLog) validatePosition(ctx context.Context, position mutationLogPosition) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.mutable(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return l.validatePositionLocked(position)
+}
+
+func (l *mutationLog) rollback(ctx context.Context, position mutationLogPosition) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.mutable(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.validatePositionLocked(position); err != nil {
+		return err
 	}
 	return l.restore(position)
 }
@@ -408,11 +484,93 @@ func (l *mutationLog) readAt(data []byte, offset uint64) error {
 	return err
 }
 
+func (l *mutationLog) retainPin() {
+	l.mu.Lock()
+	l.pins++
+	l.mu.Unlock()
+}
+
+func (l *mutationLog) releasePin() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pins == 0 {
+		return
+	}
+	l.pins--
+	if l.closed && l.cursors == 0 && l.pins == 0 {
+		l.cleanup()
+	}
+}
+
+func (l *mutationLog) readFrame(ctx context.Context, ref mutationLogRef) (storage.Mutation, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.Mutation{}, err
+	}
+	l.mu.Lock()
+	if l.failure != nil {
+		err := l.failure
+		l.mu.Unlock()
+		return storage.Mutation{}, err
+	}
+	if l.closed && l.pins == 0 {
+		l.mu.Unlock()
+		return storage.Mutation{}, storage.ErrClosed
+	}
+	if ref.offset > l.bytes || l.bytes-ref.offset < mutationLogHeaderBytes || ref.size > l.bytes-ref.offset-mutationLogHeaderBytes {
+		l.mu.Unlock()
+		return storage.Mutation{}, storage.ErrInvalidEncoding
+	}
+	available := l.limits.CursorBytes - mutationLogCursorOverhead()
+	if ref.size > math.MaxInt || ref.size > available/2 {
+		l.mu.Unlock()
+		return storage.Mutation{}, errMutationLogBudget
+	}
+	var header [mutationLogHeaderBytes]byte
+	if err := l.readAt(header[:], ref.offset); err != nil {
+		l.mu.Unlock()
+		return storage.Mutation{}, err
+	}
+	size := binary.LittleEndian.Uint64(header[:8])
+	serial := binary.LittleEndian.Uint64(header[12:])
+	if size != ref.size || serial != ref.serial {
+		l.mu.Unlock()
+		return storage.Mutation{}, storage.ErrInvalidEncoding
+	}
+	payload := make([]byte, int(size))
+	if err := l.readAt(payload, ref.offset+mutationLogHeaderBytes); err != nil {
+		l.mu.Unlock()
+		return storage.Mutation{}, err
+	}
+	l.mu.Unlock()
+	checksum := crc32.Update(crc32.ChecksumIEEE(header[:8]), crc32.IEEETable, header[12:])
+	if crc32.Update(checksum, crc32.IEEETable, payload) != binary.LittleEndian.Uint32(header[8:12]) {
+		return storage.Mutation{}, storage.ErrChecksumMismatch
+	}
+	retained := uint64(cap(payload))
+	if retained > available-size {
+		return storage.Mutation{}, errMutationLogBudget
+	}
+	mutation, err := storage.DecodeMutation(payload, available-retained-size)
+	if errors.Is(err, storage.ErrDecodeBudget) {
+		return storage.Mutation{}, errors.Join(errMutationLogBudget, err)
+	}
+	if err != nil {
+		return storage.Mutation{}, err
+	}
+	if !normalizedLogOperation(mutation.Op) {
+		return storage.Mutation{}, storage.ErrUnnormalizedBatch
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.Mutation{}, err
+	}
+	return mutation, nil
+}
+
 func (l *mutationLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.closed = true
-	if l.cursors == 0 {
+	if l.cursors == 0 && l.pins == 0 {
 		l.cleanup()
 	}
 	return l.cleanupError
@@ -530,7 +688,7 @@ func (c *mutationLogCursor) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.cursors--
-	if l.closed && l.cursors == 0 {
+	if l.closed && l.cursors == 0 && l.pins == 0 {
 		l.cleanup()
 		c.closeError = l.cleanupError
 	}

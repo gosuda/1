@@ -57,6 +57,9 @@ func bindRenameTableConstraint(ctx context.Context, statement *zpgparse.RenameSt
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(root, 0); err != nil {
+		return nil, err
+	}
 	b.dependency(root, 0)
 	rootSpec, err := root.SpecWithin(ctx, options.Descriptors)
 	if err != nil {

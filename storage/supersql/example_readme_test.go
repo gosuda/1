@@ -7,12 +7,16 @@ import (
 	"io"
 
 	supersql "github.com/gosuda/supersql-alpha"
-	"github.com/gosuda/supersql-alpha/clock"
+	localclock "github.com/gosuda/supersql-alpha/clock/local"
 )
 
-// runReadme is the README quick start: open a connector, wrap it in database/sql, run DDL, a transaction and a query.
-func runReadme(ctx context.Context, clk clock.Clock, dir string, out io.Writer) error {
-	connector, err := supersql.OpenConnector(ctx, supersql.OpenOptions{Directory: dir, Clock: clk})
+// runReadme is the README quick start: open a connector with a local clock,
+// wrap it in database/sql, and run DDL, a transaction, and a query.
+func runReadme(ctx context.Context, dir string, out io.Writer) error {
+	connector, err := supersql.OpenConnector(ctx, supersql.OpenOptions{
+		Directory: dir,
+		Clock:     localclock.New(),
+	})
 	if err != nil {
 		return err
 	}

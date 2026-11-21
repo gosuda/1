@@ -198,7 +198,25 @@ func (s *JobStore) deleteOrdinaryRetirements(ctx context.Context, transaction tx
 	return s.deleteRetirementRecord(ctx, transaction, jobLogicalKey(5, uint64(id)))
 }
 
-func (s *JobStore) scanOrdinaryRetirements(ctx context.Context, reader storage.SnapshotReader, visit func(RetirementID) error) (err error) {
+func (s *JobStore) scanJobRetirements(ctx context.Context, reader storage.SnapshotReader, visit func(JobID) error) error {
+	if visit == nil {
+		return ErrJobRecord
+	}
+	return s.scanRetirementKeys(ctx, reader, jobKindJobRetirement, true, func(id uint64) error {
+		return visit(JobID(id))
+	})
+}
+
+func (s *JobStore) scanOrdinaryRetirements(ctx context.Context, reader storage.SnapshotReader, visit func(RetirementID) error) error {
+	if visit == nil {
+		return ErrJobRecord
+	}
+	return s.scanRetirementKeys(ctx, reader, jobKindOrdinaryRetirement, false, func(id uint64) error {
+		return visit(RetirementID(id))
+	})
+}
+
+func (s *JobStore) scanRetirementKeys(ctx context.Context, reader storage.SnapshotReader, kind byte, skipZero bool, visit func(uint64) error) (err error) {
 	if s == nil || reader == nil || visit == nil {
 		return ErrJobRecord
 	}
@@ -206,8 +224,8 @@ func (s *JobStore) scanOrdinaryRetirements(ctx context.Context, reader storage.S
 		Target: s.options.Target, Layout: jobColumns(), KeyLayout: jobKeyLayout(),
 		ColumnIDs: []model.ColumnID{1},
 		Spans: []storage.KeySpan{{
-			Lower: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{5})}, Inclusive: true},
-			Upper: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{6})}},
+			Lower: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{kind})}, Inclusive: true},
+			Upper: storage.KeyBound{Values: []model.Value{model.BytesVal([]byte{kind + 1})}},
 		}},
 	}
 	plan, err := reader.PlanScan(ctx, request)
@@ -230,8 +248,7 @@ func (s *JobStore) scanOrdinaryRetirements(ctx context.Context, reader storage.S
 	if cursor == nil {
 		return storage.ErrInvalidScanPlan
 	}
-	var seen uint64
-	var previous RetirementID
+	var previous uint64
 	batch := columnar.Batch{MaxRows: s.options.BatchRows}
 	defer batch.Reset()
 	for {
@@ -252,25 +269,27 @@ func (s *JobStore) scanOrdinaryRetirements(ctx context.Context, reader storage.S
 			return columnar.ErrInvalidBatch
 		}
 		for row := range batch.Rows() {
-			if seen == s.options.MaxJobs {
-				return ErrJobLimit
-			}
 			key, _, err := columnar.CopyValue(ctx, &batch.Columns[0], batch.Lane(row), s.options.KeyBytes)
 			if err != nil {
 				return err
 			}
-			if key.IsNull || key.Type != model.TypeBytes || len(key.BytesVal) != 9 || key.BytesVal[0] != 5 {
+			if key.IsNull || key.Type != model.TypeBytes || len(key.BytesVal) != 9 || key.BytesVal[0] != kind {
 				return ErrJobRecord
 			}
-			id := RetirementID(binary.BigEndian.Uint64(key.BytesVal[1:]))
-			if id == 0 || id <= previous || !bytes.Equal(key.BytesVal, jobLogicalKey(5, uint64(id))) {
+			id := binary.BigEndian.Uint64(key.BytesVal[1:])
+			if id == 0 {
+				if skipZero {
+					continue
+				}
+				return ErrJobRecord
+			}
+			if id <= previous || !bytes.Equal(key.BytesVal, jobLogicalKey(kind, id)) {
 				return ErrJobRecord
 			}
 			previous = id
 			if err := visit(id); err != nil {
 				return err
 			}
-			seen++
 		}
 		batch.Reset()
 	}

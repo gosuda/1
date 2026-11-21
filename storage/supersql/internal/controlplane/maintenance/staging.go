@@ -117,9 +117,22 @@ func (stage *stagedTree) publish(ctx context.Context) error {
 		return err
 	}
 	// A directory rename cannot replace a nonempty directory or a regular file.
-	// This also protects a destination populated after checkDestination.
+	// This also protects a destination populated after checkDestination. Some
+	// filesystems (e.g., overlayfs) reject rename over an existing empty
+	// directory with EEXIST; Remove (rmdir) only succeeds if it is still empty.
 	if err := stage.parent.Rename(stage.name, stage.destination); err != nil {
-		return err
+		if !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		if checkErr := checkDestination(ctx, stage.parent, stage.destination); checkErr != nil {
+			return checkErr
+		}
+		if removeErr := stage.parent.Remove(stage.destination); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return ErrDestinationOccupied
+		}
+		if retryErr := stage.parent.Rename(stage.name, stage.destination); retryErr != nil {
+			return retryErr
+		}
 	}
 	stage.name = ""
 	stage.published = true

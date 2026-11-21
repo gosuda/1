@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -300,5 +303,100 @@ func TestNewRejectsInvalidHistory(t *testing.T) {
 	history.ID[0] ^= 1
 	if _, err := New(service, history); !errors.Is(err, gstime.ErrLeapHistoryMismatch) {
 		t.Fatalf("mutated history construction = %v", err)
+	}
+}
+
+func TestConcurrentReadAcrossEpochRotation(t *testing.T) {
+	service, raw, adapter := testService(t, testHistory(t))
+	anchor(t, service, raw)
+
+	const (
+		readers   = 8
+		rotations = 250
+	)
+
+	var (
+		done              atomic.Bool
+		rotated           atomic.Bool
+		postRotationReads atomic.Int64
+		initialReady      sync.WaitGroup
+		wg                sync.WaitGroup
+		errCh             = make(chan error, readers)
+		epochsMu          sync.Mutex
+		epochs            = make(map[[16]byte]struct{})
+	)
+
+	initialReady.Add(readers)
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sawInitial := false
+			for !done.Load() {
+				reading, err := adapter.Read(t.Context())
+				if err != nil {
+					if errors.Is(err, clock.ErrClockEpochChanged) || errors.Is(err, gstime.ErrConfigurationMismatch) {
+						if !sawInitial {
+							sawInitial = true
+							initialReady.Done()
+						}
+						errCh <- err
+						return
+					}
+					if !errors.Is(err, clock.ErrClockUnavailable) {
+						if !sawInitial {
+							sawInitial = true
+							initialReady.Done()
+						}
+						errCh <- err
+						return
+					}
+					continue
+				}
+				epochsMu.Lock()
+				epochs[reading.Epoch.Assurance] = struct{}{}
+				epochsMu.Unlock()
+				if !sawInitial {
+					sawInitial = true
+					initialReady.Done()
+				}
+				if rotated.Load() {
+					postRotationReads.Add(1)
+				}
+			}
+		}()
+	}
+
+	// Ensure all readers have started and observed the initial epoch before
+	// rotating so the test reliably exercises concurrent reads across rotations.
+	initialReady.Wait()
+
+	for i := range rotations {
+		if err := service.Invalidate(); err != nil {
+			done.Store(true)
+			wg.Wait()
+			t.Fatalf("Invalidate: %v", err)
+		}
+		anchor(t, service, raw)
+		if i%8 == 0 {
+			runtime.Gosched()
+		}
+	}
+
+	// Wait for readers to observe the post-rotation anchored epoch before stopping.
+	rotated.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for postRotationReads.Load() < readers && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	done.Store(true)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent Read across epoch rotation failed with spurious error: %v", err)
+	}
+	if len(epochs) < 2 {
+		t.Fatalf("observed only %d distinct assurance epoch(s), expected epoch rotations", len(epochs))
 	}
 }

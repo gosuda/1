@@ -44,7 +44,7 @@ func (runtime settingRuntime) SetConfig(ctx context.Context, name string, value 
 	if err := runtime.owner.markDataAccess(); err != nil {
 		return model.Value{}, err
 	}
-	staged := *runtime.owner.settings
+	staged := runtime.owner.settings.cloneForStaging()
 	result, err := staged.SetConfig(ctx, name, value, local)
 	if err != nil {
 		return model.Value{}, err
@@ -52,11 +52,17 @@ func (runtime settingRuntime) SetConfig(ctx context.Context, name string, value 
 	if uint64(len(result.StrVal)) > maxResultBytes {
 		return model.Value{}, settingError("54000", "setting result exceeds invocation byte budget")
 	}
-	if err := runtime.owner.syncSettingPolicy(ctx, &staged); err != nil {
+	if err := runtime.owner.syncSettingPolicy(ctx, staged); err != nil {
 		return model.Value{}, err
 	}
-	*runtime.owner.settings = staged
+	runtime.owner.settings.commitStaged(staged)
 	return result, nil
+}
+func (runtime settingRuntime) CurrentRole() string {
+	if runtime.owner == nil || runtime.owner.settings == nil {
+		return ""
+	}
+	return runtime.owner.settings.CurrentRole()
 }
 func (runtime settingRuntime) FormatLocale(ctx context.Context) (model.FormatLocale, error) {
 	runtime.owner.settingMu.Lock()
@@ -65,11 +71,12 @@ func (runtime settingRuntime) FormatLocale(ctx context.Context) (model.FormatLoc
 		return model.FormatLocale{}, err
 	}
 	settings := runtime.owner.settings
-	locale, err := settings.resolver.ResolveFormatLocale(ctx, settings.current[lcNumeric].text, settings.current[lcMonetary].text, settings.current[lcTime].text)
+	numeric, monetary, clock := settings.formatLocaleNames()
+	locale, err := settings.resolver.ResolveFormatLocale(ctx, numeric, monetary, clock)
 	if err != nil {
 		return model.FormatLocale{}, err
 	}
-	if locale.NumericName != settings.current[lcNumeric].text || locale.MonetaryName != settings.current[lcMonetary].text || locale.TimeName != settings.current[lcTime].text {
+	if locale.NumericName != numeric || locale.MonetaryName != monetary || locale.TimeName != clock {
 		return model.FormatLocale{}, settingError("XX000", "format locale resolver returned a different identity")
 	}
 	return locale, nil
@@ -88,15 +95,15 @@ func (runtime settingRuntime) CatalogSettings(ctx context.Context) ([]catalogrel
 	if err := runtime.check(ctx); err != nil {
 		return nil, err
 	}
-	settings := runtime.owner.settings
+	current, resetValues := runtime.owner.settings.catalogSettingsSnapshot()
 	result := make([]catalogrel.Setting, len(settingDefinitions))
 	for id, definition := range settingDefinitions {
-		text, unit, valueType := settings.current[id].text, "", "string"
-		reset, minimum, maximum := settings.reset[id].text, "", ""
+		text, unit, valueType := current[id].text, "", "string"
+		reset, minimum, maximum := resetValues[id].text, "", ""
 		switch definition.kind {
 		case integerSetting, memorySetting, durationSetting:
-			text = strconv.FormatInt(settings.current[id].number, 10)
-			reset = strconv.FormatInt(settings.reset[id].number, 10)
+			text = strconv.FormatInt(current[id].number, 10)
+			reset = strconv.FormatInt(resetValues[id].number, 10)
 			minimum, maximum = strconv.FormatInt(definition.minimum, 10), strconv.FormatInt(definition.maximum, 10)
 			valueType = "integer"
 			if definition.kind == memorySetting {
@@ -117,7 +124,7 @@ func (runtime settingRuntime) CatalogSettings(ctx context.Context) ([]catalogrel
 			valueType = "bool"
 		}
 		source := "default"
-		if settings.current[id].assigned {
+		if current[id].assigned {
 			source = "session"
 		}
 		result[id] = catalogrel.Setting{Name: definition.name, Value: model.StringVal(text), ReadOnly: definition.kind == readOnlySetting, Unit: unit, Description: settingDescription(definition.name), ValueType: valueType, Source: source, MinValue: minimum, MaxValue: maximum, BootValue: reset, ResetValue: reset}

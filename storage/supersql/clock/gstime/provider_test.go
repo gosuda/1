@@ -223,7 +223,13 @@ func TestProviderRequiresExplicitConfiguration(t *testing.T) {
 		{"raw read bound", func(c *Config) { c.Sync.Raw.ReadBoundNs = 99 }},
 		{"raw arithmetic range", func(c *Config) { c.Raw.(*rawclock.SimulatedRawClock).SetRaw(math.MaxUint64) }},
 		{"invalid physical scale", func(c *Config) { c.Raw.(*rawclock.SimulatedRawClock).SetScaleEnvelope(0, 1) }},
-		{"nonfinite scale", func(c *Config) { c.Sync.Raw.ScaleLowerPpm = math.NaN() }},
+		{"negative physical scale", func(c *Config) { c.Raw.(*rawclock.SimulatedRawClock).SetScaleEnvelope(-1, 1) }},
+		{"inverted physical scale", func(c *Config) { c.Raw.(*rawclock.SimulatedRawClock).SetScaleEnvelope(2, 1) }},
+		{"nonfinite scale lower NaN", func(c *Config) { c.Sync.Raw.ScaleLowerPpm = math.NaN() }},
+		{"nonfinite scale upper NaN", func(c *Config) { c.Sync.Raw.ScaleUpperPpm = math.NaN() }},
+		{"nonfinite scale lower Inf", func(c *Config) { c.Sync.Raw.ScaleLowerPpm = math.Inf(-1) }},
+		{"nonfinite scale upper Inf", func(c *Config) { c.Sync.Raw.ScaleUpperPpm = math.Inf(1) }},
+		{"inverted configured scale", func(c *Config) { c.Sync.Raw.ScaleLowerPpm, c.Sync.Raw.ScaleUpperPpm = 200, -200 }},
 		{"fault budget overflow", func(c *Config) { c.Sync.Assurance.FaultBudget = math.MaxInt }},
 	}
 	for _, tc := range cases {

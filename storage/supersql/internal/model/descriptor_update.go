@@ -124,7 +124,60 @@ func (d *Descriptor) ValidateSuccessor(ctx context.Context, next *Descriptor) er
 			}
 		}
 	}
+	if old.Role != nil && new.Role == nil {
+		return ErrInvalidDescriptor
+	}
 	return nil
+}
+
+// WithRole returns a validated successor role descriptor at Version+1.
+func (d *Descriptor) WithRole(role RoleMetadata) (*Descriptor, error) {
+	if d == nil || d.spec.Role == nil || d.spec.Version == ^uint64(0) {
+		return nil, ErrInvalidDescriptor
+	}
+	spec, err := d.Spec(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	spec.Version++
+	nextRole := role
+	spec.Role = &nextRole
+	return NewDescriptor(context.Background(), spec, d.limits)
+}
+
+// WithTableRLS returns a validated successor table descriptor with updated
+// row-level security settings and policies at Version+1.
+func (d *Descriptor) WithTableRLS(enabled, force bool, policies []PolicyDescriptor) (*Descriptor, error) {
+	if d == nil || d.spec.Table == nil || d.spec.Version == ^uint64(0) {
+		return nil, ErrInvalidDescriptor
+	}
+	spec, err := d.Spec(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	spec.Version++
+	spec.Table.RowSecurity = enabled
+	spec.Table.ForceRowSecurity = force
+	spec.Table.Policies = policies
+	return NewDescriptor(context.Background(), spec, d.limits)
+}
+
+// WithTableOwner returns a validated successor table descriptor with updated
+// owner identity at Version+1.
+func (d *Descriptor) WithTableOwner(owner OID, ownerName string) (*Descriptor, error) {
+	if d == nil || d.spec.Table == nil || d.spec.Version == ^uint64(0) {
+		return nil, ErrInvalidDescriptor
+	}
+	spec, err := d.Spec(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	spec.Version++
+	if owner != 0 {
+		spec.Table.Owner = owner
+	}
+	spec.Table.OwnerName = ownerName
+	return NewDescriptor(context.Background(), spec, d.limits)
 }
 func equalRangeTypeMetadata(a, b *RangeTypeMetadata) bool {
 	if a == nil || b == nil {

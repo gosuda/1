@@ -128,7 +128,7 @@ func (check *checkpointVerification) verifyBlock(ctx context.Context, run *sstFi
 			}
 		}
 	}
-	if !bytes.Equal(coverage, run.key(entry.coverage)) || (run.entryBytes == sstEntrySize && (minCommitTS != entry.minCommitTS || maxCommitTS != entry.maxCommitTS)) {
+	if !bytes.Equal(coverage, run.key(entry.coverage)) || (run.entryBytes >= sstEntrySizeV3 && (minCommitTS != entry.minCommitTS || maxCommitTS != entry.maxCommitTS)) {
 		return 0, 0, storage.ErrCorruptStorage
 	}
 	return lastTS, lastOrdinal, nil

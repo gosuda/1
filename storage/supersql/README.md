@@ -26,9 +26,9 @@ Set `GOPRIVATE` (or `GONOSUMDB`) so the Go toolchain fetches the module directly
 
 | Layer | Package Path | Core Types & Entry Points | Responsibility |
 | :--- | :--- | :--- | :--- |
-| **Root Driver API** | `.` | `Open()`, `OpenConnector()`, `Connector`, `Catalog` | `database/sql` connector (`sql.OpenDB`) and direct catalog execution |
-| **Cleanroom pgx API** | `pgx/` | `OpenPool()`, `Pool`, `Conn`, `Tx`, `Batch`, `NamedArgs` | In-process `pgx/v5`-compatible pool, transactions, batching, and generic row collectors |
-| **Clock & Time** | `clock/`, `clock/gstime/` | `Clock`, `ReadFence`, `Epoch`, `Provider` | Certified monotonic clock contract and GSTime synchronization provider |
+| **Root Driver API** | `.` | `Open()`, `OpenConnector()`, `Connector`, `Catalog`, `CompactionConfig`, `*supersql.Error` | `database/sql` connector (`sql.OpenDB`), direct catalog execution, hot backup/restore, and structured SQLSTATE errors |
+| **Cleanroom pgx API** | `pgx/` | `OpenPool()`, `OpenPoolWithConfig()`, `Pool`, `Conn`, `Tx`, `Batch`, `NamedArgs`, `*PgError` | In-process `pgx/v5`-compatible pool, transactions, implicit-tx batching, `pgtype` wrappers, and generic row collectors |
+| **Clock & Time** | `clock/`, `clock/local/`, `clock/gstime/` | `Clock`, `localclock.New()`, `ReadFence`, `Epoch`, `Provider` | Certified monotonic clock contract, standalone single-process local clock (`clock/local`), and GSTime synchronization provider |
 | **Model & Columnar** | `internal/model/`, `internal/columnar/` | `DataType`, `Value`, `ObjectRef`, `Batch`, `Vector` | Object identifiers, SQL type layouts, columnar vectors, null bitmaps, and batch budgets |
 | **SQL Parser & AST** | `internal/zpgparse/` | `Parse()`, `Split()`, `Fingerprint()`, `Deparse()` | Pure-Go PostgreSQL 18 lexer, parser, AST, and deparser (generated via Ragel + `goyacc`) |
 | **Controlplane** | `internal/controlplane/` | `Catalog`, `Namespace`, `SchemaJob`, `Statistics` | Versioned catalog descriptors, schema change jobs, and table statistics |
@@ -51,16 +51,15 @@ A database directory has the following structure (see [`docs/reference/storage-f
 
 ```
 <Data Directory>/
-├── database.state                       # Published state: magic, generation, log position, fence, clock scales
+├── database.state                       # Published state (NSDB0002): magic, generation, log position, fence, lease horizon, clock scales
 ├── database.state.pending               # Staging file for atomic state replacement; removed on recovery
-├── fence.secret                         # HMAC secret for ReadFence verification, created on first open
-├── rls_meta.json                        # Durable role and Row-Level Security policy metadata
-├── tmp/                                 # Spill directory for query and compaction buffers
-├── commits/<020d>.wal                   # Immutable redo WAL segment per committed log position
+├── fence.secret                         # HMAC secret for ReadFence verification, created atomically on first open
+├── tmp/                                 # Spill directory for query, transaction overlay, and compaction buffers
+├── commits/<020d>.wal                   # Immutable redo WAL segment per committed log position (group-committed)
 ├── commits/.<020d>.pending              # Staging file for an in-flight WAL segment
-├── runs/<020d>.runs                     # Incremental run manifest for one log position
-├── runs/<020d>-<8hex>.sst               # PAX v2 SSTable run file
-├── runs/base-<020d>.runs                # Base manifest (NSBASE03) produced by background maintenance
+├── runs/<020d>.runs                     # Incremental single or coalesced run manifest (NSRUNS01 / NSRUNS02)
+├── runs/<020d>-<8hex>.sst               # PAX v2 SSTable run file (NSSST004) with Bloom filters, zone maps, and TOAST blobs
+├── runs/base-<020d>.runs                # Base manifest (NSBASE04) with pruned transaction horizon produced by maintenance
 ├── runs/.base.pending                   # Staging file for a base manifest rewrite
 ├── .lock                                # Process-exclusive directory lock held while open
 └── .checkpoint-<hex>/                   # Hard-linked consistent snapshot directory for hot backups
@@ -107,7 +106,7 @@ Each SSTable block (default 64 KB) uses 8-byte aligned little-endian fields so v
 
 ### 7.1 Standard `database/sql` API
 
-SuperSQL does not register a global DSN driver (`sql.Open("supersql", ...)` is rejected because a certified clock cannot be passed in a connection string). Construct a `Connector` with `OpenConnector` and pass it to `sql.OpenDB`. On shutdown, close `sql.DB` first, then the `Connector`, then the clock provider.
+SuperSQL does not register a global DSN driver (`sql.Open("supersql", ...)` is rejected because a clock cannot be passed in a connection string). Construct a `Connector` with `OpenConnector` and pass it to `sql.OpenDB`. For standalone single-process deployments, use `localclock.New()` (`github.com/gosuda/supersql-alpha/clock/local`); for externally synchronized certified time, pass a `clock/gstime` provider. Individual storage resource budgets can be customized via `OpenOptions.Compaction` (`CompactionConfig`, with zero fields inheriting `DefaultCompactionConfig()`), and SQL errors returned by the driver unwrap to `*supersql.Error` with PostgreSQL SQLSTATE codes. On shutdown, close `sql.DB` first, then the `Connector`, then any external clock provider.
 
 <!-- docgen:begin readme-example -->
 
@@ -120,12 +119,16 @@ import (
 	"io"
 
 	supersql "github.com/gosuda/supersql-alpha"
-	"github.com/gosuda/supersql-alpha/clock"
+	localclock "github.com/gosuda/supersql-alpha/clock/local"
 )
 
-// runReadme is the README quick start: open a connector, wrap it in database/sql, run DDL, a transaction and a query.
-func runReadme(ctx context.Context, clk clock.Clock, dir string, out io.Writer) error {
-	connector, err := supersql.OpenConnector(ctx, supersql.OpenOptions{Directory: dir, Clock: clk})
+// runReadme is the README quick start: open a connector with a local clock,
+// wrap it in database/sql, and run DDL, a transaction, and a query.
+func runReadme(ctx context.Context, dir string, out io.Writer) error {
+	connector, err := supersql.OpenConnector(ctx, supersql.OpenOptions{
+		Directory: dir,
+		Clock:     localclock.New(),
+	})
 	if err != nil {
 		return err
 	}
@@ -174,7 +177,10 @@ func runReadme(ctx context.Context, clk clock.Clock, dir string, out io.Writer) 
 Applications written for `pgx/v5` and `pgxpool` can use the built-in `github.com/gosuda/supersql-alpha/pgx` package directly. It has zero external `jackc/pgx` dependencies and runs in-process over `supersql`:
 
 ```go
-pool, err := pgx.OpenPool(ctx, supersql.OpenOptions{Directory: dir, Clock: clk})
+pool, err := pgx.OpenPool(ctx, supersql.OpenOptions{
+	Directory: dir,
+	Clock:     localclock.New(),
+})
 if err != nil {
 	return err
 }
@@ -193,11 +199,12 @@ accounts, err := pgx.CollectRows(rows, pgx.RowToStructByName[Account])
 ```
 
 Supported `pgx` primitives:
-- `Pool`, `PoolConn`, `Conn`, `Tx` (including nested `tx.Begin(ctx)` via `SAVEPOINT`)
+- `Pool`, `PoolConfig` (with `BeforeConnect`, `AfterConnect`, `BeforeAcquire`, `AfterRelease` hooks), `PoolConn`, `Conn` (with `Prepare`, `Deallocate`, `DeallocateAll`), `Tx` (including nested `tx.Begin(ctx)` via `SAVEPOINT` and `TxOptions.DeferrableMode`)
 - `Begin`, `BeginTx`, `BeginFunc`, `BeginTxFunc`
-- `CommandTag`, `Rows`, `Row`, `FieldDescription`
-- `NamedArgs` (`@param` rewriting), native Go slice parameters and targets (`[]string`, `[]int64`, `[]int`, `[]float64`, `[]bool`), UUID (`[16]byte`), and JSONB (`map[string]any`, `json.RawMessage`)
-- `Batch` / `SendBatch` and `CopyFrom` (`CopyFromRows`, `CopyFromSlice`)
+- `*pgx.PgError` (matching `pgconn.PgError` fields and unwrapping to `*supersql.Error`)
+- `CommandTag`, `Rows`, `Row`, `FieldDescription` (populated with real PostgreSQL type OIDs)
+- `NamedArgs` (`@param` rewriting), native Go slice parameters and targets (including `NULL` elements via `[]*T` / `[]pgx.Text`, multi-dimensional arrays `[][]T`, `[]float32`, `[]int8`), UUID (`[16]byte`), JSONB (`map[string]any`, `json.RawMessage`), and nullable `pgtype` wrappers (`Text`, `Int2`, `Int4`, `Int8`, `Float4`, `Float8`, `Bool`, `UUID`, `Numeric`, `Timestamp`, `Timestamptz`, `Date`, `JSONB`)
+- `Batch` / `SendBatch` (wrapped in an implicit transaction outside an explicit `Tx`) and `CopyFrom` (`CopyFromRows`, `CopyFromSlice`)
 - Generic collectors: `CollectRows`, `AppendRows`, `CollectOneRow`, `CollectExactlyOneRow`, `ForEachRow`, `RowTo`, `RowToAddrOf`, `RowToMap`, `RowToStructByName`, `RowToStructByNameLax`, `RowToStructByPos`
 
 ### 7.3 SQL Feature Highlights
@@ -219,8 +226,8 @@ Supported `pgx` primitives:
   - Views, materialized views (`CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`), sequences, domains, enums, composite types, ranges
   - Functions, procedures, `DO $$ ... $$` anonymous blocks, and triggers in SQL and `PL/pgSQL`
 - **Multi-Tenant Security & Session GUC**:
-  - **Row-Level Security (RLS)**: `ALTER TABLE ... ENABLE / DISABLE / FORCE / NO FORCE ROW LEVEL SECURITY`, `CREATE / ALTER / DROP POLICY ... AS PERMISSIVE | RESTRICTIVE FOR ALL | SELECT | INSERT | UPDATE | DELETE TO <role> USING (...) WITH CHECK (...)`, plus `pg_policies` and `pg_roles` catalog views
-  - **Role Management**: `CREATE / ALTER / DROP ROLE [BYPASSRLS | SUPERUSER]`, `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`
+  - **Native MVCC Row-Level Security (RLS)**: `ALTER TABLE ... ENABLE / DISABLE / FORCE / NO FORCE ROW LEVEL SECURITY`, `CREATE / ALTER / DROP POLICY ... AS PERMISSIVE | RESTRICTIVE FOR ALL | SELECT | INSERT | UPDATE | DELETE TO <role> USING (...) WITH CHECK (...)`, stored transactionally in MVCC catalog descriptors (included automatically in hot backups) and exposed via `pg_policies` and `pg_roles`
+  - **Native Role Management**: `CREATE / ALTER / DROP ROLE [BYPASSRLS | SUPERUSER]`, `GRANT / REVOKE <role> TO / FROM <role>`, `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`
   - **Custom GUC Parameters**: Qualified session settings (`SET [LOCAL] app.tenant_id = '...'`, `current_setting('app.tenant_id', true)`, `set_config('app.tenant_id', '...', true)`)
   - **Automatic Isolation Escalation**: Driver and SQL requests for `READ UNCOMMITTED`, `READ COMMITTED`, or `REPEATABLE READ` automatically escalate to `SERIALIZABLE` by default (`SET supersql.compat_isolation = 'off'` switches the session to strict `0A000` rejection)
 

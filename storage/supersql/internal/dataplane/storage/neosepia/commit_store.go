@@ -152,15 +152,6 @@ func writeCommit(ctx context.Context, root *os.Root, position uint64, batch stor
 	return storage.ApplyResult{AppliedCount: batch.Count(), CommitTS: batch.CommitTS, ChecksumCRC: batch.ChecksumCRC, LogPosition: position}, nil
 }
 
-func syncCommitDirectory(root *os.Root) (err error) {
-	directory, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, directory.Close()) }()
-	return directory.Sync()
-}
-
 func commitName(position uint64) string        { return fmt.Sprintf("%020d.wal", position) }
 func pendingCommitName(position uint64) string { return fmt.Sprintf(".%020d.pending", position) }
 

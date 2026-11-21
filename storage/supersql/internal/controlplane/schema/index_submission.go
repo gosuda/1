@@ -101,6 +101,7 @@ func (l *IndexLifecycle) SubmitIntent(ctx context.Context, options IndexSubmissi
 		submission.resolution = storage.CommitResolution{State: storage.CommitCommitted, Result: result}
 		// A committed Commit error is cleanup failure, not permission to retry.
 		submission.cleanupErr = err
+		l.jobs.notifyWatchers()
 	}
 	return submission, errors.Join(err, submission.closeTransaction(context.WithoutCancel(ctx)))
 }

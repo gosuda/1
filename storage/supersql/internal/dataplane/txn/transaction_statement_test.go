@@ -382,30 +382,33 @@ func TestManagedStatementRollbackRetainsOnlyEarlierLocks(t *testing.T) {
 		if !errors.Is(err, failure) {
 			t.Fatal(err)
 		}
+		// Write lock on key 4 is released on statement rollback.
 		later := contractBegin(t, fixture.manager, options)
-		contractApply(t, later, write(3), write(4))
+		contractApply(t, later, write(4))
 		contractCommit(t, later)
 		readCompetitor := contractBegin(t, fixture.manager, options)
 		writeCompetitor := contractBegin(t, fixture.manager, options)
-		readDone, writeDone := make(chan error, 1), make(chan error, 1)
+		stmtReadCompetitor := contractBegin(t, fixture.manager, options)
+		readDone, writeDone, stmtReadDone := make(chan error, 1), make(chan error, 1), make(chan error, 1)
 		go func() { readDone <- readCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(1)}) }()
 		go func() { writeDone <- writeCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(2)}) }()
+		go func() { stmtReadDone <- stmtReadCompetitor.ApplyMutations(t.Context(), []storage.Mutation{write(3)}) }()
 		synctest.Wait()
-		for _, pending := range []<-chan error{readDone, writeDone} {
+		for _, pending := range []<-chan error{readDone, writeDone, stmtReadDone} {
 			if len(pending) != 0 {
-				t.Error("statement rollback released an earlier lock")
+				t.Error("statement rollback released a retained lock")
 			}
 		}
 		if err := transaction.Rollback(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-readDone; err != nil {
-			t.Fatal(err)
-		}
-		if err := <-writeDone; err != nil {
-			t.Fatal(err)
+		for _, pending := range []<-chan error{readDone, writeDone, stmtReadDone} {
+			if err := <-pending; err != nil {
+				t.Fatal(err)
+			}
 		}
 		contractCommit(t, readCompetitor)
 		contractCommit(t, writeCompetitor)
+		contractCommit(t, stmtReadCompetitor)
 	})
 }

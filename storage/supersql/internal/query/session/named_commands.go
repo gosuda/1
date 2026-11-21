@@ -204,6 +204,7 @@ func (transactions *Transactions) copyPreparedMetadata(ctx context.Context, name
 	entry := &namedPreparedStatement{
 		name: strings.Clone(name), statement: strings.Clone(sql), preparedAt: createdAt,
 		searchPath:       make([]string, len(searchPath)),
+		currentRole:      strings.Clone(transactions.settings.CurrentRole()),
 		parameterLayouts: make([]model.TypeLayout, len(parameters)),
 		parameterTypes:   make([]model.TypeID, len(parameters)),
 		resultColumns:    make([]bind.ResultColumn, len(columns)),

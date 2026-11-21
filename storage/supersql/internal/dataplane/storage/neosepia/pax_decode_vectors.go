@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"unsafe"
 
@@ -170,6 +171,9 @@ func (b *paxBlock) decByteStrings(ctx context.Context, desc *decDescriptor, base
 	if desc.encoding == encodingDictionary {
 		return b.decDictionary(ctx, desc, base, body)
 	}
+	if desc.encoding == encodingLOB {
+		return b.decLOB(ctx, desc, base, body)
+	}
 	rows := base.Length
 	if uint64(len(body)) > math.MaxUint32 {
 		return columnar.Vector{}, paxCorrupt("string body exceeds uint32 range views")
@@ -203,6 +207,113 @@ func (b *paxBlock) decByteStrings(ctx context.Context, desc *decDescriptor, base
 		return columnar.Vector{}, paxCorrupt("string body has %d trailing bytes", len(body)-pos)
 	}
 	base.Data = body
+	base.Ranges = ranges
+	return *base, nil
+}
+
+func (b *paxBlock) decLOB(ctx context.Context, _ *decDescriptor, base *columnar.Vector, body []byte) (columnar.Vector, error) {
+	rows := base.Length
+	pos := 0
+	var totalBytes uint64
+	for i := range rows {
+		if i%1024 == 0 {
+			if err := ctx.Err(); err != nil {
+				return columnar.Vector{}, err
+			}
+		}
+		if pos >= len(body) {
+			return columnar.Vector{}, paxCorrupt("LOB row %d truncated tag", i)
+		}
+		tag := body[pos]
+		pos++
+		switch tag {
+		case 0:
+			if len(body)-pos < 4 {
+				return columnar.Vector{}, paxCorrupt("LOB row %d truncated inline length", i)
+			}
+			length := binary.LittleEndian.Uint32(body[pos:])
+			pos += 4
+			if uint64(length) > uint64(len(body)-pos) {
+				return columnar.Vector{}, paxCorrupt("LOB row %d inline length %d overflows body", i, length)
+			}
+			if paxIsNull(base.Nulls, i) && length != 0 {
+				return columnar.Vector{}, paxCorrupt("LOB row %d NULL with %d inline bytes", i, length)
+			}
+			pos += int(length)
+			if uint64(length) > math.MaxUint32-totalBytes {
+				return columnar.Vector{}, paxCorrupt("LOB decoded bytes exceed uint32 range")
+			}
+			totalBytes += uint64(length)
+		case 1:
+			if len(body)-pos < 12 {
+				return columnar.Vector{}, paxCorrupt("LOB row %d truncated pointer", i)
+			}
+			if paxIsNull(base.Nulls, i) {
+				return columnar.Vector{}, paxCorrupt("LOB row %d NULL with blob pointer", i)
+			}
+			blobIdx := binary.LittleEndian.Uint32(body[pos:])
+			length := binary.LittleEndian.Uint32(body[pos+4:])
+			crc := binary.LittleEndian.Uint32(body[pos+8:])
+			pos += 12
+			if b.blobReader == nil || uint64(blobIdx) >= uint64(len(b.blobs)) {
+				return columnar.Vector{}, paxCorrupt("LOB row %d blob index %d unavailable", i, blobIdx)
+			}
+			entry := b.blobs[blobIdx]
+			if entry.length != uint64(length) || entry.crc != crc {
+				return columnar.Vector{}, paxCorrupt("LOB row %d blob metadata mismatch", i)
+			}
+			if uint64(length) > math.MaxUint32-totalBytes {
+				return columnar.Vector{}, paxCorrupt("LOB decoded bytes exceed uint32 range")
+			}
+			totalBytes += uint64(length)
+		default:
+			return columnar.Vector{}, paxCorrupt("LOB row %d invalid tag %d", i, tag)
+		}
+	}
+	if pos != len(body) {
+		return columnar.Vector{}, paxCorrupt("LOB body has %d trailing bytes", len(body)-pos)
+	}
+	if err := b.chargeLocked(uint64(rows)*8 + totalBytes); err != nil {
+		return columnar.Vector{}, err
+	}
+	ranges := make([]columnar.Range, rows)
+	data := make([]byte, totalBytes)
+	pos = 0
+	var outOff uint32
+	for i := range rows {
+		if i%1024 == 0 {
+			if err := ctx.Err(); err != nil {
+				return columnar.Vector{}, err
+			}
+		}
+		tag := body[pos]
+		pos++
+		switch tag {
+		case 0:
+			length := binary.LittleEndian.Uint32(body[pos:])
+			pos += 4
+			copy(data[outOff:outOff+length], body[pos:pos+int(length)])
+			ranges[i] = columnar.Range{Offset: outOff, Length: length}
+			outOff += length
+			pos += int(length)
+		case 1:
+			blobIdx := binary.LittleEndian.Uint32(body[pos:])
+			length := binary.LittleEndian.Uint32(body[pos+4:])
+			crc := binary.LittleEndian.Uint32(body[pos+8:])
+			pos += 12
+			entry := b.blobs[blobIdx]
+			dst := data[outOff : outOff+length]
+			if err := b.blobReader.readBlob(ctx, entry, dst, b.memory); err != nil {
+				return columnar.Vector{}, err
+			}
+			if crc32.ChecksumIEEE(dst) != crc {
+				return columnar.Vector{}, paxCorrupt("LOB row %d blob CRC mismatch", i)
+			}
+			ranges[i] = columnar.Range{Offset: outOff, Length: length}
+			outOff += length
+		}
+	}
+	base.Data = data
 	base.Ranges = ranges
 	return *base, nil
 }

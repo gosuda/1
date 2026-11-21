@@ -89,7 +89,7 @@ func (p *Plan) validateNode(ctx context.Context, id NodeID) error {
 			}
 		} else {
 			expected, ok := g.Input(n.Logical.Rel, uint32(i))
-			if !ok || child.Logical != (RelRef{n.Logical.Graph, expected}) {
+			if !ok || !implementsLogical(g, n.Logical.Graph, expected, child) {
 				return invalid("physical child does not implement logical input")
 			}
 		}
@@ -264,6 +264,11 @@ func (p *Plan) validateDelivery(ctx context.Context, n NodeSpec, logical ir.Rel)
 		if !orderPrefix(input.Ordering, d.Ordering) {
 			return invalid("stream distinct invents ordering")
 		}
+	case Project:
+		g, _ := p.Graph(n.Logical.Graph)
+		if !projectOrderPrefix(g, n.Logical.Rel, input.Ordering, d.Ordering) {
+			return invalid("operator invents ordering")
+		}
 	default:
 		if !orderPrefix(input.Ordering, d.Ordering) {
 			return invalid("operator invents ordering")
@@ -299,4 +304,80 @@ func (p *Plan) validateExchange(n NodeSpec) error {
 		}
 	}
 	return nil
+}
+
+// implementsLogical reports whether node implements expected, either directly
+// or by already delivering the exact ordering and output slots of one or more
+// bypassed ir.Sort relations.
+func implementsLogical(g *ir.Graph, graphID GraphID, expected ir.RelID, node NodeSpec) bool {
+	if node.Logical == (RelRef{graphID, expected}) {
+		return true
+	}
+	for depth := 0; depth < 16; depth++ {
+		rel, ok := g.Rel(expected)
+		if !ok || rel.Kind != ir.Sort || rel.InputCount() != 1 {
+			return false
+		}
+		if uint32(len(node.Output)) != rel.OutputCount() {
+			return false
+		}
+		for i, slot := range node.Output {
+			out, _ := g.Output(expected, uint32(i))
+			if slot.Graph != graphID || slot.ID != out {
+				return false
+			}
+		}
+		if err := logicalOrder(g, RelRef{Graph: graphID, Rel: expected}, node.Delivered.Ordering, 0); err != nil {
+			return false
+		}
+		next, ok := g.Input(expected, 0)
+		if !ok {
+			return false
+		}
+		if node.Logical == (RelRef{graphID, next}) {
+			return true
+		}
+		expected = next
+	}
+	return false
+}
+
+// projectOrderPrefix validates that every delivered OrderKey of a Project
+// either matches the corresponding input OrderKey directly or aliases its slot
+// through a direct ir.Slot projection binding with identical key metadata.
+func projectOrderPrefix(g *ir.Graph, relID ir.RelID, input, delivered []OrderKey) bool {
+	if len(delivered) > len(input) {
+		return false
+	}
+	rel, ok := g.Rel(relID)
+	if !ok {
+		return orderPrefix(input, delivered)
+	}
+	for i, want := range delivered {
+		have := input[i]
+		if want == have {
+			continue
+		}
+		if want.Direction != have.Direction || want.Nulls != have.Nulls || want.Operator != have.Operator ||
+			want.Key.Type != have.Key.Type || want.Key.Collation != have.Key.Collation ||
+			want.Key.Slot.Graph != have.Key.Slot.Graph {
+			return false
+		}
+		aliased := false
+		for j := range rel.BindingCount() {
+			binding, _ := g.Binding(relID, j)
+			if binding.Slot != want.Key.Slot.ID {
+				continue
+			}
+			scalar, ok := g.Scalar(binding.Expr)
+			if ok && scalar.Kind == ir.Slot && scalar.Slot == have.Key.Slot.ID {
+				aliased = true
+			}
+			break
+		}
+		if !aliased {
+			return false
+		}
+	}
+	return true
 }

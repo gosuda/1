@@ -242,9 +242,10 @@ func (transaction *Transaction) applyOne(ctx context.Context, borrowed storage.M
 	}
 	var previous *model.Row
 	if mutation.Op == storage.MutationDeleteRange {
-		if err := transaction.enumerateRange(ctx, target, mutation, budget); err != nil {
-			return err
+		if len(target.normalizer.keyLayout) == 0 {
+			return storage.ErrInvalidLayout
 		}
+		transaction.dataAccessed.Store(true)
 	} else {
 		previous, err = transaction.previous(ctx, target, mutation.Key)
 		if err != nil {
@@ -276,10 +277,14 @@ func (transaction *Transaction) stageNormalized(ctx context.Context, normalized 
 	}
 	transaction.ordinal++
 	normalized.Ordinal = transaction.ordinal
-	if err := transaction.overlay.StageOwned(ctx, []storage.Mutation{normalized}); err != nil {
+	ref, beforeLog, err := transaction.log.appendOne(ctx, normalized)
+	if err != nil {
 		return err
 	}
-	return transaction.log.append(ctx, []storage.Mutation{normalized})
+	if err := transaction.overlay.stageOwnedWithRef(ctx, normalized, ref); err != nil {
+		return errors.Join(err, transaction.log.rollback(context.WithoutCancel(ctx), beforeLog))
+	}
+	return nil
 }
 
 func (transaction *Transaction) encodeMutationKey(ctx context.Context, normalizer *RowNormalizer, mutation storage.Mutation, budget uint64) ([]byte, error) {

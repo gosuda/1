@@ -270,7 +270,6 @@ func (backend *Backend) runMaintenance(ctx context.Context, requested *storage.O
 			if err := prepared.finishWriters(ctx); err != nil {
 				return err
 			}
-			prepared.writers = prepared.writers[:0]
 			occupied, err := prepared.retainFragments(ctx, work)
 			if err != nil {
 				return err
@@ -333,6 +332,9 @@ func (backend *Backend) captureMaintenance(ctx context.Context, requested *stora
 	} else if watermark > floor {
 		return maintenancePlan{}, storage.ErrInvalidMutation
 	}
+	if err := backend.flushMemtableLocked(ctx, 0); err != nil {
+		return maintenancePlan{}, err
+	}
 	pin, err := backend.runs.pin(ctx)
 	if err != nil {
 		return maintenancePlan{}, err
@@ -387,6 +389,9 @@ func (backend *Backend) publishEmptyCollection(ctx context.Context, boundary mod
 	next := backend.state
 	next.Generation++
 	next.HistoryFloor = boundary
+	if next.Closed.ClosedTS > 0 {
+		next.ClosedHorizon = max(next.ClosedHorizon, backend.persistedHorizon, next.Closed.ClosedTS)
+	}
 	uncertain, err := writeDatabaseState(ctx, backend.directory.root, next, backend.limits.MetadataBytes, backend.stateFault)
 	if err != nil {
 		backend.metadataUncertain = uncertain
@@ -397,6 +402,7 @@ func (backend *Backend) publishEmptyCollection(ctx context.Context, boundary mod
 	}
 	backend.state = next
 	backend.durableClosed = next.Closed
+	backend.persistedHorizon = max(next.Closed.ClosedTS, next.ClosedHorizon)
 	backend.stateDirty = false
 	return nil
 }
@@ -427,6 +433,9 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 	if boundary < backend.state.HistoryFloor || boundary > backend.closedTimestamp() || backend.state.Generation == math.MaxUint64 {
 		return false, storage.ErrInvalidMutation
 	}
+	if err := backend.flushMemtableLocked(ctx, 0); err != nil {
+		return false, err
+	}
 	descriptors, err := backend.runs.replacementDescriptors(ctx, plan.capturedPosition, compacted, replacements)
 	if err != nil {
 		return false, err
@@ -435,9 +444,17 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 	if err := backend.directory.runs.Remove(baseManifestName(generation)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
+	prunedTransactions, prunedPosition, prunedCommitTS, fenceIndex, err := pruneBaseTransactions(
+		ctx, backend.transactions, backend.prunedPosition, backend.prunedCommitTS,
+		backend.frontier.LogPosition, boundary, backend.limits.IdentityBytes,
+	)
+	if err != nil {
+		return false, err
+	}
 	base := runBase{
 		Generation: generation, Position: backend.frontier.LogPosition, CommitTS: backend.frontier.CommitTS,
-		Floor: boundary, Epoch: backend.publishedEpoch, Files: descriptors, Transactions: backend.transactions,
+		Floor: boundary, PrunedPosition: prunedPosition, PrunedCommitTS: prunedCommitTS,
+		Epoch: backend.publishedEpoch, Files: descriptors, Transactions: prunedTransactions,
 	}
 	if err := backend.maintenanceBoundary(ctx, maintenanceBeforeBase); err != nil {
 		return false, err
@@ -459,6 +476,9 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 	previousBase := next.BaseGeneration
 	next.Generation = generation
 	next.BaseGeneration = generation
+	if next.Closed.ClosedTS > 0 {
+		next.ClosedHorizon = max(next.ClosedHorizon, backend.persistedHorizon, next.Closed.ClosedTS)
+	}
 	if err := backend.runs.checkReplacement(ctx, base.Position, base.CommitTS, opened); err != nil {
 		return false, errors.Join(err, backend.removeUnpublishedBase(generation))
 	}
@@ -475,6 +495,7 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 		return false, errors.Join(stateErr, backend.removeUnpublishedBase(generation))
 	}
 	backend.durableClosed = next.Closed
+	backend.persistedHorizon = max(next.Closed.ClosedTS, next.ClosedHorizon)
 	backend.stateDirty = false
 	if err := backend.maintenanceBoundary(ctx, maintenanceAfterState); err != nil {
 		// The durable state already names the new base while the run set still
@@ -493,6 +514,10 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 		}
 	}
 	backend.state = next
+	backend.transactions = prunedTransactions
+	backend.prunedPosition = prunedPosition
+	backend.prunedCommitTS = prunedCommitTS
+	backend.fenceIndex = fenceIndex
 	cleanupErr := backend.cleanupSupersededRunMetadata(publicationCtx, base, previousBase)
 	return true, errors.Join(replaceErr, cleanupErr)
 }
@@ -575,7 +600,7 @@ func (backend *Backend) MaintenanceBacklog(ctx context.Context) (walSegments, ru
 		set.mu.Unlock()
 		return 0, 0, storage.ErrClosed
 	}
-	runFiles = set.files
+	runFiles = set.files + backend.memtable.pendingRunCount()
 	set.mu.Unlock()
 	directory, err := backend.directory.commits.Open(".")
 	if err != nil {
@@ -609,13 +634,16 @@ func (backend *Backend) MaintenanceBacklog(ctx context.Context) (walSegments, ru
 // UncompactedRunFiles reports the number of live L0 run files and post-base
 // commit run files that have not yet been folded into the durable base.
 func (backend *Backend) UncompactedRunFiles() uint64 {
+	backend.mu.Lock()
+	pending := backend.memtable.pendingRunCount()
+	backend.mu.Unlock()
 	set := backend.runs
 	set.mu.Lock()
 	defer set.mu.Unlock()
 	if set.closed {
 		return 0
 	}
-	var count uint64
+	var count uint64 = pending
 	for generation := set.head; generation != nil; generation = generation.parent {
 		if generation.baseGeneration == 0 {
 			count += uint64(len(generation.files))

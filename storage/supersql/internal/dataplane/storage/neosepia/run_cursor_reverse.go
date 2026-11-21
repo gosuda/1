@@ -89,13 +89,31 @@ func (cursor *runVersionCursor) nextReversePoint(ctx context.Context) (versionRo
 			return versionRow{}, err
 		}
 		if state.group == nil {
-			for state.nextBlock >= state.first && cursor.snapshotTS > 0 && cursor.run.entry(state.nextBlock).minCommitTS > cursor.snapshotTS {
+			for state.nextBlock >= state.first {
 				if err := ctx.Err(); err != nil {
 					return versionRow{}, err
+				}
+				skip := cursor.snapshotTS > 0 && cursor.run.entry(state.nextBlock).minCommitTS > cursor.snapshotTS
+				zonePruned := false
+				if !skip && state.nextRow < 0 && cursor.canZonePruneBlock(state.nextBlock, true) {
+					mayMatch, err := cursor.predicate.sstZoneMayMatch(ctx, cursor.run, state.nextBlock)
+					if err != nil {
+						return versionRow{}, err
+					}
+					if !mayMatch {
+						skip = true
+						zonePruned = true
+					}
+				}
+				if !skip {
+					break
 				}
 				cursor.memory.observe(storage.ScanObservation{BlocksPruned: storage.ObservationCount{Value: 1, Known: true}})
 				state.nextBlock--
 				state.nextRow = -1
+				if zonePruned && cursor.yieldPruned {
+					return versionRow{}, errBlockZonePruned
+				}
 			}
 			if state.nextBlock < state.first {
 				return versionRow{}, io.EOF

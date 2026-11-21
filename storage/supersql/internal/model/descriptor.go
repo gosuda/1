@@ -29,6 +29,7 @@ const (
 	ObjectCompositeRelation
 	ObjectCast
 	ObjectOperator
+	ObjectRole
 )
 
 // SignatureBearing reports whether the catalog namespace key includes an
@@ -256,8 +257,26 @@ const (
 	PartitionDetachPending
 )
 
+type RoleMetadata struct {
+	Superuser bool
+	BypassRLS bool
+	MemberOf  []string `json:",omitempty"` // normalized lower-case role names
+}
+
+type PolicyDescriptor struct {
+	ID         ObjectID
+	OID        OID
+	Name       string
+	Permissive bool
+	Command    string                // "ALL", "SELECT", "INSERT", "UPDATE", "DELETE"
+	Roles      []string              `json:",omitempty"` // empty or ["public"] means PUBLIC (all roles)
+	Using      *ExpressionDefinition `json:",omitempty"`
+	WithCheck  *ExpressionDefinition `json:",omitempty"`
+}
+
 type TableMetadata struct {
-	Owner OID
+	Owner     OID
+	OwnerName string `json:",omitempty"` // optional role name (empty means default superuser owner)
 	// ColumnIDHighWatermark includes removed and reserved IDs. It never decreases.
 	ColumnIDHighWatermark ColumnID
 	Columns               []ColumnDescriptor
@@ -279,8 +298,14 @@ type TableMetadata struct {
 	ExtendedStatistics    []ExtendedStatisticDescriptor
 	Persistence           string
 	OnCommit              string
+	RowSecurity           bool               `json:",omitempty"`
+	ForceRowSecurity      bool               `json:",omitempty"`
+	Policies              []PolicyDescriptor `json:",omitempty"`
 }
-type SchemaMetadata struct{ Owner OID }
+type SchemaMetadata struct {
+	Owner     OID
+	OwnerName string `json:",omitempty"` // optional role name (empty means default superuser owner)
+}
 type IndexMetadata struct {
 	Owner               OID
 	Table               ObjectID
@@ -336,6 +361,7 @@ type ViewMutationMetadata struct {
 
 type ViewMetadata struct {
 	Owner           OID
+	OwnerName       string `json:",omitempty"` // optional role name (empty means default superuser owner)
 	Columns         []ColumnDescriptor
 	Query           ExpressionDefinition
 	Definition      string
@@ -492,6 +518,7 @@ type DescriptorSpec struct {
 	Cast                    *CastMetadata
 	Operator                *OperatorMetadata
 	Aggregate               *AggregateMetadata
+	Role                    *RoleMetadata `json:",omitempty"`
 }
 
 // Limits bound each owned descriptor, including nested type/default payloads.
@@ -654,6 +681,14 @@ func (d *Descriptor) Aggregate() (AggregateMetadata, bool) {
 		return AggregateMetadata{}, false
 	}
 	return *d.spec.Aggregate, true
+}
+
+// Role returns immutable metadata borrowed from the descriptor.
+func (d *Descriptor) Role() (RoleMetadata, bool) {
+	if d == nil || d.spec.Role == nil {
+		return RoleMetadata{}, false
+	}
+	return *d.spec.Role, true
 }
 
 // Spec returns a bounded, deeply owned editable copy.
@@ -897,6 +932,21 @@ func (c *descriptorCopier) triggers(in []TriggerDescriptor) []TriggerDescriptor 
 	}
 	return out
 }
+func (c *descriptorCopier) policies(in []PolicyDescriptor) []PolicyDescriptor {
+	out := descriptorSlice(c, in)
+	for i := range out {
+		p := &out[i]
+		p.Name = c.text(p.Name)
+		p.Command = c.text(p.Command)
+		p.Roles = descriptorSlice(c, p.Roles)
+		for j := range p.Roles {
+			p.Roles[j] = c.text(p.Roles[j])
+		}
+		p.Using = c.expression(p.Using)
+		p.WithCheck = c.expression(p.WithCheck)
+	}
+	return out
+}
 func (c *descriptorCopier) partitionDatum(in PartitionDatum) PartitionDatum {
 	out := in
 	out.Layout = c.layout(in.Layout, 1)
@@ -949,10 +999,12 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	out.Description = c.text(in.Description)
 	if in.Schema != nil && c.charge(uint64(unsafe.Sizeof(*in.Schema))) {
 		x := *in.Schema
+		x.OwnerName = c.text(x.OwnerName)
 		out.Schema = &x
 	}
 	if in.Table != nil && c.charge(uint64(unsafe.Sizeof(*in.Table))) {
 		x := *in.Table
+		x.OwnerName = c.text(x.OwnerName)
 		x.Columns = c.columns(x.Columns)
 		x.TypedColumns = descriptorSlice(c, x.TypedColumns)
 		x.PrimaryKey = c.keys(x.PrimaryKey)
@@ -978,6 +1030,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 		x.Persistence = c.text(x.Persistence)
 		x.OnCommit = c.text(x.OnCommit)
 		x.Triggers = c.triggers(x.Triggers)
+		x.Policies = c.policies(x.Policies)
 		out.Table = &x
 	}
 	if in.Index != nil && c.charge(uint64(unsafe.Sizeof(*in.Index))) {
@@ -1013,6 +1066,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.View != nil && c.charge(uint64(unsafe.Sizeof(*in.View))) {
 		x := *in.View
+		x.OwnerName = c.text(x.OwnerName)
 		x.Columns = c.columns(x.Columns)
 		x.Definition = c.text(x.Definition)
 		x.Persistence = c.text(x.Persistence)
@@ -1143,6 +1197,14 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 		x.Parallel = c.text(x.Parallel)
 		x.Volatility = c.text(x.Volatility)
 		out.Aggregate = &x
+	}
+	if in.Role != nil && c.charge(uint64(unsafe.Sizeof(*in.Role))) {
+		x := *in.Role
+		x.MemberOf = descriptorSlice(c, x.MemberOf)
+		for i := range x.MemberOf {
+			x.MemberOf[i] = c.text(x.MemberOf[i])
+		}
+		out.Role = &x
 	}
 	if c.err != nil {
 		return DescriptorSpec{}, c.err

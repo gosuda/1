@@ -124,7 +124,8 @@ func (transaction *Transaction) rollbackStatement(ctx context.Context, position 
 	}
 	restoreErr := transaction.restore(context.WithoutCancel(ctx), position)
 	if restoreErr != nil {
-		if !errors.Is(restoreErr, errLockWounded) {
+		var lifecycleAbort *lifecycleAbortError
+		if !errors.Is(restoreErr, errLockWounded) && !errors.As(restoreErr, &lifecycleAbort) {
 			transaction.terminalError = errors.Join(transaction.terminalError, restoreErr)
 			transaction.manager.mu.Lock()
 			transaction.manager.transactionCloseError = errors.Join(transaction.manager.transactionCloseError, restoreErr)
@@ -132,6 +133,8 @@ func (transaction *Transaction) rollbackStatement(ctx context.Context, position 
 		}
 		transaction.cancel(restoreErr)
 		restoreErr = errors.Join(restoreErr, transaction.abortLocked(false))
+	} else if transaction.State() == Aborting {
+		restoreErr = transaction.abortLocked(false)
 	}
 	return transactionError(errors.Join(err, restoreErr))
 }

@@ -38,6 +38,11 @@ type State struct {
 	program    *Program
 	stateBytes uint64
 	registers  []laneRegister
+	args       []model.Value
+	vectors    []*columnar.Vector
+	masks      [][]int
+	maxArgs    int
+	maskDepth  int
 	builder    *columnar.Builder
 	options    StateOptions
 	work       columnar.Allocation
@@ -84,7 +89,28 @@ func NewState(program *Program, options StateOptions) (*State, error) {
 	if options.MaxStateBytes != 0 && options.MaxStateBytes < stateBytes {
 		stateBytes = options.MaxStateBytes
 	}
-	return &State{program: program, stateBytes: stateBytes, options: options}, nil
+	maxArgs := len(program.outputs)
+	maskDepth := 1
+	depth := 1
+	for _, in := range program.code {
+		switch in.op {
+		case opCall, opSQLJSON, opSubquery, opArrayQuantified, opFieldStore, opArrayStore, opJSONBStore:
+			// Every opcode that walks its whole argument list must be sized here.
+			// evalJSONBStore slices e.args to len(in.args), so a store instruction
+			// whose arity exceeds len(p.outputs) reads past the allocation.
+			maxArgs = max(maxArgs, len(in.args))
+		case opMinMax:
+			maxArgs = max(maxArgs, 2)
+		case opArrayCoerce:
+			maxArgs = max(maxArgs, in.coercion.maxArgs)
+		case opEnter, opOnceEnter:
+			depth++
+			maskDepth = max(maskDepth, depth)
+		case opLeave, opOnceStore:
+			depth--
+		}
+	}
+	return &State{program: program, stateBytes: stateBytes, maxArgs: maxArgs, maskDepth: maskDepth, options: options}, nil
 }
 
 func (p *Program) validateCaptures(batch *columnar.Batch) error {
@@ -110,8 +136,12 @@ func (p *Program) validateCaptures(batch *columnar.Batch) error {
 	return nil
 }
 
-func (s *State) releaseRegisters() {
-	s.registers = nil
+func (s *State) releaseWork() {
+	for i := range s.registers {
+		clear(s.registers[i].values)
+	}
+	clear(s.args)
+	clear(s.vectors)
 	if s.work != nil {
 		s.work.Release()
 		s.work = nil
@@ -119,8 +149,23 @@ func (s *State) releaseRegisters() {
 }
 
 func (s *State) release() error {
-	s.releaseRegisters()
+	s.releaseWork()
+	s.registers = nil
+	s.args = nil
+	s.vectors = nil
+	s.masks = nil
 	if s.builder == nil {
+		return nil
+	}
+	err := s.builder.Close()
+	s.builder = nil
+	return err
+}
+
+// ReleaseOutput closes the retained output builder without closing the compiled
+// evaluation state; the next Eval recreates it lazily on demand.
+func (s *State) ReleaseOutput() error {
+	if s == nil || s.builder == nil {
 		return nil
 	}
 	err := s.builder.Close()
@@ -181,8 +226,11 @@ func (s *State) Eval(ctx context.Context, input *columnar.Batch, parameters []Pa
 		return errors.Join(ErrInvalid, s.release())
 	}
 	out.Reset()
-	if err := s.release(); err != nil {
-		return err
+	if s.work != nil {
+		s.releaseWork()
+	}
+	if s.builder != nil {
+		s.builder.Reset()
 	}
 	defer func() {
 		if err != nil {
@@ -190,15 +238,17 @@ func (s *State) Eval(ctx context.Context, input *columnar.Batch, parameters []Pa
 			err = errors.Join(err, s.release())
 		}
 	}()
-	defer s.releaseRegisters()
+	defer s.releaseWork()
 	row, err := s.evaluate(ctx, input, parameters, out.MaxRows, mode)
 	if err != nil {
 		return err
 	}
 	p := s.program
-	s.builder, err = columnar.NewBuilder(p.outputLayouts, columnar.BuilderOptions{MaxRows: p.limits.MaxRows, MaxBytes: p.limits.MaxOutputBytes, Allocator: s.options.OutputAllocator})
-	if err != nil {
-		return err
+	if s.builder == nil {
+		s.builder, err = columnar.NewBuilder(p.outputLayouts, columnar.BuilderOptions{MaxRows: p.limits.MaxRows, MaxBytes: p.limits.MaxOutputBytes, Allocator: s.options.OutputAllocator})
+		if err != nil {
+			return err
+		}
 	}
 	for lane := range input.Rows() {
 		for i, r := range p.outputs {
@@ -280,54 +330,54 @@ func (s *State) evaluate(ctx context.Context, input *columnar.Batch, parameters 
 }
 
 func (e *evaluation) allocate(rows int) error {
-	p := e.state.program
-	maxArgs := len(p.outputs)
-	for _, in := range p.code {
-		switch in.op {
-		case opCall, opSQLJSON, opSubquery, opArrayQuantified, opFieldStore, opArrayStore, opJSONBStore:
-			// Every opcode that walks its whole argument list must be sized here.
-			// evalJSONBStore slices e.args to len(in.args), so a store instruction
-			// whose arity exceeds len(p.outputs) reads past the allocation.
-			maxArgs = max(maxArgs, len(in.args))
-		case opMinMax:
-			maxArgs = max(maxArgs, 2)
-		case opArrayCoerce:
-			maxArgs = max(maxArgs, in.coercion.maxArgs)
-		}
-	}
+	s := e.state
+	p := s.program
+	maxArgs := s.maxArgs
+	maskDepth := s.maskDepth
 	base := uint64(len(p.registers))*uint64(unsafe.Sizeof(laneRegister{})) + uint64(maxArgs)*(uint64(unsafe.Sizeof(model.Value{}))+uint64(unsafe.Sizeof((*columnar.Vector)(nil))))
 	if len(p.subqueries) != 0 {
 		// One synchronous consumer frame is live while the body owns its result.
 		base += 3 * (uint64(unsafe.Sizeof(compiledSubquery{})) + uint64(unsafe.Sizeof(model.Value{})) + uint64(unsafe.Sizeof(error(nil))) + 32)
 	}
-	maskDepth := 1
-	depth := 1
-	for _, in := range p.code {
-		if in.op == opEnter || in.op == opOnceEnter {
-			depth++
-			maskDepth = max(maskDepth, depth)
-		}
-		if in.op == opLeave || in.op == opOnceStore {
-			depth--
-		}
-	}
 	base += uint64(maskDepth) * (uint64(rows)*uint64(unsafe.Sizeof(int(0))) + uint64(unsafe.Sizeof([]int{})))
 	if err := e.charge(base); err != nil {
 		return err
 	}
-	e.args = make([]model.Value, maxArgs)
-	e.vectors = make([]*columnar.Vector, maxArgs)
-	e.masks = make([][]int, maskDepth)
-	for i := range e.masks {
-		e.masks[i] = make([]int, 0, rows)
+	if len(s.args) < maxArgs {
+		s.args = make([]model.Value, maxArgs)
+	} else {
+		s.args = s.args[:maxArgs]
+		clear(s.args)
+	}
+	if len(s.vectors) < maxArgs {
+		s.vectors = make([]*columnar.Vector, maxArgs)
+	} else {
+		s.vectors = s.vectors[:maxArgs]
+		clear(s.vectors)
+	}
+	if len(s.masks) < maskDepth {
+		s.masks = make([][]int, maskDepth)
+	} else {
+		s.masks = s.masks[:maskDepth]
+	}
+	for i := range s.masks {
+		if cap(s.masks[i]) < rows {
+			s.masks[i] = make([]int, 0, rows)
+		} else {
+			s.masks[i] = s.masks[i][:0]
+		}
 	}
 	for i := range rows {
-		e.masks[0] = append(e.masks[0], i)
+		s.masks[0] = append(s.masks[0], i)
 	}
-	e.state.registers = make([]laneRegister, len(p.registers))
+	e.args = s.args
+	e.vectors = s.vectors
+	e.masks = s.masks
+	if len(s.registers) != len(p.registers) {
+		s.registers = make([]laneRegister, len(p.registers))
+	}
 	for i, r := range p.registers {
-		dst := &e.state.registers[i]
-		dst.vector = columnar.Vector{Type: r.layout.Type, Length: rows}
+		dst := &s.registers[i]
 		nulls := (uint64(rows) + 7) / 8
 		width := uint64(8)
 		if !fixed(r.layout.Type.Storage) {
@@ -343,17 +393,49 @@ func (e *evaluation) allocate(rows int) error {
 			if err := e.charge(nulls); err != nil {
 				return err
 			}
-			dst.computed = make([]byte, int(nulls))
+			if cap(dst.computed) < int(nulls) {
+				dst.computed = make([]byte, int(nulls))
+			} else {
+				dst.computed = dst.computed[:int(nulls)]
+				clear(dst.computed)
+			}
 		}
-		dst.vector.Nulls = make([]byte, int(nulls))
+		nullBuf := dst.vector.Nulls
+		if cap(nullBuf) < int(nulls) {
+			nullBuf = make([]byte, int(nulls))
+		} else {
+			nullBuf = nullBuf[:int(nulls)]
+			clear(nullBuf)
+		}
+		intBuf := dst.vector.Int64
+		floatBuf := dst.vector.Float64
 		switch r.layout.Type.Storage {
 		case model.TypeInt64, model.TypeBoolean, model.TypeTimestamp:
-			dst.vector.Int64 = make([]int64, rows)
+			if cap(intBuf) < rows {
+				intBuf = make([]int64, rows)
+			} else {
+				intBuf = intBuf[:rows]
+				clear(intBuf)
+			}
+			floatBuf = nil
 		case model.TypeFloat64:
-			dst.vector.Float64 = make([]float64, rows)
+			if cap(floatBuf) < rows {
+				floatBuf = make([]float64, rows)
+			} else {
+				floatBuf = floatBuf[:rows]
+				clear(floatBuf)
+			}
+			intBuf = nil
 		default:
-			dst.values = make([]model.Value, rows)
+			if cap(dst.values) < rows {
+				dst.values = make([]model.Value, rows)
+			} else {
+				dst.values = dst.values[:rows]
+				clear(dst.values)
+			}
+			intBuf, floatBuf = nil, nil
 		}
+		dst.vector = columnar.Vector{Type: r.layout.Type, Length: rows, Nulls: nullBuf, Int64: intBuf, Float64: floatBuf}
 	}
 	return nil
 }

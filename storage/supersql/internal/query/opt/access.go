@@ -153,7 +153,7 @@ func (o *optimizer) predicateSpans(id ir.RelID, object model.ObjectID, outputs [
 	if !o.step(work) {
 		return nil
 	}
-	limits := span.Limits{MaxSpans: min(1024, int(o.options.Plan.MaxOperands)), MaxNodes: o.options.IR.MaxNodes, MaxWork: work, MaxBytes: remaining}
+	limits := span.Limits{MaxSpans: min(1024, int(o.options.Plan.MaxOperands)), MaxNodes: o.options.IR.MaxNodes, MaxWork: work, MaxBytes: remaining, DefaultCollation: o.options.DefaultCollation}
 	var bounds span.Result
 	var err error
 	if o.options.Parameters == nil {

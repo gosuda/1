@@ -32,6 +32,9 @@ func BindCreateTrigger(ctx context.Context, statement *zpgparse.CreateTrigStmt, 
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
+		return nil, err
+	}
 	spec, err := table.Spec(ctx)
 	if err != nil {
 		return nil, err

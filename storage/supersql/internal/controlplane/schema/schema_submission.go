@@ -80,6 +80,7 @@ func (l *IndexLifecycle) SubmitDefinedIntent(ctx context.Context, options Define
 	case txn.Committed:
 		submission.resolution = storage.CommitResolution{State: storage.CommitCommitted, Result: result}
 		submission.cleanupErr = err
+		l.jobs.notifyWatchers()
 	}
 	return submission, errors.Join(err, submission.closeTransaction(context.WithoutCancel(ctx)))
 }

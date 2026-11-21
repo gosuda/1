@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
@@ -22,6 +23,14 @@ func targetGeneration(target storage.ObjectRef) objectGeneration {
 	return objectGeneration{object: uint64(target.ObjectID), generation: target.Generation}
 }
 
+const maxCompactionOpenWriters = 64
+
+type compactionWriterKey struct {
+	target storage.ObjectRef
+	tier   runTier
+	window uint64
+}
+
 type compactionWriter struct {
 	target storage.ObjectRef
 	name   string
@@ -30,6 +39,7 @@ type compactionWriter struct {
 	rows   uint64
 	tier   runTier
 	window uint64
+	touch  uint64
 }
 
 type compactedRuns struct {
@@ -37,7 +47,10 @@ type compactedRuns struct {
 	taskID        string
 	limits        runPreparationLimits
 	files         []preparedRun
-	writers       []compactionWriter
+	writers       map[compactionWriterKey]*compactionWriter
+	maxWriters    int
+	nextFile      uint64
+	touchSeq      uint64
 	scratch       []byte
 	metadataBytes uint64
 	detached      bool
@@ -50,15 +63,34 @@ func newCompactedRuns(root *os.Root, taskID string, limits runPreparationLimits)
 	if root == nil || taskID == "" || limits.MaxBuilders <= 0 || limits.MaxRuns == 0 {
 		return nil, storage.ErrInvalidTarget
 	}
+	writerCost := uint64(unsafe.Sizeof(compactionWriter{}))
 	fixed := uint64(64 << 10)
-	fixed += uint64(limits.MaxBuilders) * uint64(unsafe.Sizeof(compactionWriter{}))
-	if fixed > limits.MetadataBytes {
+	minWritersCost := uint64(limits.MaxBuilders) * writerCost
+	if fixed > limits.MetadataBytes || minWritersCost > limits.MetadataBytes-fixed {
 		return nil, columnar.ErrBatchBudget
 	}
-	return &compactedRuns{root: root, taskID: taskID, limits: limits, writers: make([]compactionWriter, 0, limits.MaxBuilders), scratch: make([]byte, 64<<10), metadataBytes: fixed}, nil
+	maxWriters := max(limits.MaxBuilders, maxCompactionOpenWriters)
+	affordable := int((limits.MetadataBytes - fixed) / writerCost)
+	if affordable < maxWriters {
+		maxWriters = max(limits.MaxBuilders, affordable)
+	}
+	fixed += minWritersCost
+	return &compactedRuns{
+		root:          root,
+		taskID:        taskID,
+		limits:        limits,
+		writers:       make(map[compactionWriterKey]*compactionWriter),
+		maxWriters:    maxWriters,
+		scratch:       make([]byte, 64<<10),
+		metadataBytes: fixed,
+	}, nil
 }
 
 func (runs *compactedRuns) appendTierBlock(ctx context.Context, target storage.ObjectRef, data []byte, rows uint64, tier runTier, window uint64, historyUntil model.Timestamp) error {
+	return runs.appendTierBlockWithBlobs(ctx, target, data, nil, rows, tier, window, historyUntil)
+}
+
+func (runs *compactedRuns) appendTierBlockWithBlobs(ctx context.Context, target storage.ObjectRef, data []byte, blobs []toastBlob, rows uint64, tier runTier, window uint64, historyUntil model.Timestamp) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -66,109 +98,107 @@ func (runs *compactedRuns) appendTierBlock(ctx context.Context, target storage.O
 		return err
 	}
 	target = runs.target
-	index := -1
-	for i := range runs.writers {
-		if runs.writers[i].writer == nil {
-			continue
-		}
-		if runs.writers[i].target == target && runs.writers[i].tier == tier {
-			index = i
-			break
-		}
-	}
-	if index < 0 {
-		for i := range runs.writers {
-			if runs.writers[i].writer == nil {
-				index = i
-				break
+	key := compactionWriterKey{target: target, tier: tier, window: window}
+	active := runs.writers[key]
+	if active == nil {
+		if len(runs.writers) >= runs.maxWriters {
+			if err := runs.evictLRUWriter(ctx); err != nil {
+				return err
 			}
 		}
-		if index < 0 && len(runs.writers) == cap(runs.writers) {
-			return columnar.ErrBatchBudget
-		}
 		writer, err := runs.openWriter(target, tier, window)
 		if err != nil {
 			return err
 		}
-		if index < 0 {
-			runs.writers = append(runs.writers, writer)
-			index = len(runs.writers) - 1
-		} else {
-			runs.writers[index] = writer
-		}
+		runs.writers[key] = writer
+		active = writer
 	}
-	active := &runs.writers[index]
-	if active.window != window {
-		if err := runs.finishWriter(ctx, index); err != nil {
-			return err
-		}
-		writer, err := runs.openWriter(target, tier, window)
-		if err != nil {
-			return err
-		}
-		runs.writers[index] = writer
-		active = &runs.writers[index]
-	}
-	err := active.writer.Append(ctx, data)
+	err := active.writer.AppendWithBlobs(ctx, data, blobs)
 	if errors.Is(err, columnar.ErrBatchBudget) && active.rows != 0 {
-		if err := runs.finishWriter(ctx, index); err != nil {
-			return err
+		if finishErr := runs.finishWriter(ctx, key); finishErr != nil {
+			return finishErr
 		}
-		writer, err := runs.openWriter(target, tier, window)
-		if err != nil {
-			return err
+		writer, openErr := runs.openWriter(target, tier, window)
+		if openErr != nil {
+			return openErr
 		}
-		runs.writers[index] = writer
-		active = &runs.writers[index]
-		err = active.writer.Append(ctx, data)
+		runs.writers[key] = writer
+		active = writer
+		err = active.writer.AppendWithBlobs(ctx, data, blobs)
 	}
 	if err != nil {
 		return err
 	}
 	active.rows += rows
 	active.writer.historyUntil = max(active.writer.historyUntil, historyUntil)
+	runs.touchSeq++
+	active.touch = runs.touchSeq
 	return nil
 }
 
-func (runs *compactedRuns) openWriter(target storage.ObjectRef, tier runTier, window uint64) (compactionWriter, error) {
-	activeWriters := 0
-	for i := range runs.writers {
-		if runs.writers[i].writer != nil {
-			activeWriters++
+func (runs *compactedRuns) evictLRUWriter(ctx context.Context) error {
+	var victimKey compactionWriterKey
+	var victim *compactionWriter
+	// Prefer evicting the least-recently-used inactive window writer so active
+	// output stays contiguous in a single run unless it hits compactionFileBytes.
+	for key, writer := range runs.writers {
+		if writer.tier != inactiveTier {
+			continue
+		}
+		if victim == nil || writer.touch < victim.touch {
+			victimKey, victim = key, writer
 		}
 	}
-	if uint64(len(runs.files)+activeWriters) >= runs.limits.MaxRuns {
-		return compactionWriter{}, columnar.ErrBatchBudget
+	if victim == nil {
+		for key, writer := range runs.writers {
+			if victim == nil || writer.touch < victim.touch {
+				victimKey, victim = key, writer
+			}
+		}
+	}
+	if victim == nil {
+		return columnar.ErrBatchBudget
+	}
+	return runs.finishWriter(ctx, victimKey)
+}
+
+func (runs *compactedRuns) openWriter(target storage.ObjectRef, tier runTier, window uint64) (*compactionWriter, error) {
+	if uint64(len(runs.files)+len(runs.writers)) >= runs.limits.MaxRuns {
+		return nil, columnar.ErrBatchBudget
 	}
 	suffix := "active"
 	if tier == inactiveTier {
 		suffix = "inactive"
 	}
-	name := fmt.Sprintf("c-%s-%08x.%s.sst", runs.taskID[:min(16, len(runs.taskID))], len(runs.files)+activeWriters, suffix)
+	seq := runs.nextFile
+	runs.nextFile++
+	name := fmt.Sprintf("c-%s-%08x.%s.sst", runs.taskID[:min(16, len(runs.taskID))], seq, suffix)
 	if !validBaseRunName(name) {
-		return compactionWriter{}, storage.ErrInvalidTarget
+		return nil, storage.ErrInvalidTarget
 	}
 	file, err := runs.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
-		return compactionWriter{}, err
+		return nil, err
 	}
 	writer, err := newSSTWriter(file, target, runs.limits.File)
 	if err != nil {
-		return compactionWriter{}, errors.Join(err, file.Close(), runs.root.Remove(name))
+		return nil, errors.Join(err, file.Close(), runs.root.Remove(name))
 	}
 	writer.tier = tier
 	writer.timeWindow = window
 	if tier == activeTier {
 		writer.level = runs.level
 	}
-	return compactionWriter{target: target, name: name, file: file, writer: writer, tier: tier, window: window}, nil
+	return &compactionWriter{target: target, name: name, file: file, writer: writer, tier: tier, window: window}, nil
 }
 
-func (runs *compactedRuns) finishWriter(ctx context.Context, index int) (err error) {
-	active := &runs.writers[index]
-	if active.writer == nil {
+func (runs *compactedRuns) finishWriter(ctx context.Context, key compactionWriterKey) (err error) {
+	active := runs.writers[key]
+	if active == nil || active.writer == nil {
+		delete(runs.writers, key)
 		return nil
 	}
+	delete(runs.writers, key)
 	file, name, target, rows := active.file, active.name, active.target, active.rows
 	defer func() {
 		if file != nil {
@@ -179,9 +209,6 @@ func (runs *compactedRuns) finishWriter(ctx context.Context, index int) (err err
 			if !errors.Is(removeErr, os.ErrNotExist) {
 				err = errors.Join(err, removeErr)
 			}
-		}
-		if err != nil {
-			*active = compactionWriter{}
 		}
 	}()
 	if rows == 0 {
@@ -207,7 +234,6 @@ func (runs *compactedRuns) finishWriter(ctx context.Context, index int) (err err
 		return closeErr
 	}
 	runs.files = append(runs.files, preparedRun{Name: name, Target: target, Rows: rows, Bytes: uint64(info.Size()), Checksum: checksum})
-	*active = compactionWriter{}
 	return nil
 }
 
@@ -230,11 +256,43 @@ func (runs *compactedRuns) reserveFile(name string) error {
 }
 
 func (runs *compactedRuns) finishWriters(ctx context.Context) error {
-	for i := range runs.writers {
-		if runs.writers[i].writer != nil {
-			if err := runs.finishWriter(ctx, i); err != nil {
-				return err
+	if len(runs.writers) == 0 {
+		return nil
+	}
+	keys := make([]compactionWriterKey, 0, len(runs.writers))
+	for key := range runs.writers {
+		keys = append(keys, key)
+	}
+	slices.SortFunc(keys, func(a, b compactionWriterKey) int {
+		if a.tier != b.tier {
+			if a.tier < b.tier {
+				return -1
 			}
+			return 1
+		}
+		if a.window != b.window {
+			if a.window < b.window {
+				return -1
+			}
+			return 1
+		}
+		if a.target.ObjectID != b.target.ObjectID {
+			if a.target.ObjectID < b.target.ObjectID {
+				return -1
+			}
+			return 1
+		}
+		if a.target.Generation < b.target.Generation {
+			return -1
+		}
+		if a.target.Generation > b.target.Generation {
+			return 1
+		}
+		return 0
+	})
+	for _, key := range keys {
+		if err := runs.finishWriter(ctx, key); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -260,17 +318,18 @@ func (runs *compactedRuns) Close() error {
 	}
 	runs.detached = true
 	var err error
-	for i := range runs.writers {
-		if runs.writers[i].file != nil {
-			err = errors.Join(err, runs.writers[i].file.Close())
-			runs.writers[i].file = nil
+	for key, writer := range runs.writers {
+		if writer.file != nil {
+			err = errors.Join(err, writer.file.Close())
+			writer.file = nil
 		}
-		if runs.writers[i].name != "" {
-			removeErr := runs.root.Remove(runs.writers[i].name)
+		if writer.name != "" {
+			removeErr := runs.root.Remove(writer.name)
 			if !errors.Is(removeErr, os.ErrNotExist) {
 				err = errors.Join(err, removeErr)
 			}
 		}
+		delete(runs.writers, key)
 	}
 	for _, file := range runs.files {
 		removeErr := runs.root.Remove(file.Name)

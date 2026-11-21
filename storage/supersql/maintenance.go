@@ -96,6 +96,7 @@ func (database *Catalog) maintenanceLoop(ctx context.Context) error {
 		err := database.maintainOnce(ctx)
 		switch {
 		case err == nil:
+			database.maintenanceLast.Store(nil)
 		case ctx.Err() != nil:
 			return ctx.Err()
 		case transientMaintenance(err):

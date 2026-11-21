@@ -28,7 +28,7 @@ func (s *sstFile) observedSpanCandidates(ctx context.Context, spans []encodedSpa
 func (s *sstFile) measuredSpanCandidates(ctx context.Context, spans []encodedSpan, snapshotTS model.Timestamp) (int, int, uint64, uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.file == nil {
+	if s.core == nil {
 		return 0, 0, 0, 0, storage.ErrClosed
 	}
 	first, end := s.count, 0

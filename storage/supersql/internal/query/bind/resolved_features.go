@@ -34,6 +34,9 @@ func ValidateBuiltinCollation(id model.CollationID, position int) error {
 // ValidateBuiltinRelation checks a resolved system relation's qualified identity,
 // never an unqualified source spelling or a user-owned namespace.
 func ValidateBuiltinRelation(qualifiedName string, position int) error {
+	if qualifiedName == "pg_catalog.pg_policies" {
+		return nil
+	}
 	if feature := builtinRelationFeature(qualifiedName); feature != "" {
 		return unsupported(feature, position)
 	}
@@ -74,6 +77,9 @@ func IsCustomSettingName(name string) bool {
 // unknown names and custom qualified GUC names. Value and transaction-state
 // checks belong to the session.
 func ValidateSetting(name string, position int) error {
+	if strings.EqualFold(name, "role") {
+		return nil
+	}
 	feature, known := builtinSettingFeature(strings.ToLower(name))
 	if !known {
 		if IsCustomSettingName(name) {

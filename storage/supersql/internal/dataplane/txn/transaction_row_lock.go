@@ -85,16 +85,16 @@ func (transaction *Transaction) LockRows(ctx context.Context, requests []RowLock
 	for _, request := range requests {
 		acquired, err := transaction.lockTableIntentWithPolicy(operation, request.Target, lockTableRowShare, policy)
 		if err != nil || !acquired {
-			return false, transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+			return false, transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 		}
 		mode := rowLockMode(request.Strength)
 		acquired, err = transaction.manager.locks.acquire(operation, transaction.owner, pointLock(request.Target, request.Key), mode, policy)
 		if err != nil || !acquired {
-			return false, transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+			return false, transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 		}
 	}
 	if err := transaction.active(operation); err != nil {
-		return false, transactionError(errors.Join(err, transaction.manager.locks.rollback(transaction.owner, position)))
+		return false, transactionError(errors.Join(err, transaction.manager.locks.rollbackAttempt(transaction.owner, position)))
 	}
 	return true, nil
 }

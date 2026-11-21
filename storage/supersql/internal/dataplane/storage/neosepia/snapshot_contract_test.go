@@ -168,6 +168,9 @@ func TestSnapshotScanContract(t *testing.T) {
 		}
 	})
 
+	if err := fixture.backend.flushMemtableLocked(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
 	reader := snapshotContractReader(t, fixture, 10, nil)
 	cursor := snapshotContractCursor(t, reader, requests[0].request)
 	t.Cleanup(func() { snapshotContractClose(t, cursor) })

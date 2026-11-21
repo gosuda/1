@@ -98,6 +98,10 @@ func (o *optimizer) explore(id ir.RelID) {
 		return
 	}
 	switch r.Kind {
+	case ir.Filter, ir.Project, ir.Sample, ir.LockRows:
+		o.exploreOrderPreserving(id, r, seed)
+	case ir.Sort:
+		o.exploreSort(id, r, seed)
 	case ir.Join:
 		o.exploreJoin(id, r, seed)
 	case ir.Aggregate:
@@ -160,6 +164,7 @@ func (o *optimizer) explore(id ir.RelID) {
 		child := o.winner(children[0].node.Logical.Rel, required)
 		o.register(id, o.newExpression(n, []*expression{child}, nil))
 	case ir.Limit:
+		o.exploreOrderPreserving(id, r, seed)
 		if r.WithTies || seed.node.Limit.RuntimeBounds || len(children[0].node.Delivered.Ordering) == 0 {
 			return
 		}
@@ -167,6 +172,114 @@ func (o *optimizer) explore(id ir.RelID) {
 		n.Algorithm = physical.TopK
 		n.Delivered.Ordering = children[0].node.Delivered.Ordering
 		o.register(id, o.newExpression(n, children, nil))
+	}
+}
+
+// exploreOrderPreserving registers unary operator alternatives over every
+// ordered child alternative (e.g., forward and reverse index scans) so parent
+// Sort/Limit/Window/StreamDistinct nodes can exploit existing index order.
+// For Project, direct ir.Slot copy bindings also expose aliased order keys.
+func (o *optimizer) exploreOrderPreserving(id ir.RelID, r ir.Rel, seed *expression) {
+	if len(seed.children) != 1 || len(seed.node.Required) != 1 {
+		return
+	}
+	childRel := seed.children[0].node.Logical.Rel
+	required := seed.node.Required[0]
+	if r.Kind != ir.Limit || !r.WithTies {
+		required.Ordering = nil
+	}
+	for _, alt := range o.groups[childRel].alternatives {
+		if !o.search() {
+			return
+		}
+		if len(alt.node.Delivered.Ordering) == 0 || !delivers(alt.node.Delivered, required) {
+			continue
+		}
+		n := seed.node
+		n.Delivered.Ordering = nil
+		expr := o.newExpression(n, []*expression{alt}, seed.producer)
+		if o.err != nil {
+			return
+		}
+		o.register(id, expr)
+		if r.Kind != ir.Project {
+			continue
+		}
+		if aliased := o.projectAliasedOrder(id, r, alt.node.Delivered.Ordering); len(aliased) != 0 {
+			an := seed.node
+			an.Delivered.Ordering = aliased
+			aExpr := o.newExpression(an, []*expression{alt}, seed.producer)
+			if o.err != nil {
+				return
+			}
+			o.register(id, aExpr)
+		}
+	}
+}
+
+func (o *optimizer) projectAliasedOrder(id ir.RelID, r ir.Rel, inputOrder []physical.OrderKey) []physical.OrderKey {
+	if len(inputOrder) == 0 {
+		return nil
+	}
+	aliased := make([]physical.OrderKey, 0, len(inputOrder))
+	changed := false
+	for _, key := range inputOrder {
+		mapped := key
+		foundAlias := false
+		for j := range r.BindingCount() {
+			binding, _ := o.graph.Binding(id, j)
+			if binding.Slot == key.Key.Slot.ID {
+				continue
+			}
+			scalar, ok := o.graph.Scalar(binding.Expr)
+			if !ok || scalar.Kind != ir.Slot || scalar.Slot != key.Key.Slot.ID {
+				continue
+			}
+			aliasKey := o.key(binding.Slot)
+			if aliasKey.Type != key.Key.Type || aliasKey.Collation != key.Key.Collation {
+				continue
+			}
+			mapped.Key = aliasKey
+			foundAlias = true
+			changed = true
+			break
+		}
+		if !foundAlias && !slices.Contains(o.groups[id].seed.node.Output, key.Key.Slot) {
+			break
+		}
+		aliased = append(aliased, mapped)
+	}
+	if !changed || len(aliased) == 0 {
+		return nil
+	}
+	return aliased
+}
+
+// exploreSort eliminates an explicit physical.Sort whenever a child alternative
+// already delivers the exact SQL ordering and outputs (e.g., a forward or
+// reverse PK/index scan propagated through Filter/Project).
+func (o *optimizer) exploreSort(id ir.RelID, r ir.Rel, seed *expression) {
+	if len(seed.children) != 1 || len(seed.node.Required) != 1 {
+		return
+	}
+	wantOrder := seed.node.Delivered.Ordering
+	if len(wantOrder) == 0 {
+		return
+	}
+	childRel := seed.children[0].node.Logical.Rel
+	required := seed.node.Required[0]
+	required.Ordering = nil
+	for _, alt := range o.groups[childRel].alternatives {
+		if !o.search() {
+			return
+		}
+		if !delivers(alt.node.Delivered, required) || !ordered(alt.node.Delivered.Ordering, wantOrder) {
+			continue
+		}
+		if !slices.Equal(alt.node.Output, seed.node.Output) {
+			continue
+		}
+		o.register(id, alt)
 	}
 }
 
@@ -388,10 +501,22 @@ func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physica
 			return
 		}
 		lk, rk := o.key(l.Slot), o.key(rr.Slot)
-		if !slices.Contains(left, lk.Slot) || !slices.Contains(right, rk.Slot) || lk.Type != rk.Type {
+		if lk.Type != rk.Type || lk.Collation != rk.Collation {
 			return
 		}
-		key := physical.JoinKey{Left: lk, Right: rk, Equality: s.Operator, Nulls: physical.NullsUnequal, Predicate: physical.ScalarRef{Graph: 1, Scalar: id}}
+		operator := s.Operator
+		if slices.Contains(left, lk.Slot) && slices.Contains(right, rk.Slot) {
+			// Canonical (left, right) orientation.
+		} else if slices.Contains(right, lk.Slot) && slices.Contains(left, rk.Slot) {
+			// Reversed orientation is normalized into canonical IR by
+			// normalizeJoinPredicates before planning so physical.Plan can verify
+			// Operand(0) == Left and Operand(1) == Right; do not emit an
+			// unnormalized predicate ref if normalization was skipped under budget.
+			return
+		} else {
+			return
+		}
+		key := physical.JoinKey{Left: lk, Right: rk, Equality: operator, Nulls: physical.NullsUnequal, Predicate: physical.ScalarRef{Graph: 1, Scalar: id}}
 		if !o.charge(2, uint64(unsafe.Sizeof(key))) {
 			return
 		}

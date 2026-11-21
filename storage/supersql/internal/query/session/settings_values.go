@@ -113,7 +113,7 @@ var settingDefinitions = [settingCount]settingDefinition{
 	maxIdentifierLength: {"max_identifier_length", "63", readOnlySetting, 0, 0},
 }
 
-func (s *Settings) parse(ctx context.Context, id settingID, raw string) (settingValue, error) {
+func (s *Settings) parseLocked(ctx context.Context, id settingID, raw string) (settingValue, error) {
 	if err := ctx.Err(); err != nil {
 		return settingValue{}, err
 	}
@@ -162,8 +162,8 @@ func (s *Settings) parse(ctx context.Context, id settingID, raw string) (setting
 		zone.Name = strings.Clone(zone.Name)
 		result = settingValue{text: zone.Name, zone: zone}
 	case dateStyle:
-		current := cmp.Or(s.current[dateStyle].text, "ISO, MDY")
-		reset := cmp.Or(s.reset[dateStyle].text, "ISO, MDY")
+		current := cmp.Or(s.state.current[dateStyle].text, "ISO, MDY")
+		reset := cmp.Or(s.state.reset[dateStyle].text, "ISO, MDY")
 		canonical, ok := parseDateStyle(raw, current, reset)
 		if !ok {
 			return result, badSetting(def.name, raw)
@@ -229,7 +229,7 @@ func (s *Settings) parse(ctx context.Context, id settingID, raw string) (setting
 		}
 		result.text = clean.String()
 	case lcMonetary, lcNumeric, lcTime:
-		numeric, monetary, clock := cmp.Or(s.current[lcNumeric].text, "C"), cmp.Or(s.current[lcMonetary].text, "C"), cmp.Or(s.current[lcTime].text, "C")
+		numeric, monetary, clock := cmp.Or(s.state.current[lcNumeric].text, "C"), cmp.Or(s.state.current[lcMonetary].text, "C"), cmp.Or(s.state.current[lcTime].text, "C")
 		switch id {
 		case lcNumeric:
 			numeric = raw
@@ -261,7 +261,7 @@ func (s *Settings) parse(ctx context.Context, id settingID, raw string) (setting
 		}
 		result.text = strings.Clone(result.text)
 	case defaultTextSearchConfig:
-		canonical, err := s.resolver.ResolveTextSearchConfig(ctx, raw, s.SearchPath())
+		canonical, err := s.resolver.ResolveTextSearchConfig(ctx, raw, s.searchPathLocked())
 		if err != nil {
 			var sqlErr *model.Error
 			if errors.As(err, &sqlErr) && oneOf(sqlErr.Code, "42704", "42602") {

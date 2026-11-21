@@ -11,13 +11,16 @@ func ValidateNamespaceName(n NamespaceName) error {
 	if !utf8.ValidString(n.Name) || !utf8.ValidString(n.Signature) {
 		return ErrInvalidDescriptor
 	}
-	if n.Kind < ObjectSchema || n.Kind > ObjectOperator || n.Name == "" || strings.IndexByte(n.Name, 0) >= 0 || strings.IndexByte(n.Signature, 0) >= 0 {
+	if n.Kind < ObjectSchema || n.Kind > ObjectRole || n.Name == "" || strings.IndexByte(n.Name, 0) >= 0 || strings.IndexByte(n.Signature, 0) >= 0 {
 		return ErrInvalidDescriptor
 	}
 	if !n.Kind.SignatureBearing() && n.Signature != "" {
 		return ErrInvalidDescriptor
 	}
-	if n.Kind != ObjectSchema && n.Parent == 0 {
+	if n.Kind == ObjectRole && n.Parent != 0 {
+		return ErrInvalidDescriptor
+	}
+	if n.Kind != ObjectSchema && n.Kind != ObjectRole && n.Parent == 0 {
 		return ErrInvalidDescriptor
 	}
 	return nil
@@ -305,7 +308,7 @@ func validateDescriptor(d DescriptorSpec) error {
 		}
 	}
 	count := 0
-	for _, present := range []bool{d.Schema != nil, d.Table != nil, d.Index != nil, d.Sequence != nil, d.View != nil, d.Routine != nil, d.Type != nil, d.CompositeRelation != nil, d.TextSearchTemplate != nil, d.TextSearchDictionary != nil, d.TextSearchConfiguration != nil, d.Cast != nil, d.Operator != nil, d.Aggregate != nil} {
+	for _, present := range []bool{d.Schema != nil, d.Table != nil, d.Index != nil, d.Sequence != nil, d.View != nil, d.Routine != nil, d.Type != nil, d.CompositeRelation != nil, d.TextSearchTemplate != nil, d.TextSearchDictionary != nil, d.TextSearchConfiguration != nil, d.Cast != nil, d.Operator != nil, d.Aggregate != nil, d.Role != nil} {
 		if present {
 			count++
 		}
@@ -328,6 +331,9 @@ func validateDescriptor(d DescriptorSpec) error {
 	switch d.Name.Kind {
 	case ObjectSchema:
 		if d.Schema == nil || d.Schema.Owner == 0 {
+			return ErrInvalidDescriptor
+		}
+		if d.Schema.OwnerName != "" && (!validDescriptorText(d.Schema.OwnerName) || d.Schema.OwnerName != strings.ToLower(d.Schema.OwnerName)) {
 			return ErrInvalidDescriptor
 		}
 	case ObjectTable:
@@ -389,8 +395,76 @@ func validateDescriptor(d DescriptorSpec) error {
 		return validateCastMetadata(d.Cast)
 	case ObjectOperator:
 		return validateOperatorMetadata(d.Operator)
+	case ObjectRole:
+		return validateRoleMetadata(d.Name.Name, d.Role)
 	default:
 		return ErrInvalidDescriptor
+	}
+	return nil
+}
+
+func validateRoleMetadata(name string, role *RoleMetadata) error {
+	if role == nil || name == "" || !validDescriptorText(name) || name != strings.ToLower(name) {
+		return ErrInvalidDescriptor
+	}
+	seen := make(map[string]struct{}, len(role.MemberOf))
+	for _, member := range role.MemberOf {
+		if member == "" || !validDescriptorText(member) || member != strings.ToLower(member) || member == name {
+			return ErrInvalidDescriptor
+		}
+		if _, dup := seen[member]; dup {
+			return ErrInvalidDescriptor
+		}
+		seen[member] = struct{}{}
+	}
+	return nil
+}
+
+func validatePolicies(policies []PolicyDescriptor) error {
+	names := make(map[string]struct{}, len(policies))
+	ids := make(map[ObjectID]struct{}, len(policies))
+	oids := make(map[OID]struct{}, len(policies))
+	for _, policy := range policies {
+		if policy.Name == "" || !validDescriptorText(policy.Name) {
+			return ErrInvalidDescriptor
+		}
+		if _, dup := names[policy.Name]; dup {
+			return ErrInvalidDescriptor
+		}
+		names[policy.Name] = struct{}{}
+		if policy.ID != 0 {
+			if _, dup := ids[policy.ID]; dup {
+				return ErrInvalidDescriptor
+			}
+			ids[policy.ID] = struct{}{}
+		}
+		if policy.OID != 0 {
+			if _, dup := oids[policy.OID]; dup {
+				return ErrInvalidDescriptor
+			}
+			oids[policy.OID] = struct{}{}
+		}
+		switch policy.Command {
+		case "ALL", "SELECT", "INSERT", "UPDATE", "DELETE":
+		default:
+			return ErrInvalidDescriptor
+		}
+		seenRoles := make(map[string]struct{}, len(policy.Roles))
+		for _, role := range policy.Roles {
+			if role == "" || !validDescriptorText(role) || role != strings.ToLower(role) {
+				return ErrInvalidDescriptor
+			}
+			if _, dup := seenRoles[role]; dup {
+				return ErrInvalidDescriptor
+			}
+			seenRoles[role] = struct{}{}
+		}
+		if policy.Using != nil && !validDescriptorText(policy.Using.SQL) {
+			return ErrInvalidDescriptor
+		}
+		if policy.WithCheck != nil && !validDescriptorText(policy.WithCheck.SQL) {
+			return ErrInvalidDescriptor
+		}
 	}
 	return nil
 }
@@ -697,6 +771,9 @@ func validateViewMetadata(view *ViewMetadata, materialized bool) error {
 	if view == nil || view.Owner == 0 || view.Definition == "" || view.Query.SemanticVersion != 1 || view.Query.SQL != "" || len(view.Query.Encoding) == 0 {
 		return ErrInvalidDescriptor
 	}
+	if view.OwnerName != "" && (!validDescriptorText(view.OwnerName) || view.OwnerName != strings.ToLower(view.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
 	if view.CheckOption != "" && view.CheckOption != "local" && view.CheckOption != "cascaded" {
 		return ErrInvalidDescriptor
 	}
@@ -733,6 +810,9 @@ func validateViewMetadata(view *ViewMetadata, materialized bool) error {
 
 func validateTableMetadata(t *TableMetadata, tableID ObjectID) error {
 	if t == nil || len(t.Columns) == 0 {
+		return ErrInvalidDescriptor
+	}
+	if t.OwnerName != "" && (!validDescriptorText(t.OwnerName) || t.OwnerName != strings.ToLower(t.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
 	if t.Persistence != "" && t.Persistence != "p" && t.Persistence != "t" {
@@ -841,7 +921,10 @@ func validateTableMetadata(t *TableMetadata, tableID ObjectID) error {
 	if err := validateConstraints(t.Constraints, t.Columns); err != nil {
 		return err
 	}
-	return validateTriggers(t.Triggers, t.Columns, false, t.Constraints, tableID)
+	if err := validateTriggers(t.Triggers, t.Columns, false, t.Constraints, tableID); err != nil {
+		return err
+	}
+	return validatePolicies(t.Policies)
 }
 
 func validatePartitionBound(bound *PartitionBound) error {

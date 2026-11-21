@@ -374,6 +374,9 @@ func triggerTarget(ctx context.Context, b *binder, relation *zpgparse.RangeVar) 
 	if err != nil {
 		return nil, model.DescriptorSpec{}, nil, err
 	}
+	if err := b.requireTableOwner(table, int(relation.Location)+1); err != nil {
+		return nil, model.DescriptorSpec{}, nil, err
+	}
 	spec, err := table.Spec(ctx)
 	if err != nil {
 		return nil, model.DescriptorSpec{}, nil, err

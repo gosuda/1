@@ -171,18 +171,23 @@ type sharedCursor struct {
 func (s *sharedCursor) Next(ctx context.Context, out *columnar.Batch) error {
 	out.Reset()
 	if s.closed || s.ended {
+		if s.output != nil {
+			err := s.output.Close()
+			s.output = nil
+			if err != nil {
+				return err
+			}
+		}
 		return io.EOF
 	}
-	if s.output != nil {
-		if err := s.output.Close(); err != nil {
+	if s.output == nil {
+		var err error
+		s.output, err = builder(s.env, s.layouts)
+		if err != nil {
 			return err
 		}
-		s.output = nil
-	}
-	var err error
-	s.output, err = builder(s.env, s.layouts)
-	if err != nil {
-		return err
+	} else {
+		s.output.Reset()
 	}
 	maximum := batchRows(out, s.env)
 	for s.output.Rows() < maximum {
@@ -198,6 +203,11 @@ func (s *sharedCursor) Next(ctx context.Context, out *columnar.Batch) error {
 		}
 	}
 	if s.output.Rows() == 0 && s.ended {
+		err := s.output.Close()
+		s.output = nil
+		if err != nil {
+			return err
+		}
 		return io.EOF
 	}
 	return s.output.Publish(out)

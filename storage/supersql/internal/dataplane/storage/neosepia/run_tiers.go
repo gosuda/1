@@ -62,6 +62,33 @@ func (generation *runGeneration) indexTiers() {
 		generation.levels[level] = generation.activeFiles[first:end:end]
 		first = end
 	}
+	if len(generation.files) == 0 {
+		generation.byTarget = nil
+		generation.byTargetLevels = nil
+		return
+	}
+	byTarget := make(map[objectGeneration][]*sstFile)
+	for _, file := range generation.files {
+		key := targetGeneration(file.target)
+		byTarget[key] = append(byTarget[key], file)
+	}
+	byTargetLevels := make(map[objectGeneration][MaxLevels][]*sstFile, len(byTarget))
+	for level := range MaxLevels {
+		files := generation.levels[level]
+		for i := 0; i < len(files); {
+			key := targetGeneration(files[i].target)
+			j := i + 1
+			for j < len(files) && targetGeneration(files[j].target) == key {
+				j++
+			}
+			perLevel := byTargetLevels[key]
+			perLevel[level] = files[i:j:j]
+			byTargetLevels[key] = perLevel
+			i = j
+		}
+	}
+	generation.byTarget = byTarget
+	generation.byTargetLevels = byTargetLevels
 }
 
 func (pin *runPin) visitSnapshot(ctx context.Context, target storage.ObjectRef, timestamp model.Timestamp, visit func(*sstFile) error) error {

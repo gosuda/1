@@ -91,5 +91,46 @@ func (reader *snapshotReader) ObserveSnapshot(ctx context.Context, target storag
 	if err != nil {
 		return storage.SnapshotObservation{}, err
 	}
+	if reader.mem != nil && reader.spec.Timestamp >= reader.mem.firstCommitTS {
+		if state := reader.mem.targets[targetGeneration(target)]; state != nil && state.rows > 0 {
+			var memObserved bool
+			var memBytes uint64
+			cursor := state.entries.First(false)
+			for {
+				if err := ctx.Err(); err != nil {
+					cursor.Close()
+					return storage.SnapshotObservation{}, err
+				}
+				_, entry, ok := cursor.Next()
+				if !ok {
+					break
+				}
+				if entry == nil || entry.commitTS > reader.spec.Timestamp {
+					continue
+				}
+				memObserved = true
+				if entry.bytes <= math.MaxUint64-memBytes {
+					memBytes += entry.bytes
+				} else {
+					memBytes = math.MaxUint64
+				}
+				if observation.VersionRows.Known && entry.op != storage.MutationDeleteRange {
+					if observation.VersionRows.Value == math.MaxUint64 {
+						cursor.Close()
+						return storage.SnapshotObservation{}, storage.ErrCorruptStorage
+					}
+					observation.VersionRows.Value++
+				}
+			}
+			cursor.Close()
+			if memObserved {
+				if observation.Blocks.Value == math.MaxUint64 || memBytes > math.MaxUint64-observation.DeltaBytes.Value {
+					return storage.SnapshotObservation{}, storage.ErrCorruptStorage
+				}
+				observation.Blocks.Value++
+				observation.DeltaBytes.Value += memBytes
+			}
+		}
+	}
 	return observation, ctx.Err()
 }

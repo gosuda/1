@@ -29,13 +29,14 @@ type CheckpointVerifier struct {
 }
 
 type checkpointVerification struct {
-	limits       Limits
-	manifest     storage.CheckpointManifest
-	extras       []string
-	used         []bool
-	metadata     uint64
-	transactions ordered.Tree[recoveryTxnID, transactionRecord]
-	layouts      ordered.Tree[checkpointTarget, [32]byte]
+	limits         Limits
+	manifest       storage.CheckpointManifest
+	extras         []string
+	used           []bool
+	metadata       uint64
+	prunedPosition uint64
+	transactions   ordered.Tree[recoveryTxnID, transactionRecord]
+	layouts        ordered.Tree[checkpointTarget, [32]byte]
 }
 
 func (verifier CheckpointVerifier) VerifyCheckpoint(ctx context.Context, root *os.Root, manifest storage.CheckpointManifest) (err error) {
@@ -121,7 +122,7 @@ func (verifier CheckpointVerifier) VerifyCheckpoint(ctx context.Context, root *o
 			return err
 		}
 	}
-	if position.CommitTS > manifest.SnapshotTS || check.transactions.Len() != manifest.Fence.LogPosition {
+	if position.CommitTS > manifest.SnapshotTS || check.prunedPosition+check.transactions.Len() != manifest.Fence.LogPosition {
 		return storage.ErrCorruptStorage
 	}
 	for _, used := range check.used {

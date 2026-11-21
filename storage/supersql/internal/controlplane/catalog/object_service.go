@@ -1,7 +1,9 @@
 package catalog
 
 import (
+	"cmp"
 	"context"
+	"math"
 	"slices"
 
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
@@ -91,11 +93,18 @@ func (s *Store) PlanObjectDrops(ctx context.Context, snapshot *CatalogSnapshot, 
 // descriptor's dependencies instead.
 func ordinaryObjectKind(kind model.ObjectKind) bool {
 	switch kind {
-	case model.ObjectSchema, model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectCompositeRelation, model.ObjectType, model.ObjectRoutine, model.ObjectOperator, model.ObjectCast, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration:
+	case model.ObjectSchema, model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectCompositeRelation, model.ObjectType, model.ObjectRoutine, model.ObjectOperator, model.ObjectCast, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectRole:
 		return true
 	default:
 		return false
 	}
+}
+
+func (s *Store) catalogScanLimit() uint32 {
+	if s.limits.Descriptor.MaxItems <= 0 {
+		return 0
+	}
+	return uint32(min(uint64(s.limits.Descriptor.MaxItems), uint64(math.MaxUint32)))
 }
 
 func (s *Store) objectDropOrder(ctx context.Context, snapshot *CatalogSnapshot, requested []*model.Descriptor, cascade bool, maximum uint32) ([]*model.Descriptor, error) {
@@ -106,6 +115,8 @@ func (s *Store) objectDropOrder(ctx context.Context, snapshot *CatalogSnapshot, 
 // dropOrder is the shared closure-expansion plus topological ordering used by
 // the generic object and type drop planners. Callers differ only in the kinds
 // they scan, the kind predicate they accept, and the error text they report.
+// The full-catalog scan is bounded by the store's descriptor population limit
+// (Limits.Descriptor.MaxItems), while maximum bounds only the affected targets.
 func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, requested []*model.Descriptor, cascade bool, maximum uint32, kinds []model.ObjectKind, scanMsg string, allowed func(model.ObjectKind) bool, cycleMsg, depMsg, limitMsg string) ([]*model.Descriptor, error) {
 	if len(requested) == 0 {
 		return nil, nil
@@ -117,37 +128,68 @@ func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, reques
 		}
 		targets[descriptor.ID()] = descriptor
 	}
-	for {
-		added := false
-		err := scanDescriptors(ctx, snapshot, maximum, kinds, scanMsg, func(descriptor *model.Descriptor) error {
-			if descriptor == nil || targets[descriptor.ID()] != nil {
-				return nil
+	if uint64(len(targets)) > uint64(maximum) {
+		return nil, &model.Error{Code: "54000", Message: limitMsg}
+	}
+	dependents := make(map[model.ObjectID][]*model.Descriptor)
+	depsByID := make(map[model.ObjectID][]model.Dependency)
+	err := scanDescriptors(ctx, snapshot, s.catalogScanLimit(), kinds, scanMsg, func(descriptor *model.Descriptor) error {
+		if descriptor == nil {
+			return nil
+		}
+		spec, err := descriptor.SpecWithin(ctx, s.limits.Descriptor)
+		if err != nil {
+			return err
+		}
+		id := descriptor.ID()
+		depsByID[id] = spec.Dependencies
+		inTargets := targets[id] != nil
+		var seenDep map[model.ObjectID]struct{}
+		for _, dependency := range spec.Dependencies {
+			if dependency.Object == id || dependency.Object == 0 {
+				continue
 			}
-			spec, err := descriptor.Spec(ctx)
-			if err != nil {
-				return err
-			}
-			depends := slices.ContainsFunc(spec.Dependencies, func(dependency model.Dependency) bool {
-				return targets[dependency.Object] != nil && dependency.Object != descriptor.ID()
-			})
-			if !depends {
-				return nil
-			}
-			if !cascade {
+			if !inTargets && !cascade && targets[dependency.Object] != nil {
 				return &model.Error{Code: "2BP01", Message: depMsg}
 			}
-			if uint64(len(targets)) >= uint64(maximum) {
-				return &model.Error{Code: "54000", Message: limitMsg}
+			if len(spec.Dependencies) > 1 {
+				if seenDep == nil {
+					seenDep = make(map[model.ObjectID]struct{}, len(spec.Dependencies))
+				}
+				if _, dup := seenDep[dependency.Object]; dup {
+					continue
+				}
+				seenDep[dependency.Object] = struct{}{}
 			}
-			targets[descriptor.ID()] = descriptor
-			added = true
-			return nil
-		})
-		if err != nil {
-			return nil, err
+			dependents[dependency.Object] = append(dependents[dependency.Object], descriptor)
 		}
-		if !added {
-			break
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if cascade {
+		queue := make([]model.ObjectID, 0, len(targets))
+		for id := range targets {
+			queue = append(queue, id)
+		}
+		slices.Sort(queue)
+		for head := 0; head < len(queue); head++ {
+			current := queue[head]
+			children := dependents[current]
+			slices.SortFunc(children, func(left, right *model.Descriptor) int {
+				return cmp.Compare(left.ID(), right.ID())
+			})
+			for _, child := range children {
+				if targets[child.ID()] != nil {
+					continue
+				}
+				if uint64(len(targets)) >= uint64(maximum) {
+					return nil, &model.Error{Code: "54000", Message: limitMsg}
+				}
+				targets[child.ID()] = child
+				queue = append(queue, child.ID())
+			}
 		}
 	}
 	ids := make([]model.ObjectID, 0, len(targets))
@@ -155,6 +197,33 @@ func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, reques
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	targetDependents := make(map[model.ObjectID][]model.ObjectID, len(ids))
+	for _, candidateID := range ids {
+		deps, known := depsByID[candidateID]
+		if !known {
+			spec, err := targets[candidateID].SpecWithin(ctx, s.limits.Descriptor)
+			if err != nil {
+				return nil, err
+			}
+			deps = spec.Dependencies
+		}
+		var seen map[model.ObjectID]struct{}
+		for _, dependency := range deps {
+			if dependency.Object == candidateID || targets[dependency.Object] == nil {
+				continue
+			}
+			if len(deps) > 1 {
+				if seen == nil {
+					seen = make(map[model.ObjectID]struct{}, len(deps))
+				}
+				if _, dup := seen[dependency.Object]; dup {
+					continue
+				}
+				seen[dependency.Object] = struct{}{}
+			}
+			targetDependents[dependency.Object] = append(targetDependents[dependency.Object], candidateID)
+		}
+	}
 	ordered := make([]*model.Descriptor, 0, len(targets))
 	visiting := make(map[model.ObjectID]bool, len(targets))
 	visited := make(map[model.ObjectID]bool, len(targets))
@@ -167,19 +236,9 @@ func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, reques
 			return &model.Error{Code: "2BP01", Message: cycleMsg}
 		}
 		visiting[id] = true
-		for _, candidateID := range ids {
-			if candidateID == id {
-				continue
-			}
-			candidate := targets[candidateID]
-			spec, err := candidate.Spec(ctx)
-			if err != nil {
+		for _, dependentID := range targetDependents[id] {
+			if err := visit(dependentID); err != nil {
 				return err
-			}
-			if slices.ContainsFunc(spec.Dependencies, func(dependency model.Dependency) bool { return dependency.Object == id }) {
-				if err := visit(candidateID); err != nil {
-					return err
-				}
 			}
 		}
 		visiting[id] = false

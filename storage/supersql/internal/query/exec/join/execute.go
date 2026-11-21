@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"unsafe"
 
 	"github.com/zeebo/xxh3"
@@ -12,8 +13,16 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
+	"github.com/gosuda/supersql-alpha/internal/query/exec/rowstore"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
 )
+
+func partitionHash(key []byte, depth int) uint64 {
+	if depth <= 1 {
+		return xxh3.Hash(key)
+	}
+	return xxh3.HashSeed(key, uint64(depth)*0x9e3779b97f4a7c15)
+}
 
 func (c *cursor) initialize(ctx context.Context) error {
 	if c.options.Kind == ir.MarkJoin {
@@ -21,6 +30,8 @@ func (c *cursor) initialize(ctx context.Context) error {
 	}
 	for i := range c.partitions {
 		p := &c.partitions[i]
+		p.depth = 1
+		p.logical = uint32(i)
 		var err error
 		p.left, err = c.newSpool(ctx, Left)
 		if err != nil {
@@ -159,6 +170,107 @@ func (c *cursor) prepareRow(ctx context.Context, batch *columnar.Batch, lane int
 
 func (c *cursor) openPartition(ctx context.Context) error {
 	p := &c.partitions[c.part]
+	leftEmpty := p.left == nil || p.left.Rows() == 0
+	rightEmpty := p.right == nil || p.right.Rows() == 0
+
+	if leftEmpty {
+		if !c.preservesRight() || rightEmpty {
+			if err := c.closePartition(); err != nil {
+				return err
+			}
+			c.part++
+			return nil
+		}
+		var err error
+		c.rightReader, err = p.right.Reader(ctx)
+		if err != nil {
+			return err
+		}
+		c.draining = true
+		c.hashMode = false
+		c.partOpen = true
+		return nil
+	}
+	if rightEmpty {
+		if !c.emitsUnmatchedLeft() {
+			if err := c.closePartition(); err != nil {
+				return err
+			}
+			c.part++
+			return nil
+		}
+		var err error
+		c.leftReader, err = p.left.Reader(ctx)
+		if err != nil {
+			return err
+		}
+		c.hashMode = true
+		c.partOpen = true
+		return nil
+	}
+
+	if len(c.options.Keys) > 0 {
+		rows := p.right.Rows()
+		perEntry := uint64(unsafe.Sizeof(entry{})) + uint64(unsafe.Sizeof(int(0)))*2
+		fits := rows <= c.hashBytes/perEntry
+		if fits {
+			// Fixed arrays avoid map growth or a per-key allocation during build/probe.
+			size := rows * perEntry
+			var err error
+			c.hashClaim, err = c.options.Query.Allocator(runtime.WorkMemory).Reserve(size)
+			if errors.Is(err, runtime.ErrBudget) {
+				fits = false
+			} else if err != nil {
+				return err
+			}
+		}
+		if fits {
+			var err error
+			c.leftReader, err = p.left.Reader(ctx)
+			if err != nil {
+				return err
+			}
+			c.rightReader, err = p.right.Reader(ctx)
+			if err != nil {
+				return err
+			}
+			c.entries = make([]entry, 0, int(rows))
+			c.buckets = make([]int, max(1, int(rows)*2))
+			for i := range c.buckets {
+				c.buckets[i] = -1
+			}
+			for {
+				position, row, e := c.rightReader.NextRow(ctx)
+				if e == io.EOF {
+					break
+				}
+				if e != nil {
+					return e
+				}
+				hash := partitionHash(row[0].BytesVal, p.depth+1)
+				bucket := hash % uint64(len(c.buckets))
+				index := len(c.entries)
+				c.entries = append(c.entries, entry{position: position, next: c.buckets[bucket]})
+				if row[1].IntVal != 0 {
+					c.buckets[bucket] = index
+				}
+			}
+			c.hashMode = true
+			c.partOpen = true
+			return nil
+		}
+		if p.depth < c.options.MaxDepth && c.options.MaxPartitions >= 2 && rows > 1 {
+			split, err := c.repartition(ctx)
+			if err != nil {
+				return err
+			}
+			if split {
+				return nil
+			}
+		}
+		c.replayFallbacks++
+	}
+
 	var err error
 	c.leftReader, err = p.left.Reader(ctx)
 	if err != nil {
@@ -168,46 +280,202 @@ func (c *cursor) openPartition(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(c.options.Keys) == 0 {
-		return nil
+	c.partOpen = true
+	return nil
+}
+
+func (c *cursor) repartition(ctx context.Context) (bool, error) {
+	p := &c.partitions[c.part]
+	fanout := c.options.MaxPartitions
+	nextDepth, ok, err := c.selectRepartitionDepth(ctx, p.right, p.depth+1, fanout)
+	if err != nil || !ok {
+		return false, err
 	}
-	rows := p.right.Rows()
-	perEntry := uint64(unsafe.Sizeof(entry{})) + uint64(unsafe.Sizeof(int(0)))*2
-	if max(uint64(1), rows) > c.hashBytes/perEntry {
-		return nil
+	subRight := make([]*rowstore.Spool, fanout)
+	subLeft := make([]*rowstore.Spool, fanout)
+	cleanup := func() error {
+		var closeErr error
+		for i := range fanout {
+			if subRight[i] != nil {
+				closeErr = errors.Join(closeErr, subRight[i].Close())
+				subRight[i] = nil
+			}
+			if subLeft[i] != nil {
+				closeErr = errors.Join(closeErr, subLeft[i].Close())
+				subLeft[i] = nil
+			}
+		}
+		return closeErr
 	}
-	// Fixed arrays avoid map growth or a per-key allocation during build/probe.
-	size := max(uint64(1), rows) * perEntry
-	c.hashClaim, err = c.options.Query.Allocator(runtime.WorkMemory).Reserve(size)
-	if errors.Is(err, runtime.ErrBudget) {
-		return nil
-	}
+
+	splitRight, err := c.splitSide(ctx, p.right, Right, nextDepth, fanout, subRight, nil)
 	if err != nil {
-		return err
+		return false, errors.Join(err, cleanup())
 	}
-	c.entries = make([]entry, 0, int(rows))
-	c.buckets = make([]int, max(1, int(rows)*2))
-	for i := range c.buckets {
-		c.buckets[i] = -1
+	if !splitRight {
+		return false, cleanup()
+	}
+
+	var rightPresence []*rowstore.Spool
+	if !c.emitsUnmatchedLeft() {
+		rightPresence = subRight
+	}
+	splitLeft, err := c.splitSide(ctx, p.left, Left, nextDepth, fanout, subLeft, rightPresence)
+	if err != nil {
+		return false, errors.Join(err, cleanup())
+	}
+	if !splitLeft {
+		return false, cleanup()
+	}
+
+	var closeErr error
+	if p.left != nil {
+		closeErr = errors.Join(closeErr, p.left.Close())
+		p.left = nil
+	}
+	if p.right != nil {
+		closeErr = errors.Join(closeErr, p.right.Close())
+		p.right = nil
+	}
+	if closeErr != nil {
+		return false, errors.Join(closeErr, cleanup())
+	}
+
+	logical := p.logical
+	children := make([]partition, 0, fanout)
+	for i := range fanout {
+		if subLeft[i] == nil && subRight[i] == nil {
+			continue
+		}
+		if subLeft[i] == nil && !c.preservesRight() {
+			if err := subRight[i].Close(); err != nil {
+				subRight[i] = nil
+				return false, errors.Join(err, cleanup())
+			}
+			subRight[i] = nil
+			continue
+		}
+		children = append(children, partition{
+			left:    subLeft[i],
+			right:   subRight[i],
+			depth:   nextDepth,
+			logical: logical,
+		})
+		subLeft[i] = nil
+		subRight[i] = nil
+	}
+	c.partitions = slices.Replace(c.partitions, c.part, c.part+1, children...)
+	c.repartitions++
+	return true, nil
+}
+
+func (c *cursor) selectRepartitionDepth(ctx context.Context, spool *rowstore.Spool, startDepth, fanout int) (int, bool, error) {
+	counts := make([]uint64, fanout)
+	var firstKey []byte
+	for depth := startDepth; depth <= c.options.MaxDepth; depth++ {
+		clear(counts)
+		r, err := spool.Reader(ctx)
+		if err != nil {
+			return 0, false, err
+		}
+		hasFirst := false
+		distinct := false
+		for {
+			if err := c.check(ctx); err != nil {
+				return 0, false, errors.Join(err, r.Close())
+			}
+			_, row, e := r.NextRow(ctx)
+			if e == io.EOF {
+				break
+			}
+			if e != nil {
+				return 0, false, errors.Join(e, r.Close())
+			}
+			key := row[0].BytesVal
+			if !hasFirst {
+				firstKey = append(firstKey[:0], key...)
+				hasFirst = true
+			} else if !distinct && !bytes.Equal(key, firstKey) {
+				distinct = true
+			}
+			idx := partitionHash(key, depth) % uint64(fanout)
+			counts[idx]++
+		}
+		if err := r.Close(); err != nil {
+			return 0, false, err
+		}
+		if !distinct {
+			// All rows share an identical join key; recursive hashing cannot split it further.
+			return 0, false, nil
+		}
+		nonEmpty := 0
+		for _, n := range counts {
+			if n > 0 {
+				nonEmpty++
+			}
+		}
+		if nonEmpty >= 2 {
+			return depth, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func (c *cursor) splitSide(ctx context.Context, spool *rowstore.Spool, side Side, depth, fanout int, dst, requireNonNil []*rowstore.Spool) (bool, error) {
+	if spool == nil || spool.Rows() == 0 {
+		return true, nil
+	}
+	r, err := spool.Reader(ctx)
+	if err != nil {
+		return false, err
 	}
 	for {
-		position, row, e := c.rightReader.NextRow(ctx)
+		if err := c.check(ctx); err != nil {
+			return false, errors.Join(err, r.Close())
+		}
+		_, row, e := r.NextRow(ctx)
 		if e == io.EOF {
 			break
 		}
 		if e != nil {
-			return e
+			return false, errors.Join(e, r.Close())
 		}
-		hash := xxh3.Hash(row[0].BytesVal)
-		bucket := hash % uint64(len(c.buckets))
-		index := len(c.entries)
-		c.entries = append(c.entries, entry{position: position, next: c.buckets[bucket]})
-		if row[1].IntVal != 0 {
-			c.buckets[bucket] = index
+		idx := partitionHash(row[0].BytesVal, depth) % uint64(fanout)
+		if requireNonNil != nil && requireNonNil[idx] == nil {
+			continue
+		}
+		if dst[idx] == nil {
+			sp, e := c.newSpoolForDepth(ctx, side, depth)
+			if errors.Is(e, runtime.ErrBudget) {
+				return false, r.Close()
+			}
+			if e != nil {
+				return false, errors.Join(e, r.Close())
+			}
+			dst[idx] = sp
+		}
+		if _, e := dst[idx].AppendRow(ctx, row); e != nil {
+			if errors.Is(e, runtime.ErrBudget) {
+				return false, r.Close()
+			}
+			return false, errors.Join(e, r.Close())
 		}
 	}
-	c.hashMode = true
-	return nil
+	if err := r.Close(); err != nil {
+		return false, err
+	}
+	for i := range fanout {
+		if dst[i] == nil {
+			continue
+		}
+		if err := dst[i].Seal(ctx); err != nil {
+			if errors.Is(err, runtime.ErrBudget) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (c *cursor) mapRow(dst []model.Value, mapping []Column, left, right []model.Value) {
@@ -340,8 +608,8 @@ func (c *cursor) startLeft(ctx context.Context) error {
 	c.scanning = true
 	if c.hashMode {
 		c.candidate = -1
-		if row[1].IntVal != 0 {
-			hash := xxh3.Hash(row[0].BytesVal)
+		if row[1].IntVal != 0 && len(c.buckets) > 0 {
+			hash := partitionHash(row[0].BytesVal, c.partitions[c.part].depth+1)
 			c.candidate = c.buckets[hash%uint64(len(c.buckets))]
 		}
 		return nil
@@ -390,9 +658,12 @@ func (c *cursor) next(ctx context.Context) error {
 		if err := c.check(ctx); err != nil {
 			return err
 		}
-		if c.leftReader == nil {
+		if !c.partOpen {
 			if err := c.openPartition(ctx); err != nil {
 				return err
+			}
+			if !c.partOpen {
+				continue
 			}
 		}
 		if c.draining {

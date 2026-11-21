@@ -68,18 +68,26 @@ func nativeV2SST(t *testing.T, data []byte) []byte {
 	indexOffset := int(binary.LittleEndian.Uint64(data[40:48]))
 	count := int(binary.LittleEndian.Uint32(data[36:40]))
 	index := data[indexOffset:]
+	rangeCount := int(binary.LittleEndian.Uint32(index[4:8]))
+	keyBytes := int(binary.LittleEndian.Uint64(index[8:16]))
+	blobCount := int(binary.LittleEndian.Uint32(index[16:20]))
+	zoneCount := int(binary.LittleEndian.Uint32(index[20:24]))
 	out := append([]byte(nil), data[:64]...)
 	out = append(out, data[sstHeaderSize:indexOffset]...)
 	previousOffset := len(out)
-	out = append(out, index[:sstIndexHeaderSize]...)
+	out = append(out, index[:sstIndexHeaderSizeV3]...)
 	var encoded [sstEntrySize]byte
 	for i := range count {
-		entry := decodeSSTEntry(index[sstIndexHeaderSize+i*sstEntrySize:sstIndexHeaderSize+(i+1)*sstEntrySize])
-		entry.offset -= sstHeaderSize-64
+		entry := decodeSSTEntry(index[sstIndexHeaderSize+i*sstEntrySize : sstIndexHeaderSize+(i+1)*sstEntrySize])
+		entry.offset -= sstHeaderSize - 64
 		encodeSSTEntry(encoded[:], entry)
 		out = append(out, encoded[:56]...)
 	}
-	out = append(out, index[sstIndexHeaderSize+count*sstEntrySize:len(index)-sstIndexHashSize]...)
+	rangeStart := sstIndexHeaderSize + count*sstEntrySize
+	rangeEnd := rangeStart + rangeCount*sstRangeEntrySize
+	out = append(out, index[rangeStart:rangeEnd]...)
+	keyStart := rangeEnd + blobCount*sstBlobEntrySize + zoneCount*sstZoneEntrySize
+	out = append(out, index[keyStart:keyStart+keyBytes]...)
 	digest := sha256.Sum256(out[previousOffset:])
 	out = append(out, digest[:]...)
 	copy(out[:8], "NSSST002")

@@ -71,7 +71,7 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 
 	requireCode := func(statement, code string) {
 		t.Helper()
-		_, err := database.Exec(ctx, statement, 0)
+		_, err := database.exec(ctx, statement, 0)
 		if err == nil {
 			t.Fatalf("%s: expected SQLSTATE %s, got nil error", statement, code)
 		}
@@ -81,7 +81,7 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 	}
 	requireExec := func(statement string) {
 		t.Helper()
-		if _, err := database.Exec(ctx, statement, 0); err != nil {
+		if _, err := database.exec(ctx, statement, 0); err != nil {
 			t.Fatalf("%s: %v", statement, err)
 		}
 	}
@@ -182,7 +182,7 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 	}
 	covered := make(map[string]bool)
 	for _, excludedStatement := range excluded {
-		_, err := database.Exec(ctx, excludedStatement.statement, 0)
+		_, err := database.exec(ctx, excludedStatement.statement, 0)
 		if err == nil {
 			t.Fatalf("%s: expected 0A000 %s, got nil error", excludedStatement.statement, excludedStatement.feature)
 		}
@@ -232,7 +232,7 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 
 	// A statement rejected during binding does not advance sequence state.
 	requireCode(`SELECT nextval('s'), XMLPARSE(DOCUMENT '<a/>')`, "0A000")
-	result, err := database.Exec(ctx, `SELECT nextval('s')`, 0)
+	result, err := database.exec(ctx, `SELECT nextval('s')`, 0)
 	if err != nil {
 		t.Fatalf("nextval: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 	// table.
 	requireExec(`CREATE TABLE pg_stat_activity (a int)`)
 	requireExec(`INSERT INTO public.pg_stat_activity VALUES (1)`)
-	result, err = database.Exec(ctx, `SELECT a FROM public.pg_stat_activity`, 0)
+	result, err = database.exec(ctx, `SELECT a FROM public.pg_stat_activity`, 0)
 	if err != nil {
 		t.Fatalf("qualified user pg_stat_activity: %v", err)
 	}
@@ -491,10 +491,10 @@ func TestHistoricalCatalogSnapshot(t *testing.T) {
 	}
 	defer database.Close()
 
-	if _, err := database.Exec(ctx, `CREATE TABLE items (id bigint PRIMARY KEY, value text)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE items (id bigint PRIMARY KEY, value text)`, 0); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := database.Exec(ctx, `INSERT INTO items VALUES (1, 'before')`, 0); err != nil {
+	if _, err := database.exec(ctx, `INSERT INTO items VALUES (1, 'before')`, 0); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	// Capture a certified instant above the committed insert.
@@ -502,14 +502,14 @@ func TestHistoricalCatalogSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clock read: %v", err)
 	}
-	if _, err := database.Exec(ctx, `UPDATE items SET value = 'after' WHERE id = 1`, 0); err != nil {
+	if _, err := database.exec(ctx, `UPDATE items SET value = 'after' WHERE id = 1`, 0); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if _, err := database.Exec(ctx, `ALTER TABLE items ADD COLUMN extra bigint`, 0); err != nil {
+	if _, err := database.exec(ctx, `ALTER TABLE items ADD COLUMN extra bigint`, 0); err != nil {
 		t.Fatalf("alter: %v", err)
 	}
 	instant := time.Unix(0, int64(reading.Latest)).UTC()
-	historical, err := database.Exec(ctx,
+	historical, err := database.exec(ctx,
 		`SELECT value FROM items AS OF SYSTEM TIME '`+instant.Format("2006-01-02 15:04:05.999999999-07:00")+`'::timestamptz`, 0)
 	if err != nil {
 		t.Fatalf("historical select: %v", err)

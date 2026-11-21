@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
 	"github.com/gosuda/supersql-alpha/internal/query/physical"
 )
@@ -25,6 +26,13 @@ type joinPredicate struct {
 	leaves      []int
 	selectivity float64
 	tree        *joinTree
+	hashLeft    int
+	hashRight   int
+}
+type reorderedRegion struct {
+	region ir.RelID
+	tree   *joinTree
+	facts  []joinPredicate
 }
 
 func reorderAllocate[T any](o *optimizer, n uint64) []T {
@@ -41,17 +49,57 @@ func reorderAllocate[T any](o *optimizer, n uint64) []T {
 	return allocate[T](o, n)
 }
 
+func (o *optimizer) hashJoinLeaves(id ir.ScalarID, leafOf func(model.SlotID) int) (int, int) {
+	s, ok := o.graph.Scalar(id)
+	if !ok || s.Kind != ir.Call || s.OperandCount() != 2 || !s.Strict || s.Effects.Volatility != ir.Immutable || s.Effects.MayError || s.Operator == 0 {
+		return -1, -1
+	}
+	op, ok := builtin.LookupOperator(s.Operator)
+	if !ok || !op.HashJoinable {
+		return -1, -1
+	}
+	lhsID, _ := o.graph.Operand(id, 0)
+	rhsID, _ := o.graph.Operand(id, 1)
+	lhs, _ := o.graph.Scalar(lhsID)
+	rhs, _ := o.graph.Scalar(rhsID)
+	if lhs.Kind != ir.Slot || rhs.Kind != ir.Slot {
+		return -1, -1
+	}
+	lk, rk := o.key(lhs.Slot), o.key(rhs.Slot)
+	if lk.Type != rk.Type || lk.Collation != rk.Collation {
+		return -1, -1
+	}
+	li, ri := leafOf(lhs.Slot), leafOf(rhs.Slot)
+	if li >= 0 && ri >= 0 && li != ri {
+		return li, ri
+	}
+	return -1, -1
+}
+
 func (o *optimizer) subsetJoin(leaves []ir.RelID, predicates []ir.ScalarID) (*joinTree, []joinPredicate) {
 	facts := reorderAllocate[joinPredicate](o, uint64(len(predicates)))
 	if o.err != nil || o.exhausted {
 		return nil, nil
+	}
+	leafOf := func(slot model.SlotID) int {
+		for i, leaf := range leaves {
+			r, _ := o.graph.Rel(leaf)
+			for j := range r.OutputCount() {
+				out, _ := o.graph.Output(leaf, j)
+				if out == slot {
+					return i
+				}
+			}
+		}
+		return -1
 	}
 	for i, predicate := range predicates {
 		mask, safe := o.predicateMask(predicate, leaves, 0)
 		if !safe {
 			return nil, nil
 		}
-		facts[i] = joinPredicate{id: predicate, mask: mask, selectivity: o.selectivity(predicate, 0)}
+		hl, hr := o.hashJoinLeaves(predicate, leafOf)
+		facts[i] = joinPredicate{id: predicate, mask: mask, selectivity: o.selectivity(predicate, 0), hashLeft: hl, hashRight: hr}
 	}
 	count := 1 << len(leaves)
 	trees := reorderAllocate[joinTree](o, uint64(count))
@@ -83,17 +131,25 @@ func (o *optimizer) exploreSubset(trees []joinTree, facts []joinPredicate, mask 
 		}
 		right := mask ^ left
 		selectivity := 1.0
+		hasHashKey := false
+		leftMask, rightMask := uint16(left), uint16(right)
 		for _, predicate := range facts {
 			if !o.step(1) {
 				return false
 			}
-			crosses := predicate.mask&uint16(left) != predicate.mask && predicate.mask&uint16(right) != predicate.mask
+			crosses := predicate.mask&leftMask != predicate.mask && predicate.mask&rightMask != predicate.mask
 			rootFilter := mask == len(trees)-1 && bits.OnesCount16(predicate.mask) < 2
 			if predicate.mask&uint16(mask) == predicate.mask && (crosses || rootFilter) {
 				selectivity *= predicate.selectivity
 			}
+			if crosses && predicate.hashLeft >= 0 {
+				lBit, rBit := uint16(1)<<predicate.hashLeft, uint16(1)<<predicate.hashRight
+				if (leftMask&lBit != 0 && rightMask&rBit != 0) || (leftMask&rBit != 0 && rightMask&lBit != 0) {
+					hasHashKey = true
+				}
+			}
 		}
-		candidate := o.joinCandidate(&trees[left], &trees[right], selectivity)
+		candidate := o.joinCandidate(&trees[left], &trees[right], selectivity, hasHashKey)
 		candidate.mask = uint16(mask)
 		o.expressions++
 		if trees[mask].mask == 0 || candidate.cost < trees[mask].cost {
@@ -104,19 +160,33 @@ func (o *optimizer) exploreSubset(trees []joinTree, facts []joinPredicate, mask 
 }
 
 func (o *optimizer) joinLeaf(id ir.RelID) joinTree {
-	node := &o.groups[id].seed.node
+	best := o.groups[id].seed
+	for _, alt := range o.groups[id].alternatives {
+		if alt != nil && alt.node.Cost.Total < best.node.Cost.Total {
+			best = alt
+		}
+	}
+	node := &best.node
 	return joinTree{leaf: id, rows: node.Estimate.Rows, rowBytes: node.Estimate.RowBytes, cost: node.Cost.Total}
 }
 
-func (o *optimizer) joinCandidate(left, right *joinTree, selectivity float64) joinTree {
+func (o *optimizer) joinCandidate(left, right *joinTree, selectivity float64, hasHashKey bool) joinTree {
 	l := expression{node: physical.NodeSpec{Estimate: physical.Estimate{Rows: left.rows, RowBytes: left.rowBytes}, Cost: physical.Cost{Total: left.cost}}}
 	r := expression{node: physical.NodeSpec{Estimate: physical.Estimate{Rows: right.rows, RowBytes: right.rowBytes}, Cost: physical.Cost{Total: right.cost}}}
 	children := [2]*expression{&l, &r}
 	rows := cappedMultiply(left.rows, right.rows) * selectivity
 	width := left.rowBytes + right.rowBytes
-	e := expression{node: physical.NodeSpec{Algorithm: physical.NestedLoopJoin, Estimate: physical.Estimate{Rows: rows, RowBytes: width}}, children: children[:]}
-	o.cost(&e)
-	return joinTree{left: left, right: right, rows: rows, rowBytes: width, cost: e.node.Cost.Total}
+	nl := expression{node: physical.NodeSpec{Algorithm: physical.NestedLoopJoin, Break: physical.ExpectedBreak(physical.NestedLoopJoin), Estimate: physical.Estimate{Rows: rows, RowBytes: width}}, children: children[:]}
+	o.cost(&nl)
+	bestCost := nl.node.Cost.Total
+	if hasHashKey {
+		hj := expression{node: physical.NodeSpec{Algorithm: physical.HashJoin, Break: physical.ExpectedBreak(physical.HashJoin), Estimate: physical.Estimate{Rows: rows, RowBytes: width}}, children: children[:]}
+		o.cost(&hj)
+		if hj.node.Cost.Total < bestCost {
+			bestCost = hj.node.Cost.Total
+		}
+	}
+	return joinTree{left: left, right: right, rows: rows, rowBytes: width, cost: bestCost}
 }
 
 // Large regions retain only one prefix and one candidate per remaining leaf.
@@ -155,6 +225,12 @@ func (o *optimizer) greedyJoin(leaves []ir.RelID, predicates []ir.ScalarID) (*jo
 			owners[slot] = i + 1
 		}
 	}
+	leafOf := func(slot model.SlotID) int {
+		if int(slot) >= len(owners) || owners[slot] == 0 {
+			return -1
+		}
+		return owners[slot] - 1
+	}
 	for i, id := range predicates {
 		clear(marks)
 		if !o.step(uint64(len(marks))) || !o.predicateLeaves(id, owners, marks, 0) {
@@ -177,7 +253,8 @@ func (o *optimizer) greedyJoin(leaves []ir.RelID, predicates []ir.ScalarID) (*jo
 				at++
 			}
 		}
-		facts[i] = joinPredicate{id: id, leaves: refs, selectivity: o.selectivity(id, 0)}
+		hl, hr := o.hashJoinLeaves(id, leafOf)
+		facts[i] = joinPredicate{id: id, leaves: refs, selectivity: o.selectivity(id, 0), hashLeft: hl, hashRight: hr}
 	}
 	chosen[start] = true
 	prefix := &trees[start]
@@ -194,14 +271,23 @@ func (o *optimizer) greedyJoin(leaves []ir.RelID, predicates []ir.ScalarID) (*jo
 			}
 			selectivity := 1.0
 			connected := false
+			hasHashKey := false
 			for _, predicate := range facts {
 				ready, crosses := o.greedyPredicate(predicate, chosen, i)
 				if ready {
 					selectivity *= predicate.selectivity
 					connected = connected || crosses
+					if crosses && predicate.hashLeft >= 0 && ((chosen[predicate.hashLeft] && predicate.hashRight == i) || (chosen[predicate.hashRight] && predicate.hashLeft == i)) {
+						hasHashKey = true
+					}
 				}
 			}
-			candidate := o.joinCandidate(prefix, &trees[i], selectivity)
+			candidate := o.joinCandidate(prefix, &trees[i], selectivity, hasHashKey)
+			if hasHashKey {
+				if swapped := o.joinCandidate(&trees[i], prefix, selectivity, hasHashKey); swapped.cost < candidate.cost {
+					candidate = swapped
+				}
+			}
 			o.expressions++
 			newConnection := connected && !connectedWinner
 			betterCost := candidate.cost < best.cost || (candidate.cost == best.cost && candidate.rows < best.rows)
@@ -278,30 +364,77 @@ func (o *optimizer) predicateLeaves(id ir.ScalarID, owners []int, marks []bool, 
 	return true
 }
 
-// Reordering is restricted to identity-preserving inner/cross join regions.
-// Renamed outputs, captured scopes and effects remain original-order barriers.
-func (o *optimizer) reorder(best *physical.Plan) (*physical.Plan, error) {
-	root := o.graph.Root()
-	region := root
-	for o.step(1) {
-		r, _ := o.graph.Rel(region)
-		if r.SecurityBarrier || r.Effects.Volatility != ir.Immutable || r.Effects.MayError {
-			return best, nil
-		}
-		if r.Kind == ir.Join {
-			break
-		}
-		transparent := r.Kind == ir.Project || r.Kind == ir.Filter || r.Kind == ir.Sort
-		if r.InputCount() != 1 || !transparent {
-			return best, o.err
-		}
-		region, _ = o.graph.Input(region, 0)
-	}
+func (o *optimizer) isReorderableJoin(id ir.RelID) bool {
+	r, ok := o.graph.Rel(id)
+	return ok && r.Kind == ir.Join && (r.JoinKind == ir.InnerJoin || r.JoinKind == ir.CrossJoin) && !r.SecurityBarrier && r.Effects.Volatility == ir.Immutable && !r.Effects.MayError && o.graph.CaptureCount(r.Scope) == 0
+}
+
+func (o *optimizer) findJoinRegions(root ir.RelID) []ir.RelID {
+	visited := allocate[bool](o, uint64(o.graph.RelCount())+1)
 	if o.err != nil {
-		return nil, o.err
+		return nil
 	}
+	var regions []ir.RelID
+	var visit func(ir.RelID, uint32)
+	visit = func(id ir.RelID, depth uint32) {
+		if id == 0 || visited[id] || depth >= o.options.IR.MaxDepth || !o.step(1) {
+			return
+		}
+		visited[id] = true
+		r, ok := o.graph.Rel(id)
+		if !ok || r.SecurityBarrier || r.Effects.Volatility != ir.Immutable {
+			return
+		}
+		if o.isReorderableJoin(id) {
+			if !o.charge(2, 4) {
+				return
+			}
+			regions = append(regions, id)
+			return
+		}
+		switch r.Kind {
+		case ir.Project, ir.Filter, ir.Sort, ir.Aggregate, ir.Limit, ir.Distinct, ir.Window, ir.SetOp, ir.Join:
+			for i := range r.InputCount() {
+				child, _ := o.graph.Input(id, i)
+				visit(child, depth+1)
+			}
+		}
+	}
+	visit(root, 0)
+	return regions
+}
+
+func (o *optimizer) collectJoinRegion(region ir.RelID) ([]ir.RelID, []ir.ScalarID, bool) {
 	var leaves []ir.RelID
 	var predicates []ir.ScalarID
+	var addPredicate func(ir.ScalarID, uint32) bool
+	addPredicate = func(id ir.ScalarID, depth uint32) bool {
+		if id == 0 {
+			return true
+		}
+		if !o.step(1) {
+			return false
+		}
+		if depth >= o.options.IR.MaxDepth {
+			o.err = ErrLimit
+			return false
+		}
+		s, _ := o.graph.Scalar(id)
+		if s.Kind == ir.Bool && s.BoolOp == ir.And && s.OperandCount() != 0 {
+			for i := range s.OperandCount() {
+				child, _ := o.graph.Operand(id, i)
+				if !addPredicate(child, depth+1) {
+					return false
+				}
+			}
+			return true
+		}
+		if !o.charge(2, 4) {
+			return false
+		}
+		predicates = append(predicates, id)
+		return true
+	}
 	var collect func(ir.RelID, uint32) bool
 	collect = func(id ir.RelID, depth uint32) bool {
 		if !o.search() {
@@ -312,8 +445,7 @@ func (o *optimizer) reorder(best *physical.Plan) (*physical.Plan, error) {
 			return false
 		}
 		r, _ := o.graph.Rel(id)
-		reorderableKind := r.Kind == ir.Join && (r.JoinKind == ir.InnerJoin || r.JoinKind == ir.CrossJoin)
-		if !reorderableKind || r.SecurityBarrier || r.Effects.Volatility != ir.Immutable || r.Effects.MayError || o.graph.CaptureCount(r.Scope) != 0 {
+		if !o.isReorderableJoin(id) {
 			if !o.charge(2, 4) {
 				return false
 			}
@@ -342,28 +474,55 @@ func (o *optimizer) reorder(best *physical.Plan) (*physical.Plan, error) {
 		if l.Scope != r.Scope || rr.Scope != r.Scope {
 			return false
 		}
-		if r.Predicate != 0 {
-			if !o.charge(2, 4) {
-				return false
-			}
-			predicates = append(predicates, r.Predicate)
+		if !addPredicate(r.Predicate, 0) {
+			return false
 		}
 		return collect(left, depth+1) && collect(right, depth+1)
 	}
 	if !collect(region, 0) || len(leaves) < 2 {
+		return nil, nil, false
+	}
+	return leaves, predicates, true
+}
+
+// Reordering is restricted to identity-preserving inner/cross join regions.
+// Renamed outputs, captured scopes and effects remain original-order barriers.
+func (o *optimizer) reorder(best *physical.Plan) (*physical.Plan, error) {
+	regionIDs := o.findJoinRegions(o.graph.Root())
+	if o.err != nil || len(regionIDs) == 0 {
 		return best, o.err
 	}
-	var tree *joinTree
-	var facts []joinPredicate
-	if len(leaves) <= 8 {
-		tree, facts = o.subsetJoin(leaves, predicates)
-	} else {
-		tree, facts = o.greedyJoin(leaves, predicates)
+	var reordered []reorderedRegion
+	for _, region := range regionIDs {
+		if !o.search() {
+			break
+		}
+		leaves, predicates, ok := o.collectJoinRegion(region)
+		if o.err != nil {
+			return nil, o.err
+		}
+		if !ok {
+			continue
+		}
+		var tree *joinTree
+		var facts []joinPredicate
+		if len(leaves) <= 8 {
+			tree, facts = o.subsetJoin(leaves, predicates)
+		} else {
+			tree, facts = o.greedyJoin(leaves, predicates)
+		}
+		if o.err != nil {
+			return nil, o.err
+		}
+		if tree == nil {
+			continue
+		}
+		if !o.charge(2, uint64(unsafe.Sizeof(reorderedRegion{}))) {
+			return nil, o.err
+		}
+		reordered = append(reordered, reorderedRegion{region: region, tree: tree, facts: facts})
 	}
-	if tree == nil {
-		return best, o.err
-	}
-	if !o.search() {
+	if len(reordered) == 0 || !o.search() {
 		return best, o.err
 	}
 	reserve := o.options.IR.MaxBytes + o.options.Plan.MaxBytes
@@ -371,7 +530,7 @@ func (o *optimizer) reorder(best *physical.Plan) (*physical.Plan, error) {
 		o.exhausted = true
 		return best, nil
 	}
-	graph, err := o.rebuildJoin(region, tree, facts)
+	graph, err := o.rebuildJoins(reordered)
 	if err != nil {
 		if errors.Is(err, ir.ErrLimit) {
 			o.exhausted = true
@@ -441,7 +600,7 @@ func (o *optimizer) predicateMask(id ir.ScalarID, leaves []ir.RelID, depth uint3
 	}
 	return mask, true
 }
-func (o *optimizer) rebuildJoin(region ir.RelID, tree *joinTree, predicates []joinPredicate) (*ir.Graph, error) {
+func (o *optimizer) rebuildJoins(regions []reorderedRegion) (*ir.Graph, error) {
 	if !o.charge(o.options.IR.MaxBytes, 1) {
 		return nil, o.err
 	}
@@ -449,123 +608,169 @@ func (o *optimizer) rebuildJoin(region ir.RelID, tree *joinTree, predicates []jo
 	if err != nil {
 		return nil, err
 	}
-	logical, _ := o.graph.Rel(region)
+	replacements := allocate[ir.RelID](o, uint64(o.graph.RelCount())+1)
+	if o.err != nil {
+		return nil, o.err
+	}
 	type built struct {
 		id    ir.RelID
 		slots []model.SlotID
 	}
-	var build func(*joinTree, bool) (built, error)
-	build = func(t *joinTree, root bool) (built, error) {
-		if !o.step(1) {
-			return built{}, o.err
-		}
-		if t.leaf != 0 {
-			r, _ := o.graph.Rel(t.leaf)
-			slots := allocate[model.SlotID](o, uint64(r.OutputCount()))
-			if o.err != nil {
+	for _, entry := range regions {
+		logical, _ := o.graph.Rel(entry.region)
+		var build func(*joinTree, bool) (built, error)
+		build = func(t *joinTree, root bool) (built, error) {
+			if !o.step(1) {
 				return built{}, o.err
 			}
-			for i := range slots {
-				slots[i], _ = o.graph.Output(t.leaf, uint32(i))
-			}
-			return built{id: t.leaf, slots: slots}, nil
-		}
-		left, err := build(t.left, false)
-		if err != nil {
-			return built{}, err
-		}
-		right, err := build(t.right, false)
-		if err != nil {
-			return built{}, err
-		}
-		outputs := allocate[model.SlotID](o, uint64(len(left.slots)+len(right.slots)))
-		if o.err != nil {
-			return built{}, o.err
-		}
-		copy(outputs, left.slots)
-		copy(outputs[len(left.slots):], right.slots)
-		var selected []ir.ScalarID
-		for _, predicate := range predicates {
-			crosses := predicate.mask&t.left.mask != predicate.mask && predicate.mask&t.right.mask != predicate.mask
-			rootFilter := root && bits.OnesCount16(predicate.mask) < 2
-			covered := t.mask != 0 && predicate.mask&t.mask == predicate.mask
-			belongsHere := covered && (crosses || rootFilter)
-			if predicate.tree == t || belongsHere {
-				if !o.charge(2, 4) {
+			if t.leaf != 0 {
+				r, _ := o.graph.Rel(t.leaf)
+				slots := allocate[model.SlotID](o, uint64(r.OutputCount()))
+				if o.err != nil {
 					return built{}, o.err
 				}
-				selected = append(selected, predicate.id)
+				for i := range slots {
+					slots[i], _ = o.graph.Output(t.leaf, uint32(i))
+				}
+				return built{id: t.leaf, slots: slots}, nil
 			}
-		}
-		predicate := ir.ScalarID(0)
-		if len(selected) == 1 {
-			predicate = selected[0]
-		}
-		if len(selected) > 1 {
-			s, _ := o.graph.Scalar(selected[0])
-			predicate, err = b.AddScalar(o.ctx, ir.ScalarSpec{Scalar: ir.Scalar{Kind: ir.Bool, Scope: logical.Scope, Layout: s.Layout, Nullable: true, BoolOp: ir.And}, Operands: selected})
+			left, err := build(t.left, false)
 			if err != nil {
 				return built{}, err
 			}
-		}
-		kind := ir.CrossJoin
-		if predicate != 0 {
-			kind = ir.InnerJoin
-		}
-		id, err := b.AddRel(o.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Join, Scope: logical.Scope, JoinKind: kind, Predicate: predicate}, Inputs: []ir.RelID{left.id, right.id}, Outputs: outputs})
-		return built{id: id, slots: outputs}, err
-	}
-	replacement, err := build(tree, true)
-	if err != nil {
-		return nil, err
-	}
-	original := allocate[model.SlotID](o, uint64(logical.OutputCount()))
-	if o.err != nil {
-		return nil, o.err
-	}
-	for i := range original {
-		original[i], _ = o.graph.Output(region, uint32(i))
-	}
-	if !slices.Equal(original, replacement.slots) {
-		bindings := allocate[ir.Binding](o, uint64(len(original)))
-		if o.err != nil {
-			return nil, o.err
-		}
-		for i, slot := range original {
-			info, _ := o.graph.Slot(slot)
-			scalar, err := b.AddScalar(o.ctx, ir.ScalarSpec{Scalar: ir.Scalar{Kind: ir.Slot, Scope: logical.Scope, Layout: info.Layout, Nullable: info.Nullable, Slot: slot}})
+			right, err := build(t.right, false)
 			if err != nil {
-				return nil, err
+				return built{}, err
 			}
-			bindings[i] = ir.Binding{Slot: slot, Expr: scalar}
+			outputs := allocate[model.SlotID](o, uint64(len(left.slots)+len(right.slots)))
+			if o.err != nil {
+				return built{}, o.err
+			}
+			copy(outputs, left.slots)
+			copy(outputs[len(left.slots):], right.slots)
+			var selected []ir.ScalarID
+			for _, predicate := range entry.facts {
+				crosses := predicate.mask&t.left.mask != predicate.mask && predicate.mask&t.right.mask != predicate.mask
+				rootFilter := root && bits.OnesCount16(predicate.mask) < 2
+				covered := t.mask != 0 && predicate.mask&t.mask == predicate.mask
+				belongsHere := covered && (crosses || rootFilter)
+				if predicate.tree == t || belongsHere {
+					if !o.charge(2, 4) {
+						return built{}, o.err
+					}
+					predID, _, err := commuteJoinPredicate(o.ctx, o.graph, b, predicate.id, left.slots, right.slots, o.options.IR.MaxDepth, 0)
+					if err != nil {
+						return built{}, err
+					}
+					selected = append(selected, predID)
+				}
+			}
+			predicate := ir.ScalarID(0)
+			if len(selected) == 1 {
+				predicate = selected[0]
+			}
+			if len(selected) > 1 {
+				s, _ := o.graph.Scalar(entry.facts[0].id)
+				predicate, err = b.AddScalar(o.ctx, ir.ScalarSpec{Scalar: ir.Scalar{Kind: ir.Bool, Scope: logical.Scope, Layout: s.Layout, Nullable: true, BoolOp: ir.And}, Operands: selected})
+				if err != nil {
+					return built{}, err
+				}
+			}
+			kind := ir.CrossJoin
+			if predicate != 0 {
+				kind = ir.InnerJoin
+			}
+			id, err := b.AddRel(o.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Join, Scope: logical.Scope, JoinKind: kind, Predicate: predicate}, Inputs: []ir.RelID{left.id, right.id}, Outputs: outputs})
+			return built{id: id, slots: outputs}, err
 		}
-		replacement.id, err = b.AddRel(o.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Project, Scope: logical.Scope}, Inputs: []ir.RelID{replacement.id}, Outputs: original, Bindings: bindings})
+		replacement, err := build(entry.tree, true)
 		if err != nil {
 			return nil, err
 		}
+		original := allocate[model.SlotID](o, uint64(logical.OutputCount()))
+		if o.err != nil {
+			return nil, o.err
+		}
+		for i := range original {
+			original[i], _ = o.graph.Output(entry.region, uint32(i))
+		}
+		if !slices.Equal(original, replacement.slots) {
+			bindings := allocate[ir.Binding](o, uint64(len(original)))
+			if o.err != nil {
+				return nil, o.err
+			}
+			for i, slot := range original {
+				info, _ := o.graph.Slot(slot)
+				scalar, err := b.AddScalar(o.ctx, ir.ScalarSpec{Scalar: ir.Scalar{Kind: ir.Slot, Scope: logical.Scope, Layout: info.Layout, Nullable: info.Nullable, Slot: slot}})
+				if err != nil {
+					return nil, err
+				}
+				bindings[i] = ir.Binding{Slot: slot, Expr: scalar}
+			}
+			replacement.id, err = b.AddRel(o.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Project, Scope: logical.Scope}, Inputs: []ir.RelID{replacement.id}, Outputs: original, Bindings: bindings})
+			if err != nil {
+				return nil, err
+			}
+		}
+		replacements[entry.region] = replacement.id
 	}
-	var rebuild func(ir.RelID) (ir.RelID, error)
-	rebuild = func(id ir.RelID) (ir.RelID, error) {
-		if id == region {
-			return replacement.id, nil
+	memo := allocate[ir.RelID](o, uint64(o.graph.RelCount())+1)
+	if o.err != nil {
+		return nil, o.err
+	}
+	var rebuild func(ir.RelID, uint32) (ir.RelID, error)
+	rebuild = func(id ir.RelID, depth uint32) (ir.RelID, error) {
+		if id == 0 {
+			return 0, nil
+		}
+		if rep := replacements[id]; rep != 0 {
+			return rep, nil
+		}
+		if cached := memo[id]; cached != 0 {
+			return cached, nil
+		}
+		if depth >= o.options.IR.MaxDepth {
+			return 0, ir.ErrLimit
 		}
 		if !o.step(1) {
 			return 0, o.err
+		}
+		r, _ := o.graph.Rel(id)
+		if r.InputCount() == 0 {
+			memo[id] = id
+			return id, nil
+		}
+		inputs := allocate[ir.RelID](o, uint64(r.InputCount()))
+		if o.err != nil {
+			return 0, o.err
+		}
+		changed := false
+		for i := range inputs {
+			orig, _ := o.graph.Input(id, uint32(i))
+			updated, err := rebuild(orig, depth+1)
+			if err != nil {
+				return 0, err
+			}
+			inputs[i] = updated
+			changed = changed || updated != orig
+		}
+		if !changed {
+			memo[id] = id
+			return id, nil
 		}
 		spec, err := o.graph.CloneRelSpec(o.ctx, id, o.options.IR.MaxBytes)
 		if err != nil {
 			return 0, err
 		}
-		if len(spec.Inputs) != 1 {
-			return 0, ErrInvalid
-		}
-		spec.Inputs[0], err = rebuild(spec.Inputs[0])
+		spec.Inputs = inputs
+		next, err := b.AddRel(o.ctx, spec)
 		if err != nil {
 			return 0, err
 		}
-		return b.AddRel(o.ctx, spec)
+		memo[id] = next
+		return next, nil
 	}
-	root, err := rebuild(o.graph.Root())
+	root, err := rebuild(o.graph.Root(), 0)
 	if err != nil {
 		return nil, err
 	}

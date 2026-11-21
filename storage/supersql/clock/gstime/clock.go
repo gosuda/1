@@ -53,10 +53,10 @@ func (c *certifiedClock) Read(ctx context.Context) (clock.Reading, error) {
 	if err := c.contextError(ctx); err != nil {
 		return clock.Reading{}, err
 	}
-	if err := c.adoptEpoch(sample); err != nil {
+	if err := c.adoptAndValidateIdentity(sample); err != nil {
 		return clock.Reading{}, err
 	}
-	return c.validate(sample)
+	return c.validateSample(sample)
 }
 
 func (c *certifiedClock) contextError(ctx context.Context) error {
@@ -75,11 +75,13 @@ func sampleEpoch(sample gstime.AssuredNow) clock.Epoch {
 	return clock.Epoch{Assurance: sample.AssuranceEpochID, LeapHistory: sample.LeapHistoryID, Config: sample.ConfigID}
 }
 
-// adoptEpoch re-pins the certified epoch to the service's current assurance
-// epoch. gstime mints a new assurance epoch whenever it leaves the synced state
-// (Invalidate, expired anchor, identity change), so a re-acquired clock is read
-// under its new epoch; fences issued under the old epoch fail in WaitUntilAfter.
-func (c *certifiedClock) adoptEpoch(sample gstime.AssuredNow) error {
+// adoptAndValidateIdentity re-pins the certified epoch to the service's current
+// assurance epoch and validates sample identity atomically under c.mu. gstime
+// mints a new assurance epoch whenever it leaves the synced state (Invalidate,
+// expired anchor, identity change), so a re-acquired clock is read under its
+// new epoch without racing concurrent readers; fences issued under the old
+// epoch still fail in WaitUntilAfter.
+func (c *certifiedClock) adoptAndValidateIdentity(sample gstime.AssuredNow) error {
 	if sample.LeapHistoryID != c.history.ID {
 		return errors.Join(clock.ErrClockEpochChanged, gstime.ErrLeapHistoryMismatch)
 	}
@@ -92,20 +94,20 @@ func (c *certifiedClock) adoptEpoch(sample gstime.AssuredNow) error {
 		return errors.Join(clock.ErrClockEpochChanged, gstime.ErrConfigurationMismatch)
 	}
 	c.epoch.Assurance = sample.AssuranceEpochID
-	return nil
-}
-
-func (c *certifiedClock) currentEpoch() clock.Epoch {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.epoch
+	return c.validateIdentityLocked(sample)
 }
 
 func (c *certifiedClock) validateIdentity(sample gstime.AssuredNow) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.validateIdentityLocked(sample)
+}
+
+func (c *certifiedClock) validateIdentityLocked(sample gstime.AssuredNow) error {
 	if sample.LeapHistoryID != c.history.ID {
 		return errors.Join(clock.ErrClockEpochChanged, gstime.ErrLeapHistoryMismatch)
 	}
-	if sampleEpoch(sample) != c.currentEpoch() {
+	if sampleEpoch(sample) != c.epoch {
 		return errors.Join(clock.ErrClockEpochChanged, gstime.ErrConfigurationMismatch)
 	}
 	if sample.AssuranceEpochID == ([16]byte{}) || sample.ConfigID == ([32]byte{}) {
@@ -118,6 +120,10 @@ func (c *certifiedClock) validate(sample gstime.AssuredNow) (clock.Reading, erro
 	if err := c.validateIdentity(sample); err != nil {
 		return clock.Reading{}, err
 	}
+	return c.validateSample(sample)
+}
+
+func (c *certifiedClock) validateSample(sample gstime.AssuredNow) (clock.Reading, error) {
 	if sample.Status != gstime.StatusSynced && sample.Status != gstime.StatusHoldover || !sample.HasInterval {
 		return clock.Reading{}, sampleError(sample)
 	}

@@ -33,10 +33,11 @@ type Parameter struct {
 // MaxNodes bounds the graph inventory; MaxWork bounds visits and comparisons.
 // Callers normally supply MaxSpans=1024. Every limit must be positive.
 type Limits struct {
-	MaxSpans int
-	MaxNodes uint32
-	MaxWork  uint64
-	MaxBytes uint64
+	MaxSpans         int
+	MaxNodes         uint32
+	MaxWork          uint64
+	MaxBytes         uint64
+	DefaultCollation model.CollationID
 }
 
 // Empty is a proof, whereas one fully unbounded span means no useful restriction.
@@ -56,6 +57,8 @@ type extractor struct {
 	ctx               context.Context
 	graph             *ir.Graph
 	keys              []Key
+	keyBPChar         []bool
+	keyEnum           []bool
 	parameters        []Parameter
 	limits            Limits
 	work, bytes       uint64
@@ -124,6 +127,18 @@ func extract(ctx context.Context, graph *ir.Graph, predicate ir.ScalarID, keys [
 	e := extractor{ctx: ctx, graph: graph, keys: keys, parameters: parameters, limits: limits, requireParameters: requireParameters}
 	if !e.validate() {
 		return Result{}, e.err
+	}
+	if len(keys) != 0 {
+		if !e.charge(uint64(len(keys)), 2) {
+			return Result{}, e.err
+		}
+		e.keyBPChar = make([]bool, len(keys))
+		e.keyEnum = make([]bool, len(keys))
+		for i, key := range keys {
+			if key.Column.Type.ID == 1042 {
+				e.keyBPChar[i] = true
+			}
+		}
 	}
 	count := uint64(graph.ScalarCount()) + 1
 	if !e.charge(count, uint64(unsafe.Sizeof(fact{}))+1) {

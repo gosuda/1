@@ -33,7 +33,11 @@ func OrdinaryObjectAlter(statement *zpgparse.AlterTableStmt) bool {
 				zpgparse.AlterTableType_AT_DropOf,
 				zpgparse.AlterTableType_AT_SetNotNull,
 				zpgparse.AlterTableType_AT_DropNotNull,
-				zpgparse.AlterTableType_AT_SetStatistics:
+				zpgparse.AlterTableType_AT_SetStatistics,
+				zpgparse.AlterTableType_AT_EnableRowSecurity,
+				zpgparse.AlterTableType_AT_DisableRowSecurity,
+				zpgparse.AlterTableType_AT_ForceRowSecurity,
+				zpgparse.AlterTableType_AT_NoForceRowSecurity:
 			default:
 				return false
 			}
@@ -136,6 +140,9 @@ func BindIdentitySequenceAlter(ctx context.Context, statement *zpgparse.AlterTab
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
+		return nil, err
+	}
 	metadata, ok := table.Table()
 	if !ok {
 		return nil, model.ErrInvalidDescriptor
@@ -215,6 +222,9 @@ func BindAlterTableIdentity(ctx context.Context, statement *zpgparse.AlterTableS
 		if statement.MissingOk && isMissingObject(err) {
 			return &BoundDeclaration{warnings: []model.Error{{Code: "42P01", Message: "relation does not exist, skipping"}}}, nil
 		}
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, int(statement.Relation.Location)+1); err != nil {
 		return nil, err
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -299,6 +309,9 @@ func BindAlterTableExpression(ctx context.Context, statement *zpgparse.AlterTabl
 			command, bindErr := bindOrdinaryObjectAlter(ctx, statement, snapshot, options)
 			return command, nil, bindErr
 		}
+		return nil, nil, err
+	}
+	if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
 		return nil, nil, err
 	}
 	spec, err := table.SpecWithin(ctx, options.Descriptors)
@@ -470,6 +483,9 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, int(statement.Relation.Location)+1); err != nil {
+		return nil, err
+	}
 	b.dependency(base, 0)
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
@@ -515,6 +531,14 @@ func bindOrdinaryObjectAlter(ctx context.Context, statement *zpgparse.AlterTable
 				if err := bindSetStatistics(&spec, command, false); err != nil {
 					return nil, err
 				}
+			case zpgparse.AlterTableType_AT_EnableRowSecurity:
+				spec.Table.RowSecurity = true
+			case zpgparse.AlterTableType_AT_DisableRowSecurity:
+				spec.Table.RowSecurity = false
+			case zpgparse.AlterTableType_AT_ForceRowSecurity:
+				spec.Table.ForceRowSecurity = true
+			case zpgparse.AlterTableType_AT_NoForceRowSecurity:
+				spec.Table.ForceRowSecurity = false
 			}
 		} else if spec.Index != nil {
 			if err := bindSetStatistics(&spec, command, true); err != nil {

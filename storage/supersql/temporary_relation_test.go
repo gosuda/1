@@ -56,7 +56,7 @@ func TestTemporaryRelationLifecycle(t *testing.T) {
 		{statement: "SELECT * FROM permanent_tbl"},
 	}
 	for _, step := range steps {
-		_, err := database.Exec(ctx, step.statement, 10000)
+		_, err := database.exec(ctx, step.statement, 10000)
 		if step.wantError {
 			if err == nil {
 				t.Errorf("%s: succeeded, want an error", step.statement)
@@ -85,26 +85,26 @@ func TestTemporaryRelationShadowsPermanentName(t *testing.T) {
 	}
 	defer database.Close()
 
-	if _, err := database.Exec(ctx, "CREATE TABLE shadow_tbl (v int)", 10000); err != nil {
+	if _, err := database.exec(ctx, "CREATE TABLE shadow_tbl (v int)", 10000); err != nil {
 		t.Fatalf("create permanent: %v", err)
 	}
-	if _, err := database.Exec(ctx, "INSERT INTO shadow_tbl VALUES (1)", 10000); err != nil {
+	if _, err := database.exec(ctx, "INSERT INTO shadow_tbl VALUES (1)", 10000); err != nil {
 		t.Fatalf("insert permanent: %v", err)
 	}
-	if _, err := database.Exec(ctx, "CREATE TEMP TABLE shadow_tbl (v int)", 10000); err != nil {
+	if _, err := database.exec(ctx, "CREATE TEMP TABLE shadow_tbl (v int)", 10000); err != nil {
 		t.Fatalf("create temporary: %v", err)
 	}
-	if _, err := database.Exec(ctx, "INSERT INTO shadow_tbl VALUES (2)", 10000); err != nil {
+	if _, err := database.exec(ctx, "INSERT INTO shadow_tbl VALUES (2)", 10000); err != nil {
 		t.Fatalf("insert temporary: %v", err)
 	}
-	outcome, err := database.Exec(ctx, "SELECT v FROM shadow_tbl", 10000)
+	outcome, err := database.exec(ctx, "SELECT v FROM shadow_tbl", 10000)
 	if err != nil {
 		t.Fatalf("select temporary: %v", err)
 	}
 	if len(outcome.Rows) != 1 || outcome.Rows[0][0].IntVal != 2 {
 		t.Fatalf("unqualified name resolved to %v, want the temporary relation's single row 2", outcome.Rows)
 	}
-	outcome, err = database.Exec(ctx, "SELECT v FROM public.shadow_tbl", 10000)
+	outcome, err = database.exec(ctx, "SELECT v FROM public.shadow_tbl", 10000)
 	if err != nil {
 		t.Fatalf("select permanent: %v", err)
 	}

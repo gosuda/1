@@ -26,7 +26,31 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	if target.automatic() {
 		b.mutationProvenance = target.executionDescriptor.ID()
 	}
+	mergeHasInsert, mergeHasUpdate, mergeHasDelete := false, false, false
+	for _, whenNode := range n.MergeWhenClauses {
+		if clause := whenNode.GetMergeWhenClause(); clause != nil {
+			switch clause.CommandType {
+			case zpgparse.CmdType_CMD_INSERT:
+				mergeHasInsert = true
+			case zpgparse.CmdType_CMD_UPDATE:
+				mergeHasUpdate = true
+			case zpgparse.CmdType_CMD_DELETE:
+				mergeHasDelete = true
+			}
+		}
+	}
+	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	savedMergeUpdate, savedMergeDelete := b.rlsMergeHasUpdate, b.rlsMergeHasDelete
+	if target.executionDescriptor != nil {
+		b.rlsTargetID = target.executionDescriptor.ID()
+	} else {
+		b.rlsTargetID = target.descriptor.ID()
+	}
+	b.rlsTargetCommand = "MERGE"
+	b.rlsMergeHasUpdate, b.rlsMergeHasDelete = mergeHasUpdate, mergeHasDelete
 	left, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
+	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
+	b.rlsMergeHasUpdate, b.rlsMergeHasDelete = savedMergeUpdate, savedMergeDelete
 	b.mutationProvenance = previousProvenance
 	if err != nil {
 		return relation{}, err
@@ -172,6 +196,9 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 		spec.Actions = append(spec.Actions, action)
 	}
 	d := target.executionDescriptor
+	if err := b.applyModifyRLS(s, target, ir.Merge, &spec, mergeHasInsert, mergeHasUpdate); err != nil {
+		return relation{}, err
+	}
 	viewSteps, viewEffects, err := b.bindViewMutationSteps(s, target)
 	if err != nil {
 		return relation{}, err

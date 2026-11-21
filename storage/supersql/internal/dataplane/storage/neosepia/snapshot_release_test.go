@@ -338,7 +338,7 @@ func TestSnapshotCursorCloseFailureReleasesOwnership(t *testing.T) {
 	bound := reader.plans
 	snapshotContractClose(t, reader)
 	snapshotContractClose(t, set)
-	if err := file.file.Close(); err != nil {
+	if err := file.core.directFile.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := cursor.Close(); !errors.Is(err, os.ErrClosed) {

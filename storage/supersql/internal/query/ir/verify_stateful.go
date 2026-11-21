@@ -518,6 +518,26 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 			return invalid("invalid OLD/NEW row slot")
 		}
 	}
+	if n.RLSRow != 0 {
+		if !validID(n.RLSRow, g.slots) || g.slots[n.RLSRow-1].Scope != n.Scope || g.slots[n.RLSRow-1].Object != n.Object || g.slots[n.RLSRow-1].Nullable || g.layouts[g.slots[n.RLSRow-1].Layout-1].typ.Storage != model.TypeComposite {
+			return invalid("invalid RLS row slot")
+		}
+		if n.RLSRow == n.OldRow || n.RLSRow == n.NewRow || n.RLSRow == n.ExcludedRow || n.RLSRow == n.MergeResultRow {
+			return invalid("RLS row slot must be distinct")
+		}
+	}
+	if (n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0) && n.RLSRow == 0 {
+		return invalid("RLS check requires RLS row slot")
+	}
+	if n.RLSRow != 0 && n.RLSInsertCheck == 0 && n.RLSUpdateCheck == 0 {
+		return invalid("RLS row slot without RLS check predicate")
+	}
+	if n.RLSInsertCheck != 0 && (n.ModifyKind != Insert && n.ModifyKind != Merge || !g.boolean(n.RLSInsertCheck)) {
+		return invalid("invalid RLS insert check predicate")
+	}
+	if n.RLSUpdateCheck != 0 && (n.ModifyKind != Update && n.ModifyKind != Merge && n.Conflict != ConflictUpdate || !g.boolean(n.RLSUpdateCheck)) {
+		return invalid("invalid RLS update check predicate")
+	}
 	for _, slot := range [...]model.SlotID{n.OldTableOID, n.NewTableOID, n.MergeTableOID} {
 		if slot == 0 {
 			continue
@@ -589,12 +609,12 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 		}
 	}
 	source := n
-	source.OldRow, source.NewRow, source.ExcludedRow, source.OldTableOID, source.NewTableOID, source.MergeTableOID = 0, 0, 0, 0, 0, 0
+	source.OldRow, source.NewRow, source.ExcludedRow, source.RLSRow, source.OldTableOID, source.NewTableOID, source.MergeTableOID = 0, 0, 0, 0, 0, 0, 0
 	if err := g.validateAssignments(ctx, source, n.assignments, limits); err != nil {
 		return err
 	}
 	action := n
-	action.inputs, action.NewRow, action.OldTableOID, action.NewTableOID, action.MergeTableOID = extent{}, 0, 0, 0, 0
+	action.inputs, action.NewRow, action.RLSRow, action.OldTableOID, action.NewTableOID, action.MergeTableOID = extent{}, 0, 0, 0, 0, 0
 	if err := g.validateAssignments(ctx, action, n.conflictAssignments, limits); err != nil {
 		return err
 	}
@@ -603,8 +623,17 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 			return err
 		}
 	}
+	rlsCheck := n
+	rlsCheck.inputs, rlsCheck.OldRow, rlsCheck.NewRow, rlsCheck.ExcludedRow, rlsCheck.MergeResultRow, rlsCheck.MergeActionSlot, rlsCheck.OldTableOID, rlsCheck.NewTableOID, rlsCheck.MergeTableOID = extent{}, 0, 0, 0, 0, 0, 0, 0, 0
+	for _, checkID := range [...]ScalarID{n.RLSInsertCheck, n.RLSUpdateCheck} {
+		if checkID != 0 {
+			if err := g.expressionAvailable(ctx, rlsCheck, checkID, 0, limits); err != nil {
+				return err
+			}
+		}
+	}
 	returning := n
-	returning.ExcludedRow = 0
+	returning.ExcludedRow, returning.RLSRow = 0, 0
 	for _, binding := range sliceAt(g.bindings, n.bindings) {
 		if err := g.expressionAvailable(ctx, returning, binding.Expr, 0, limits); err != nil {
 			return err
@@ -649,7 +678,7 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 		}
 	}
 	candidate := n
-	candidate.OldRow, candidate.NewRow, candidate.MergeResultRow, candidate.MergeActionSlot, candidate.OldTableOID, candidate.NewTableOID, candidate.MergeTableOID = 0, 0, 0, 0, 0, 0, 0
+	candidate.OldRow, candidate.NewRow, candidate.RLSRow, candidate.MergeResultRow, candidate.MergeActionSlot, candidate.OldTableOID, candidate.NewTableOID, candidate.MergeTableOID = 0, 0, 0, 0, 0, 0, 0, 0
 	var terminal [4]bool
 	for _, action := range sliceAt(g.actions, n.actions) {
 		if !g.validMergeAction(action) {

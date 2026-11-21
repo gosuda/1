@@ -15,6 +15,9 @@ func settingStatementFeature(statement *zpgparse.VariableSetStmt) FeatureID {
 			return isolationValueFeature(statement.Args[0])
 		}
 	}
+	if strings.EqualFold(statement.Name, "role") {
+		return ""
+	}
 	feature, _ := builtinSettingFeature(strings.ToLower(statement.Name))
 	return feature
 }

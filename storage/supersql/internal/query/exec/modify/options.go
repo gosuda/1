@@ -129,6 +129,8 @@ type Options struct {
 	AssignmentColumns     []model.ColumnID
 	UpdatedColumns        []model.ColumnID
 	ViewMutationSteps     []ViewMutationStep
+	RLSInsertCheck        *expr.Program
+	RLSUpdateCheck        *expr.Program
 	Returning             *expr.Program
 	ReturningInputLayouts []model.TypeLayout
 	// ReturningSourceColumns are strictly increasing indices into InputLayouts.
@@ -137,6 +139,7 @@ type Options struct {
 	// three for MERGE. OID layouts follow the RETURNING row-image layouts.
 	ReturningTableOIDs int
 	Parameters         []expr.ParameterValue
+	BorrowParameters   bool
 	Subqueries         expr.SubqueryRuntime
 	Sequences          model.SequenceRuntime
 	Relations          model.RelationRuntime
@@ -151,6 +154,7 @@ type Options struct {
 	BatchRows          int
 	BatchBytes         uint64
 	MaxRecordBytes     uint64
+	MaxRowBytes        uint64
 	SpoolMemoryBytes   uint64
 	MaxSpoolBytes      uint64
 	MaxRows            uint64
@@ -204,7 +208,7 @@ func (c *cursor) configure(ctx context.Context) error {
 	if missingInput || invalidBatch || invalidSpool {
 		return runtime.ErrInvalidConfig
 	}
-	for _, n := range []uint64{o.BatchBytes, o.MaxRecordBytes, o.SpoolMemoryBytes, o.MaxSpoolBytes, o.WorkBytes, o.SortRunBytes, o.MaxRows} {
+	for _, n := range []uint64{o.BatchBytes, o.MaxRecordBytes, o.MaxRowBytes, o.SpoolMemoryBytes, o.MaxSpoolBytes, o.WorkBytes, o.SortRunBytes, o.MaxRows} {
 		if n > uint64(math.MaxInt)/128 {
 			return runtime.ErrInvalidConfig
 		}
@@ -567,21 +571,51 @@ func (c *cursor) configure(ctx context.Context) error {
 			return err
 		}
 	}
-	parameters := make([]expr.ParameterValue, len(o.Parameters))
-	for i, parameter := range o.Parameters {
-		layout, used, err := model.CopyTypeLayout(ctx, parameter.Layout, remaining)
+	if o.RLSInsertCheck != nil || o.RLSUpdateCheck != nil {
+		for _, program := range []*expr.Program{o.RLSInsertCheck, o.RLSUpdateCheck} {
+			if program == nil {
+				continue
+			}
+			layouts := program.OutputLayouts()
+			if len(layouts) != 1 || layouts[0].Type.Storage != model.TypeBoolean {
+				return storage.ErrInvalidLayout
+			}
+		}
+		if o.RLSInsertCheck != nil {
+			c.rlsInsertCheck, err = expr.NewState(o.RLSInsertCheck, c.stateOptions())
+			if err != nil {
+				return err
+			}
+		}
+		if o.RLSUpdateCheck != nil {
+			c.rlsUpdateCheck, err = expr.NewState(o.RLSUpdateCheck, c.stateOptions())
+			if err != nil {
+				return err
+			}
+		}
+		composite := model.TypeLayout{Type: model.Type{ID: 2249, Modifier: -1, Storage: model.TypeComposite}, Children: c.visibleLayouts}
+		c.rlsCheckInput, err = columnar.NewBuilder([]model.TypeLayout{composite}, columnar.BuilderOptions{MaxRows: 1, MaxBytes: o.BatchBytes, Allocator: o.Query.Allocator(runtime.WorkMemory)})
 		if err != nil {
 			return err
 		}
-		remaining -= used
-		value, used, err := model.CopyValue(ctx, parameter.Value, remaining)
-		if err != nil {
-			return err
-		}
-		remaining -= used
-		parameters[i] = expr.ParameterValue{Number: parameter.Number, Layout: layout, Value: value}
 	}
-	o.Parameters = parameters
+	if !o.BorrowParameters {
+		parameters := make([]expr.ParameterValue, len(o.Parameters))
+		for i, parameter := range o.Parameters {
+			layout, used, err := model.CopyTypeLayout(ctx, parameter.Layout, remaining)
+			if err != nil {
+				return err
+			}
+			remaining -= used
+			value, used, err := model.CopyValue(ctx, parameter.Value, remaining)
+			if err != nil {
+				return err
+			}
+			remaining -= used
+			parameters[i] = expr.ParameterValue{Number: parameter.Number, Layout: layout, Value: value}
+		}
+		o.Parameters = parameters
+	}
 	c.descriptor = o.Descriptor
 	o.Descriptor = nil
 	sourceImageColumns := 0

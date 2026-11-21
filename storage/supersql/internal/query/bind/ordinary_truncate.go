@@ -90,6 +90,9 @@ func BindTruncateTransactional(ctx context.Context, statement *zpgparse.Truncate
 		if table == nil || table.Kind() != model.ObjectTable || table.State() != model.StatePublic {
 			return nil, model.ErrInvalidDescriptor
 		}
+		if err := b.requireTableOwner(table, 0); err != nil {
+			return nil, err
+		}
 		targets[table.ID()] = true
 		spec, err := table.SpecWithin(ctx, options.Descriptors)
 		if err != nil {

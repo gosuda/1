@@ -54,12 +54,18 @@ func bindHierarchyAlter(ctx context.Context, statement *zpgparse.AlterTableStmt,
 		if err != nil {
 			return nil, err
 		}
+		if err := b.requireTableOwner(child, int(statement.Relation.Location)+1); err != nil {
+			return nil, err
+		}
 		parentRange := command.Def.GetRangeVar()
 		if parentRange == nil {
 			return nil, bindError("42601", "INHERIT requires a parent table", 0)
 		}
 		parent, err := b.resolveTableRange(parentRange)
 		if err != nil {
+			return nil, err
+		}
+		if err := b.requireTableOwner(parent, int(parentRange.Location)+1); err != nil {
 			return nil, err
 		}
 		if command.Subtype == zpgparse.AlterTableType_AT_AddInherit {
@@ -69,6 +75,9 @@ func bindHierarchyAlter(ctx context.Context, statement *zpgparse.AlterTableStmt,
 	case zpgparse.AlterTableType_AT_AttachPartition:
 		parent, err := b.resolveTableRange(statement.Relation)
 		if err != nil {
+			return nil, err
+		}
+		if err := b.requireTableOwner(parent, int(statement.Relation.Location)+1); err != nil {
 			return nil, err
 		}
 		partition := command.Def.GetPartitionCmd()

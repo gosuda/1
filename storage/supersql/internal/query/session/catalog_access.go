@@ -42,6 +42,11 @@ type CatalogAccess struct {
 	options CatalogAccessOptions
 }
 
+// defaultCatalogAccessMaxPaths is used when CatalogAccessOptions.MaxPaths is 0,
+// giving tables with many secondary indexes room for both forward and reverse
+// scan paths without silently dropping indexes beyond the 7th.
+const defaultCatalogAccessMaxPaths = 64
+
 func NewCatalogAccess(snapshot *catalog.CatalogSnapshot, reader storage.SnapshotReader, encoder storage.KeyEncoder, options CatalogAccessOptions) (*CatalogAccess, error) {
 	limits := options.IndexLimits
 	_, decoder := encoder.(storage.KeyDecoder)
@@ -55,7 +60,10 @@ func NewCatalogAccess(snapshot *catalog.CatalogSnapshot, reader storage.Snapshot
 	if _, err := NewIndexExpressionCompiler(snapshot, options.IndexExpressions); err != nil {
 		return nil, err
 	}
-	invalidPaths := options.MaxPaths <= 0 || options.MaxBytes == 0 || options.MaxBytes > math.MaxInt
+	if options.MaxPaths == 0 {
+		options.MaxPaths = defaultCatalogAccessMaxPaths
+	}
+	invalidPaths := options.MaxPaths < 0 || options.MaxBytes == 0 || options.MaxBytes > math.MaxInt
 	invalidMetadata := limits.MetadataBytes == 0 || limits.MetadataBytes > math.MaxInt
 	invalidEntries := limits.EntryBytes == 0 || limits.EntryBytes > math.MaxInt
 	invalidColumns := limits.MaxColumns <= 0 || uint64(limits.MaxColumns) > math.MaxUint32
@@ -81,8 +89,12 @@ func (a *CatalogAccess) Access(ctx context.Context, request opt.AccessRequest) (
 	if err := ctx.Err(); err != nil {
 		return opt.Access{}, err
 	}
-	if request.MaxPaths <= 0 || request.MaxBytes == 0 {
+	if request.MaxPaths < 0 || request.MaxBytes == 0 {
 		return opt.Access{}, opt.ErrLimit
+	}
+	requestMaxPaths := request.MaxPaths
+	if requestMaxPaths == 0 {
+		requestMaxPaths = a.options.MaxPaths
 	}
 	if request.Predicate != 0 {
 		if request.Graph == nil {
@@ -133,7 +145,7 @@ func (a *CatalogAccess) Access(ctx context.Context, request opt.AccessRequest) (
 	if err != nil {
 		return opt.Access{}, err
 	}
-	pathLimit := min(request.MaxPaths, a.options.MaxPaths)
+	pathLimit := min(requestMaxPaths, a.options.MaxPaths)
 	capacity := min(pathLimit, len(spec.Table.Indexes)+1)
 	if err := budget.charge(uint64(capacity), uint64(unsafe.Sizeof(opt.AccessPath{}))); err != nil {
 		return opt.Access{}, err
@@ -194,6 +206,40 @@ func (a *CatalogAccess) Access(ctx context.Context, request opt.AccessRequest) (
 		}
 		result.Paths = append(result.Paths, path)
 	}
+	// Expose ScanReverse counterparts for keyed paths (primary and secondary
+	// indexes) after all forward paths so reverse scans never crowd out a
+	// secondary index when pathLimit is tight, while ORDER BY ... DESC can
+	// stream directly in reverse without a full sort.
+	forwardCount := len(result.Paths)
+	for i := range forwardCount {
+		if err := ctx.Err(); err != nil {
+			return opt.Access{}, err
+		}
+		if len(result.Paths) >= pathLimit {
+			break
+		}
+		forward := result.Paths[i]
+		if len(forward.Keys) == 0 {
+			continue
+		}
+		savedBudget := budget
+		if err := budget.charge(1, uint64(unsafe.Sizeof(opt.AccessPath{}))); err != nil {
+			budget = savedBudget
+			break
+		}
+		reverse, err := a.reversePath(ctx, forward, &budget)
+		if err != nil {
+			if ctx.Err() != nil {
+				return opt.Access{}, ctx.Err()
+			}
+			if errors.Is(err, opt.ErrLimit) {
+				budget = savedBudget
+				break
+			}
+			return opt.Access{}, err
+		}
+		result.Paths = append(result.Paths, reverse)
+	}
 	constraints, err := a.partitionConstraints(ctx, table, spec.Table, &budget)
 	if err != nil {
 		return opt.Access{}, err
@@ -204,6 +250,7 @@ func (a *CatalogAccess) Access(ctx context.Context, request opt.AccessRequest) (
 			return opt.Access{}, err
 		}
 	}
+	result.Paths = slices.Clip(result.Paths)
 	if err := ctx.Err(); err != nil {
 		return opt.Access{}, err
 	}
@@ -437,7 +484,7 @@ func (a *CatalogAccess) primary(ctx context.Context, descriptor *model.Descripto
 	}
 	path.Operators = make([]model.OperatorID, 0, len(table.PrimaryKey))
 	for _, key := range table.PrimaryKey {
-		operator := catalogAccessEquality(key)
+		operator := catalogAccessOrderingOperator(key, false)
 		if operator == 0 {
 			break
 		}
@@ -452,8 +499,93 @@ func (a *CatalogAccess) primary(ctx context.Context, descriptor *model.Descripto
 	return path, nil
 }
 
+func catalogAccessOperatorClass(key model.KeyElement) (builtin.OperatorClassInfo, bool) {
+	if key.OperatorClass != 0 {
+		return builtin.LookupOperatorClass(key.OperatorClass)
+	}
+	if class, ok := builtin.LookupDefaultOperatorClass("btree", key.Type.ID); ok {
+		return class, true
+	}
+	if key.Type.ID == 1043 {
+		return builtin.LookupDefaultOperatorClass("btree", 25)
+	}
+	return builtin.OperatorClassInfo{}, false
+}
+
+func catalogAccessOrderingOperator(key model.KeyElement, reverse bool) model.OperatorID {
+	if key.Expression != nil {
+		return catalogAccessEquality(key)
+	}
+	class, ok := catalogAccessOperatorClass(key)
+	if !ok || class.Method != "btree" {
+		return 0
+	}
+	descending := key.Descending != reverse
+	name := "<"
+	strategy := uint8(1)
+	if descending {
+		name = ">"
+		strategy = 5
+	}
+	var fallback model.OperatorID
+	for operator := range builtin.OperatorsNamed(name) {
+		exact := operator.Left == key.Type.ID && operator.Right == key.Type.ID
+		classMatch := operator.Left == class.InputType && operator.Right == class.InputType
+		if !exact && !classMatch {
+			continue
+		}
+		for interpretation := range builtin.RowComparisonInterpretations(operator.ID) {
+			if interpretation.Family == class.Family && interpretation.Strategy == strategy {
+				if exact {
+					return operator.ID
+				}
+				if fallback == 0 {
+					fallback = operator.ID
+				}
+			}
+		}
+	}
+	return fallback
+}
+
+func catalogAccessReverseOperator(operatorID model.OperatorID) model.OperatorID {
+	if operatorID == 0 {
+		return 0
+	}
+	source, ok := builtin.LookupOperator(operatorID)
+	if !ok {
+		return operatorID
+	}
+	var targetName string
+	var targetStrategy uint8
+	switch source.Name {
+	case "<":
+		targetName, targetStrategy = ">", 5
+	case ">":
+		targetName, targetStrategy = "<", 1
+	default:
+		return operatorID
+	}
+	for interp := range builtin.RowComparisonInterpretations(operatorID) {
+		if interp.Strategy != 1 && interp.Strategy != 5 {
+			continue
+		}
+		for candidate := range builtin.OperatorsNamed(targetName) {
+			if candidate.Left != source.Left || candidate.Right != source.Right {
+				continue
+			}
+			for candInterp := range builtin.RowComparisonInterpretations(candidate.ID) {
+				if candInterp.Family == interp.Family && candInterp.Strategy == targetStrategy {
+					return candidate.ID
+				}
+			}
+		}
+	}
+	return operatorID
+}
+
 func catalogAccessEquality(key model.KeyElement) model.OperatorID {
-	class, ok := builtin.LookupOperatorClass(key.OperatorClass)
+	class, ok := catalogAccessOperatorClass(key)
 	if !ok || class.Method != "btree" {
 		return 0
 	}
@@ -514,6 +646,7 @@ func (a *CatalogAccess) secondary(ctx context.Context, table, index *model.Descr
 	}
 	expressions := make([]opt.AccessExpression, len(metadata.Keys))
 	operators := make([]model.OperatorID, len(metadata.Keys))
+	hasExpressionKeys := slices.ContainsFunc(metadata.Keys, func(key model.KeyElement) bool { return key.Expression != nil })
 	for i, key := range metadata.Keys {
 		if key.Column != 0 {
 			if !catalogAccessCovers(mapping, key.Column) {
@@ -532,7 +665,11 @@ func (a *CatalogAccess) secondary(ctx context.Context, table, index *model.Descr
 				return opt.AccessPath{}, err
 			}
 		}
-		operators[i] = catalogAccessEquality(key)
+		if hasExpressionKeys {
+			operators[i] = catalogAccessEquality(key)
+		} else {
+			operators[i] = catalogAccessOrderingOperator(key, false)
+		}
 	}
 	include := 0
 	for _, column := range layout.Columns {
@@ -578,6 +715,114 @@ func (a *CatalogAccess) secondary(ctx context.Context, table, index *model.Descr
 	copy(baseMap, primary.ColumnMap)
 	path.Lookup = opt.LookupAccess{Enabled: true, OwnerColumn: plan.OwnerColumn(), Target: base.Target, Layout: base.Layout, ColumnMap: baseMap, Keys: base.KeyLayout}
 	return path, nil
+}
+
+func (a *CatalogAccess) reversePath(ctx context.Context, forward opt.AccessPath, budget *catalogAccessBudget) (opt.AccessPath, error) {
+	owned, err := budget.copyRequest(ctx, storage.PushdownRequest{
+		Target:    forward.Target,
+		Layout:    forward.Layout,
+		KeyLayout: forward.Keys,
+		Direction: storage.ScanReverse,
+	})
+	if err != nil {
+		return opt.AccessPath{}, err
+	}
+	if err := budget.charge(uint64(len(forward.ColumnMap)), uint64(unsafe.Sizeof(physical.ScanColumn{}))); err != nil {
+		return opt.AccessPath{}, err
+	}
+	columnMap := make([]physical.ScanColumn, len(forward.ColumnMap))
+	copy(columnMap, forward.ColumnMap)
+	if err := budget.charge(uint64(len(forward.Operators)), uint64(unsafe.Sizeof(model.OperatorID(0)))); err != nil {
+		return opt.AccessPath{}, err
+	}
+	operators := make([]model.OperatorID, len(forward.Operators))
+	for i, op := range forward.Operators {
+		operators[i] = catalogAccessReverseOperator(op)
+	}
+	var expressions []opt.AccessExpression
+	if len(forward.KeyExpressions) != 0 {
+		if err := budget.charge(uint64(len(forward.KeyExpressions)), uint64(unsafe.Sizeof(opt.AccessExpression{}))); err != nil {
+			return opt.AccessPath{}, err
+		}
+		expressions = make([]opt.AccessExpression, len(forward.KeyExpressions))
+		for i, expression := range forward.KeyExpressions {
+			expressions[i], err = cloneAccessExpression(ctx, expression, budget)
+			if err != nil {
+				return opt.AccessPath{}, err
+			}
+		}
+	}
+	predicate, err := cloneAccessExpression(ctx, forward.Predicate, budget)
+	if err != nil {
+		return opt.AccessPath{}, err
+	}
+	reverse := opt.AccessPath{
+		Target:         owned.Target,
+		Layout:         owned.Layout,
+		ColumnMap:      columnMap,
+		Algorithm:      forward.Algorithm,
+		Index:          forward.Index,
+		Keys:           owned.KeyLayout,
+		KeyExpressions: expressions,
+		Predicate:      predicate,
+		Operators:      operators,
+		Direction:      storage.ScanReverse,
+	}
+	if forward.Lookup.Enabled {
+		base, err := budget.copyRequest(ctx, storage.PushdownRequest{
+			Target:    forward.Lookup.Target,
+			Layout:    forward.Lookup.Layout,
+			KeyLayout: forward.Lookup.Keys,
+			Direction: storage.ScanForward,
+		})
+		if err != nil {
+			return opt.AccessPath{}, err
+		}
+		if err := budget.charge(uint64(len(forward.Lookup.ColumnMap)), uint64(unsafe.Sizeof(physical.ScanColumn{}))); err != nil {
+			return opt.AccessPath{}, err
+		}
+		baseMap := make([]physical.ScanColumn, len(forward.Lookup.ColumnMap))
+		copy(baseMap, forward.Lookup.ColumnMap)
+		reverse.Lookup = opt.LookupAccess{
+			Enabled:     true,
+			OwnerColumn: forward.Lookup.OwnerColumn,
+			Target:      base.Target,
+			Layout:      base.Layout,
+			ColumnMap:   baseMap,
+			Keys:        base.KeyLayout,
+		}
+	}
+	if err := (storage.PushdownRequest{Target: reverse.Target, Layout: reverse.Layout, KeyLayout: reverse.Keys, Direction: reverse.Direction}).Validate(ctx); err != nil {
+		return opt.AccessPath{}, err
+	}
+	return reverse, nil
+}
+
+func cloneAccessExpression(ctx context.Context, source opt.AccessExpression, budget *catalogAccessBudget) (opt.AccessExpression, error) {
+	if source.Graph == nil {
+		return opt.AccessExpression{}, nil
+	}
+	if err := budget.charge(1, uint64(unsafe.Sizeof(*source.Graph))+source.Graph.OwnedBytes()); err != nil {
+		return opt.AccessExpression{}, err
+	}
+	if err := budget.charge(uint64(len(source.Parameters)), uint64(unsafe.Sizeof(opt.AccessExpressionParameter{}))); err != nil {
+		return opt.AccessExpression{}, err
+	}
+	result := opt.AccessExpression{
+		Graph:      source.Graph,
+		Root:       source.Root,
+		Parameters: make([]opt.AccessExpressionParameter, len(source.Parameters)),
+		Builtin:    source.Builtin,
+	}
+	for i, parameter := range source.Parameters {
+		layout, used, err := model.CopyTypeLayout(ctx, parameter.Layout, budget.remaining)
+		if err != nil {
+			return opt.AccessExpression{}, err
+		}
+		budget.remaining -= used
+		result.Parameters[i] = opt.AccessExpressionParameter{Column: parameter.Column, Layout: layout}
+	}
+	return result, nil
 }
 
 func catalogAccessCovers(mapping []physical.ScanColumn, id model.ColumnID) bool {

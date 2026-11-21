@@ -18,10 +18,11 @@ func TestStatementFeatureBoundary(t *testing.T) {
 	}{
 		{"database", "CREATE DATABASE db", bind.ClusterAdmin},
 		{"tablespace", "CREATE TABLE t(i int) TABLESPACE other", bind.ClusterAdmin},
-		{"role", "CREATE ROLE r", bind.Authorization},
+		{"role", "CREATE ROLE r", ""},
+		{"table grant", "GRANT SELECT ON t TO r", bind.Authorization},
 		{"schema authorization", "CREATE SCHEMA s AUTHORIZATION r", bind.Authorization},
 		{"security definer", "CREATE FUNCTION f() RETURNS int LANGUAGE SQL SECURITY DEFINER AS 'SELECT 1'", bind.Authorization},
-		{"row security", "ALTER TABLE t ENABLE ROW LEVEL SECURITY", bind.Authorization},
+		{"row security", "ALTER TABLE t ENABLE ROW LEVEL SECURITY", ""},
 		{"extension", "CREATE EXTENSION hstore", bind.ExternalCode},
 		{"native routine", "CREATE FUNCTION f() RETURNS int LANGUAGE C AS 'library', 'f'", bind.ExternalCode},
 		{"external anonymous block", "DO LANGUAGE plpython3u 'pass'", bind.ExternalCode},

@@ -78,5 +78,5 @@ func (b *binder) minMax(n *zpgparse.MinMaxExpr, s *scope) (expression, error) {
 	if err != nil {
 		return expression{}, err
 	}
-	return b.addScalar(s, expression{typ: typ, collation: state, nullable: nullable, effects: signatureEffects(sig), position: pos}, ir.Scalar{Kind: kind, Signature: id, Operator: selected.operator, Strict: sig.Strict}, args)
+	return b.addScalar(s, expression{typ: typ, collation: state, nullable: nullable, effects: b.signatureEffects(sig, state.id), position: pos}, ir.Scalar{Kind: kind, Signature: id, Operator: selected.operator, Strict: sig.Strict}, args)
 }

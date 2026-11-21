@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
+	"time"
 
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/model"
@@ -40,10 +42,11 @@ func loopTestBindOptions() bind.Options {
 // contain and serves canned rows for the dynamically built command. It records
 // every request so a test can observe what reached SQL execution.
 type loopTestExecutor struct {
-	values   map[string]model.Value
-	rows     [][]model.Value
-	columns  []model.TypeLayout
-	requests []SQLRequest
+	values     map[string]model.Value
+	rows       [][]model.Value
+	columns    []model.TypeLayout
+	requests   []SQLRequest
+	skipRecord bool
 }
 
 func (e *loopTestExecutor) value(request SQLRequest) (model.Value, error) {
@@ -63,7 +66,9 @@ func (e *loopTestExecutor) RunRoutine(context.Context, RoutineInvocation, func(c
 }
 
 func (e *loopTestExecutor) ExecuteSQL(_ context.Context, request SQLRequest) (SQLResult, error) {
-	e.requests = append(e.requests, request)
+	if !e.skipRecord {
+		e.requests = append(e.requests, request)
+	}
 	text, err := zpgparse.Deparse(&zpgparse.ParseResult{Stmts: []*zpgparse.RawStmt{request.Statement}})
 	if err != nil {
 		return SQLResult{}, err
@@ -98,6 +103,11 @@ func (e *loopTestExecutor) Report(context.Context, model.Error) {}
 // statement it contains, so a test can exercise runLoop without a session.
 func loopTestFrame(t *testing.T, body string, executor *loopTestExecutor) (*frame, statement) {
 	t.Helper()
+	return loopTestFrameWithLimits(t, body, DefaultLimits(), executor)
+}
+
+func loopTestFrameWithLimits(t *testing.T, body string, limits Limits, executor *loopTestExecutor) (*frame, statement) {
+	t.Helper()
 	parsed, err := zpgparse.Parse("DO $$ " + body + " $$")
 	if err != nil {
 		t.Fatalf("parse DO block: %v", err)
@@ -106,7 +116,7 @@ func loopTestFrame(t *testing.T, body string, executor *loopTestExecutor) (*fram
 	if statement == nil {
 		t.Fatal("source did not parse as DO")
 	}
-	program, _, err := (Compiler{Limits: DefaultLimits()}).CompileInline(t.Context(), statement, loopTestSnapshot{}, loopTestBindOptions())
+	program, _, err := (Compiler{Limits: limits}).CompileInline(t.Context(), statement, loopTestSnapshot{}, loopTestBindOptions())
 	if err != nil {
 		t.Fatalf("compile DO block: %v", err)
 	}
@@ -302,3 +312,137 @@ func TestRunLoopForeachWithoutSliceIteratesElements(t *testing.T) {
 		t.Fatalf("final element = %+v, want int64 3", f.values[target])
 	}
 }
+
+func TestRunLoopEmptyBodyEnforcesMaxSteps(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxSteps = 25
+
+	arrayElems := make([]model.Value, 50)
+	queryRows := make([][]model.Value, 50)
+	for i := range arrayElems {
+		v := model.Int64Val(int64(i + 1))
+		arrayElems[i] = v
+		queryRows[i] = []model.Value{v}
+	}
+
+	cases := []struct {
+		name     string
+		body     string
+		executor *loopTestExecutor
+	}{
+		{
+			name:     "unconditional loop",
+			body:     `BEGIN LOOP END LOOP; END`,
+			executor: &loopTestExecutor{},
+		},
+		{
+			name: "for integer range",
+			body: `BEGIN FOR i IN 1..1000000000 LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT 1":          model.Int64Val(1),
+					"SELECT 1000000000": model.Int64Val(1_000_000_000),
+				},
+			},
+		},
+		{
+			name: "while true",
+			body: `BEGIN WHILE true LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT true": model.BoolVal(true),
+				},
+			},
+		},
+		{
+			name: "foreach array",
+			body: `DECLARE x int; BEGIN FOREACH x IN ARRAY ARRAY[1] LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT ARRAY[1]": {
+						Type:       model.TypeArray,
+						Dimensions: []model.ArrayDimension{{Length: int32(len(arrayElems)), LowerBound: 1}},
+						ArrayVal:   arrayElems,
+					},
+				},
+			},
+		},
+		{
+			name: "for query",
+			body: `DECLARE r record; BEGIN FOR r IN EXECUTE 'SELECT 1' LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT 'SELECT 1'": model.StringVal("SELECT 1"),
+					"!SELECT 1":         model.Int64Val(0),
+				},
+				rows: queryRows,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, loop := loopTestFrameWithLimits(t, tc.body, limits, tc.executor)
+			_, err := f.runLoop(t.Context(), loop)
+			if !errors.Is(err, ErrLimit) {
+				t.Fatalf("runLoop err = %v, want ErrLimit", err)
+			}
+			if f.steps != limits.MaxSteps+1 {
+				t.Fatalf("steps = %d, want %d", f.steps, limits.MaxSteps+1)
+			}
+		})
+	}
+}
+
+func TestRunLoopEmptyBodyHonorsContextTimeout(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxSteps = math.MaxInt
+	limits.MaxRows = math.MaxInt
+	limits.MaxResultBytes = math.MaxUint64
+
+	cases := []struct {
+		name     string
+		body     string
+		executor *loopTestExecutor
+	}{
+		{
+			name:     "unconditional loop",
+			body:     `BEGIN LOOP END LOOP; END`,
+			executor: &loopTestExecutor{skipRecord: true},
+		},
+		{
+			name: "for integer range",
+			body: `BEGIN FOR i IN 1..1000000000 LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT 1":          model.Int64Val(1),
+					"SELECT 1000000000": model.Int64Val(1_000_000_000),
+				},
+				skipRecord: true,
+			},
+		},
+		{
+			name: "while true",
+			body: `BEGIN WHILE true LOOP END LOOP; END`,
+			executor: &loopTestExecutor{
+				values: map[string]model.Value{
+					"SELECT true": model.BoolVal(true),
+				},
+				skipRecord: true,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, loop := loopTestFrameWithLimits(t, tc.body, limits, tc.executor)
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Millisecond)
+			defer cancel()
+			_, err := f.runLoop(ctx, loop)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("runLoop err = %v, want context.DeadlineExceeded", err)
+			}
+		})
+	}
+}
+

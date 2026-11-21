@@ -85,14 +85,18 @@ func TestSessionIntrospectionOrderingCancellationAndReentry(t *testing.T) {
 
 func TestNamedPreparedSearchPathAndDependencyInvalidation(t *testing.T) {
 	entry := &namedPreparedStatement{
-		searchPath: []string{"first", "public"},
-		semantics:  builtin.ResolveOptions{},
+		searchPath:  []string{"first", "public"},
+		currentRole: "tenant_a",
+		semantics:   builtin.ResolveOptions{},
 	}
-	if namedPreparedSettingsChanged(entry, []string{"first", "public"}, builtin.ResolveOptions{}) || cachedPreparedInvalidation(nil) {
+	if namedPreparedSettingsChanged(entry, []string{"first", "public"}, "tenant_a", builtin.ResolveOptions{}) || cachedPreparedInvalidation(nil) {
 		t.Fatal("new earlier same-name relation reanalyzed without a bound dependency change")
 	}
-	if !namedPreparedSettingsChanged(entry, []string{"second", "public"}, builtin.ResolveOptions{}) {
+	if !namedPreparedSettingsChanged(entry, []string{"second", "public"}, "tenant_a", builtin.ResolveOptions{}) {
 		t.Fatal("changed search path retained old analysis")
+	}
+	if !namedPreparedSettingsChanged(entry, []string{"first", "public"}, "tenant_b", builtin.ResolveOptions{}) {
+		t.Fatal("changed active role retained old analysis")
 	}
 	if !cachedPreparedInvalidation(errPreparedDependency) {
 		t.Fatal("descriptor or statistics invalidation retained cached analysis")

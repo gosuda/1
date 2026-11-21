@@ -122,6 +122,8 @@ func ExecuteStatisticsCommand(ctx context.Context, transactions *Transactions, n
 			return settingError("25006", "cannot execute statistics commands in a read-only transaction")
 		}
 		options.Binding.Bind.SearchPath = transactions.settings.SearchPath()
+		options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 		options.Binding.Owner = transactions.settings.Principal().OID()
 		options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = transactions.temporal

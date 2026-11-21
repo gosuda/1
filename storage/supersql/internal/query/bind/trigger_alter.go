@@ -75,6 +75,9 @@ func bindTriggerStateAlter(ctx context.Context, statement *zpgparse.AlterTableSt
 		if spec.Table.Owner != options.Owner {
 			return nil, bindError("42501", "must be owner of table", int(statement.Relation.Location)+1)
 		}
+		if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
+			return nil, err
+		}
 		metadata := cloneTableMetadata(spec.Table)
 		metadata.Triggers = slices.Clone(spec.Table.Triggers)
 		spec.Table = metadata

@@ -44,6 +44,17 @@ var nativeViewSources = [...]nativeViewSource{
         pg_get_viewdef(C.oid) AS definition
     FROM pg_class C LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
     WHERE C.relkind = 'm'`},
+	{relation: IDPgPolicies, sql: `SELECT
+        N.nspname AS schemaname,
+        C.relname AS tablename,
+        CAST(NULL AS name) AS policyname,
+        CAST(NULL AS text) AS permissive,
+        CAST(NULL AS name[]) AS roles,
+        CAST(NULL AS text) AS cmd,
+        CAST(NULL AS text) AS qual,
+        CAST(NULL AS text) AS with_check
+    FROM pg_class C LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
+    WHERE C.relrowsecurity AND FALSE`},
 	{relation: IDPgRoles, sql: `SELECT 'embedded'::name AS rolname, false AS rolsuper, true AS rolinherit,
        false AS rolcreaterole, false AS rolcreatedb, true AS rolcanlogin,
        false AS rolreplication, -1::integer AS rolconnlimit,

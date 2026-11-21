@@ -102,11 +102,21 @@ type lockOwner struct {
 }
 
 type lockRecord struct {
-	request  lockRequest
-	mode     lockMode
-	ordinal  uint64
-	size     uint64
-	previous *lockRecord
+	owner         *lockOwner
+	request       lockRequest
+	mode          lockMode
+	ordinal       uint64
+	size          uint64
+	previous      *lockRecord
+	bucketIndex   int
+	retainedShare bool
+}
+
+type objectLockBucket struct {
+	records       []*lockRecord
+	changed       chan struct{}
+	waiters       int
+	pendingNotify bool
 }
 
 type lockPosition struct {
@@ -117,11 +127,11 @@ type lockPosition struct {
 type lockRegistry struct {
 	mu                  sync.Mutex
 	owners              map[model.TxnID]*lockOwner
+	objects             map[model.ObjectID]*objectLockBucket
 	maxOwners, maxLocks int
 	maxBytes, usedBytes uint64
 	lockCount           int
 	age                 uint64
-	changed             chan struct{}
 	waitGraph           *locks.WaitGraph
 }
 
@@ -137,8 +147,9 @@ func newLockRegistry(maxOwners, maxLocks int, maxBytes uint64, waitGraphs ...*lo
 	}
 	return &lockRegistry{
 		owners:    make(map[model.TxnID]*lockOwner),
+		objects:   make(map[model.ObjectID]*objectLockBucket),
 		maxOwners: maxOwners, maxLocks: maxLocks, maxBytes: maxBytes,
-		changed: make(chan struct{}), waitGraph: waitGraph,
+		waitGraph: waitGraph,
 	}, nil
 }
 
@@ -204,16 +215,12 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 	if err := context.Cause(ctx); err != nil {
 		return false, err
 	}
-	covered := false
-	for record := owner.locks; record != nil; record = record.previous {
-		if record.mode != grantMode || !lockContains(record.request, request) {
-			continue
+	matched, covered, conflictCovered := coveredRecord(owner, request, grantMode, conflictMode)
+	if conflictCovered {
+		if grantMode == lockShare && matched.mode != lockShare {
+			matched.retainedShare = true
 		}
-		if grantMode == conflictMode {
-			return true, nil
-		}
-		covered = true
-		break
+		return true, nil
 	}
 	if policy != lockWait {
 		conflict, _ := r.conflicts(owner, request, conflictMode, false, nil)
@@ -224,6 +231,9 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 			return false, nil
 		}
 		if covered {
+			if grantMode == lockShare && matched.mode != lockShare {
+				matched.retainedShare = true
+			}
 			return true, nil
 		}
 	}
@@ -274,13 +284,15 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 		conflict, blockers = r.conflicts(owner, request, conflictMode, true, blockers[:0])
 		if !conflict {
 			if covered {
+				if grantMode == lockShare && matched.mode != lockShare {
+					matched.retainedShare = true
+				}
 				return true, nil
 			}
 			if owner.sequence == ^uint64(0) {
 				return false, errLockSequence
 			}
-			owner.sequence++
-			owner.locks = &lockRecord{request: request, mode: grantMode, ordinal: owner.sequence, size: size, previous: owner.locks}
+			r.addRecordLocked(owner, request, grantMode, size)
 			granted = true
 			return true, nil
 		}
@@ -299,7 +311,9 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 		}
 		waited = true
 		waitStarted := time.Now()
-		changed := r.changed
+		bucket := r.bucketLocked(request.ObjectID)
+		bucket.waiters++
+		changed := bucket.changed
 		r.mu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -308,6 +322,10 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 		case <-changed:
 		}
 		r.mu.Lock()
+		bucket.waiters--
+		if len(bucket.records) == 0 && bucket.waiters == 0 {
+			delete(r.objects, request.ObjectID)
+		}
 		waitDuration += time.Since(waitStarted)
 	}
 }
@@ -324,8 +342,21 @@ func (r *lockRegistry) acquireNoWaitFor(ctx context.Context, owner *lockOwner, r
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
+	matched, covered, conflictCovered := coveredRecord(owner, request, grantMode, conflictMode)
+	if conflictCovered {
+		if grantMode == lockShare && matched.mode != lockShare {
+			matched.retainedShare = true
+		}
+		return nil
+	}
 	if conflict, _ := r.conflicts(owner, request, conflictMode, false, nil); conflict {
 		return errLockUnavailable
+	}
+	if covered {
+		if grantMode == lockShare && matched.mode != lockShare {
+			matched.retainedShare = true
+		}
+		return nil
 	}
 	if owner.sequence == ^uint64(0) {
 		return errLockSequence
@@ -339,8 +370,7 @@ func (r *lockRegistry) acquireNoWaitFor(ctx context.Context, owner *lockOwner, r
 	}
 	request.Lower.Key = cloneLockKey(request.Lower.Key)
 	request.Upper.Key = cloneLockKey(request.Upper.Key)
-	owner.sequence++
-	owner.locks = &lockRecord{request: request, mode: grantMode, ordinal: owner.sequence, size: size, previous: owner.locks}
+	r.addRecordLocked(owner, request, grantMode, size)
 	r.usedBytes += size
 	r.lockCount++
 	return nil
@@ -361,11 +391,11 @@ func (r *lockRegistry) acquireEligible(ctx context.Context, owner *lockOwner, re
 		return nil, 0, err
 	}
 	conflicts := make([]lockRequest, 0)
-	for _, holder := range r.owners {
-		if holder == owner {
-			continue
-		}
-		for record := holder.locks; record != nil; record = record.previous {
+	if bucket := r.objects[request.ObjectID]; bucket != nil {
+		for _, record := range bucket.records {
+			if record.owner == owner {
+				continue
+			}
 			if isTableLockMode(record.mode) || !lockRequestsConflict(request, conflictMode, record.request, record.mode) {
 				continue
 			}
@@ -430,8 +460,7 @@ func (r *lockRegistry) acquireEligible(ctx context.Context, owner *lockOwner, re
 		part.Lower.Key = cloneLockKey(part.Lower.Key)
 		part.Upper.Key = cloneLockKey(part.Upper.Key)
 		size := uint64(unsafe.Sizeof(lockRecord{})) + uint64(len(part.Lower.Key)) + uint64(len(part.Upper.Key))
-		owner.sequence++
-		owner.locks = &lockRecord{request: *part, mode: grantMode, ordinal: owner.sequence, size: size, previous: owner.locks}
+		r.addRecordLocked(owner, *part, grantMode, size)
 		r.usedBytes += size
 		r.lockCount++
 	}
@@ -517,22 +546,23 @@ func lockRequestsConflict(a lockRequest, am lockMode, b lockRequest, bm lockMode
 	return !lockEndsBefore(a.Upper, b.Lower) && !lockEndsBefore(b.Upper, a.Lower)
 }
 
+var tableLockConflictMask = [...]uint8{
+	1 << 7,
+	1<<6 | 1<<7,
+	1<<4 | 1<<5 | 1<<6 | 1<<7,
+	1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
+	1<<2 | 1<<3 | 1<<5 | 1<<6 | 1<<7,
+	1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
+	1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
+	1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
+}
+
 func lockModesConflict(a, b lockMode) bool {
 	if isTableLockMode(a) || isTableLockMode(b) {
 		if !isTableLockMode(a) || !isTableLockMode(b) {
 			return false
 		}
-		access := [...]uint8{
-			1 << 7,
-			1<<6 | 1<<7,
-			1<<4 | 1<<5 | 1<<6 | 1<<7,
-			1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
-			1<<2 | 1<<3 | 1<<5 | 1<<6 | 1<<7,
-			1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
-			1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
-			1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<5 | 1<<6 | 1<<7,
-		}
-		return access[tableLockRank(a)]&(1<<tableLockRank(b)) != 0
+		return tableLockConflictMask[tableLockRank(a)]&(1<<tableLockRank(b)) != 0
 	}
 	if a == lockUpdate || b == lockUpdate {
 		return true
@@ -541,6 +571,46 @@ func lockModesConflict(a, b lockMode) bool {
 		return false
 	}
 	return a == lockNoKeyUpdate || b == lockNoKeyUpdate
+}
+
+func lockModeSubsumes(held, requested lockMode) bool {
+	if held == requested {
+		return true
+	}
+	if isTableLockMode(held) != isTableLockMode(requested) {
+		return false
+	}
+	if isTableLockMode(held) {
+		hm := tableLockConflictMask[tableLockRank(held)]
+		rm := tableLockConflictMask[tableLockRank(requested)]
+		return hm&rm == rm
+	}
+	switch held {
+	case lockUpdate:
+		return true
+	case lockNoKeyUpdate:
+		return requested == lockShare || requested == lockKeyShare
+	case lockShare:
+		return requested == lockKeyShare
+	default:
+		return false
+	}
+}
+
+func coveredRecord(owner *lockOwner, request lockRequest, grantMode, conflictMode lockMode) (*lockRecord, bool, bool) {
+	var matched *lockRecord
+	for record := owner.locks; record != nil; record = record.previous {
+		if !lockModeSubsumes(record.mode, grantMode) || !lockContains(record.request, request) {
+			continue
+		}
+		if lockModeSubsumes(record.mode, conflictMode) {
+			return record, true, true
+		}
+		if matched == nil {
+			matched = record
+		}
+	}
+	return matched, matched != nil, false
 }
 
 func isTableLockMode(mode lockMode) bool {
@@ -605,24 +675,26 @@ func compareLockBounds(a, b lockBound, aEdge, bEdge int) int {
 // Cancellation is a request to abort, not cleanup acknowledgement. Aborting and
 // committing owners retain conflicts until rollback or release removes records.
 func (r *lockRegistry) conflicts(owner *lockOwner, request lockRequest, mode lockMode, wound bool, blockers []locks.WaitOwner) (bool, []locks.WaitOwner) {
+	bucket := r.objects[request.ObjectID]
+	if bucket == nil || len(bucket.records) == 0 {
+		return false, blockers
+	}
 	conflict := false
-	for _, holder := range r.owners {
+	for _, record := range bucket.records {
+		holder := record.owner
 		if holder == owner {
 			continue
 		}
-		for record := holder.locks; record != nil; record = record.previous {
-			if !lockRequestsConflict(request, mode, record.request, record.mode) {
-				continue
-			}
-			conflict = true
-			wounded := wound && owner.age < holder.age && holder.state == lockOwnerActive
-			if wounded {
-				holder.state = lockOwnerAborting
-				holder.cancel(errLockWounded)
-			} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {
-				blockers = append(blockers, holder.waitOwner)
-			}
-			break
+		if !lockRequestsConflict(request, mode, record.request, record.mode) {
+			continue
+		}
+		conflict = true
+		wounded := wound && owner.age < holder.age && holder.state == lockOwnerActive
+		if wounded {
+			holder.state = lockOwnerAborting
+			holder.cancel(errLockWounded)
+		} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {
+			blockers = append(blockers, holder.waitOwner)
 		}
 	}
 	return conflict, blockers
@@ -660,9 +732,22 @@ func (r *lockRegistry) savepoint(owner *lockOwner) (lockPosition, error) {
 	return position, nil
 }
 
-// rollback acknowledges cleanup of writes made after position. Wounded owners
-// must abort completely; they cannot restore activity by rolling back a savepoint.
+// rollback acknowledges cleanup of writes made after position under Strict 2PL.
+// Write/update and exclusive locks acquired after position are released while
+// lockShare read locks are retained until transaction commit or full abort.
+// Wounded owners must abort completely; they cannot restore activity by rolling
+// back a savepoint.
 func (r *lockRegistry) rollback(owner *lockOwner, position lockPosition) error {
+	return r.rollbackLocks(owner, position, true)
+}
+
+// rollbackAttempt removes every lock acquired after position by an atomic
+// acquisition call that failed or skipped before returning data.
+func (r *lockRegistry) rollbackAttempt(owner *lockOwner, position lockPosition) error {
+	return r.rollbackLocks(owner, position, false)
+}
+
+func (r *lockRegistry) rollbackLocks(owner *lockOwner, position lockPosition, retainReadLocks bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.active(owner); err != nil {
@@ -674,10 +759,27 @@ func (r *lockRegistry) rollback(owner *lockOwner, position lockPosition) error {
 	if position.owner != owner || position.ordinal > owner.sequence {
 		return errLockPosition
 	}
-	for owner.locks != nil && owner.locks.ordinal > position.ordinal {
-		r.pop(owner)
+	var dirtyBuf [8]*objectLockBucket
+	dirty := dirtyBuf[:0]
+	for prev := &owner.locks; *prev != nil && (*prev).ordinal > position.ordinal; {
+		record := *prev
+		if retainReadLocks {
+			if record.mode == lockShare {
+				prev = &record.previous
+				continue
+			}
+			if record.retainedShare {
+				record.mode = lockShare
+				record.retainedShare = false
+				r.markBucketDirtyLocked(record.request.ObjectID, &dirty)
+				prev = &record.previous
+				continue
+			}
+		}
+		*prev = record.previous
+		r.removeRecordLocked(record, &dirty)
 	}
-	r.notify()
+	r.notifyBucketsLocked(dirty)
 	return nil
 }
 
@@ -705,26 +807,83 @@ func (r *lockRegistry) release(owner *lockOwner) error {
 	if owner.state == lockOwnerEnded {
 		return nil
 	}
+	var dirtyBuf [8]*objectLockBucket
+	dirty := dirtyBuf[:0]
 	for owner.locks != nil {
-		r.pop(owner)
+		record := owner.locks
+		owner.locks = record.previous
+		r.removeRecordLocked(record, &dirty)
 	}
 	owner.state = lockOwnerEnded
 	owner.cancel(context.Canceled)
 	owner.cancel = nil
 	delete(r.owners, owner.id)
-	r.notify()
+	r.notifyBucketsLocked(dirty)
 	return nil
 }
 
-func (r *lockRegistry) pop(owner *lockOwner) {
-	record := owner.locks
-	owner.locks = record.previous
+func (r *lockRegistry) bucketLocked(objectID model.ObjectID) *objectLockBucket {
+	bucket := r.objects[objectID]
+	if bucket == nil {
+		bucket = &objectLockBucket{changed: make(chan struct{})}
+		r.objects[objectID] = bucket
+	}
+	return bucket
+}
+
+func (r *lockRegistry) addRecordLocked(owner *lockOwner, request lockRequest, mode lockMode, size uint64) *lockRecord {
+	owner.sequence++
+	bucket := r.bucketLocked(request.ObjectID)
+	record := &lockRecord{
+		owner:       owner,
+		request:     request,
+		mode:        mode,
+		ordinal:     owner.sequence,
+		size:        size,
+		previous:    owner.locks,
+		bucketIndex: len(bucket.records),
+	}
+	owner.locks = record
+	bucket.records = append(bucket.records, record)
+	return record
+}
+
+func (r *lockRegistry) removeRecordLocked(record *lockRecord, dirty *[]*objectLockBucket) {
+	objectID := record.request.ObjectID
+	if bucket := r.objects[objectID]; bucket != nil {
+		last := len(bucket.records) - 1
+		if record.bucketIndex != last {
+			moved := bucket.records[last]
+			bucket.records[record.bucketIndex] = moved
+			moved.bucketIndex = record.bucketIndex
+		}
+		bucket.records[last] = nil
+		bucket.records = bucket.records[:last]
+		if bucket.waiters > 0 {
+			if !bucket.pendingNotify {
+				bucket.pendingNotify = true
+				*dirty = append(*dirty, bucket)
+			}
+		} else if len(bucket.records) == 0 {
+			delete(r.objects, objectID)
+		}
+	}
 	r.usedBytes -= record.size
 	r.lockCount--
 	*record = lockRecord{}
 }
 
-func (r *lockRegistry) notify() {
-	close(r.changed)
-	r.changed = make(chan struct{})
+func (r *lockRegistry) markBucketDirtyLocked(objectID model.ObjectID, dirty *[]*objectLockBucket) {
+	if bucket := r.objects[objectID]; bucket != nil && bucket.waiters > 0 && !bucket.pendingNotify {
+		bucket.pendingNotify = true
+		*dirty = append(*dirty, bucket)
+	}
+}
+
+func (r *lockRegistry) notifyBucketsLocked(dirty []*objectLockBucket) {
+	for _, bucket := range dirty {
+		bucket.pendingNotify = false
+		close(bucket.changed)
+		bucket.changed = make(chan struct{})
+	}
 }

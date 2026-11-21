@@ -23,10 +23,15 @@ type Backend struct {
 	extras             []string
 	state              databaseState
 	durableClosed      storage.ReadFence
+	persistedHorizon   model.Timestamp
+	recoveredHorizon   model.Timestamp
 	stateDirty         bool
 	frontier           recoveredPosition
 	publishedEpoch     clock.Epoch
 	transactions       ordered.Tree[recoveryTxnID, transactionRecord]
+	prunedPosition     uint64
+	prunedCommitTS     model.Timestamp
+	fenceIndex         coveredFenceIndex
 	pending            *pendingCommit
 	metadataUncertain  bool
 	collectionBoundary model.Timestamp
@@ -40,6 +45,10 @@ type Backend struct {
 	maintenanceFault   func(context.Context, maintenancePoint) error
 	commitFault        commitFault
 	stateFault         stateFault
+	memtable           memtable
+	groupMu            sync.Mutex
+	groupQueue         []*groupCommitReq
+	groupActive        bool
 }
 
 type pendingCommit struct {
@@ -47,6 +56,8 @@ type pendingCommit struct {
 	epoch        clock.Epoch
 	transactions ordered.Tree[recoveryTxnID, transactionRecord]
 	admission    *runAdmission
+	batch        *storage.MutationBatch
+	next         *pendingCommit
 }
 
 // State is an owned recovery/coordination view, not a new read barrier.
@@ -122,6 +133,7 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 	}
 	backend.state = state
 	backend.durableClosed = state.Closed
+	backend.persistedHorizon = max(state.Closed.ClosedTS, state.ClosedHorizon)
 	recovered, err := recoverPublishedRuns(ctx, directory, state, runRecoveryLimits{
 		Log: config.Limits.recovery(), Preparation: config.Limits.preparation(), Resident: config.Limits.resident(),
 		StagingBytes: config.Limits.ResidentBytes, IdentityBytes: config.Limits.IdentityBytes,
@@ -136,8 +148,13 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 		return nil, err
 	}
 	backend.runs, backend.frontier, backend.transactions, backend.publishedEpoch = recovered.Set, recovered.Position, recovered.Transactions, recovered.PublishedEpoch
+	backend.prunedPosition, backend.prunedCommitTS, backend.fenceIndex = recovered.PrunedPosition, recovered.PrunedCommitTS, recovered.FenceIndex
+	backend.memtable = recovered.Memtable
 	if err := backend.validateState(ctx, state); err != nil {
 		return nil, err
+	}
+	if state.Closed.ClosedTS > 0 {
+		backend.recoveredHorizon = max(state.Closed.ClosedTS, state.ClosedHorizon)
 	}
 	if suppliedScale {
 		current := state.Scales[len(state.Scales)-1].Scale
@@ -158,6 +175,7 @@ func Open(ctx context.Context, config Config) (_ *Backend, err error) {
 			}
 			backend.state = state
 			backend.durableClosed = state.Closed
+			backend.persistedHorizon = max(state.Closed.ClosedTS, state.ClosedHorizon)
 		}
 	}
 	if err := directory.root.Remove(databaseStatePending); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -211,7 +229,7 @@ func validateRecordState(record *storedCommit, state databaseState) error {
 }
 
 func (backend *Backend) validateState(ctx context.Context, state databaseState) error {
-	closed := max(state.Closed.ClosedTS, backend.frontier.CommitTS)
+	closed := max(state.Closed.ClosedTS, state.ClosedHorizon, backend.frontier.CommitTS)
 	if state.Closed.LogPosition > backend.frontier.LogPosition || state.HistoryFloor > closed {
 		return storage.ErrCorruptStorage
 	}
@@ -221,13 +239,33 @@ func (backend *Backend) validateState(ctx context.Context, state databaseState) 
 		}
 	}
 	if state.Closed.ClosedTS != 0 {
-		return backend.runs.validateFence(ctx, state.Closed, backend.transactions)
+		return backend.validateFenceLocked(ctx, state.Closed)
 	}
 	return ctx.Err()
 }
 
+func (backend *Backend) validateFenceLocked(ctx context.Context, fence storage.ReadFence) error {
+	handled, err := backend.memtable.validateFence(fence)
+	if err != nil {
+		return err
+	}
+	if handled {
+		return nil
+	}
+	return backend.runs.validateFence(ctx, fence, backend.fenceIndex)
+}
+
+// flushMemtableLocked flushes buffered memtable commits up to maxPos (0 = all)
+// into coalesced NSSST004 PAX SST runs. Caller holds backend.commitMu and backend.mu.
+func (backend *Backend) flushMemtableLocked(ctx context.Context, maxPos uint64) error {
+	if backend.memtable.empty() {
+		return nil
+	}
+	return backend.memtable.flushToRuns(ctx, backend.directory.runs, backend.runs, backend.limits, maxPos)
+}
+
 func (backend *Backend) closedTimestamp() model.Timestamp {
-	return max(backend.state.Closed.ClosedTS, backend.frontier.CommitTS)
+	return max(backend.state.Closed.ClosedTS, backend.frontier.CommitTS, backend.recoveredHorizon)
 }
 
 func (backend *Backend) State(ctx context.Context) (State, error) {
@@ -240,7 +278,7 @@ func (backend *Backend) State(ctx context.Context) (State, error) {
 		return State{}, err
 	}
 	epoch := backend.publishedEpoch
-	if backend.state.Closed.ClosedTS >= backend.frontier.CommitTS {
+	if max(backend.state.Closed.ClosedTS, backend.recoveredHorizon) >= backend.frontier.CommitTS && backend.state.Closed.ClosedTS != 0 {
 		epoch = backend.state.Closed.Epoch
 	}
 	return State{LogPosition: backend.frontier.LogPosition, CommitTS: backend.frontier.CommitTS, ClosedTS: backend.closedTimestamp(), HistoryFloor: backend.state.HistoryFloor, Epoch: epoch, Scale: copyClockScale(backend.state.Scales[len(backend.state.Scales)-1].Scale)}, nil
@@ -269,14 +307,24 @@ func (backend *Backend) Close() error {
 	backend.commitMu.Lock()
 	defer backend.commitMu.Unlock()
 	backend.mu.Lock()
+	var flushErr error
+	if !backend.memtable.empty() && !backend.metadataUncertain && backend.pending == nil && backend.runs != nil && backend.directory != nil {
+		flushErr = backend.flushMemtableLocked(context.Background(), 0)
+	}
 	var stateErr error
-	if backend.stateDirty && !backend.metadataUncertain && backend.pending == nil && backend.runs != nil && backend.directory != nil && backend.state.Generation < ^uint64(0) {
+	targetHorizon := model.Timestamp(0)
+	if backend.state.Closed.ClosedTS > 0 {
+		targetHorizon = max(backend.state.Closed.ClosedTS, backend.recoveredHorizon)
+	}
+	if (backend.stateDirty || backend.persistedHorizon != targetHorizon) && !backend.metadataUncertain && backend.pending == nil && backend.runs != nil && backend.directory != nil && backend.state.Generation < ^uint64(0) {
 		next := backend.state
 		next.Generation++
+		next.ClosedHorizon = targetHorizon
 		_, stateErr = writeDatabaseState(context.Background(), backend.directory.root, next, backend.limits.MetadataBytes, nil)
 		if stateErr == nil {
 			backend.state = next
 			backend.durableClosed = next.Closed
+			backend.persistedHorizon = next.ClosedHorizon
 			backend.stateDirty = false
 		}
 	}
@@ -284,17 +332,23 @@ func (backend *Backend) Close() error {
 	if backend.runs != nil {
 		runErr = backend.runs.Close()
 	}
+	backend.memtable.reset()
 	backend.pending = nil
 	backend.transactions = ordered.Tree[recoveryTxnID, transactionRecord]{}
+	backend.prunedPosition = 0
+	backend.prunedCommitTS = 0
+	backend.fenceIndex = coveredFenceIndex{}
 	backend.state = databaseState{}
 	backend.durableClosed = storage.ReadFence{}
+	backend.persistedHorizon = 0
+	backend.recoveredHorizon = 0
 	backend.stateDirty = false
 	backend.encoder = nil
 	backend.verifier = nil
 	backend.commitFault = nil
 	backend.stateFault = nil
 	backend.maintenanceFault = nil
-	backend.closeErr = errors.Join(stateErr, runErr, backend.directory.Close())
+	backend.closeErr = errors.Join(flushErr, stateErr, runErr, backend.directory.Close())
 	err := backend.closeErr
 	backend.mu.Unlock()
 	close(done)

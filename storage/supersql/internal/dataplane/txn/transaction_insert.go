@@ -127,7 +127,7 @@ func (transaction *Transaction) prepareRow(ctx context.Context, preparation Inse
 	if budget <= header || transaction.statementDepth >= 64 {
 		return nil, errTransactionBudget
 	}
-	claim, err := preparation.Allocator.Reserve(budget)
+	claim, err := preparation.Allocator.Reserve(header)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +136,14 @@ func (transaction *Transaction) prepareRow(ctx context.Context, preparation Inse
 			claim.Release()
 		}
 	}()
+	admitted, err := claim.GrowUpTo(budget)
+	if err != nil {
+		return nil, err
+	}
+	if admitted <= header {
+		return nil, errTransactionBudget
+	}
+	budget = admitted
 	transaction.scratchUsed += budget
 	defer func() { transaction.scratchUsed -= budget }()
 	position, err := transaction.checkpoint()

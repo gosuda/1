@@ -44,6 +44,8 @@ func runInlineRoutineStatement(ctx context.Context, owner *Transactions, transac
 	}
 	binding := owner.commandBindOptions()
 	binding.SearchPath = owner.settings.SearchPath()
+	binding.CurrentRole = owner.settings.CurrentRole()
+	binding.SessionUser = owner.settings.SessionUser()
 	binding.Builtin = environment.Builtin
 	binding.Temporal = owner.temporal
 	program, dependencies, compileErr := compiler.CompileInline(ctx, command.Statement, snapshot, binding)

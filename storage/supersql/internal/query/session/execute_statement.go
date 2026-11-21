@@ -17,7 +17,6 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
-	"github.com/gosuda/supersql-alpha/internal/query/opt/span"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
@@ -189,10 +188,7 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 			}
 			defer func() { err = errors.Join(err, snapshot.Close()) }()
 			if parameters != nil {
-				planning.Optimize.Parameters = make([]span.Parameter, len(parameters))
-				for i, parameter := range parameters {
-					planning.Optimize.Parameters[i] = span.Parameter{Number: parameter.Number, Layout: parameter.Layout, Value: parameter.Value}
-				}
+				planning.Optimize.Parameters = spanParameters(parameters)
 			}
 			prepared, err := prepareBound(ctx, analyzed.bound, planning)
 			if err == nil {
@@ -278,6 +274,13 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 				return nil, err
 			}
 			defer func() { err = errors.Join(err, snapshot.Close()) }()
+			if len(options.Execution.Environment.Parameters) != 0 {
+				reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Execution.Environment.Parameters, planning.Normalize.Builtin, options.Execution.Environment.Limits)
+				if paramErr != nil {
+					return nil, paramErr
+				}
+				planning.Optimize.Parameters = spanParameters(reconciled)
+			}
 			prepared, err := prepareBound(ctx, bound, planning)
 			if err == nil {
 				prepared.requiredTimestamp = transactions.historical
@@ -456,10 +459,17 @@ func (transactions *Transactions) statementPlanning(ctx context.Context, view tx
 	planning.Normalize.Builtin = builtins
 	planning.Bind.Temporal = transactions.temporal
 	planning.Bind.SearchPath = transactions.searchPath()
-	planning.Optimize.WorkingMemory = min(planning.Optimize.WorkingMemory, uint64(transactions.settings.Resources().EffectiveWorkMemoryBytes))
+	planning.Bind.CurrentRole = transactions.settings.CurrentRole()
+	planning.Bind.SessionUser = transactions.settings.SessionUser()
+	if effectiveWork := transactions.settings.Resources().EffectiveWorkMemoryBytes; effectiveWork > 0 && planning.Optimize.WorkingMemory > 0 {
+		planning.Optimize.WorkingMemory = uint64(effectiveWork)
+	}
 	planning.Optimize.StatisticsKeyEncoder = transactions.options.KeyEncoder
 	if encoder, ok := transactions.options.KeyEncoder.(*builtin.KeyEncoder); ok {
 		planning.Optimize.StatisticsKeyEncoder = encoder.WithResolveOptions(builtins)
+	}
+	if planning.Optimize.DefaultCollation == 0 {
+		planning.Optimize.DefaultCollation = builtins.DefaultCollation
 	}
 	if statistics := options.Execution.Statistics; statistics != nil && statistics.Store != nil {
 		planning.Optimize.ExtendedStatistics = &catalogExtendedStatistics{snapshot: snapshot, limits: statistics.Binding.Descriptors}

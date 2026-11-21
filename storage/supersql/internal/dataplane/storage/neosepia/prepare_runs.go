@@ -176,7 +176,7 @@ func (p *preparedRuns) flush(ctx context.Context, position uint64, builder *muta
 		return columnar.ErrBatchBudget
 	}
 	name := preparedRunName(position, len(p.files))
-	data, err := builder.Flush(ctx)
+	data, blobs, err := builder.FlushWithBlobs(ctx)
 	if err != nil {
 		return err
 	}
@@ -186,7 +186,7 @@ func (p *preparedRuns) flush(ctx context.Context, position uint64, builder *muta
 	}
 	p.files = append(p.files, preparedRun{Name: name, Target: builder.layout.Target, Rows: uint64(count)})
 	p.metadataBytes += nameBytes
-	descriptor, err := writePreparedRun(ctx, file, builder.layout.Target, data, limits.File, scratch)
+	descriptor, err := writePreparedRun(ctx, file, builder.layout.Target, data, blobs, limits.File, scratch)
 	if err != nil {
 		return err
 	}
@@ -196,13 +196,13 @@ func (p *preparedRuns) flush(ctx context.Context, position uint64, builder *muta
 	return nil
 }
 
-func writePreparedRun(ctx context.Context, file *os.File, target storage.ObjectRef, data []byte, limits sstLimits, scratch []byte) (_ preparedRun, err error) {
+func writePreparedRun(ctx context.Context, file *os.File, target storage.ObjectRef, data []byte, blobs []toastBlob, limits sstLimits, scratch []byte) (_ preparedRun, err error) {
 	defer func() { err = errors.Join(err, file.Close()) }()
 	writer, err := newSSTWriter(file, target, limits)
 	if err != nil {
 		return preparedRun{}, err
 	}
-	if err := writer.Append(ctx, data); err != nil {
+	if err := writer.AppendWithBlobs(ctx, data, blobs); err != nil {
 		return preparedRun{}, err
 	}
 	if err := writer.Finish(ctx); err != nil {

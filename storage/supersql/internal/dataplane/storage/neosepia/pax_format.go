@@ -1,6 +1,7 @@
 package neosepia
 
 import (
+	"context"
 	"errors"
 	"hash/crc32"
 
@@ -14,15 +15,52 @@ import (
 // slot per logical lane, including NULLs; its bitmap marks NULL values.
 // The block checksum covers metadata and payloads, excluding its own field.
 const (
-	paxMagic       uint32 = 0x32584150
-	paxVersion     uint32 = 2
-	paxHeaderSize         = 64
-	paxColumnSize         = 64
-	paxVersionSize        = 40
-	paxZoneInteger uint16 = 1
+	paxMagic         uint32 = 0x32584150
+	paxVersion       uint32 = 2
+	paxHeaderSize           = 64
+	paxColumnSize           = 64
+	paxVersionSize          = 40
+	paxZoneInteger   uint16 = 1
+	toastThreshold          = 64 << 10
+	sstBlobEntrySize        = 24
 )
 
 var errPAXBlock = errors.Join(storage.ErrCorruptStorage, errors.New("invalid PAX block"))
+
+type toastBlob struct {
+	data []byte
+	crc  uint32
+}
+
+type sstBlobEntry struct {
+	offset uint64
+	length uint64
+	crc    uint32
+}
+
+type paxBlobReader interface {
+	readBlob(ctx context.Context, entry sstBlobEntry, dst []byte, memory *sourceMemory) error
+}
+
+type memBlobReader struct {
+	blobs []toastBlob
+}
+
+func (m memBlobReader) readBlob(ctx context.Context, entry sstBlobEntry, dst []byte, _ *sourceMemory) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	idx := int(entry.offset)
+	if idx < 0 || idx >= len(m.blobs) {
+		return storage.ErrCorruptStorage
+	}
+	blob := m.blobs[idx]
+	if uint64(len(blob.data)) != entry.length || uint64(len(dst)) != entry.length || blob.crc != entry.crc {
+		return storage.ErrCorruptStorage
+	}
+	copy(dst, blob.data)
+	return nil
+}
 
 type blockLimits struct {
 	MaxRows         int

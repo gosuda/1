@@ -138,7 +138,7 @@ func BindCreateSchema(ctx context.Context, statement *zpgparse.CreateSchemaStmt,
 	if err != nil {
 		return nil, err
 	}
-	d, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: id, OID: oid, Name: name, Version: 1, State: model.StatePublic, Schema: &model.SchemaMetadata{Owner: options.Owner}}, options.Descriptors)
+	d, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: id, OID: oid, Name: name, Version: 1, State: model.StatePublic, Schema: &model.SchemaMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole)}}, options.Descriptors)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +206,7 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 	if len(statement.TableElts) > options.Descriptors.MaxItems {
 		return nil, model.ErrDescriptorLimit
 	}
-	meta := &model.TableMetadata{Owner: options.Owner, Persistence: "p"}
+	meta := &model.TableMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Persistence: "p"}
 	if statement.Relation.Relpersistence == "t" {
 		meta.Persistence = "t"
 	}

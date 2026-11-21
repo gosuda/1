@@ -13,7 +13,13 @@ func TestScrubRangeCountsHistoryAndDetectsPayloadDamage(t *testing.T) {
 	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 1, 20, 100, 100)); err != nil {
 		t.Fatal(err)
 	}
+	if err := fixture.backend.flushMemtableLocked(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 2, 30, 90, 110)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.backend.flushMemtableLocked(t.Context(), 0); err != nil {
 		t.Fatal(err)
 	}
 	run := fixture.backend.runs.head.files[0]

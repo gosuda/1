@@ -11,9 +11,12 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
 	"github.com/gosuda/supersql-alpha/internal/query/exec"
+	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
 	"github.com/gosuda/supersql-alpha/internal/query/fragment"
+	"github.com/gosuda/supersql-alpha/internal/query/ir"
 	"github.com/gosuda/supersql-alpha/internal/query/normalize"
 	"github.com/gosuda/supersql-alpha/internal/query/opt"
+	"github.com/gosuda/supersql-alpha/internal/query/opt/span"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
@@ -65,6 +68,9 @@ func prepareBound(ctx context.Context, bound *bind.BoundStatement, options Prepa
 	logical, err := normalize.Normalize(ctx, bound.Graph(), options.Normalize)
 	if err != nil {
 		return nil, err
+	}
+	if len(options.Optimize.Parameters) != 0 {
+		options.Optimize.Parameters = filterSpanParametersForGraph(logical, options.Optimize.Parameters)
 	}
 	optimized, err := opt.Optimize(ctx, logical, options.Optimize)
 	if err != nil {
@@ -150,3 +156,106 @@ func rejectPreparedEnvironment(environment exec.Environment, err error) error {
 	}
 	return err
 }
+
+func spanParameters(parameters []expr.ParameterValue) []span.Parameter {
+	if len(parameters) == 0 {
+		return nil
+	}
+	result := make([]span.Parameter, len(parameters))
+	for i, parameter := range parameters {
+		result[i] = span.Parameter{Number: parameter.Number, Layout: parameter.Layout, Value: parameter.Value}
+	}
+	return result
+}
+
+// filterSpanParametersForGraph narrows Optimize.Parameters to the exact
+// ir.Param set present in the normalized graph. Constant folding or routine
+// frame passing can leave declared parameters unreferenced in the normalized
+// IR; span.Extract rejects unreferenced or mismatched parameters as ErrInvalid,
+// so filtering here keeps span specialization exact without false rejections.
+func filterSpanParametersForGraph(graph *ir.Graph, parameters []span.Parameter) []span.Parameter {
+	if graph == nil || len(parameters) == 0 {
+		return nil
+	}
+	needed := make(map[uint32]ir.Scalar)
+	for id := ir.ScalarID(1); uint32(id) <= graph.ScalarCount(); id++ {
+		node, ok := graph.Scalar(id)
+		if !ok || node.Kind != ir.Param {
+			continue
+		}
+		if existing, exists := needed[node.Parameter]; !exists || (existing.Nullable && !node.Nullable) {
+			needed[node.Parameter] = node
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	matched := make([]span.Parameter, 0, len(needed))
+	seen := make(map[uint32]struct{}, len(needed))
+	for _, parameter := range parameters {
+		node, ok := needed[parameter.Number]
+		if !ok {
+			continue
+		}
+		if _, duplicate := seen[parameter.Number]; duplicate {
+			return nil
+		}
+		if (!node.Nullable && parameter.Value.IsNull) || !graphLayoutEquals(graph, node.Layout, parameter.Layout, 0) || !validSpanValue(parameter.Layout, parameter.Value, 0) {
+			return nil
+		}
+		seen[parameter.Number] = struct{}{}
+		matched = append(matched, parameter)
+	}
+	if len(matched) != len(needed) {
+		return nil
+	}
+	return matched
+}
+
+func graphLayoutEquals(graph *ir.Graph, id ir.LayoutID, layout model.TypeLayout, depth int) bool {
+	if depth > 64 {
+		return false
+	}
+	typ, ok := graph.Type(id)
+	if !ok || typ != layout.Type || uint64(graph.LayoutChildCount(id)) != uint64(len(layout.Children)) {
+		return false
+	}
+	for i, child := range layout.Children {
+		childID, _ := graph.LayoutChild(id, uint32(i))
+		if !graphLayoutEquals(graph, childID, child, depth+1) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSpanValue(layout model.TypeLayout, value model.Value, depth int) bool {
+	if depth > 64 || value.Type != layout.Type.Storage {
+		return false
+	}
+	if value.IsNull {
+		return true
+	}
+	switch value.Type {
+	case model.TypeArray:
+		if len(layout.Children) != 1 || model.ValidateArrayShape(value.Dimensions, uint64(len(value.ArrayVal))) != nil {
+			return false
+		}
+		for _, item := range value.ArrayVal {
+			if !validSpanValue(layout.Children[0], item, depth+1) {
+				return false
+			}
+		}
+	case model.TypeComposite:
+		if len(value.ArrayVal) != len(layout.Children) {
+			return false
+		}
+		for i, item := range value.ArrayVal {
+			if !validSpanValue(layout.Children[i], item, depth+1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+

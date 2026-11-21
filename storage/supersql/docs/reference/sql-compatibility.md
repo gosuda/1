@@ -22,7 +22,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | --- | --- | --- | --- | --- | --- |
 | server_transport | unsupported | 0A000 | 1 | 0 | PostgreSQL wire transport and psql client commands are not embedded SQL. |
 | cluster_admin | unsupported | 0A000 | 16 | 10 | Database instances and filesystem placement are host-owned. |
-| authorization | unsupported | 0A000 | 18 | 3 | The embedded principal is not a PostgreSQL privilege enforcement subsystem. |
+| authorization | unsupported | 0A000 | 12 | 2 | Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded. |
 | external_code | unsupported | 0A000 | 12 | 5 | External extensions and native or external language handlers are not loaded. |
 | foreign_data | unsupported | 0A000 | 13 | 0 | Only local database objects participate in execution. |
 | replication | unsupported | 0A000 | 7 | 61 | The embedded backend has no PostgreSQL replication or archive SQL interface. |
@@ -105,7 +105,7 @@ Resolved objects: 10.
 
 ### `authorization`
 
-The embedded principal is not a PostgreSQL privilege enforcement subsystem.
+Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded.
 
 | Field | Value |
 | --- | --- |
@@ -115,34 +115,28 @@ The embedded principal is not a PostgreSQL privilege enforcement subsystem.
 
 AST match strings:
 
-- `CreateRoleStmt`
-- `AlterRoleStmt`
 - `AlterRoleSetStmt`
-- `DropRoleStmt`
 - `GrantStmt`
-- `GrantRoleStmt`
 - `AlterDefaultPrivilegesStmt`
 - `DropOwnedStmt`
 - `ReassignOwnedStmt`
 - `AlterOwnerStmt`
-- `CreatePolicyStmt`
-- `AlterPolicyStmt`
 - `SecLabelStmt`
 - `CreateSchemaStmt.authrole present`
 - `routine option security = true`
-- `VariableSetStmt.name = role or session_authorization`
-- `AlterTableCmd owner or row security subcommands`
-- `object kind ROLE, POLICY, DEFACL, PARAMETER_ACL`
+- `VariableSetStmt.name = session_authorization`
+- `AlterTableCmd.subtype = AT_ChangeOwner`
+- `object kind ROLE, DEFACL, PARAMETER_ACL`
 
-Resolved objects: 3.
+Resolved objects: 2.
 
 | Kind | Count |
 | --- | --- |
-| setting | 3 |
+| setting | 2 |
 
 | Kind | Namespace | Count |
 | --- | --- | --- |
-| setting |  | 3 |
+| setting |  | 2 |
 
 ### `external_code`
 
@@ -679,14 +673,15 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-125 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+121 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
-| connector.go:328 | `model.Error{Code: "0A000"}` |
-| connector.go:969 | `model.Error{Code: "0A000"}` |
+| connector.go:1515 | `model.Error{Code: "0A000"}` |
+| connector.go:334 | `model.Error{Code: "0A000"}` |
+| execution.go:201 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/catalog/type_service.go:1051 | `model.Error{Code: "0A000"}` |
-| internal/controlplane/schema/index_scheduler.go:27 | `model.Error{Code: "0A000"}` |
+| internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |
 | internal/dataplane/txn/transaction_historical.go:12 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/aggregate_invocation.go:205 | `ordered-set aggregates cannot be used as window functions` |
 | internal/query/bind/aggregate_invocation.go:208 | `DISTINCT is not implemented for window functions` |
@@ -701,9 +696,9 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
 | internal/query/bind/definition_declaration.go:307 | `support function arguments must be inferred from the declaration` |
 | internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
-| internal/query/bind/function.go:204 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/function.go:526 | `routine dependency version changed` |
-| internal/query/bind/function.go:531 | `routine semantic definition encoding is unavailable` |
+| internal/query/bind/function.go:214 | `ordered-set aggregates cannot be used as window functions` |
+| internal/query/bind/function.go:536 | `routine dependency version changed` |
+| internal/query/bind/function.go:541 | `routine semantic definition encoding is unavailable` |
 | internal/query/bind/function_arguments.go:268 | `function defaults cannot contain subqueries` |
 | internal/query/bind/function_window.go:123 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/function_window.go:126 | `aggregate ORDER BY is not implemented for window functions` |
@@ -724,14 +719,14 @@ No resolved catalog objects.
 | internal/query/bind/index_expression_encoding.go:82 | `index expression uses a different timezone data revision` |
 | internal/query/bind/indirection.go:14 | `row expansion via * is not supported here` |
 | internal/query/bind/native_rows.go:247 | `could not determine row type for set-returning function` |
-| internal/query/bind/object_declaration.go:198 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/object_declaration.go:352 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/ordinary_alter.go:534 | `WITH CHECK OPTION is supported only on automatically updatable views` |
-| internal/query/bind/ordinary_alter.go:592 | `statistics target can only be set for an index expression` |
+| internal/query/bind/object_declaration.go:226 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/object_declaration.go:381 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/ordinary_alter.go:558 | `WITH CHECK OPTION is supported only on automatically updatable views` |
+| internal/query/bind/ordinary_alter.go:616 | `statistics target can only be set for an index expression` |
 | internal/query/bind/ordinary_reindex.go:220 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
-| internal/query/bind/partition_alter.go:165 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
-| internal/query/bind/partition_alter.go:176 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
-| internal/query/bind/partition_alter.go:671 | `CONCURRENTLY requires DETACH PARTITION` |
+| internal/query/bind/partition_alter.go:174 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
+| internal/query/bind/partition_alter.go:185 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
+| internal/query/bind/partition_alter.go:680 | `CONCURRENTLY requires DETACH PARTITION` |
 | internal/query/bind/partition_declaration.go:115 | `HASH partitioning does not support a default partition` |
 | internal/query/bind/partition_declaration.go:361 | `unique constraint on partitioned table must include all partitioning columns` |
 | internal/query/bind/partition_declaration.go:38 | `LIST partitioning requires exactly one key` |
@@ -755,7 +750,7 @@ No resolved catalog objects.
 | internal/query/bind/schema_constraint_ddl.go:16 | `constraint recursion or CASCADE requires inherited constraint planning` |
 | internal/query/bind/schema_constraint_ddl.go:486 | `constraint type is not deferrable` |
 | internal/query/bind/schema_constraint_ddl.go:494 | `constraint enforceability cannot be altered` |
-| internal/query/bind/schema_ddl.go:1762 | `cannot drop a partitioned index concurrently` |
+| internal/query/bind/schema_ddl.go:1765 | `cannot drop a partitioned index concurrently` |
 | internal/query/bind/select.go:252 | `row locking is not allowed with aggregate or window queries` |
 | internal/query/bind/select.go:361 | `row locking is not allowed with set-returning targets` |
 | internal/query/bind/select.go:41 | `row locking is not allowed with this query form` |
@@ -776,18 +771,18 @@ No resolved catalog objects.
 | internal/query/bind/text_search_declaration.go:542 | `unsupported native text search dictionary template` |
 | internal/query/bind/text_search_declaration.go:702 | `only the native default text search parser is supported` |
 | internal/query/bind/text_search_declaration.go:822 | `unsupported ALTER TEXT SEARCH CONFIGURATION action` |
-| internal/query/bind/trigger.go:441 | `trigger WHEN condition cannot contain a subquery` |
+| internal/query/bind/trigger.go:444 | `trigger WHEN condition cannot contain a subquery` |
 | internal/query/bind/type_declaration.go:1325 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:1362 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:1374 | `unsupported ALTER TYPE attribute command` |
 | internal/query/bind/type_declaration.go:260 | `only shell CREATE TYPE declarations are supported` |
 | internal/query/bind/type_declaration.go:370 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:575 | `domain constraints cannot be DEFERRABLE` |
-| internal/query/bind/utility.go:362 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/utility.go:648 | `cannot update a non-updatable view column` |
+| internal/query/bind/utility.go:365 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility.go:659 | `cannot update a non-updatable view column` |
 | internal/query/bind/utility.go:92 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:283 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility_merge.go:310 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
 | internal/query/builtin/date_fields.go:130 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:296 | `model.Error{Code: "0A000"}` |
@@ -796,16 +791,11 @@ No resolved catalog objects.
 | internal/query/builtin/interval_fields.go:106 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
-| internal/query/exec/modify/options.go:168 | `model.Error{Code: "0A000"}` |
+| internal/query/exec/modify/options.go:172 | `model.Error{Code: "0A000"}` |
 | internal/query/session/execute_prepared.go:31 | `model.Error{Code: "0A000"}` |
-| internal/query/session/named_execute.go:341 | `model.Error{Code: "0A000"}` |
-| internal/query/session/prepare.go:105 | `model.Error{Code: "0A000"}` |
-| internal/query/session/prepare.go:107 | `model.Error{Code: "0A000"}` |
+| internal/query/session/named_execute.go:340 | `model.Error{Code: "0A000"}` |
+| internal/query/session/prepare.go:111 | `model.Error{Code: "0A000"}` |
+| internal/query/session/prepare.go:113 | `model.Error{Code: "0A000"}` |
 | internal/query/session/sequence_runtime.go:129 | `model.Error{Code: "0A000"}` |
 | internal/query/session/settings_values.go:207 | `model.Error{Code: "0A000"}` |
-| open.go:1023 | `model.Error{Code: "0A000"}` |
-| rls.go:602 | `model.Error{Code: "0A000"}` |
-| rls.go:743 | `model.Error{Code: "0A000"}` |
-| rls.go:765 | `model.Error{Code: "0A000"}` |
-| rls.go:785 | `model.Error{Code: "0A000"}` |
 

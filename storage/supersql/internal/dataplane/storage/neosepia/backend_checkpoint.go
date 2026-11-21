@@ -46,6 +46,11 @@ func (backend *Backend) captureCheckpoint(ctx context.Context, spec storage.Snap
 	if err := backend.prepareRead(ctx, spec); err != nil {
 		return nil, err
 	}
+	if !backend.memtable.empty() && spec.Fence.LogPosition >= backend.memtable.firstPos {
+		if err := backend.flushMemtableLocked(ctx, spec.Fence.LogPosition); err != nil {
+			return nil, err
+		}
+	}
 	pin, err := backend.runs.pinCheckpoint(ctx, spec)
 	if err != nil {
 		return nil, err
@@ -111,6 +116,7 @@ func (backend *Backend) captureCheckpoint(ctx context.Context, spec storage.Snap
 	handle.manifest = storage.CheckpointManifest{FormatVersion: 1, Backend: "neosepia", SnapshotTS: spec.Timestamp, HistoryFloor: backend.state.HistoryFloor, Fence: spec.Fence, Scale: copyClockScale(currentScale)}
 	state := backend.state
 	state.Closed = spec.Fence
+	state.ClosedHorizon = spec.Fence.ClosedTS
 	state.BaseGeneration = 0
 	var basePosition uint64
 	for generation := pin.generation; generation != nil; generation = generation.parent {

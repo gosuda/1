@@ -228,9 +228,6 @@ func DecodeDescriptor(ctx context.Context, data []byte, limits Limits) (*model.D
 			}
 		}
 	}
-	if _, err := model.NewDescriptor(ctx, wire.Descriptor, limits.Descriptor); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrCorruptCatalog, err)
-	}
 	var used uint64
 	for _, entry := range wire.Defaults {
 		if int(entry.Section) >= len(groups) {
@@ -244,6 +241,9 @@ func DecodeDescriptor(ctx context.Context, data []byte, limits Limits) (*model.D
 			}
 			if c.ConstantDefault != nil {
 				return nil, ErrCorruptCatalog
+			}
+			if err := c.Layout.Validate(); err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrCorruptCatalog, err)
 			}
 			value, err := storage.DecodeValue(ctx, entry.Value, limits.Descriptor.MaxBytes-used)
 			if err != nil {

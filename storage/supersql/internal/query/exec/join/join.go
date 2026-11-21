@@ -39,8 +39,9 @@ type Key struct {
 // Parameters are borrowed through Close; callers serialize Next and Close.
 // MemoryBytes may be zero to force disk partitions. Other limits are positive.
 // PartitionBytes limits each input partition, not the joined result. HashBytes
-// bounds the fixed index; oversized/skewed partitions use rewindable replay.
-// Replay never repartitions, so its depth is one, within every valid MaxDepth.
+// bounds the fixed index; oversized partitions recursively hash-partition up to
+// MaxDepth with salted seeds before falling back to rewindable replay for
+// duplicate-key skew or tight file/memory budgets.
 // Provision 2*MaxPartitions+1 query files and two query readers.
 // WorkBytes covers join state and spools; input/output batches and residual
 // expression state have their own limits and share the query admission ledger.
@@ -75,7 +76,11 @@ type Options struct {
 	MaxPartitions, MaxDepth                                                       int
 }
 
-type partition struct{ left, right *rowstore.Spool }
+type partition struct {
+	left, right *rowstore.Spool
+	depth       int
+	logical     uint32
+}
 type entry struct {
 	position rowstore.Position
 	next     int
@@ -104,13 +109,14 @@ type cursor struct {
 	leftRow                                                                 []model.Value
 	candidate                                                               int
 	unmatched                                                               int
-	mark                                                                    model.Value
-	hashMode, leftMatched, scanning, draining, initialized, pending, closed bool
-	markBatch                                                               columnar.Batch
-	markIndex, leftDemand                                                   int
-	markRow                                                                 []model.Value
-	markReady, markEOF                                                      bool
-	closeErr                                                                error
+	mark                                                                              model.Value
+	partOpen, hashMode, leftMatched, scanning, draining, initialized, pending, closed bool
+	repartitions, replayFallbacks                                                     int
+	markBatch                                                                         columnar.Batch
+	markIndex, leftDemand                                                             int
+	markRow                                                                           []model.Value
+	markReady, markEOF                                                                bool
+	closeErr                                                                          error
 }
 
 func resource(message string, cause error) error {
@@ -341,12 +347,19 @@ func (c *cursor) check(ctx context.Context) error {
 	return errors.Join(context.Cause(ctx), context.Cause(c.ctx), context.Cause(c.options.Query.Context()))
 }
 func (c *cursor) newSpool(ctx context.Context, side Side) (*rowstore.Spool, error) {
+	return c.newSpoolForDepth(ctx, side, 1)
+}
+func (c *cursor) newSpoolForDepth(ctx context.Context, side Side, depth int) (*rowstore.Spool, error) {
 	o := c.options
 	schema := c.leftSchema
 	if side == Right {
 		schema = c.rightSchema
 	}
-	memory := o.MemoryBytes / uint64(2*len(c.partitions)+1)
+	divisor := uint64(2*len(c.partitions) + 1)
+	if depth > 1 {
+		divisor = uint64(2*len(c.partitions) + 2*o.MaxPartitions + 1)
+	}
+	memory := o.MemoryBytes / divisor
 	return rowstore.New(ctx, o.Query, schema, rowstore.Limits{MemoryBytes: memory, MaxBytes: o.PartitionBytes, MaxRows: math.MaxInt64, MaxRecordBytes: o.MaxRecordBytes, MetadataBytes: c.metadata, DecodeBytes: o.MaxRecordBytes * 8, MaxReaders: 1})
 }
 
@@ -397,7 +410,7 @@ func (c *cursor) Next(ctx context.Context, out *columnar.Batch) (err error) {
 			c.pending = true
 		}
 		if c.partitioned != nil {
-			partition := uint32(c.part)
+			partition := c.partitions[c.part].logical
 			if c.builder.Rows() > 0 && partition != batchPartition {
 				break
 			}
@@ -460,6 +473,7 @@ func (c *cursor) closePartition() error {
 			p.right = nil
 		}
 	}
+	c.partOpen = false
 	c.scanning = false
 	c.draining = false
 	c.hashMode = false

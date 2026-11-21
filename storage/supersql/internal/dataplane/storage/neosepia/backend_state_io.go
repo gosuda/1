@@ -38,7 +38,7 @@ func readDatabaseState(ctx context.Context, root *os.Root, maxBytes uint64) (sta
 	if err != nil {
 		return databaseState{}, err
 	}
-	if !info.Mode().IsRegular() || info.Size() < databaseStateHeader {
+	if !info.Mode().IsRegular() || info.Size() < databaseStateLegacyHeader {
 		return databaseState{}, storage.ErrCorruptStorage
 	}
 	if uint64(info.Size()) > maxBytes || info.Size() > int64(math.MaxInt) {

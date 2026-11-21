@@ -81,8 +81,8 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options OpenOption
 		Limits:      backupLimits,
 		Verifier: neosepia.CheckpointVerifier{
 			FenceVerifier: authority,
-			Limits:      neosepia.Limits(options.Compaction),
-			ExtraFiles:  []string{nativeFenceSecretFile},
+			Limits:        mergeCompactionConfig(options.Compaction),
+			ExtraFiles:    []string{nativeFenceSecretFile},
 		},
 	})
 	if err != nil {

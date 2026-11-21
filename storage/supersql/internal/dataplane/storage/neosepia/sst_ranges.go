@@ -140,8 +140,8 @@ func encodeSSTRangeEntry(data []byte, entry sstRangeEntry) {
 }
 
 func (s *sstFile) rangeEntry(index int) sstRangeEntry {
-	offset := sstIndexHeaderSize + s.count*s.entryBytes + index*sstRangeEntrySize
-	data := s.index[offset : offset+sstRangeEntrySize]
+	offset := index * sstRangeEntrySize
+	data := s.core.ranges[offset : offset+sstRangeEntrySize]
 	return sstRangeEntry{start: columnar.Range{Offset: binary.LittleEndian.Uint32(data[0:4]), Length: binary.LittleEndian.Uint32(data[4:8])}, end: columnar.Range{Offset: binary.LittleEndian.Uint32(data[8:12]), Length: binary.LittleEndian.Uint32(data[12:16])}, timestamp: model.Timestamp(binary.LittleEndian.Uint64(data[16:24])), ordinal: binary.LittleEndian.Uint64(data[24:32])}
 }
 
@@ -156,7 +156,7 @@ func (s *sstFile) validateRanges(ctx context.Context, rows uint64) error {
 		}
 		entry := s.rangeEntry(i)
 		for _, key := range [2]columnar.Range{entry.start, entry.end} {
-			if key.Length == 0 || uint64(key.Offset)+uint64(key.Length) > uint64(len(s.keys)) {
+			if key.Length == 0 || uint64(key.Offset)+uint64(key.Length) > uint64(len(s.core.keys)) {
 				return storage.ErrCorruptStorage
 			}
 		}

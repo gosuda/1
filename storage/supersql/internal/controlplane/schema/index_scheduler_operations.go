@@ -31,7 +31,9 @@ func (s *IndexJobScheduler) Wait(ctx context.Context, id JobID) (Job, error) {
 	defer finish()
 	ticker := time.NewTicker(s.options.PollInterval)
 	defer ticker.Stop()
+	woke := false
 	for {
+		done := s.doneChannel()
 		job, err := s.Status(operation, id)
 		if err != nil {
 			return job, err
@@ -39,9 +41,14 @@ func (s *IndexJobScheduler) Wait(ctx context.Context, id JobID) (Job, error) {
 		if job.Terminal() {
 			return job, indexRunnerTerminalError(job)
 		}
+		if !woke {
+			s.Wake()
+			woke = true
+		}
 		select {
 		case <-operation.Done():
 			return job, operation.Err()
+		case <-done:
 		case <-ticker.C:
 		}
 	}

@@ -108,18 +108,30 @@ func dependencyBudgetError() error {
 	return &model.Error{Code: "54000", Message: "prepared read dependency byte budget exceeded"}
 }
 
+func readViewCatalogIdentity(view txn.ReadView) txn.CatalogReadIdentity {
+	if identified, ok := view.(interface{ CatalogIdentity() txn.CatalogReadIdentity }); ok {
+		return identified.CatalogIdentity()
+	}
+	return txn.CatalogReadIdentity{}
+}
+
 // statementScanDependencies derives the data read set for a bound statement
 // whose caller supplied no dependencies. Each scan relation is enumerated
 // through the statement's own access planner while the binding view is still
 // open, so declared targets and key layouts are exactly the requests
 // optimization may negotiate: every candidate path target, index descriptor
 // reads for secondary scans, lookup bases, and the bare table markers
-// covering-only secondary scans retain. Spans stay unbounded; planning narrows
-// them inside the declared objects.
-func (transactions *Transactions) statementScanDependencies(ctx context.Context, view txn.ReadView, bound *bind.BoundStatement, options PreparedExecution, planning func(context.Context, txn.ReadView, builtin.ResolveOptions) (*catalog.CatalogSnapshot, PrepareOptions, error), builtins builtin.ResolveOptions) (dependencies []txn.ReadDependency, err error) {
+// covering-only secondary scans retain. Spans stay unbounded when trial
+// narrowing cannot run; otherwise trial planning narrows the declared spans.
+func (transactions *Transactions) statementScanDependencies(ctx context.Context, view txn.ReadView, bound *bind.BoundStatement, options PreparedExecution, planning func(context.Context, txn.ReadView, builtin.ResolveOptions) (*catalog.CatalogSnapshot, PrepareOptions, error), builtins builtin.ResolveOptions) ([]txn.ReadDependency, error) {
+	dependencies, _, err := transactions.statementScanDependenciesWithTrial(ctx, view, bound, options, planning, builtins)
+	return dependencies, err
+}
+
+func (transactions *Transactions) statementScanDependenciesWithTrial(ctx context.Context, view txn.ReadView, bound *bind.BoundStatement, options PreparedExecution, planning func(context.Context, txn.ReadView, builtin.ResolveOptions) (*catalog.CatalogSnapshot, PrepareOptions, error), builtins builtin.ResolveOptions) (dependencies []txn.ReadDependency, trialPrepared *Prepared, err error) {
 	store := options.Catalog
 	if bound == nil || store == nil {
-		return nil, errPreparedInvocation
+		return nil, nil, errPreparedInvocation
 	}
 	graph := bound.Graph()
 	scans := false
@@ -137,7 +149,7 @@ func (transactions *Transactions) statementScanDependencies(ctx context.Context,
 		}
 	}
 	if !scans && !catalogScans {
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 	maximum := options.Environment.Limits.MetadataBytes
 	const dependencyBytes = 512
@@ -162,69 +174,88 @@ func (transactions *Transactions) statementScanDependencies(ctx context.Context,
 		// negotiated access path, so declare them all up front.
 		for _, dependency := range catalogScanDependencies(options.Catalog, options.Environment.Catalog) {
 			if err := add(dependency); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
 	if !scans {
-		return dependencies, ctx.Err()
+		return dependencies, nil, ctx.Err()
 	}
 	if planning == nil {
-		return nil, errPreparedInvocation
+		return nil, nil, errPreparedInvocation
 	}
 	snapshot, plan, err := planning(ctx, view, builtins)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { err = errors.Join(err, snapshot.Close()) }()
 	planner := plan.Optimize.Access
 	if planner == nil {
 		// Optimization reports the missing planner itself; returning only the
 		// binding catalog set preserves that diagnostic.
-		return dependencies, nil
+		return dependencies, nil, nil
 	}
-	if len(boundRowLockPolicies(bound)) == 0 && len(bound.Parameters()) == 0 && plan.Optimize.Statistics == nil {
+	// Trial-plan to derive narrowed read-lock spans whenever there are no row
+	// locks and either the statement has no parameters or runtime parameter
+	// values are available to specialize spans.
+	hasParams := len(bound.Parameters()) != 0
+	if len(boundRowLockPolicies(bound)) == 0 && (!hasParams || len(options.Environment.Parameters) != 0) {
 		trial := plan
+		canReuse := trial.ValidateBound == nil
 		trial.ValidateBound = nil
-		if prepared, prepErr := prepareBound(ctx, bound, trial); prepErr == nil && prepared != nil && prepared.graph != nil {
-			if planDeps, _, depErr := prepared.ReadDependencies(ctx, store, maximum); depErr == nil {
-				for _, dependency := range planDeps {
-					if err := add(dependency); err != nil {
-						return nil, err
+		paramsReady := true
+		if len(options.Environment.Parameters) != 0 {
+			reconciled, paramErr := reconcileBoundParameters(ctx, bound, options.Environment.Parameters, trial.Normalize.Builtin, options.Environment.Limits)
+			if paramErr != nil {
+				paramsReady = false
+			} else {
+				trial.Optimize.Parameters = spanParameters(reconciled)
+			}
+		}
+		if paramsReady {
+			if prepared, prepErr := prepareBound(ctx, bound, trial); prepErr == nil && prepared != nil && prepared.graph != nil {
+				if planDeps, _, depErr := prepared.ReadDependencies(ctx, store, maximum); depErr == nil {
+					for _, dependency := range planDeps {
+						if err := add(dependency); err != nil {
+							return nil, nil, err
+						}
 					}
-				}
-				for id := ir.RelID(1); id <= ir.RelID(graph.RelCount()); id++ {
-					relation, ok := graph.Rel(id)
-					if !ok || relation.Kind != ir.Scan || relation.Occurrence == 0 {
-						continue
-					}
-					columns := make([]model.ColumnID, 0, relation.OutputCount())
-					for i := uint32(0); i < relation.OutputCount(); i++ {
-						if slot, ok := graph.Output(id, i); ok {
-							if info, ok := graph.Slot(slot); ok && info.Column != 0 {
-								columns = append(columns, info.Column)
+					for id := ir.RelID(1); id <= ir.RelID(graph.RelCount()); id++ {
+						relation, ok := graph.Rel(id)
+						if !ok || relation.Kind != ir.Scan || relation.Occurrence == 0 {
+							continue
+						}
+						columns := make([]model.ColumnID, 0, relation.OutputCount())
+						for i := uint32(0); i < relation.OutputCount(); i++ {
+							if slot, ok := graph.Output(id, i); ok {
+								if info, ok := graph.Slot(slot); ok && info.Column != 0 {
+									columns = append(columns, info.Column)
+								}
+							}
+						}
+						access, accessErr := planner.Access(ctx, opt.AccessRequest{Object: relation.Object, Generation: relation.Generation, DescriptorVersion: relation.DescriptorVersion, Columns: columns, MaxPaths: plan.Optimize.MaxAccessPaths, MaxBytes: plan.Optimize.MaxBytes})
+						if accessErr != nil {
+							return nil, nil, accessErr
+						}
+						for _, path := range access.Paths {
+							if path.Index != 0 {
+								if err := add(store.DescriptorDependency(path.Target.ObjectID)); err != nil {
+									return nil, nil, err
+								}
 							}
 						}
 					}
-					access, accessErr := planner.Access(ctx, opt.AccessRequest{Object: relation.Object, Generation: relation.Generation, DescriptorVersion: relation.DescriptorVersion, Columns: columns, MaxPaths: plan.Optimize.MaxAccessPaths, MaxBytes: plan.Optimize.MaxBytes})
-					if accessErr != nil {
-						return nil, accessErr
+					if canReuse {
+						trialPrepared = prepared
 					}
-					for _, path := range access.Paths {
-						if path.Index != 0 {
-							if err := add(store.DescriptorDependency(path.Target.ObjectID)); err != nil {
-								return nil, err
-							}
-						}
-					}
+					return dependencies, trialPrepared, ctx.Err()
 				}
-				return dependencies, ctx.Err()
 			}
 		}
 	}
 	for id := ir.RelID(1); id <= ir.RelID(graph.RelCount()); id++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		relation, ok := graph.Rel(id)
 		if !ok || relation.Kind != ir.Scan || relation.Occurrence == 0 {
@@ -244,28 +275,28 @@ func (transactions *Transactions) statementScanDependencies(ctx context.Context,
 		}
 		access, err := planner.Access(ctx, opt.AccessRequest{Object: relation.Object, Generation: relation.Generation, DescriptorVersion: relation.DescriptorVersion, Columns: columns, MaxPaths: plan.Optimize.MaxAccessPaths, MaxBytes: plan.Optimize.MaxBytes})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, path := range access.Paths {
 			if err := add(txn.ReadDependency{Target: path.Target, Occurrence: relation.Occurrence, KeyLayout: path.Keys, Spans: []storage.KeySpan{full}}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if path.Index == 0 {
 				continue
 			}
 			if err := add(store.DescriptorDependency(path.Target.ObjectID)); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if path.Lookup.Enabled {
 				if err := add(txn.ReadDependency{Target: path.Lookup.Target, Occurrence: relation.Occurrence, KeyLayout: path.Lookup.Keys, Spans: []storage.KeySpan{full}}); err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 			} else if err := add(txn.ReadDependency{Target: access.Target, Occurrence: relation.Occurrence}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
-	return dependencies, ctx.Err()
+	return dependencies, nil, ctx.Err()
 }
 
 // namedStatementPlanView opens the read view covering one named statement's

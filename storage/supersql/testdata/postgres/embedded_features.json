@@ -204,36 +204,25 @@
     {
       "id": "authorization",
       "disposition": "unsupported",
-      "reason": "The embedded principal is not a PostgreSQL privilege enforcement subsystem.",
+      "reason": "Native MVCC roles and Row-Level Security (RLS) policies are supported; table/object GRANT/REVOKE, ownership transfer, SECURITY DEFINER, and SESSION AUTHORIZATION remain excluded.",
       "ast_match": [
-        "CreateRoleStmt",
-        "AlterRoleStmt",
         "AlterRoleSetStmt",
-        "DropRoleStmt",
         "GrantStmt",
-        "GrantRoleStmt",
         "AlterDefaultPrivilegesStmt",
         "DropOwnedStmt",
         "ReassignOwnedStmt",
         "AlterOwnerStmt",
-        "CreatePolicyStmt",
-        "AlterPolicyStmt",
         "SecLabelStmt",
         "CreateSchemaStmt.authrole present",
         "routine option security = true",
-        "VariableSetStmt.name = role or session_authorization",
-        "AlterTableCmd owner or row security subcommands",
-        "object kind ROLE, POLICY, DEFACL, PARAMETER_ACL"
+        "VariableSetStmt.name = session_authorization",
+        "AlterTableCmd.subtype = AT_ChangeOwner",
+        "object kind ROLE, DEFACL, PARAMETER_ACL"
       ],
       "resolved_objects": [
         {
           "kind": "setting",
           "name": "is_superuser",
-          "mutable": false
-        },
-        {
-          "kind": "setting",
-          "name": "role",
           "mutable": false
         },
         {

@@ -28,6 +28,7 @@ type BoundObjectCommand struct {
 	tag          string
 	cascade      bool
 	populate     bool
+	noop         bool
 }
 
 func (c *BoundObjectCommand) Creates() []*model.Descriptor { return slices.Clone(c.creates) }
@@ -42,6 +43,7 @@ func (c *BoundObjectCommand) CommandTag() string            { return c.tag }
 func (c *BoundObjectCommand) Cascade() bool                 { return c.cascade }
 func (c *BoundObjectCommand) Query() *BoundStatement        { return c.query }
 func (c *BoundObjectCommand) Populate() bool                { return c.populate }
+func (c *BoundObjectCommand) NoOp() bool                    { return c.noop }
 func (c *BoundObjectCommand) Declaration() (*BoundDeclaration, bool) {
 	if c == nil || len(c.drops) != 0 {
 		return nil, false
@@ -61,6 +63,24 @@ func BindObjectCommand(ctx context.Context, node *zpgparse.Node, snapshot Catalo
 		return nil, false, bindError("42601", "missing object command", 0)
 	}
 	switch statement := node.Node.(type) {
+	case *zpgparse.Node_CreateRoleStmt:
+		command, err := bindCreateRole(ctx, statement.CreateRoleStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_AlterRoleStmt:
+		command, err := bindAlterRole(ctx, statement.AlterRoleStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_DropRoleStmt:
+		command, err := bindDropRole(ctx, statement.DropRoleStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_GrantRoleStmt:
+		command, err := bindGrantRole(ctx, statement.GrantRoleStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_CreatePolicyStmt:
+		command, err := bindCreatePolicy(ctx, statement.CreatePolicyStmt, snapshot, options)
+		return command, true, err
+	case *zpgparse.Node_AlterPolicyStmt:
+		command, err := bindAlterPolicy(ctx, statement.AlterPolicyStmt, snapshot, options)
+		return command, true, err
 	case *zpgparse.Node_ViewStmt:
 		command, err := bindCreateView(ctx, statement.ViewStmt, snapshot, options)
 		return command, true, err
@@ -88,6 +108,10 @@ func BindObjectCommand(ctx context.Context, node *zpgparse.Node, snapshot Catalo
 		command, err := bindAlterRoutine(ctx, statement.AlterFunctionStmt, snapshot, options)
 		return command, true, err
 	case *zpgparse.Node_DropStmt:
+		if statement.DropStmt.RemoveType == zpgparse.ObjectType_OBJECT_POLICY {
+			command, err := bindDropPolicy(ctx, statement.DropStmt, snapshot, options)
+			return command, true, err
+		}
 		if TextSearchLifecycleKind(node) {
 			command, _, err := BindTextSearchLifecycle(ctx, node, snapshot, options)
 			return command, true, err
@@ -110,6 +134,10 @@ func BindObjectCommand(ctx context.Context, node *zpgparse.Node, snapshot Catalo
 		command, err := bindDropObjects(ctx, statement.DropStmt, snapshot, options)
 		return command, true, err
 	case *zpgparse.Node_RenameStmt:
+		if statement.RenameStmt.RenameType == zpgparse.ObjectType_OBJECT_POLICY {
+			command, err := bindRenamePolicy(ctx, statement.RenameStmt, snapshot, options)
+			return command, true, err
+		}
 		if TextSearchLifecycleKind(node) {
 			command, _, err := BindTextSearchLifecycle(ctx, node, snapshot, options)
 			return command, true, err
@@ -198,6 +226,7 @@ func bindCreateView(ctx context.Context, statement *zpgparse.ViewStmt, snapshot 
 		return nil, bindError("0A000", "WITH CHECK OPTION is supported only on automatically updatable views", int(statement.View.Location)+1)
 	}
 	metadata.Owner = options.Owner
+	metadata.OwnerName = normalizeOwnerName(options.Bind.CurrentRole)
 	metadata.Persistence = statement.View.Relpersistence
 	if metadata.Persistence == "" {
 		metadata.Persistence = "p"
@@ -451,6 +480,7 @@ func bindCreateTableAs(ctx context.Context, statement *zpgparse.CreateTableAsStm
 		return nil, err
 	}
 	table := materializedTable(view.Columns, options.Owner, persistence)
+	table.OwnerName = normalizeOwnerName(options.Bind.CurrentRole)
 	switch into.OnCommit {
 	case zpgparse.OnCommitAction_ON_COMMIT_ACTION_UNDEFINED, zpgparse.OnCommitAction_ONCOMMIT_NOOP:
 		if persistence == "t" {
@@ -480,6 +510,7 @@ func bindCreateTableAs(ctx context.Context, statement *zpgparse.CreateTableAsStm
 	if statement.Objtype == zpgparse.ObjectType_OBJECT_MATVIEW {
 		kind = model.ObjectMaterializedView
 		view.Owner = options.Owner
+		view.OwnerName = table.OwnerName
 		view.Persistence = persistence
 		view.Populated = !into.SkipData
 		view.RowType = rowTypeID
@@ -762,13 +793,17 @@ func bindDropObjects(ctx context.Context, statement *zpgparse.DropStmt, snapshot
 	command := &BoundObjectCommand{tag: objectCommandTag("DROP", statement.RemoveType), cascade: statement.Behavior == zpgparse.DropBehavior_DROP_CASCADE}
 	seen := make(map[model.ObjectID]bool)
 	for _, node := range statement.Objects {
-		list := node.GetList()
-		if list == nil {
+		var parts []string
+		if list := node.GetList(); list != nil {
+			var nameErr error
+			parts, nameErr = names(list.Items)
+			if nameErr != nil {
+				return nil, nameErr
+			}
+		} else if str := node.GetString_(); str != nil && str.Sval != "" {
+			parts = []string{str.Sval}
+		} else {
 			return nil, bindError("42601", "invalid DROP object name", 0)
-		}
-		parts, nameErr := names(list.Items)
-		if nameErr != nil {
-			return nil, nameErr
 		}
 		descriptor, resolveErr := resolveOrdinaryObject(ctx, b, parts, objectKinds(statement.RemoveType), "42704")
 		if resolveErr != nil {
@@ -778,6 +813,15 @@ func bindDropObjects(ctx context.Context, statement *zpgparse.DropStmt, snapshot
 				continue
 			}
 			return nil, resolveErr
+		}
+		if descriptor.Kind() == model.ObjectSchema {
+			if err := b.checkSchemaDropOwnership(ctx, snapshot, descriptor, command.cascade, 0); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := b.requireTableOwner(descriptor, 0); err != nil {
+				return nil, err
+			}
 		}
 		if !seen[descriptor.ID()] {
 			seen[descriptor.ID()] = true
@@ -927,6 +971,9 @@ func bindRenameObject(ctx context.Context, statement *zpgparse.RenameStmt, snaps
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	if base.Kind() == model.ObjectSchema {
 		if _, conflictErr := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newname}); conflictErr == nil {
 			return nil, bindError("42P06", "schema already exists", 0)
@@ -1018,6 +1065,9 @@ func bindRenameColumn(ctx context.Context, b *binder, statement *zpgparse.Rename
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	next, err := nextObjectDescriptor(ctx, base, options, func(spec *model.DescriptorSpec) error {
 		rename := func(columns []model.ColumnDescriptor) error {
 			index := slices.IndexFunc(columns, func(column model.ColumnDescriptor) bool {
@@ -1090,6 +1140,9 @@ func bindSetObjectSchema(ctx context.Context, statement *zpgparse.AlterObjectSch
 	}
 	base, err := resolveOrdinaryObject(ctx, b, parts, objectKinds(statement.ObjectType), "42704")
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	baseSpec, err := base.SpecWithin(ctx, options.Descriptors)

@@ -20,8 +20,9 @@ type readLimits struct {
 }
 
 type snapshotReader struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	pin        *runPin
+	mem        *memtableSnapshot
 	spec       storage.SnapshotSpec
 	encoder    storage.KeyEncoder
 	limits     readLimits
@@ -46,6 +47,10 @@ var _ storage.SnapshotReader = (*snapshotReader)(nil)
 // The backend authenticates and pins the published fence before construction.
 // Ownership of pin transfers even when construction fails.
 func newSnapshotReader(ctx context.Context, pin *runPin, spec storage.SnapshotSpec, encoder storage.KeyEncoder, limits readLimits) (storage.SnapshotReader, error) {
+	return newSnapshotReaderWithMem(ctx, pin, nil, spec, encoder, limits)
+}
+
+func newSnapshotReaderWithMem(ctx context.Context, pin *runPin, mem *memtableSnapshot, spec storage.SnapshotSpec, encoder storage.KeyEncoder, limits readLimits) (storage.SnapshotReader, error) {
 	if pin == nil {
 		return nil, storage.ErrClosed
 	}
@@ -74,18 +79,60 @@ func newSnapshotReader(ctx context.Context, pin *runPin, spec storage.SnapshotSp
 		}
 		spec.Overlay = retained
 	}
-	reader := &snapshotReader{pin: pin, spec: spec, encoder: encoder, limits: limits}
+	reader := &snapshotReader{pin: pin, mem: mem, spec: spec, encoder: encoder, limits: limits}
 	rand.Read(reader.identity[:])
 	return reader, nil
 }
 
 func (reader *snapshotReader) Get(ctx context.Context, request storage.ReadRequest) (model.Row, error) {
-	reader.mu.Lock()
-	defer reader.mu.Unlock()
+	reader.mu.RLock()
+	defer reader.mu.RUnlock()
 	if reader.closed {
 		return model.Row{}, storage.ErrClosed
 	}
 	limits := reader.limits
+	if reader.mem != nil {
+		if err := ctx.Err(); err != nil {
+			return model.Row{}, err
+		}
+		if err := request.Validate(ctx); err != nil {
+			return model.Row{}, err
+		}
+		// Overlay takes precedence over committed memtable writes.
+		if reader.spec.Overlay != nil {
+			retained, err := reader.spec.Overlay.Retain()
+			if err != nil {
+				return model.Row{}, err
+			}
+			mutation, found, lookupErr := retained.Lookup(ctx, request.Target, request.Key)
+			closeErr := retained.Close()
+			if lookupErr != nil {
+				return model.Row{}, errors.Join(lookupErr, closeErr)
+			}
+			if closeErr != nil {
+				return model.Row{}, closeErr
+			}
+			if found {
+				return copyOwnPoint(ctx, mutation, request, limits.RowBytes)
+			}
+		}
+		row, found, deleted, err := reader.mem.lookup(ctx, request, reader.spec.Timestamp, limits.RowBytes)
+		if err != nil {
+			return model.Row{}, err
+		}
+		if found {
+			if deleted {
+				return model.Row{}, storage.ErrRowNotFound
+			}
+			return row, nil
+		}
+		// Overlay already checked above; pass nil overlay to SST lookup.
+		return reader.pin.get(ctx, reader.spec.Timestamp, nil, request, pinnedPointLimits{
+			SourceBytes: limits.SourceBytes, BlockBytes: limits.BlockBytes,
+			Merge: mergeLimits{MaxBytes: limits.MergeBytes, MaxKeyBytes: limits.KeyBytes},
+			Point: pointReadLimits{ScanBytes: limits.ScanBytes, RowBytes: limits.RowBytes},
+		})
+	}
 	return reader.pin.get(ctx, reader.spec.Timestamp, reader.spec.Overlay, request, pinnedPointLimits{
 		SourceBytes: limits.SourceBytes, BlockBytes: limits.BlockBytes,
 		Merge: mergeLimits{MaxBytes: limits.MergeBytes, MaxKeyBytes: limits.KeyBytes},
@@ -120,7 +167,7 @@ func (reader *snapshotReader) VectorizedScan(ctx context.Context, plan storage.P
 		return nil, storage.ErrInvalidScanPlan
 	}
 	limits := reader.limits
-	cursor, err := reader.pin.scan(ctx, reader.spec.Timestamp, plan.Request.Direction, bound.spec, pinnedScanLimits{
+	cursor, err := reader.pin.scanWithMem(ctx, reader.mem, reader.spec.Timestamp, plan.Request.Direction, bound.spec, pinnedScanLimits{
 		SourceBytes: limits.SourceBytes, BlockBytes: limits.BlockBytes,
 		Merge:   mergeLimits{MaxBytes: limits.MergeBytes, MaxKeyBytes: limits.KeyBytes},
 		Reverse: mergeLimits{MaxBytes: limits.MergeBytes, MaxKeyBytes: limits.KeyBytes},
@@ -170,6 +217,7 @@ func (reader *snapshotReader) Close() error {
 	}
 	reader.planCount = 0
 	reader.planBytes = 0
+	reader.mem = nil
 	var overlayErr error
 	if reader.spec.Overlay != nil {
 		overlayErr = reader.spec.Overlay.Close()

@@ -204,7 +204,7 @@ func (s *Store) CompositeTypeDependents(ctx context.Context, snapshot *CatalogSn
 		return nil, nil
 	}
 	tables := make([]*model.Descriptor, 0)
-	err := scanDescriptors(ctx, snapshot, maximum, catalogScanKinds, "type dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
+	err := scanDescriptors(ctx, snapshot, s.catalogScanLimit(), catalogScanKinds, "type dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
 		if descriptor == nil {
 			return model.ErrInvalidDescriptor
 		}
@@ -329,7 +329,7 @@ func (s *Store) DomainColumnReferences(ctx context.Context, snapshot *CatalogSna
 	}
 	targets := map[model.TypeID]TypeUpdate{domain: {}}
 	var references []DomainColumnReference
-	err := scanDescriptors(ctx, snapshot, maximum, catalogScanKinds, "type dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
+	err := scanDescriptors(ctx, snapshot, s.catalogScanLimit(), catalogScanKinds, "type dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
 		if descriptor == nil || descriptor.Kind() != model.ObjectTable && descriptor.Kind() != model.ObjectMaterializedView {
 			return nil
 		}
@@ -515,7 +515,7 @@ func (s *Store) PlanTypeDependencyCascade(ctx context.Context, snapshot *Catalog
 	result.Dependencies = dependencies
 	descriptors := make(map[model.ObjectID]*model.Descriptor)
 	var tables []*model.Descriptor
-	if err := scanDescriptors(ctx, snapshot, maximum, objectScanKinds, "object dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
+	if err := scanDescriptors(ctx, snapshot, s.catalogScanLimit(), objectScanKinds, "object dependency scan limit exceeded", func(descriptor *model.Descriptor) error {
 		if descriptor == nil {
 			return model.ErrInvalidDescriptor
 		}

@@ -135,13 +135,13 @@ func NewPlan(ctx context.Context, spec Spec, limits Limits) (*Plan, error) {
 		return nil, invalid("unresolved root parameters")
 	}
 	rootGraph, _ := p.Graph(p.nodes[p.root-1].Logical.Graph)
-	if rootGraph.Root() != p.nodes[p.root-1].Logical.Rel {
+	rootNode := p.nodes[p.root-1]
+	if !implementsLogical(rootGraph, rootNode.Logical.Graph, rootGraph.Root(), rootNode) {
 		return nil, invalid("physical root does not implement the complete logical graph")
 	}
-	rootNode := p.nodes[p.root-1]
 	rootRel, _ := rootGraph.Rel(rootGraph.Root())
 	if rootRel.Kind == ir.Sort {
-		if err := logicalOrder(rootGraph, rootNode.Logical, rootNode.Delivered.Ordering, 0); err != nil {
+		if err := logicalOrder(rootGraph, RelRef{Graph: rootNode.Logical.Graph, Rel: rootGraph.Root()}, rootNode.Delivered.Ordering, 0); err != nil {
 			return nil, err
 		}
 	}

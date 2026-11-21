@@ -241,7 +241,7 @@ func TestMissingSettingNullDoesNotHideExcludedSettings(t *testing.T) {
 	}
 	_, err = s.Show("not_a_guc")
 	requireCode(t, err, "42704")
-	for _, name := range []string{"shared_buffers", "plan_cache_mode", "idle_session_timeout", "session_authorization"} {
+	for _, name := range []string{"shared_buffers", "plan_cache_mode", "idle_session_timeout"} {
 		_, err = s.CurrentSetting(name, true)
 		requireCode(t, err, "0A000")
 		_, err = s.Set(t.Context(), name, "on", SessionScope)

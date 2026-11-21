@@ -97,7 +97,7 @@ func TestOpenExecutesStatementsEndToEnd(t *testing.T) {
 		}
 	})
 
-	created, err := database.Exec(ctx, `CREATE TABLE items (id bigint PRIMARY KEY, value bigint)`, 0)
+	created, err := database.exec(ctx, `CREATE TABLE items (id bigint PRIMARY KEY, value bigint)`, 0)
 	if err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestOpenExecutesStatementsEndToEnd(t *testing.T) {
 		t.Fatalf("CREATE TABLE tag = %q", created.Tag)
 	}
 
-	inserted, err := database.Exec(ctx, `INSERT INTO items VALUES (1, 10), (2, 20), (3, 30)`, 0)
+	inserted, err := database.exec(ctx, `INSERT INTO items VALUES (1, 10), (2, 20), (3, 30)`, 0)
 	if err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestOpenExecutesStatementsEndToEnd(t *testing.T) {
 		t.Fatalf("INSERT outcome = %+v", inserted)
 	}
 
-	selected, err := database.Exec(ctx, `SELECT id, value FROM items ORDER BY id`, 0)
+	selected, err := database.exec(ctx, `SELECT id, value FROM items ORDER BY id`, 0)
 	if err != nil {
 		t.Fatalf("SELECT: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestOpenExecutesStatementsEndToEnd(t *testing.T) {
 			t.Errorf("reopen Close: %v", err)
 		}
 	}()
-	after, err := reopened.Exec(ctx, `SELECT count(*) FROM items`, 0)
+	after, err := reopened.exec(ctx, `SELECT count(*) FROM items`, 0)
 	if err != nil {
 		t.Fatalf("SELECT after reopen: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestCloseIsIdempotent(t *testing.T) {
 	if second := database.Close(); second != first {
 		t.Fatalf("second Close = %v, want %v", second, first)
 	}
-	if _, err := database.Exec(ctx, `SELECT 1`, 1); !errors.Is(err, ErrDatabaseClosed) {
+	if _, err := database.exec(ctx, `SELECT 1`, 1); !errors.Is(err, ErrDatabaseClosed) {
 		t.Fatalf("Exec after Close = %v, want ErrDatabaseClosed", err)
 	}
 }

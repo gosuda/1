@@ -50,12 +50,28 @@ func renderConfiguration(g *generator) ([]byte, error) {
 	return writer.bytes(), nil
 }
 
+func findRootStruct(g *generator, name string) (*ast.File, *ast.StructType, bool, error) {
+	files, err := g.dirFiles("", false)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	for _, rel := range files {
+		file, err := g.parse(rel)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if structure, ok := findStruct(file, name); ok {
+			return file, structure, true, nil
+		}
+	}
+	return nil, nil, false, nil
+}
+
 func writeOpenOptions(g *generator, writer *mdWriter) error {
-	file, err := g.parse(openOptionsFile)
+	file, structure, ok, err := findRootStruct(g, "OpenOptions")
 	if err != nil {
 		return err
 	}
-	structure, ok := findStruct(file, "OpenOptions")
 	if !ok {
 		return fmt.Errorf("%s: OpenOptions not found", openOptionsFile)
 	}
@@ -182,12 +198,8 @@ func writeIRLimits(g *generator, writer *mdWriter) error {
 }
 
 func writeCopyOptions(g *generator, writer *mdWriter) {
-	file, err := g.parse(openOptionsFile)
-	if err != nil {
-		return
-	}
-	structure, ok := findStruct(file, "CopyOptions")
-	if !ok {
+	file, structure, ok, err := findRootStruct(g, "CopyOptions")
+	if err != nil || !ok {
 		return
 	}
 	writer.heading(2, "`supersql.CopyOptions`")

@@ -177,6 +177,10 @@ func (b *binder) descriptorRelation(descriptor, namespace *model.Descriptor, nod
 	if err != nil {
 		return relation{}, err
 	}
+	scan, err = b.applyScanRLS(scan, descriptor, namespace, spec.Table, scope, position)
+	if err != nil {
+		return relation{}, err
+	}
 	columns, err := aliasColumns(scan.columns, node.Alias, node.Relname)
 	if err != nil {
 		return relation{}, err
@@ -189,7 +193,7 @@ func (b *binder) descriptorRelation(descriptor, namespace *model.Descriptor, nod
 	if node.Alias != nil {
 		qualifier = relationQualifier{name: node.Alias.Aliasname}
 	}
-	named, err := b.nameRelation(relation{id: scan.id, columns: columns, occurrence: occurrence}, scope, qualifier, descriptor)
+	named, err := b.nameRelation(relation{id: scan.id, columns: columns, effects: scan.effects, occurrence: occurrence}, scope, qualifier, descriptor)
 	if err == nil {
 		named.lockTargets = named.namespaces
 	}
@@ -292,6 +296,19 @@ func (b *binder) catalogDependencies(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	if err := b.catalog.ScanNamespace(ctx, 0, model.ObjectRole, func(published catalog.PublishedDescriptor) error {
+		if published.Descriptor == nil || published.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		count++
+		if count > uint64(b.options.Limits.MaxOperands) {
+			return bindError("54000", "logical catalog dependency limit exceeded", 0)
+		}
+		b.dependency(published.Descriptor, 0)
+		return nil
+	}); err != nil {
+		return err
 	}
 	b.catalogDependenciesBound = true
 	return nil

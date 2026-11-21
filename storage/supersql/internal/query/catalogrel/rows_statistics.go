@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/statistics"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
@@ -27,7 +28,22 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 	if reader.Timestamp() != view.Timestamp() {
 		return &model.Error{Code: "55000", Message: "statistics snapshot timestamp mismatch"}
 	}
+	activeRole := ""
+	if provider, ok := options.Settings.(RoleProvider); ok {
+		activeRole = provider.CurrentRole()
+	}
+	var cachedRoles map[string]model.RoleMetadata
+	rolesLoaded := false
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
+		if object.spec.Table != nil && object.spec.Table.RowSecurity {
+			visible, err := statsVisibleUnderRLS(ctx, snapshot, options, object.spec.Table, activeRole, &cachedRoles, &rolesLoaded)
+			if err != nil {
+				return err
+			}
+			if !visible {
+				return nil
+			}
+		}
 		ref := storage.ObjectRef{ObjectID: object.spec.ID, Generation: object.spec.Physical.Generation, DescriptorVersion: object.spec.Version, EncodingVersion: object.spec.Physical.EncodingVersion}
 		table, ok, err := reader.Lookup(ctx, ref)
 		if err != nil { return err }
@@ -44,6 +60,101 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 		}
 		return nil
 	})
+}
+
+func statsVisibleUnderRLS(ctx context.Context, snapshot Snapshot, options SourceOptions, table *model.TableMetadata, activeRole string, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
+	if table == nil || !table.RowSecurity {
+		return true, nil
+	}
+	role := strings.ToLower(strings.TrimSpace(activeRole))
+	if isDefaultSuperuserRole(role, options.Database.RoleName) {
+		return true, nil
+	}
+	if !*rolesLoaded {
+		roles, err := loadCatalogRoles(ctx, snapshot, options)
+		if err != nil {
+			return false, err
+		}
+		*cachedRoles = roles
+		*rolesLoaded = true
+	}
+	roles := *cachedRoles
+	meta, ok := roles[role]
+	if !ok {
+		return false, nil
+	}
+	if meta.Superuser || meta.BypassRLS {
+		return true, nil
+	}
+	if !table.ForceRowSecurity && table.OwnerName != "" {
+		owner := strings.ToLower(strings.TrimSpace(table.OwnerName))
+		if role == owner || roleIsMemberOf(roles, role, owner) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isDefaultSuperuserRole(role, defaultRoleName string) bool {
+	if role == "" || role == "none" || role == "embedded" || role == "supersql" || role == "postgres" {
+		return true
+	}
+	return defaultRoleName != "" && strings.EqualFold(role, defaultRoleName)
+}
+
+func loadCatalogRoles(ctx context.Context, snapshot Snapshot, options SourceOptions) (map[string]model.RoleMetadata, error) {
+	roles := make(map[string]model.RoleMetadata)
+	if snapshot == nil {
+		return roles, nil
+	}
+	count := uint64(0)
+	err := snapshot.ScanNamespace(ctx, 0, model.ObjectRole, func(published catalog.PublishedDescriptor) error {
+		count++
+		if options.MaxDescriptors > 0 && count > options.MaxDescriptors {
+			return &model.Error{Code: "54000", Message: "catalog descriptor budget exceeded"}
+		}
+		descriptor := published.Descriptor
+		if descriptor == nil || descriptor.State() != model.StatePublic {
+			return nil
+		}
+		meta, ok := descriptor.Role()
+		if !ok {
+			return nil
+		}
+		roles[strings.ToLower(descriptor.Name().Name)] = meta
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return roles, nil
+}
+
+func roleIsMemberOf(roles map[string]model.RoleMetadata, role, target string) bool {
+	if role == target {
+		return true
+	}
+	visited := map[string]struct{}{role: {}}
+	queue := []string{role}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		meta, ok := roles[current]
+		if !ok {
+			continue
+		}
+		for _, member := range meta.MemberOf {
+			normalized := strings.ToLower(member)
+			if normalized == target {
+				return true
+			}
+			if _, seen := visited[normalized]; !seen {
+				visited[normalized] = struct{}{}
+				queue = append(queue, normalized)
+			}
+		}
+	}
+	return false
 }
 func emitExtendedStatisticDefinitions(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
@@ -96,7 +207,22 @@ func emitExtendedStatisticData(ctx context.Context, snapshot Snapshot, view Read
 	if reader == nil || reader.Timestamp() != view.Timestamp() {
 		return &model.Error{Code: "55000", Message: "statistics snapshot timestamp mismatch"}
 	}
+	activeRole := ""
+	if provider, ok := options.Settings.(RoleProvider); ok {
+		activeRole = provider.CurrentRole()
+	}
+	var cachedRoles map[string]model.RoleMetadata
+	rolesLoaded := false
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
+		if object.spec.Table != nil && object.spec.Table.RowSecurity {
+			visible, err := statsVisibleUnderRLS(ctx, snapshot, options, object.spec.Table, activeRole, &cachedRoles, &rolesLoaded)
+			if err != nil {
+				return err
+			}
+			if !visible {
+				return nil
+			}
+		}
 		ref := storage.ObjectRef{ObjectID: object.spec.ID, Generation: object.spec.Physical.Generation, DescriptorVersion: object.spec.Version, EncodingVersion: object.spec.Physical.EncodingVersion}
 		table, ok, err := reader.Lookup(ctx, ref)
 		if err != nil || !ok {

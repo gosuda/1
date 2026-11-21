@@ -66,6 +66,9 @@ func newPushdownStore(t *testing.T, configure ...func(*neosepia.Limits)) *pushdo
 	s.request = storage.PushdownRequest{Target: storage.ObjectRef{ObjectID: 1, Generation: 1, DescriptorVersion: 1, EncodingVersion: 1}, Layout: []storage.ColumnLayout{{ID: 1, Type: integer}, {ID: 2, Type: integer, Nullable: true}, {ID: 3, Type: numeric, Nullable: true}}, KeyLayout: []storage.KeyColumn{{ColumnID: 1, Type: integer}}, ColumnIDs: []model.ColumnID{1}, Spans: []storage.KeySpan{{Lower: storage.KeyBound{Unbounded: true}, Upper: storage.KeyBound{Unbounded: true}}}}
 	s.apply(t, 20, s.upsert(t, 1, model.Int64Val(10), "0"), s.upsert(t, 2, model.NullVal(model.TypeInt64), "0"), s.upsert(t, 3, model.Int64Val(10), "0"), s.upsert(t, 4, model.Int64Val(20), "1.0"), s.upsert(t, 5, model.Int64Val(10), "0"), s.upsert(t, 6, model.Int64Val(0), ""))
 	s.apply(t, 30, s.upsert(t, 1, model.Int64Val(99), "0"))
+	if err := s.backend.Collect(t.Context(), storage.GCRequest{Boundary: 0}); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -316,7 +319,12 @@ func TestPushdownResidualContract(t *testing.T) {
 					}
 				}
 				var batch columnar.Batch
-				err = portal.Next(t.Context(), &batch)
+				for {
+					err = portal.Next(t.Context(), &batch)
+					if err != nil || batch.Rows() != 0 {
+						break
+					}
+				}
 				if !errors.Is(err, storage.ErrCorruptStorage) || batch.Rows() != 0 {
 					t.Fatalf("corrupt scan=%v rows=%d", err, batch.Rows())
 				}

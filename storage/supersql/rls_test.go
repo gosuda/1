@@ -2,11 +2,15 @@ package supersql
 
 import (
 	"bytes"
+	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
@@ -26,9 +30,9 @@ func TestMultiTenantGUCAndRowLevelSecurity(t *testing.T) {
 		}
 	}()
 
-	mustExec := func(sql string) Outcome {
+	mustExec := func(sql string) outcome {
 		t.Helper()
-		out, err := db.Exec(ctx, sql, 0)
+		out, err := db.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", sql, err)
 		}
@@ -37,7 +41,7 @@ func TestMultiTenantGUCAndRowLevelSecurity(t *testing.T) {
 
 	requireErrCode := func(sql, code string) {
 		t.Helper()
-		_, err := db.Exec(ctx, sql, 0)
+		_, err := db.exec(ctx, sql, 0)
 		if err == nil {
 			t.Fatalf("%s: expected SQLSTATE %s, got nil", sql, code)
 		}
@@ -177,7 +181,7 @@ func TestInformationSchemaSQLStandardsPopulated(t *testing.T) {
 	defer db.Close()
 
 	for _, table := range []string{"sql_features", "sql_parts", "sql_sizing"} {
-		out, err := db.Exec(ctx, "SELECT count(*) FROM information_schema."+table, 0)
+		out, err := db.exec(ctx, "SELECT count(*) FROM information_schema."+table, 0)
 		if err != nil {
 			t.Fatalf("SELECT count(*) FROM information_schema.%s: %v", table, err)
 		}
@@ -202,9 +206,9 @@ func TestRLSProductionCompleteness(t *testing.T) {
 		}
 	}()
 
-	mustExec := func(sql string) Outcome {
+	mustExec := func(sql string) outcome {
 		t.Helper()
-		out, err := db.Exec(ctx, sql, 0)
+		out, err := db.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", sql, err)
 		}
@@ -213,7 +217,7 @@ func TestRLSProductionCompleteness(t *testing.T) {
 
 	requireErrCode := func(sql, code string) {
 		t.Helper()
-		_, err := db.Exec(ctx, sql, 0)
+		_, err := db.exec(ctx, sql, 0)
 		if err == nil {
 			t.Fatalf("%s: expected SQLSTATE %s, got nil", sql, code)
 		}
@@ -310,9 +314,9 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 	}
 	defer db.Close()
 
-	mustExec := func(sql string) Outcome {
+	mustExec := func(sql string) outcome {
 		t.Helper()
-		out, err := db.Exec(ctx, sql, 0)
+		out, err := db.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", sql, err)
 		}
@@ -321,7 +325,7 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 
 	requireErrCode := func(sql, code string) {
 		t.Helper()
-		_, err := db.Exec(ctx, sql, 0)
+		_, err := db.exec(ctx, sql, 0)
 		if err == nil {
 			t.Fatalf("%s: expected SQLSTATE %s, got nil", sql, code)
 		}
@@ -495,9 +499,9 @@ func TestRLSOuterJoinSemantics(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	mustExec := func(sql string) Outcome {
+	mustExec := func(sql string) outcome {
 		t.Helper()
-		out, err := db.Exec(ctx, sql, 0)
+		out, err := db.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", sql, err)
 		}
@@ -564,9 +568,9 @@ func TestRLSTransactionalCatalogAndBackup(t *testing.T) {
 		}
 	}()
 
-	mustExec := func(sql string) Outcome {
+	mustExec := func(sql string) outcome {
 		t.Helper()
-		out, err := db.Exec(ctx, sql, 0)
+		out, err := db.exec(ctx, sql, 0)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", sql, err)
 		}
@@ -579,9 +583,10 @@ func TestRLSTransactionalCatalogAndBackup(t *testing.T) {
 	mustExec(`ALTER TABLE tx_docs ENABLE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY committed_pol ON tx_docs FOR ALL TO tx_user USING (tenant_id = 't1')`)
 
-	// Verify rls_meta.json exists in the database root directory (matching README).
-	if _, err := os.Stat(filepath.Join(dir, "rls_meta.json")); err != nil {
-		t.Fatalf("expected rls_meta.json in data directory root: %v", err)
+	// Native MVCC catalog RLS stores roles and policies inside catalog
+	// descriptors and WAL rather than a sidecar rls_meta.json file.
+	if _, err := os.Stat(filepath.Join(dir, "rls_meta.json")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected legacy rls_meta.json sidecar in data directory: err=%v", err)
 	}
 
 	// 1. ROLLBACK discards uncommitted policy and role mutations.
@@ -626,10 +631,10 @@ func TestRLSTransactionalCatalogAndBackup(t *testing.T) {
 	}
 	defer restored.Close()
 
-	if _, err := restored.Exec(ctx, `SET ROLE tx_user`, 0); err != nil {
+	if _, err := restored.exec(ctx, `SET ROLE tx_user`, 0); err != nil {
 		t.Fatalf("restored SET ROLE tx_user: %v", err)
 	}
-	out, err = restored.Exec(ctx, `SELECT id FROM tx_docs ORDER BY id`, 0)
+	out, err = restored.exec(ctx, `SELECT id FROM tx_docs ORDER BY id`, 0)
 	if err != nil {
 		t.Fatalf("restored SELECT tx_docs: %v", err)
 	}
@@ -657,15 +662,15 @@ func TestReadWriteConcurrencyAndParallelism(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec(ctx, `CREATE TABLE kv_bench (id bigint PRIMARY KEY, bucket bigint NOT NULL, val bigint NOT NULL)`, 0); err != nil {
+	if _, err := db.exec(ctx, `CREATE TABLE kv_bench (id bigint PRIMARY KEY, bucket bigint NOT NULL, val bigint NOT NULL)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO kv_bench SELECT g, g % 8, g * 10 FROM generate_series(1, 200) AS g`, 0); err != nil {
+	if _, err := db.exec(ctx, `INSERT INTO kv_bench SELECT g, g % 8, g * 10 FROM generate_series(1, 200) AS g`, 0); err != nil {
 		t.Fatalf("INSERT generate_series: %v", err)
 	}
 
 	// W1: Autocommit SELECT runs in implicit ReadOnly mode while SHOW transaction_read_only remains "off".
-	out, err := db.Exec(ctx, `SHOW transaction_read_only`, 0)
+	out, err := db.exec(ctx, `SHOW transaction_read_only`, 0)
 	if err != nil || len(out.Rows) != 1 || out.Rows[0][0].StrVal != "off" {
 		t.Fatalf("SHOW transaction_read_only = %+v, err=%v, want 'off'", out.Rows, err)
 	}
@@ -769,5 +774,335 @@ func itoa64(v int64) string {
 	}
 	return string(buf[i:])
 }
+
+// TestNativeRLSPenetrationMatrix verifies that every vulnerability class
+// historically present in AST-rewriting RLS is structurally closed by native
+// MVCC catalog roles/policies, single-point binder injection, per-branch
+// Modify WITH CHECK enforcement, and ResetSession sanitization.
+func TestNativeRLSPenetrationMatrix(t *testing.T) {
+	ctx := t.Context()
+	dir := testDirectory(t)
+	db, err := Open(ctx, OpenOptions{Directory: dir, Clock: newTestClock()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	mustExec := func(sqlText string) outcome {
+		t.Helper()
+		out, err := db.exec(ctx, sqlText, 0)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", sqlText, err)
+		}
+		return out
+	}
+	requireErrCode := func(sqlText, wantCode string) {
+		t.Helper()
+		_, err := db.exec(ctx, sqlText, 0)
+		if err == nil {
+			t.Fatalf("%s: expected error %s, got nil", sqlText, wantCode)
+		}
+		var mErr *model.Error
+		if !errors.As(err, &mErr) || mErr.Code != wantCode {
+			t.Fatalf("%s: got error %v, want SQLSTATE %s", sqlText, err, wantCode)
+		}
+	}
+
+	// Setup base schema, roles, tables, views, and statistics as superuser.
+	mustExec(`CREATE ROLE pen_tenant`)
+	mustExec(`CREATE ROLE pen_other`)
+	mustExec(`CREATE TABLE secret (id bigint PRIMARY KEY, tenant_id text NOT NULL, payload text NOT NULL)`)
+	mustExec(`INSERT INTO secret VALUES (1, 't1', 't1-secret-1'), (2, 't2', 't2-secret-2'), (3, 't1', 't1-secret-3')`)
+	mustExec(`ALTER TABLE secret ENABLE ROW LEVEL SECURITY`)
+	mustExec(`CREATE POLICY secret_tenant_pol ON secret FOR ALL TO pen_tenant USING (tenant_id = current_setting('app.tenant_id', true)) WITH CHECK (tenant_id = current_setting('app.tenant_id', true))`)
+	mustExec(`CREATE STATISTICS secret_ext_stats (ndistinct, dependencies, mcv) ON tenant_id, payload FROM secret`)
+	mustExec(`ANALYZE secret`)
+
+	mustExec(`CREATE TABLE secret_alter (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, plain_col bigint NOT NULL, gen_col bigint GENERATED ALWAYS AS (plain_col * 2) STORED)`)
+	mustExec(`CREATE TABLE leak (id bigint PRIMARY KEY, tenant_id text NOT NULL, payload text NOT NULL)`)
+	mustExec(`CREATE TABLE scratch (id bigint PRIMARY KEY, val text)`)
+	mustExec(`CREATE VIEW v_definer AS SELECT id, tenant_id, payload FROM secret`)
+	mustExec(`CREATE VIEW v_invoker WITH (security_invoker = true) AS SELECT id, tenant_id, payload FROM secret`)
+	mustExec(`CREATE SCHEMA s2`)
+	mustExec(`CREATE FUNCTION trig_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$`)
+
+	// Verify superuser sees pg_stats and pg_statistic_ext_data rows for secret before switching role.
+	out := mustExec(`SELECT count(*) FROM pg_stats WHERE tablename = 'secret'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal == 0 {
+		t.Fatalf("superuser pg_stats count for secret = %+v, want > 0", out.Rows)
+	}
+	out = mustExec(`SELECT count(*) FROM pg_statistic_ext_data d JOIN pg_statistic_ext e ON e.oid = d.stxoid WHERE e.stxname = 'secret_ext_stats'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal == 0 {
+		t.Fatalf("superuser pg_statistic_ext_data count for secret_ext_stats = %+v, want > 0", out.Rows)
+	}
+
+	// Switch to restricted tenant role.
+	mustExec(`SET ROLE pen_tenant`)
+	mustExec(`SET app.tenant_id = 't1'`)
+
+	// 1. Role escalation attempts via set_config / SET / routine SET must fail with 42501.
+	requireErrCode(`SELECT set_config('supersql.active_role', 'supersql', false)`, "42501")
+	requireErrCode(`SELECT set_config('supersql.session_user', 'supersql', false)`, "42501")
+	requireErrCode(`SELECT set_config('role', 'supersql', false)`, "42501")
+	requireErrCode(`SELECT set_config('session_authorization', 'supersql', false)`, "42501")
+	requireErrCode(`SET supersql.active_role = 'supersql'`, "42501")
+	requireErrCode(`CREATE FUNCTION esc_fn1() RETURNS int LANGUAGE SQL SET supersql.active_role = 'supersql' AS 'SELECT 1'`, "42501")
+	requireErrCode(`CREATE FUNCTION esc_fn2() RETURNS int LANGUAGE SQL SET role = 'supersql' AS 'SELECT 1'`, "42501")
+	requireErrCode(`CREATE FUNCTION esc_fn3() RETURNS int LANGUAGE SQL SET supersql."session_user" = 'supersql' AS 'SELECT 1'`, "42501")
+	mustExec(`CREATE FUNCTION benign_fn() RETURNS int LANGUAGE SQL AS 'SELECT 1'`)
+	requireErrCode(`ALTER FUNCTION benign_fn() SET supersql.active_role = 'supersql'`, "42501")
+
+	// 2. EXPLAIN ANALYZE SELECT/UPDATE/DELETE under restricted role enforces RLS.
+	mustExec(`EXPLAIN ANALYZE SELECT * FROM secret`)
+	mustExec(`EXPLAIN ANALYZE UPDATE secret SET payload = 'pwned' WHERE id = 2`)
+	mustExec(`EXPLAIN ANALYZE DELETE FROM secret WHERE id = 2`)
+
+	// 3. Writable CTE cannot delete hidden rows.
+	out = mustExec(`WITH d AS (DELETE FROM secret WHERE id = 2 RETURNING id) SELECT count(*) FROM d`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 0 {
+		t.Fatalf("writable CTE deleted hidden row: %+v", out.Rows)
+	}
+
+	// 4. DML WITH clause cannot leak hidden rows into another table.
+	mustExec(`WITH s AS (SELECT id, tenant_id, payload FROM secret) INSERT INTO leak SELECT * FROM s`)
+	out = mustExec(`SELECT id FROM leak ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][0].IntVal != 1 || out.Rows[1][0].IntVal != 3 {
+		t.Fatalf("DML WITH leaked rows: %+v, want [1, 3]", out.Rows)
+	}
+
+	// 5. RETURNING subquery cannot exfiltrate hidden rows.
+	out = mustExec(`INSERT INTO scratch VALUES (1, 'x') RETURNING (SELECT count(*) FROM secret WHERE tenant_id = 't2')`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 0 {
+		t.Fatalf("RETURNING subquery exfiltrated hidden rows: %+v", out.Rows)
+	}
+
+	// 6. Non-owner DDL bypass attempts must all fail with 42501.
+	requireErrCode(`ALTER TABLE secret SET SCHEMA s2`, "42501")
+	requireErrCode(`DROP SCHEMA s2 CASCADE`, "42501")
+	requireErrCode(`CREATE TRIGGER hijack_trig AFTER INSERT ON secret FOR EACH ROW EXECUTE FUNCTION trig_noop()`, "42501")
+	requireErrCode(`ALTER TABLE secret RENAME TO stolen`, "42501")
+	requireErrCode(`DROP TABLE secret`, "42501")
+	requireErrCode(`TRUNCATE secret`, "42501")
+	requireErrCode(`ALTER TABLE secret ADD COLUMN extra text`, "42501")
+	requireErrCode(`ALTER TABLE secret_alter ALTER COLUMN id SET INCREMENT BY 2`, "42501")
+	requireErrCode(`ALTER TABLE secret_alter ALTER COLUMN plain_col ADD GENERATED ALWAYS AS IDENTITY`, "42501")
+	requireErrCode(`ALTER TABLE secret_alter ALTER COLUMN gen_col SET EXPRESSION AS (plain_col * 3)`, "42501")
+	requireErrCode(`ALTER TABLE secret_alter ALTER COLUMN gen_col DROP EXPRESSION`, "42501")
+
+	// 7. security_invoker = true vs security_invoker = false views.
+	out = mustExec(`SELECT id FROM v_invoker ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][0].IntVal != 1 || out.Rows[1][0].IntVal != 3 {
+		t.Fatalf("security_invoker=true view rows = %+v, want [1, 3]", out.Rows)
+	}
+	out = mustExec(`SELECT id FROM v_definer ORDER BY id`)
+	if len(out.Rows) != 3 {
+		t.Fatalf("security_invoker=false view rows = %+v, want 3 (owner bypass)", out.Rows)
+	}
+
+	// 8. Native catalog views pg_policies, pg_roles, and pg_stats RLS masking.
+	out = mustExec(`SELECT policyname, cmd FROM pg_policies WHERE tablename = 'secret'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].StrVal != "secret_tenant_pol" || out.Rows[0][1].StrVal != "ALL" {
+		t.Fatalf("pg_policies rows = %+v, want [(secret_tenant_pol, ALL)]", out.Rows)
+	}
+	out = mustExec(`SELECT rolname FROM pg_roles WHERE rolname IN ('pen_tenant', 'pen_other') ORDER BY rolname`)
+	if len(out.Rows) != 2 || out.Rows[0][0].StrVal != "pen_other" || out.Rows[1][0].StrVal != "pen_tenant" {
+		t.Fatalf("pg_roles rows = %+v, want [pen_other, pen_tenant]", out.Rows)
+	}
+	out = mustExec(`SELECT count(*) FROM pg_stats WHERE tablename = 'secret'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 0 {
+		t.Fatalf("non-owner pg_stats count for RLS table = %+v, want 0 (masked)", out.Rows)
+	}
+	out = mustExec(`SELECT count(*) FROM pg_statistic_ext_data d JOIN pg_statistic_ext e ON e.oid = d.stxoid WHERE e.stxname = 'secret_ext_stats'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 0 {
+		t.Fatalf("non-owner pg_statistic_ext_data count for RLS table = %+v, want 0 (masked)", out.Rows)
+	}
+
+	// 9. Owner ALTER TABLE ... SET SCHEMA preserves policies in destination schema,
+	//    and non-owner schema CASCADE still cannot drop superuser-owned table.
+	mustExec(`CREATE SCHEMA tenant_owned_schema`)
+	mustExec(`RESET ROLE`)
+	// Verify hidden row (id = 2) was untouched by EXPLAIN ANALYZE / writable CTE.
+	out = mustExec(`SELECT payload FROM secret WHERE id = 2`)
+	if len(out.Rows) != 1 || out.Rows[0][0].StrVal != "t2-secret-2" {
+		t.Fatalf("hidden row id=2 was modified or deleted: %+v", out.Rows)
+	}
+	mustExec(`ALTER TABLE secret SET SCHEMA s2`)
+	mustExec(`CREATE TABLE tenant_owned_schema.admin_owned (id bigint PRIMARY KEY)`)
+
+	mustExec(`SET ROLE pen_tenant`)
+	mustExec(`SET app.tenant_id = 't1'`)
+	out = mustExec(`SELECT id FROM s2.secret ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][0].IntVal != 1 || out.Rows[1][0].IntVal != 3 {
+		t.Fatalf("s2.secret after SET SCHEMA rows = %+v, want [1, 3]", out.Rows)
+	}
+	requireErrCode(`DROP SCHEMA tenant_owned_schema CASCADE`, "42501")
+
+	// 10. Per-branch INSERT ... ON CONFLICT DO UPDATE with distinct INSERT (col > 0)
+	//     and UPDATE (col < 10) policies (must NOT be conjoined together!).
+	mustExec(`RESET ROLE`)
+	mustExec(`CREATE TABLE upsert_branch (id bigint PRIMARY KEY, col bigint NOT NULL)`)
+	mustExec(`INSERT INTO upsert_branch VALUES (1, 5)`)
+	mustExec(`ALTER TABLE upsert_branch ENABLE ROW LEVEL SECURITY`)
+	mustExec(`CREATE POLICY sel_all ON upsert_branch FOR SELECT TO pen_tenant USING (true)`)
+	mustExec(`CREATE POLICY ins_pos ON upsert_branch FOR INSERT TO pen_tenant WITH CHECK (col > 0)`)
+	mustExec(`CREATE POLICY upd_lt10 ON upsert_branch FOR UPDATE TO pen_tenant USING (true) WITH CHECK (col < 10)`)
+
+	mustExec(`SET ROLE pen_tenant`)
+	// New row with col=20: satisfies INSERT (20 > 0) even though it violates UPDATE (20 < 10).
+	mustExec(`INSERT INTO upsert_branch VALUES (2, 20) ON CONFLICT (id) DO UPDATE SET col = EXCLUDED.col`)
+	// New row with col=-1: violates INSERT (-1 > 0) -> 42501.
+	requireErrCode(`INSERT INTO upsert_branch VALUES (3, -1) ON CONFLICT (id) DO UPDATE SET col = EXCLUDED.col`, "42501")
+	// Conflict on id=1 updating col=-5: satisfies UPDATE (-5 < 10) even though -5 > 0 is false.
+	mustExec(`INSERT INTO upsert_branch VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET col = -5`)
+	// Conflict on id=1 updating col=15: violates UPDATE (15 < 10) -> 42501.
+	requireErrCode(`INSERT INTO upsert_branch VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET col = 15`, "42501")
+	out = mustExec(`SELECT id, col FROM upsert_branch ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][1].IntVal != -5 || out.Rows[1][1].IntVal != 20 {
+		t.Fatalf("upsert_branch rows = %+v, want [(1,-5), (2,20)]", out.Rows)
+	}
+
+	// 11. Concurrent RLS DDL (CREATE POLICY / CREATE ROLE via sql.DB) -> zero lost updates.
+	mustExec(`RESET ROLE`)
+	mustExec(`CREATE TABLE conc_t (id bigint PRIMARY KEY, tenant_id text NOT NULL)`)
+	mustExec(`ALTER TABLE conc_t ENABLE ROW LEVEL SECURITY`)
+	connector := NewConnectorWithCatalog(db)
+	sqlDB := sql.OpenDB(connector)
+	defer sqlDB.Close()
+
+	execWithRetry := func(query string) error {
+		var lastErr error
+		for attempt := range 64 {
+			_, err := sqlDB.ExecContext(ctx, query)
+			if err == nil {
+				return nil
+			}
+			var mErr *model.Error
+			if errors.As(err, &mErr) && (mErr.Code == "40001" || mErr.Code == "55P03") {
+				lastErr = err
+				time.Sleep(time.Duration(1+attempt%5) * 5 * time.Millisecond)
+				continue
+			}
+			return err
+		}
+		return fmt.Errorf("exceeded retries for %s: last error: %w", query, lastErr)
+	}
+
+	const workers = 6
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers*2)
+	for i := range workers {
+		wg.Add(2)
+		go func(idx int) {
+			defer wg.Done()
+			errCh <- execWithRetry(fmt.Sprintf(`CREATE ROLE conc_role_%d`, idx))
+		}(i)
+		go func(idx int) {
+			defer wg.Done()
+			errCh <- execWithRetry(fmt.Sprintf(`CREATE POLICY conc_pol_%d ON conc_t FOR SELECT TO PUBLIC USING (tenant_id = 't%d')`, idx, idx))
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent RLS DDL error: %v", err)
+		}
+	}
+	out = mustExec(`SELECT count(*) FROM pg_policies WHERE tablename = 'conc_t'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != workers {
+		t.Fatalf("concurrent CREATE POLICY count = %+v, want %d (lost update!)", out.Rows, workers)
+	}
+	out = mustExec(`SELECT count(*) FROM pg_roles WHERE rolname LIKE 'conc_role_%'`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != workers {
+		t.Fatalf("concurrent CREATE ROLE count = %+v, want %d (lost update!)", out.Rows, workers)
+	}
+
+	// 12. Pooled sql.DB ResetSession sanitizes active role, custom GUCs, temp
+	//     tables, SQL prepared statements, held cursors, and advisory locks.
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	conn1, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("sqlDB.Conn 1: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `CREATE TEMP TABLE pool_leak_tmp (id bigint PRIMARY KEY)`); err != nil {
+		t.Fatalf("conn1 CREATE TEMP TABLE: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `INSERT INTO pool_leak_tmp VALUES (1)`); err != nil {
+		t.Fatalf("conn1 INSERT temp: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `PREPARE pool_leak_prep AS SELECT 99`); err != nil {
+		t.Fatalf("conn1 PREPARE: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `BEGIN`); err != nil {
+		t.Fatalf("conn1 BEGIN for WITH HOLD cursor: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `DECLARE pool_leak_cur CURSOR WITH HOLD FOR SELECT 1`); err != nil {
+		t.Fatalf("conn1 DECLARE CURSOR WITH HOLD: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `COMMIT`); err != nil {
+		t.Fatalf("conn1 COMMIT for WITH HOLD cursor: %v", err)
+	}
+	var acquired bool
+	if err := conn1.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(77777)`).Scan(&acquired); err != nil || !acquired {
+		t.Fatalf("conn1 pg_try_advisory_lock: acquired=%v err=%v", acquired, err)
+	}
+	if _, err := conn1.ExecContext(ctx, `SET ROLE pen_tenant`); err != nil {
+		t.Fatalf("conn1 SET ROLE: %v", err)
+	}
+	if _, err := conn1.ExecContext(ctx, `SET app.tenant_id = 't1'`); err != nil {
+		t.Fatalf("conn1 SET app.tenant_id: %v", err)
+	}
+	if err := conn1.Close(); err != nil {
+		t.Fatalf("conn1 Close: %v", err)
+	}
+
+	// database/sql invokes driver.SessionResetter.ResetSession on the next
+	// checkout from the pool, sanitizing all session-scoped state before reuse.
+	conn2, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("sqlDB.Conn 2: %v", err)
+	}
+	defer conn2.Close()
+
+	// Verify session-level advisory lock was released on ResetSession by
+	// acquiring it from a distinct session (the embedded catalog session).
+	out = mustExec(`SELECT pg_try_advisory_lock(77777)`)
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal == 0 {
+		t.Fatalf("pooled connection leaked session advisory lock 77777: pg_try_advisory_lock = %+v", out.Rows)
+	}
+	mustExec(`SELECT pg_advisory_unlock(77777)`)
+	var gotRole string
+	if err := conn2.QueryRowContext(ctx, `SHOW role`).Scan(&gotRole); err != nil {
+		t.Fatalf("conn2 SHOW role: %v", err)
+	}
+	if gotRole != "none" {
+		t.Fatalf("pooled connection leaked role = %q, want %q", gotRole, "none")
+	}
+	var gotTenant sql.NullString
+	if err := conn2.QueryRowContext(ctx, `SELECT current_setting('app.tenant_id', true)`).Scan(&gotTenant); err != nil {
+		t.Fatalf("conn2 current_setting: %v", err)
+	}
+	if gotTenant.Valid && gotTenant.String != "" {
+		t.Fatalf("pooled connection leaked app.tenant_id = %q, want NULL/empty", gotTenant.String)
+	}
+	var unlocked bool
+	if err := conn2.QueryRowContext(ctx, `SELECT pg_advisory_unlock(77777)`).Scan(&unlocked); err != nil {
+		t.Fatalf("conn2 pg_advisory_unlock: %v", err)
+	}
+	if unlocked {
+		t.Fatalf("pooled connection still held session advisory lock 77777")
+	}
+	if _, err := conn2.ExecContext(ctx, `SELECT * FROM pool_leak_tmp`); err == nil || SQLState(err) != "42P01" {
+		t.Fatalf("pooled connection leaked temp table: err=%v, want SQLSTATE 42P01", err)
+	}
+	if _, err := conn2.ExecContext(ctx, `EXECUTE pool_leak_prep`); err == nil || SQLState(err) != "26000" {
+		t.Fatalf("pooled connection leaked SQL PREPARE statement: err=%v, want SQLSTATE 26000", err)
+	}
+	if _, err := conn2.ExecContext(ctx, `FETCH 1 FROM pool_leak_cur`); err == nil || SQLState(err) != "34000" {
+		t.Fatalf("pooled connection leaked held cursor: err=%v, want SQLSTATE 34000", err)
+	}
+}
+
 
 

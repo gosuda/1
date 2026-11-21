@@ -86,9 +86,6 @@ func (manager *Manager) submit(ctx context.Context, batch storage.MutationBatch,
 		manager.mu.Unlock()
 		outcome.State = storage.CommitUnknown
 		result, err := manager.backend.ApplyMutations(ctx, batch)
-		manager.mu.Lock()
-		manager.pendingInFlight = false
-		manager.mu.Unlock()
 		if err == nil {
 			if err := manager.publishResolved(pending, result); err != nil {
 				return err
@@ -103,6 +100,7 @@ func (manager *Manager) submit(ctx context.Context, batch storage.MutationBatch,
 		}
 		resolution, resolveErr := manager.resolvePending(ctx, pending)
 		if resolveErr != nil || resolution.State == storage.CommitUnknown {
+			manager.markPendingIndeterminate(pending)
 			return errors.Join(storage.ErrCommitIndeterminate, err, resolveErr)
 		}
 		outcome.State = resolution.State
@@ -173,6 +171,14 @@ func (manager *Manager) clearPending(pending *managerCommit) {
 	}
 }
 
+func (manager *Manager) markPendingIndeterminate(pending *managerCommit) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.pending == pending {
+		manager.pendingInFlight = false
+	}
+}
+
 // publishResolved advances the durable frontier for one resolved commit.
 //
 // catalogVersion is the content identity every live snapshot-derived catalog
@@ -203,6 +209,9 @@ func (manager *Manager) publishResolved(pending *managerCommit, result storage.A
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if manager.pending != pending || result != pending.expected {
+		if manager.pending == pending {
+			manager.pendingInFlight = false
+		}
 		return storage.ErrCorruptStorage
 	}
 	manager.frontier.LogPosition = result.LogPosition

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"slices"
 	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
@@ -40,16 +41,18 @@ func activeLevelBudget(level uint8) uint64 {
 }
 
 // selectTargetCompaction coalesces all remaining files of a target into a
-// single level-1 interval when the target has uncompacted L0 runs, multiple
-// active runs, or multiple inactive runs in the same time window and its total
+// single level-1 interval when the target has uncompacted L0 runs, overlapping
+// or under-filled fragmented active runs, an oversized active level, or
+// colliding/fragmented inactive runs in the same time window, and its total
 // size fits within the single-pass compaction and merge budgets.
 func (pin *runPin) selectTargetCompaction(ctx context.Context, target storage.ObjectRef, exclude map[string]struct{}, limits Limits) (levelCompaction, error) {
 	var sizes [MaxLevels]uint64
-	var l0Count, activeCount uint64
+	var levelFiles [MaxLevels][]*sstFile
+	var l0Count uint64
 	var totalSize uint64
 	var minLower, maxUpper []byte
-	var windowCollision bool
-	windows := make(map[uint64]struct{})
+	windowFiles := make(map[uint64][]*sstFile)
+	fileSizes := make(map[string]uint64)
 	files := make(map[string]*sstFile)
 	if err := pin.visit(ctx, target, func(file *sstFile) error {
 		if _, done := exclude[file.descriptor.Name]; done {
@@ -64,21 +67,18 @@ func (pin *runPin) selectTargetCompaction(ctx context.Context, target storage.Ob
 			return columnar.ErrBatchBudget
 		}
 		totalSize += size
+		fileSizes[file.descriptor.Name] = size
 		if file.tier == activeTier {
 			if size > math.MaxUint64-sizes[file.level] {
 				return columnar.ErrBatchBudget
 			}
 			sizes[file.level] += size
-			activeCount++
+			levelFiles[file.level] = append(levelFiles[file.level], file)
 			if file.level == 0 {
 				l0Count++
 			}
 		} else {
-			if _, exists := windows[file.timeWindow]; exists {
-				windowCollision = true
-			} else {
-				windows[file.timeWindow] = struct{}{}
-			}
+			windowFiles[file.timeWindow] = append(windowFiles[file.timeWindow], file)
 		}
 		lower := file.lowerBound()
 		if minLower == nil || bytes.Compare(lower, minLower) < 0 {
@@ -93,10 +93,49 @@ func (pin *runPin) selectTargetCompaction(ctx context.Context, target storage.Ob
 	}); err != nil {
 		return levelCompaction{}, err
 	}
-	needsCompaction := l0Count > 0 || activeCount > 1 || windowCollision
+	targetFileBytes := min(limits.RunBytes, compactionFileBytes)
+	minCoalesceFill := targetFileBytes / 2
+	minCoalesceBlocks := uint64(limits.RunBlocks) / 2
+	filesNeedCoalescing := func(group []*sstFile) bool {
+		if len(group) <= 1 {
+			return false
+		}
+		slices.SortFunc(group, func(a, b *sstFile) int {
+			return bytes.Compare(a.lowerBound(), b.lowerBound())
+		})
+		for i := 1; i < len(group); i++ {
+			prev, curr := group[i-1], group[i]
+			if !prev.endsBefore(curr.lowerBound()) {
+				return true
+			}
+			prevBlocks := uint64(prev.count)
+			currBlocks := uint64(curr.count)
+			if fileSizes[prev.descriptor.Name]+fileSizes[curr.descriptor.Name] <= minCoalesceFill && prevBlocks+currBlocks <= minCoalesceBlocks {
+				return true
+			}
+		}
+		return false
+	}
+	needsCompaction := l0Count > 0
 	if !needsCompaction {
 		for candidate := 1; candidate < MaxLevels-1; candidate++ {
 			if sizes[candidate] > activeLevelBudget(uint8(candidate)) {
+				needsCompaction = true
+				break
+			}
+		}
+	}
+	if !needsCompaction {
+		for level := 1; level < MaxLevels; level++ {
+			if filesNeedCoalescing(levelFiles[level]) {
+				needsCompaction = true
+				break
+			}
+		}
+	}
+	if !needsCompaction {
+		for _, group := range windowFiles {
+			if filesNeedCoalescing(group) {
 				needsCompaction = true
 				break
 			}

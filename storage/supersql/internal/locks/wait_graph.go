@@ -83,18 +83,17 @@ func (graph *WaitGraph) BeginWait(waiter WaitOwner, blockers []WaitOwner) error 
 	return nil
 }
 
-func (graph *WaitGraph) reaches(current, target WaitOwner, proposed []WaitOwner, visiting map[WaitOwner]bool) bool {
-	if visiting[current] {
+func (graph *WaitGraph) reaches(current, target WaitOwner, proposed []WaitOwner, visited map[WaitOwner]bool) bool {
+	if visited[current] {
 		return false
 	}
-	visiting[current] = true
-	defer delete(visiting, current)
+	visited[current] = true
 	blockers := proposed
 	if current != target {
 		blockers = graph.waits[current].blockers
 	}
 	for _, blocker := range blockers {
-		if blocker == target || graph.reaches(blocker, target, proposed, visiting) {
+		if blocker == target || graph.reaches(blocker, target, proposed, visited) {
 			return true
 		}
 	}

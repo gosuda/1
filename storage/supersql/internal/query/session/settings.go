@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -65,23 +66,35 @@ type SettingResult struct {
 	Warning *model.Error
 }
 
-// Settings has one owner and is not goroutine-safe. Begin/Commit/Rollback track
-// settings only; the orchestrator must compose them with actual transaction
-// outcomes. Errors leave settings unchanged; transaction abort handling belongs
-// to that orchestrator. No deadlines, storage quotas, or SQL execution run here.
+// Settings synchronizes concurrent reads (such as timeout cleanup vs incoming
+// statements) through mu. Begin/Commit/Rollback track settings and protected
+// role identity only; the orchestrator must compose them with actual
+// transaction outcomes. Errors leave settings unchanged; transaction abort
+// handling belongs to that orchestrator.
 type Settings struct {
-	resolver       SettingResolver
-	limits         SettingLimits
-	reset          settingValues
-	current        settingValues
-	retained       settingValues
-	before         settingValues
-	customCurrent  []customSetting
-	customRetained []customSetting
-	customBefore   []customSetting
-	active         bool
-	dataAccess     bool
-	savepoints     []settingSavepoint
+	mu       sync.RWMutex
+	resolver SettingResolver
+	limits   SettingLimits
+	state    settingState
+}
+
+type settingState struct {
+	reset              settingValues
+	current            settingValues
+	retained           settingValues
+	before             settingValues
+	customCurrent      []customSetting
+	customRetained     []customSetting
+	customBefore       []customSetting
+	currentRole        string
+	retainedRole       string
+	beforeRole         string
+	sessionUser        string
+	retainedSessionUsr string
+	beforeSessionUsr   string
+	active             bool
+	dataAccess         bool
+	savepoints         []settingSavepoint
 }
 
 type settingValues [settingCount]settingValue
@@ -101,11 +114,15 @@ type customSetting struct {
 }
 
 type settingSavepoint struct {
-	name           string
-	current        settingValues
-	retained       settingValues
-	customCurrent  []customSetting
-	customRetained []customSetting
+	name               string
+	current            settingValues
+	retained           settingValues
+	customCurrent      []customSetting
+	customRetained     []customSetting
+	currentRole        string
+	retainedRole       string
+	sessionUser        string
+	retainedSessionUsr string
 }
 
 func NewSettings(ctx context.Context, opts SettingsOptions) (*Settings, error) {
@@ -116,18 +133,250 @@ func NewSettings(ctx context.Context, opts SettingsOptions) (*Settings, error) {
 	}
 	s := &Settings{resolver: opts.Resolver, limits: opts.Limits}
 	for id, def := range settingDefinitions {
-		value, err := s.parse(ctx, settingID(id), def.initial)
+		value, err := s.parseLocked(ctx, settingID(id), def.initial)
 		if err != nil {
 			return nil, err
 		}
-		s.current[id] = value
+		s.state.current[id] = value
 	}
-	s.reset, s.retained = s.current, s.current
+	s.state.reset, s.state.retained = s.state.current, s.state.current
 	return s, nil
 }
 
 func (*Settings) Principal() model.Principal { return model.Principal{} }
-func (s *Settings) InTransaction() bool      { return s.active }
+
+func (s *Settings) InTransaction() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.active
+}
+
+// CurrentRole returns the active role for authorization and RLS evaluation.
+// An empty string indicates the default built-in superuser principal.
+func (s *Settings) CurrentRole() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentRoleLocked()
+}
+
+func (s *Settings) currentRoleLocked() string {
+	if s.state.currentRole != "" {
+		return s.state.currentRole
+	}
+	return s.state.sessionUser
+}
+
+// SessionUser returns the session's authenticated user role, or "" for the
+// default built-in superuser principal.
+func (s *Settings) SessionUser() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.sessionUser
+}
+
+// SetRole updates the protected active role. Only privileged authorization
+// paths should invoke this after checking membership/superuser permissions.
+func (s *Settings) SetRole(ctx context.Context, role string, local bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized := strings.ToLower(strings.TrimSpace(role))
+	if normalized == "" || normalized == "none" {
+		return s.ResetRole(ctx, local)
+	}
+	if !s.validString(normalized) {
+		return badSetting("role", "invalid UTF8, zero byte, or host value-size limit")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if local && !s.state.active {
+		return nil
+	}
+	cloned := strings.Clone(normalized)
+	s.state.currentRole = cloned
+	if !local {
+		s.state.retainedRole = cloned
+	}
+	return nil
+}
+
+// ResetRole clears the active role override so execution reverts to SessionUser.
+func (s *Settings) ResetRole(ctx context.Context, local bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if local && !s.state.active {
+		return nil
+	}
+	s.state.currentRole = ""
+	if !local {
+		s.state.retainedRole = ""
+	}
+	return nil
+}
+
+// SetSessionUser updates the protected session_user identity and resets the
+// current role override, matching PostgreSQL SET [LOCAL] SESSION AUTHORIZATION.
+func (s *Settings) SetSessionUser(ctx context.Context, role string, local bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized := strings.ToLower(strings.TrimSpace(role))
+	if normalized == "default" {
+		normalized = ""
+	}
+	if normalized != "" && !s.validString(normalized) {
+		return badSetting("session_authorization", "invalid UTF8, zero byte, or host value-size limit")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if local && !s.state.active {
+		return nil
+	}
+	cloned := strings.Clone(normalized)
+	s.state.sessionUser = cloned
+	s.state.currentRole = ""
+	if !local {
+		s.state.retainedSessionUsr = cloned
+		s.state.retainedRole = ""
+	}
+	return nil
+}
+
+// ResetAllSessionState resets all non-read-only settings, custom GUCs, active
+// role, and session_user to initial connection defaults for safe pool reuse.
+func (s *Settings) ResetAllSessionState(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.active {
+		return settingError("25001", "cannot reset session state inside an active transaction")
+	}
+	for id, def := range settingDefinitions {
+		if def.kind == readOnlySetting {
+			continue
+		}
+		s.state.current[id] = s.state.reset[id]
+		s.state.retained[id] = s.state.reset[id]
+	}
+	s.state.before = settingValues{}
+	s.state.customCurrent = nil
+	s.state.customRetained = nil
+	s.state.customBefore = nil
+	s.state.currentRole = ""
+	s.state.retainedRole = ""
+	s.state.beforeRole = ""
+	s.state.sessionUser = ""
+	s.state.retainedSessionUsr = ""
+	s.state.beforeSessionUsr = ""
+	clear(s.state.savepoints)
+	s.state.savepoints = s.state.savepoints[:0]
+	s.state.dataAccess = false
+	return nil
+}
+
+func (s *Settings) snapshotState() settingState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := s.state
+	st.savepoints = slices.Clone(st.savepoints)
+	return st
+}
+
+func (s *Settings) restoreState(st settingState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st.savepoints = slices.Clone(st.savepoints)
+	s.state = st
+}
+
+func (s *Settings) cloneForStaging() *Settings {
+	return &Settings{
+		resolver: s.resolver,
+		limits:   s.limits,
+		state:    s.snapshotState(),
+	}
+}
+
+func (s *Settings) commitStaged(staged *Settings) {
+	st := staged.snapshotState()
+	s.restoreState(st)
+}
+
+func (s *Settings) restoreStatementSettings(before settingState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.current = before.current
+	s.state.retained = before.retained
+	s.state.customCurrent = before.customCurrent
+	s.state.customRetained = before.customRetained
+	s.state.currentRole = before.currentRole
+	s.state.retainedRole = before.retainedRole
+	s.state.sessionUser = before.sessionUser
+	s.state.retainedSessionUsr = before.retainedSessionUsr
+}
+
+func (s *Settings) savepointCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.state.savepoints)
+}
+
+func (s *Settings) findSavepointIndex(name string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.savepointIndexLocked(name)
+}
+
+func (s *Settings) transactionCharacteristics() transactionCharacteristics {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return transactionCharacteristics{
+		isolation:  s.state.current[transactionIsolation].text,
+		readOnly:   s.state.current[transactionReadOnly].flag,
+		deferrable: s.state.current[transactionDeferrable].flag,
+	}
+}
+
+func (s *Settings) clientMinMessages() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current[clientMinMessages].text
+}
+
+func (s *Settings) routineSettingsSnapshot() (current, retained settingValues) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current, s.state.retained
+}
+
+func (s *Settings) restoreRoutineSettings(current, retained settingValues) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.current, s.state.retained = current, retained
+}
+
+func (s *Settings) formatLocaleNames() (numeric, monetary, clock string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current[lcNumeric].text, s.state.current[lcMonetary].text, s.state.current[lcTime].text
+}
+
+func (s *Settings) catalogSettingsSnapshot() (current, reset settingValues) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current, s.state.reset
+}
 
 // BeginOptions uses empty isolation and nil flags to inherit session defaults.
 // Read-only mode cannot subsequently be upgraded to writable mode.
@@ -143,133 +392,204 @@ func (s *Settings) Begin(opts BeginOptions) error {
 			return err
 		}
 	}
-	if s.active {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.active {
 		return settingError("25001", "a transaction is already active")
 	}
-	s.before = s.current
-	s.retained = s.current
-	s.customBefore = s.customCurrent
-	s.customRetained = s.customCurrent
-	s.current[transactionIsolation] = s.current[defaultIsolation]
-	s.current[transactionReadOnly] = s.current[defaultReadOnly]
-	s.current[transactionDeferrable] = s.current[defaultDeferrable]
+	s.state.before = s.state.current
+	s.state.retained = s.state.current
+	s.state.customBefore = s.state.customCurrent
+	s.state.customRetained = s.state.customCurrent
+	s.state.beforeRole = s.state.currentRole
+	s.state.retainedRole = s.state.currentRole
+	s.state.beforeSessionUsr = s.state.sessionUser
+	s.state.retainedSessionUsr = s.state.sessionUser
+	s.state.current[transactionIsolation] = s.state.current[defaultIsolation]
+	s.state.current[transactionReadOnly] = s.state.current[defaultReadOnly]
+	s.state.current[transactionDeferrable] = s.state.current[defaultDeferrable]
 	if opts.Isolation != "" {
-		s.current[transactionIsolation].assigned = true
+		s.state.current[transactionIsolation].assigned = true
 	}
 	if opts.ReadOnly != nil {
-		s.current[transactionReadOnly] = booleanValue(*opts.ReadOnly)
-		s.current[transactionReadOnly].assigned = true
+		s.state.current[transactionReadOnly] = booleanValue(*opts.ReadOnly)
+		s.state.current[transactionReadOnly].assigned = true
 	}
 	if opts.Deferrable != nil {
-		s.current[transactionDeferrable] = booleanValue(*opts.Deferrable)
-		s.current[transactionDeferrable].assigned = true
+		s.state.current[transactionDeferrable] = booleanValue(*opts.Deferrable)
+		s.state.current[transactionDeferrable].assigned = true
 	}
-	s.active, s.dataAccess = true, false
+	s.state.active, s.state.dataAccess = true, false
 	return nil
 }
 
 // MarkDataAccess is called when the transaction takes its first data snapshot,
 // not for SET/SHOW or a statement that fails before data access.
 func (s *Settings) MarkDataAccess() error {
-	if !s.active {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.state.active {
 		return settingError("25P01", "no active transaction")
 	}
-	s.dataAccess = true
+	s.state.dataAccess = true
 	return nil
 }
 
 func (s *Settings) Commit() error {
-	if !s.active {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.state.active {
 		return settingError("25P01", "no active transaction")
 	}
-	s.current = s.retained
-	s.customCurrent = s.customRetained
-	s.finish()
+	s.state.current = s.state.retained
+	s.state.customCurrent = s.state.customRetained
+	s.state.currentRole = s.state.retainedRole
+	s.state.sessionUser = s.state.retainedSessionUsr
+	s.finishLocked()
 	return nil
 }
 
 func (s *Settings) Rollback() error {
-	if !s.active {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.state.active {
 		return settingError("25P01", "no active transaction")
 	}
-	s.current = s.before
-	s.customCurrent = s.customBefore
-	s.finish()
+	s.state.current = s.state.before
+	s.state.customCurrent = s.state.customBefore
+	s.state.currentRole = s.state.beforeRole
+	s.state.sessionUser = s.state.beforeSessionUsr
+	s.finishLocked()
 	return nil
 }
 
-func (s *Settings) finish() {
-	s.current[transactionIsolation] = s.current[defaultIsolation]
-	s.current[transactionReadOnly] = s.current[defaultReadOnly]
-	s.current[transactionDeferrable] = s.current[defaultDeferrable]
-	s.retained = s.current
-	s.before = settingValues{}
-	s.customRetained = s.customCurrent
-	s.customBefore = nil
-	clear(s.savepoints)
-	s.savepoints = s.savepoints[:0]
-	s.active, s.dataAccess = false, false
+func (s *Settings) finishLocked() {
+	s.state.current[transactionIsolation] = s.state.current[defaultIsolation]
+	s.state.current[transactionReadOnly] = s.state.current[defaultReadOnly]
+	s.state.current[transactionDeferrable] = s.state.current[defaultDeferrable]
+	s.state.retained = s.state.current
+	s.state.before = settingValues{}
+	s.state.customRetained = s.state.customCurrent
+	s.state.customBefore = nil
+	s.state.retainedRole = s.state.currentRole
+	s.state.beforeRole = ""
+	s.state.retainedSessionUsr = s.state.sessionUser
+	s.state.beforeSessionUsr = ""
+	clear(s.state.savepoints)
+	s.state.savepoints = s.state.savepoints[:0]
+	s.state.active, s.state.dataAccess = false, false
 }
 
 func (s *Settings) Savepoint(name string) error {
-	if !s.active {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.state.active {
 		return settingError("25P01", "no active transaction")
 	}
 	if name == "" || !s.validString(name) {
 		return settingError("22023", "invalid savepoint name")
 	}
-	if len(s.savepoints) == s.limits.MaxSavepoints {
+	if len(s.state.savepoints) == s.limits.MaxSavepoints {
 		return settingError("54000", "savepoint host limit exceeded")
 	}
-	s.savepoints = append(s.savepoints, settingSavepoint{
-		name:           strings.Clone(name),
-		current:        s.current,
-		retained:       s.retained,
-		customCurrent:  s.customCurrent,
-		customRetained: s.customRetained,
+	s.state.savepoints = append(s.state.savepoints, settingSavepoint{
+		name:               strings.Clone(name),
+		current:            s.state.current,
+		retained:           s.state.retained,
+		customCurrent:      s.state.customCurrent,
+		customRetained:     s.state.customRetained,
+		currentRole:        s.state.currentRole,
+		retainedRole:       s.state.retainedRole,
+		sessionUser:        s.state.sessionUser,
+		retainedSessionUsr: s.state.retainedSessionUsr,
 	})
 	return nil
 }
 
 func (s *Settings) RollbackTo(name string) error {
-	index, err := s.savepointIndex(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index, err := s.savepointIndexLocked(name)
 	if err != nil {
 		return err
 	}
-	point := s.savepoints[index]
-	s.current, s.retained = point.current, point.retained
-	s.customCurrent, s.customRetained = point.customCurrent, point.customRetained
+	point := s.state.savepoints[index]
+	s.state.current, s.state.retained = point.current, point.retained
+	s.state.customCurrent, s.state.customRetained = point.customCurrent, point.customRetained
+	s.state.currentRole, s.state.retainedRole = point.currentRole, point.retainedRole
+	s.state.sessionUser, s.state.retainedSessionUsr = point.sessionUser, point.retainedSessionUsr
 	// FirstSnapshotSet is transaction-wide in PostgreSQL; it does not rewind.
-	clear(s.savepoints[index+1:])
-	s.savepoints = s.savepoints[:index+1]
+	clear(s.state.savepoints[index+1:])
+	s.state.savepoints = s.state.savepoints[:index+1]
 	return nil
 }
 
 func (s *Settings) Release(name string) error {
-	index, err := s.savepointIndex(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index, err := s.savepointIndexLocked(name)
 	if err != nil {
 		return err
 	}
-	clear(s.savepoints[index:])
-	s.savepoints = s.savepoints[:index]
+	clear(s.state.savepoints[index:])
+	s.state.savepoints = s.state.savepoints[:index]
 	return nil
 }
 
-func (s *Settings) savepointIndex(name string) (int, error) {
-	if !s.active {
+func (s *Settings) savepointIndexLocked(name string) (int, error) {
+	if !s.state.active {
 		return 0, settingError("25P01", "no active transaction")
 	}
-	for i := len(s.savepoints) - 1; i >= 0; i-- {
-		if s.savepoints[i].name == name {
+	for i := len(s.state.savepoints) - 1; i >= 0; i-- {
+		if s.state.savepoints[i].name == name {
 			return i, nil
 		}
 	}
 	return 0, settingError("3B001", "savepoint does not exist")
 }
 
+func isProtectedRoleSetting(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "role", "session_authorization", "supersql.active_role", "supersql.session_user":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Settings) Show(name string) (model.Value, error) { return s.CurrentSetting(name, false) }
 
 func (s *Settings) CurrentSetting(name string, missingOK bool) (model.Value, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "role":
+		if s.state.currentRole != "" {
+			return model.StringVal(s.state.currentRole), nil
+		}
+		return model.StringVal("none"), nil
+	case "session_authorization":
+		if s.state.sessionUser != "" {
+			return model.StringVal(s.state.sessionUser), nil
+		}
+		return model.StringVal(model.Principal{}.Name()), nil
+	case "supersql.active_role":
+		if role := s.currentRoleLocked(); role != "" {
+			return model.StringVal(role), nil
+		}
+		if missingOK {
+			return model.NullVal(model.TypeString), nil
+		}
+		return model.Value{}, &model.Error{Code: "42704", Message: "unrecognized configuration parameter", Detail: name}
+	case "supersql.session_user":
+		if s.state.sessionUser != "" {
+			return model.StringVal(s.state.sessionUser), nil
+		}
+		if missingOK {
+			return model.NullVal(model.TypeString), nil
+		}
+		return model.Value{}, &model.Error{Code: "42704", Message: "unrecognized configuration parameter", Detail: name}
+	}
 	id, custom, err := lookupSetting(name)
 	if err != nil {
 		var sqlErr *model.Error
@@ -284,7 +604,7 @@ func (s *Settings) CurrentSetting(name string, missingOK bool) (model.Value, err
 	}
 	if custom {
 		canonical := strings.ToLower(name)
-		for _, entry := range s.customCurrent {
+		for _, entry := range s.state.customCurrent {
 			if entry.name == canonical {
 				return model.StringVal(entry.text), nil
 			}
@@ -294,7 +614,7 @@ func (s *Settings) CurrentSetting(name string, missingOK bool) (model.Value, err
 		}
 		return model.Value{}, &model.Error{Code: "42704", Message: "unrecognized configuration parameter", Detail: name}
 	}
-	return model.StringVal(s.current[id].text), nil
+	return model.StringVal(s.state.current[id].text), nil
 }
 
 // Set accepts a decoded GUC value, never SQL source. Local assignments outside a
@@ -322,6 +642,12 @@ func (s *Settings) change(ctx context.Context, name string, raw *string, scope S
 	if err := ctx.Err(); err != nil {
 		return SettingResult{}, err
 	}
+	if isProtectedRoleSetting(name) {
+		return SettingResult{}, &model.Error{
+			Code:    "42501",
+			Message: fmt.Sprintf("permission denied to set parameter %q", strings.ToLower(strings.TrimSpace(name))),
+		}
+	}
 	id, custom, err := lookupSetting(name)
 	if err != nil {
 		return SettingResult{}, err
@@ -329,6 +655,8 @@ func (s *Settings) change(ctx context.Context, name string, raw *string, scope S
 	if scope != SessionScope && scope != LocalScope {
 		return SettingResult{}, settingError("22023", "invalid setting scope")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if custom {
 		text := ""
 		assigned := false
@@ -341,54 +669,54 @@ func (s *Settings) change(ctx context.Context, name string, raw *string, scope S
 		}
 		canonical := strings.ToLower(name)
 		result := SettingResult{Value: model.StringVal(text)}
-		if scope == LocalScope && !s.active {
+		if scope == LocalScope && !s.state.active {
 			if warn {
 				result.Warning = &model.Error{Code: "25P01", Message: "SET LOCAL can only be used in transaction blocks"}
 			}
 			return result, nil
 		}
-		nextCurrent, err := setCustomSetting(s.customCurrent, canonical, text, assigned)
+		nextCurrent, err := setCustomSetting(s.state.customCurrent, canonical, text, assigned)
 		if err != nil {
 			return SettingResult{}, err
 		}
 		if scope == SessionScope {
-			nextRetained, err := setCustomSetting(s.customRetained, canonical, text, assigned)
+			nextRetained, err := setCustomSetting(s.state.customRetained, canonical, text, assigned)
 			if err != nil {
 				return SettingResult{}, err
 			}
-			s.customRetained = nextRetained
+			s.state.customRetained = nextRetained
 		}
-		s.customCurrent = nextCurrent
+		s.state.customCurrent = nextCurrent
 		return result, nil
 	}
 	if settingDefinitions[id].kind == readOnlySetting {
 		return SettingResult{}, settingError("55P02", "parameter cannot be changed")
 	}
-	value := s.reset[id]
+	value := s.state.reset[id]
 	if raw == nil {
 		if isTransactionSetting(id) {
 			return SettingResult{}, settingError("0A000", "parameter cannot be reset")
 		}
 	} else {
-		value, err = s.parse(ctx, id, *raw)
+		value, err = s.parseLocked(ctx, id, *raw)
 		if err != nil {
 			return SettingResult{}, err
 		}
 	}
 	value.assigned = raw != nil
-	if err := s.checkTransactionChange(id, value); err != nil {
+	if err := s.checkTransactionChangeLocked(id, value); err != nil {
 		return SettingResult{}, err
 	}
 	result := SettingResult{Value: model.StringVal(value.text)}
-	if scope == LocalScope && !s.active {
+	if scope == LocalScope && !s.state.active {
 		if warn {
 			result.Warning = &model.Error{Code: "25P01", Message: "SET LOCAL can only be used in transaction blocks"}
 		}
 		return result, nil
 	}
-	s.current[id] = value
+	s.state.current[id] = value
 	if scope == SessionScope {
-		s.retained[id] = value
+		s.state.retained[id] = value
 	}
 	return result, nil
 }
@@ -407,45 +735,50 @@ func setCustomSetting(list []customSetting, canonical, text string, assigned boo
 	return append(cloned, customSetting{name: strings.Clone(canonical), text: text, assigned: assigned}), nil
 }
 
-func (s *Settings) checkTransactionChange(id settingID, value settingValue) error {
-	if !s.active {
+func (s *Settings) checkTransactionChangeLocked(id settingID, value settingValue) error {
+	if !s.state.active {
 		return nil
 	}
 	switch id {
 	case transactionReadOnly:
-		if s.current[id].flag && !value.flag {
-			if s.dataAccess || len(s.savepoints) > 0 {
+		if s.state.current[id].flag && !value.flag {
+			if s.state.dataAccess || len(s.state.savepoints) > 0 {
 				return settingError("25001", "cannot set transaction read-write mode after data access or in a subtransaction")
 			}
 			return settingError("25006", "read-only transaction cannot be upgraded")
 		}
 	case transactionDeferrable:
-		if s.dataAccess || len(s.savepoints) > 0 {
+		if s.state.dataAccess || len(s.state.savepoints) > 0 {
 			return settingError("25001", "transaction deferrability must be set before data access and outside subtransactions")
 		}
 	}
 	return nil
 }
 
-// ResetAll leaves current transaction characteristics alone (PG GUC_NO_RESET_ALL).
+// ResetAll leaves current transaction characteristics and session_authorization
+// alone (PG GUC_NO_RESET_ALL), while resetting role and ordinary GUCs.
 func (s *Settings) ResetAll(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for id, def := range settingDefinitions {
 		if def.kind == readOnlySetting || isTransactionSetting(settingID(id)) {
 			continue
 		}
-		s.current[id], s.retained[id] = s.reset[id], s.reset[id]
+		s.state.current[id], s.state.retained[id] = s.state.reset[id], s.state.reset[id]
 	}
-	if len(s.customCurrent) > 0 {
-		resetCustom := make([]customSetting, len(s.customCurrent))
-		for i, entry := range s.customCurrent {
+	if len(s.state.customCurrent) > 0 {
+		resetCustom := make([]customSetting, len(s.state.customCurrent))
+		for i, entry := range s.state.customCurrent {
 			resetCustom[i] = customSetting{name: entry.name, text: "", assigned: false}
 		}
-		s.customCurrent = resetCustom
-		s.customRetained = resetCustom
+		s.state.customCurrent = resetCustom
+		s.state.customRetained = resetCustom
 	}
+	s.state.currentRole = ""
+	s.state.retainedRole = ""
 	return nil
 }
 
@@ -457,8 +790,10 @@ func isTransactionSetting(id settingID) bool {
 type TransactionPolicy struct{ ReadOnly, Deferrable bool }
 
 func (s *Settings) TransactionPolicy() TransactionPolicy {
-	readOnly := s.current[transactionReadOnly].flag
-	return TransactionPolicy{ReadOnly: readOnly, Deferrable: readOnly && s.current[transactionDeferrable].flag}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	readOnly := s.state.current[transactionReadOnly].flag
+	return TransactionPolicy{ReadOnly: readOnly, Deferrable: readOnly && s.state.current[transactionDeferrable].flag}
 }
 
 // ResourcePolicy exposes validated settings and explicit effective host caps.
@@ -478,7 +813,9 @@ type ResourcePolicy struct {
 }
 
 func (s *Settings) Resources() ResourcePolicy {
-	temp := s.current[tempFileLimit].number
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	temp := s.state.current[tempFileLimit].number
 	if temp >= 0 {
 		temp *= 1024
 	}
@@ -486,12 +823,12 @@ func (s *Settings) Resources() ResourcePolicy {
 	if temp >= 0 {
 		effectiveTemp = min(temp, effectiveTemp)
 	}
-	work, maintenance := s.current[workMem].number*1024, s.current[maintenanceWorkMem].number*1024
+	work, maintenance := s.state.current[workMem].number*1024, s.state.current[maintenanceWorkMem].number*1024
 	return ResourcePolicy{
-		StatementTimeout:         time.Duration(s.current[statementTimeout].number) * time.Millisecond,
-		LockTimeout:              time.Duration(s.current[lockTimeout].number) * time.Millisecond,
-		IdleInTransactionTimeout: time.Duration(s.current[idleInTransactionTimeout].number) * time.Millisecond,
-		TransactionTimeout:       time.Duration(s.current[transactionTimeout].number) * time.Millisecond,
+		StatementTimeout:         time.Duration(s.state.current[statementTimeout].number) * time.Millisecond,
+		LockTimeout:              time.Duration(s.state.current[lockTimeout].number) * time.Millisecond,
+		IdleInTransactionTimeout: time.Duration(s.state.current[idleInTransactionTimeout].number) * time.Millisecond,
+		TransactionTimeout:       time.Duration(s.state.current[transactionTimeout].number) * time.Millisecond,
 		WorkMemoryBytes:          work, MaintenanceMemoryBytes: maintenance, TempFileLimitBytes: temp,
 		EffectiveWorkMemoryBytes:        min(work, s.limits.WorkMemoryBytes),
 		EffectiveMaintenanceMemoryBytes: min(maintenance, s.limits.MaintenanceMemoryBytes),
@@ -499,13 +836,23 @@ func (s *Settings) Resources() ResourcePolicy {
 	}
 }
 
-func (s *Settings) TimeZone() Zone { return s.current[timeZone].zone }
+func (s *Settings) TimeZone() Zone {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current[timeZone].zone
+}
 
 // SearchPath returns owned logical names, retaining $user and pg_temp for the
 // binder to resolve against the same catalog snapshot as the statement. Missing
 // schemas are not errors at SET time; pg_catalog/temp precedence is binder-owned.
 func (s *Settings) SearchPath() []string {
-	parts, _ := identifierList(s.current[searchPath].text)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.searchPathLocked()
+}
+
+func (s *Settings) searchPathLocked() []string {
+	parts, _ := identifierList(s.state.current[searchPath].text)
 	return parts
 }
 
@@ -517,9 +864,11 @@ type SettingInfo struct {
 
 // ShowAll returns only the fixed supported inventory, in definition order.
 func (s *Settings) ShowAll() []SettingInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	result := make([]SettingInfo, len(settingDefinitions))
 	for id, def := range settingDefinitions {
-		result[id] = SettingInfo{Name: def.name, Value: model.StringVal(s.current[id].text), ReadOnly: def.kind == readOnlySetting}
+		result[id] = SettingInfo{Name: def.name, Value: model.StringVal(s.state.current[id].text), ReadOnly: def.kind == readOnlySetting}
 	}
 	return result
 }
@@ -543,15 +892,17 @@ type SemanticSettings struct {
 }
 
 func (s *Settings) Semantics() SemanticSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return SemanticSettings{
-		SearchPath: s.SearchPath(), TimeZone: s.TimeZone(),
-		DateStyle: s.current[dateStyle].text, IntervalStyle: s.current[intervalStyle].text,
-		ExtraFloatDigits: int(s.current[extraFloatDigits].number), ByteaOutput: s.current[byteaOutput].text,
-		StandardConformingStrings: s.current[standardConformingStrings].flag,
-		EscapeStringWarning:       s.current[escapeStringWarning].flag,
-		BackslashQuote:            s.current[backslashQuote].text, ClientEncoding: s.current[clientEncoding].text,
-		ClientMinMessages: s.current[clientMinMessages].text, CheckFunctionBodies: s.current[checkFunctionBodies].flag,
-		DefaultTextSearchConfig: s.current[defaultTextSearchConfig].text,
+		SearchPath: s.searchPathLocked(), TimeZone: s.state.current[timeZone].zone,
+		DateStyle: s.state.current[dateStyle].text, IntervalStyle: s.state.current[intervalStyle].text,
+		ExtraFloatDigits: int(s.state.current[extraFloatDigits].number), ByteaOutput: s.state.current[byteaOutput].text,
+		StandardConformingStrings: s.state.current[standardConformingStrings].flag,
+		EscapeStringWarning:       s.state.current[escapeStringWarning].flag,
+		BackslashQuote:            s.state.current[backslashQuote].text, ClientEncoding: s.state.current[clientEncoding].text,
+		ClientMinMessages: s.state.current[clientMinMessages].text, CheckFunctionBodies: s.state.current[checkFunctionBodies].flag,
+		DefaultTextSearchConfig: s.state.current[defaultTextSearchConfig].text,
 	}
 }
 

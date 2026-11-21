@@ -61,8 +61,10 @@ func NewRetentionCoordinator(options RetentionOptions) (*RetentionCoordinator, e
 	return &RetentionCoordinator{options: options, gate: make(chan struct{}, 1)}, nil
 }
 
+var errRetirementBatchFull = errors.New("retirement batch reached MaxRetiredTargets")
+
 func (c *RetentionCoordinator) retirementDependency() txn.ReadDependency {
-	kinds := [...]byte{2, 4, 5}
+	kinds := [...]byte{jobKindActive, jobKindJobRetirement, jobKindOrdinaryRetirement, jobKindTerminal}
 	spans := make([]storage.KeySpan, len(kinds))
 	for i, kind := range kinds {
 		spans[i] = storage.KeySpan{
@@ -116,7 +118,7 @@ func (c *RetentionCoordinator) Advance(ctx context.Context) (err error) {
 	return err
 }
 
-func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader storage.SnapshotReader, boundary model.Timestamp) ([]storage.ObjectRetirement, []JobID, []RetirementID, error) {
+func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader storage.SnapshotReader, boundary model.Timestamp) ([]storage.ObjectRetirement, []JobID, []RetirementID, []prunableJob, error) {
 	capacity := min(c.options.MaxRetiredTargets, 64)
 	retired := make([]storage.ObjectRetirement, 0, capacity)
 	jobs := make([]JobID, 0, capacity)
@@ -130,7 +132,7 @@ func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader st
 			if len(retired) == 0 {
 				return false, ErrJobLimit
 			}
-			return false, nil
+			return false, errRetirementBatchFull
 		}
 		for _, object := range objects {
 			retirement, err := storage.NewObjectRetirement(object, retiredAt)
@@ -141,11 +143,18 @@ func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader st
 		}
 		return true, nil
 	}
-	err := c.options.Jobs.Scan(ctx, reader, func(job Job) error {
+	err := c.options.Jobs.scanJobRetirements(ctx, reader, func(id JobID) error {
+		job, err := c.options.Jobs.Get(ctx, reader, id)
+		if errors.Is(err, storage.ErrRowNotFound) {
+			return ErrJobRecord
+		}
+		if err != nil {
+			return err
+		}
 		if !job.Terminal() {
 			return nil
 		}
-		retiredAt, objects, err := c.options.Jobs.retirements(ctx, reader, job.ID)
+		retiredAt, objects, err := c.options.Jobs.retirements(ctx, reader, id)
 		if errors.Is(err, storage.ErrRowNotFound) {
 			return nil
 		}
@@ -157,29 +166,31 @@ func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader st
 			return err
 		}
 		if included {
-			jobs = append(jobs, job.ID)
+			jobs = append(jobs, id)
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, nil, nil, err
+	if err != nil && !errors.Is(err, errRetirementBatchFull) {
+		return nil, nil, nil, nil, err
 	}
-	err = c.options.Jobs.scanOrdinaryRetirements(ctx, reader, func(id RetirementID) error {
-		retiredAt, objects, err := c.options.Jobs.ordinaryRetirements(ctx, reader, id)
-		if err != nil {
-			return err
+	if !errors.Is(err, errRetirementBatchFull) {
+		err = c.options.Jobs.scanOrdinaryRetirements(ctx, reader, func(id RetirementID) error {
+			retiredAt, objects, err := c.options.Jobs.ordinaryRetirements(ctx, reader, id)
+			if err != nil {
+				return err
+			}
+			included, err := appendRecord(retiredAt, objects)
+			if err != nil {
+				return err
+			}
+			if included {
+				ordinary = append(ordinary, id)
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, errRetirementBatchFull) {
+			return nil, nil, nil, nil, err
 		}
-		included, err := appendRecord(retiredAt, objects)
-		if err != nil {
-			return err
-		}
-		if included {
-			ordinary = append(ordinary, id)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, nil, nil, err
 	}
 	slices.SortFunc(retired, func(left, right storage.ObjectRetirement) int {
 		a, b := left.Target(), right.Target()
@@ -190,10 +201,19 @@ func (c *RetentionCoordinator) collectRetirements(ctx context.Context, reader st
 	})
 	for i := 1; i < len(retired); i++ {
 		if retired[i-1].Target() == retired[i].Target() {
-			return nil, nil, nil, ErrJobRecord
+			return nil, nil, nil, nil, ErrJobRecord
 		}
 	}
-	return retired, jobs, ordinary, nil
+	collectedJobs := make(map[JobID]bool, len(jobs))
+	for _, id := range jobs {
+		collectedJobs[id] = true
+	}
+	batchLimit := max(c.options.Jobs.options.MaxJobs, 64)
+	prunable, err := c.options.Jobs.collectPrunableTerminalJobs(ctx, reader, c.options.Jobs.options.MaxJobs, batchLimit, collectedJobs)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return retired, jobs, ordinary, prunable, nil
 }
 
 func (c *RetentionCoordinator) advance(ctx context.Context, transaction *txn.Transaction, retention time.Duration) (err error) {
@@ -233,20 +253,28 @@ func (c *RetentionCoordinator) advance(ctx context.Context, transaction *txn.Tra
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if boundary <= state.HistoryFloor {
+	if boundary <= 0 || boundary < state.HistoryFloor {
 		return nil
 	}
 	reader, err := transaction.ReadView(ctx, []txn.ReadDependency{c.retirementDependency()})
 	if err != nil {
 		return err
 	}
-	defer func() { err = errors.Join(err, reader.Close()) }()
-	retired, jobs, ordinary, err := c.collectRetirements(ctx, reader, boundary)
-	if err != nil {
+	// Read all retirement and terminal-job metadata and release the snapshot pin
+	// BEFORE calling Backend.Collect so retention never self-pins the backend.
+	retired, jobs, ordinary, prunable, collectErr := c.collectRetirements(ctx, reader, boundary)
+	closeErr := reader.Close()
+	if err := errors.Join(collectErr, closeErr); err != nil {
 		return err
 	}
-	if err := c.options.Backend.Collect(ctx, storage.GCRequest{Boundary: boundary, Retired: retired}); err != nil {
-		return fmt.Errorf("advance retained history to %d: %w", boundary, errors.Join(err, ctx.Err()))
+	needCollect := boundary > state.HistoryFloor || len(retired) > 0
+	if !needCollect && len(jobs) == 0 && len(ordinary) == 0 && len(prunable) == 0 {
+		return nil
+	}
+	if needCollect {
+		if err := c.options.Backend.Collect(ctx, storage.GCRequest{Boundary: boundary, Retired: retired}); err != nil {
+			return fmt.Errorf("advance retained history to %d: %w", boundary, errors.Join(err, ctx.Err()))
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -260,6 +288,9 @@ func (c *RetentionCoordinator) advance(ctx context.Context, transaction *txn.Tra
 		if err := c.options.Jobs.deleteOrdinaryRetirements(ctx, transaction, id); err != nil {
 			return err
 		}
+	}
+	if err := c.options.Jobs.deletePrunableJobs(ctx, transaction, prunable); err != nil {
+		return err
 	}
 	return nil
 }

@@ -272,7 +272,7 @@ func indexRunnerRetryable(err error) bool {
 			return false
 		}
 		sqlError, ok := err.(*model.Error)
-		if !ok || sqlError.Code != "40001" {
+		if !ok || (sqlError.Code != "40001" && sqlError.Code != "40P01" && sqlError.Code != "55P03") {
 			return false
 		}
 		var nested *model.Error

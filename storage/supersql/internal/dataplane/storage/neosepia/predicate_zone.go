@@ -23,7 +23,7 @@ func (p *predicateProgram) zoneMayMatch(ctx context.Context, block *paxBlock, in
 		}
 		return p.zoneMayMatch(ctx, block, node.b)
 	case predCompare:
-		if node.family != predInt && node.family != predTimestamp {
+		if node.family != predInt && node.family != predTimestamp && node.family != predBool {
 			return true, nil
 		}
 		column, constant, op := node.left, node.right, node.op

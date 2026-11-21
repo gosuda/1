@@ -9,8 +9,10 @@ import (
 // BuiltinOptions captures callable settings for both preparation and execution.
 // Collations come from the immutable catalog snapshot, not session text settings.
 func (s *Settings) BuiltinOptions(collation, defaultCollation model.CollationID) builtin.ResolveOptions {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	style := builtin.IntervalPostgres
-	switch s.current[intervalStyle].text {
+	switch s.state.current[intervalStyle].text {
 	case "postgres_verbose":
 		style = builtin.IntervalPostgresVerbose
 	case "sql_standard":
@@ -19,7 +21,7 @@ func (s *Settings) BuiltinOptions(collation, defaultCollation model.CollationID)
 		style = builtin.IntervalISO8601
 	}
 	dateFormat, dateOrder := builtin.DateISO, builtin.DateMDY
-	format, order, _ := strings.Cut(s.current[dateStyle].text, ", ")
+	format, order, _ := strings.Cut(s.state.current[dateStyle].text, ", ")
 	switch format {
 	case "SQL":
 		dateFormat = builtin.DateSQL
@@ -34,11 +36,11 @@ func (s *Settings) BuiltinOptions(collation, defaultCollation model.CollationID)
 	case "YMD":
 		dateOrder = builtin.DateYMD
 	}
-	zone := s.TimeZone()
+	zone := s.state.current[timeZone].zone
 	return builtin.ResolveOptions{
 		Collation: collation, DefaultCollation: defaultCollation,
-		ExtraFloatDigits: int(s.current[extraFloatDigits].number),
-		ByteaEscape:      s.current[byteaOutput].text == "escape", IntervalStyle: style,
+		ExtraFloatDigits: int(s.state.current[extraFloatDigits].number),
+		ByteaEscape:      s.state.current[byteaOutput].text == "escape", IntervalStyle: style,
 		DateStyle: dateFormat, DateOrder: dateOrder,
 		TimeZone: builtin.TimeZoneContext{Name: zone.Name, Fixed: zone.Fixed, OffsetSeconds: zone.OffsetSeconds},
 	}

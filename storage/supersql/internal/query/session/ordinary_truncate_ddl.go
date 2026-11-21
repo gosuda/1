@@ -56,6 +56,8 @@ func (transactions *Transactions) runTruncate(ctx context.Context, statement *zp
 			}
 		}()
 		options.Binding.Bind.SearchPath = declarationSearchPath(transactions.settings.SearchPath(), options.Binding.SchemaContext)
+		options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 		options.Binding.Owner = transactions.settings.Principal().OID()
 		options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = transactions.temporal

@@ -29,7 +29,7 @@ func TestCheckpointRestore(t *testing.T) {
 		`INSERT INTO accounts VALUES (1, 100), (2, 100)`,
 		`INSERT INTO ledger VALUES (1, 'seed')`,
 	} {
-		if _, err := database.Exec(ctx, statement, 0); err != nil {
+		if _, err := database.exec(ctx, statement, 0); err != nil {
 			t.Fatalf("%s: %v", statement, err)
 		}
 	}
@@ -46,7 +46,7 @@ func TestCheckpointRestore(t *testing.T) {
 	}
 
 	// More committed work after the backup must not appear in the restore.
-	if _, err := database.Exec(ctx, `INSERT INTO accounts VALUES (3, 50)`, 0); err != nil {
+	if _, err := database.exec(ctx, `INSERT INTO accounts VALUES (3, 50)`, 0); err != nil {
 		t.Fatalf("post-backup INSERT: %v", err)
 	}
 
@@ -60,7 +60,7 @@ func TestCheckpointRestore(t *testing.T) {
 		}
 	}()
 
-	outcome, err := restored.Exec(ctx, `SELECT id, balance FROM accounts ORDER BY id`, 0)
+	outcome, err := restored.exec(ctx, `SELECT id, balance FROM accounts ORDER BY id`, 0)
 	if err != nil {
 		t.Fatalf("restored SELECT: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestCheckpointRestore(t *testing.T) {
 			t.Fatalf("restored rows = %v, want %v", rows, want)
 		}
 	}
-	if _, err := restored.Exec(ctx, `INSERT INTO accounts VALUES (4, 75)`, 0); err != nil {
+	if _, err := restored.exec(ctx, `INSERT INTO accounts VALUES (4, 75)`, 0); err != nil {
 		t.Fatalf("restored INSERT (writable readiness): %v", err)
 	}
 }
@@ -87,7 +87,7 @@ func TestCheckpointRestoreRejectsCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := database.Exec(ctx, `CREATE TABLE t (n bigint); INSERT INTO t VALUES (1)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE t (n bigint); INSERT INTO t VALUES (1)`, 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	backupDir := filepath.Join(t.TempDir(), "backup")
@@ -128,7 +128,7 @@ func TestCheckpointRestoreRejectsOccupiedDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := database.Exec(ctx, `CREATE TABLE t (n bigint)`, 0); err != nil {
+	if _, err := database.exec(ctx, `CREATE TABLE t (n bigint)`, 0); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	backupDir := filepath.Join(t.TempDir(), "backup")

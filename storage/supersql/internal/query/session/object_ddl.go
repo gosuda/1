@@ -25,12 +25,8 @@ type ObjectCommandOptions struct {
 	Limits           schema.IndexLimits
 	PolicyBytes      uint64
 	MaxDescriptors   uint32
-	Constraints      *schema.IndexPolicyProvider
-	// RewriteQuery rewrites the source query that populates a CREATE TABLE AS
-	// or REFRESH MATERIALIZED VIEW target. The target is the relation this
-	// command declares or refreshes, so only the source is offered.
-	RewriteQuery     func(context.Context, *zpgparse.RawStmt) (*zpgparse.RawStmt, error)
-	populate         func(context.Context, *bind.BoundObjectCommand, *DeclarationResult) (uint64, error)
+	Constraints    *schema.IndexPolicyProvider
+	populate       func(context.Context, *bind.BoundObjectCommand, *DeclarationResult) (uint64, error)
 }
 
 type ObjectCommandResult struct {
@@ -224,6 +220,8 @@ func (transactions *Transactions) runAlterTableIdentitySequence(ctx context.Cont
 		}
 	}()
 	options.Binding.Bind.SearchPath = declarationSearchPath(transactions.settings.SearchPath(), options.Binding.SchemaContext)
+	options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+	options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 	options.Binding.Owner = transactions.settings.Principal().OID()
 	options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 	options.Binding.Bind.Temporal = transactions.temporal
@@ -492,14 +490,6 @@ func (transactions *Transactions) populateObjectCommand(ctx context.Context, bou
 	if err != nil {
 		return 0, err
 	}
-	if invocation.Execution.ObjectDDL != nil && invocation.Execution.ObjectDDL.RewriteQuery != nil {
-		insert := statement.Stmt.GetInsertStmt()
-		rewritten, err := invocation.Execution.ObjectDDL.RewriteQuery(ctx, &zpgparse.RawStmt{Stmt: insert.SelectStmt})
-		if err != nil {
-			return 0, err
-		}
-		insert.SelectStmt = rewritten.Stmt
-	}
 	// The population insert writes a relation this statement created, which the
 	// committed catalog has not published yet. Admission already admitted that
 	// relation's mutation target, so resolve through the admission result first
@@ -631,6 +621,9 @@ func isObjectCommand(node *zpgparse.Node) bool {
 	if node == nil {
 		return false
 	}
+	if bind.IsRoleOrPolicyCommand(node) {
+		return true
+	}
 	switch statement := node.Node.(type) {
 	case *zpgparse.Node_CreateStmt, *zpgparse.Node_CreateSchemaStmt, *zpgparse.Node_CreateSeqStmt, *zpgparse.Node_AlterSeqStmt, *zpgparse.Node_ViewStmt, *zpgparse.Node_CreateTableAsStmt, *zpgparse.Node_RefreshMatViewStmt, *zpgparse.Node_TruncateStmt:
 		return true
@@ -735,6 +728,8 @@ func ExecuteObjectCommand(ctx context.Context, transactions *Transactions, node 
 			}
 		}()
 		options.Binding.Bind.SearchPath = declarationSearchPath(transactions.settings.SearchPath(), options.Binding.SchemaContext)
+		options.Binding.Bind.CurrentRole = transactions.settings.CurrentRole()
+		options.Binding.Bind.SessionUser = transactions.settings.SessionUser()
 		options.Binding.Owner = transactions.settings.Principal().OID()
 		options.Binding.Bind.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		options.Binding.Bind.Temporal = transactions.temporal
@@ -769,10 +764,10 @@ func ExecuteObjectCommand(ctx context.Context, transactions *Transactions, node 
 		}
 		result.Tag, result.Warnings = bound.CommandTag(), bound.Warnings()
 		if len(bound.Creates()) == 0 && len(bound.Updates()) == 0 && len(bound.Drops()) == 0 {
-			if len(bound.Warnings()) == 0 {
-				return model.ErrInvalidDescriptor
+			if bound.NoOp() || len(bound.Warnings()) != 0 {
+				return nil
 			}
-			return nil
+			return model.ErrInvalidDescriptor
 		}
 		temporaryCommand := objectCommandTemporary(ctx, bound, options.Binding.Descriptors)
 		lockedForValidation := false

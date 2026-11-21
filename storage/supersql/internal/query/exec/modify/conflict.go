@@ -221,7 +221,7 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		for i, column := range c.assignmentColumns {
 			proposed.Values[column] = assigned[i]
 		}
-		replacement, proceed, err := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerInsert, nil, &proposed, o.MaxRecordBytes*8)
+		replacement, proceed, err := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerInsert, nil, &proposed, c.rowPayloadBytes())
 		if err != nil || !proceed {
 			return false, err
 		}
@@ -234,15 +234,16 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		}
 		return true, nil
 	}
+	rowLimit := c.rowPayloadBytes()
 	var candidate *txn.InsertCandidate
 	var proposed model.Row
 	var route *partitionChild
 	if o.Partitions != nil {
-		candidate, route, proposed, err = o.Partitions.PrepareInsert(ctx, o.Transaction, columnIDs, assigned, o.Query.Allocator(runtime.WorkMemory), o.MaxRecordBytes*8, partitionExpressions(*o))
+		candidate, route, proposed, err = o.Partitions.PrepareInsert(ctx, o.Transaction, columnIDs, assigned, o.Query.Allocator(runtime.WorkMemory), rowLimit, partitionExpressions(*o))
 	} else {
-		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: c.target, ColumnIDs: columnIDs, Values: assigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: o.MaxRecordBytes * 8, Expressions: partitionExpressions(*o)})
+		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: c.target, ColumnIDs: columnIDs, Values: assigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 		if err == nil {
-			proposed, _, err = candidate.CopyRow(ctx, o.MaxRecordBytes*8)
+			proposed, _, err = candidate.CopyRow(ctx, rowLimit)
 		}
 	}
 	if err != nil {
@@ -258,7 +259,7 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		if route != nil {
 			triggerDescriptor = route.descriptor
 		}
-		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, triggerDescriptor, model.TriggerInsert, nil, &proposed, o.MaxRecordBytes*8)
+		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, triggerDescriptor, model.TriggerInsert, nil, &proposed, rowLimit)
 		if triggerErr != nil {
 			return false, triggerErr
 		}
@@ -289,11 +290,11 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 				return false, err
 			}
 		}
-		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: target, ColumnIDs: ids, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: o.MaxRecordBytes * 8, Expressions: partitionExpressions(*o)})
+		candidate, err = o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: target, ColumnIDs: ids, Values: replacement.Values, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 		if err != nil {
 			return false, err
 		}
-		proposed, _, err = candidate.CopyRow(ctx, o.MaxRecordBytes*8)
+		proposed, _, err = candidate.CopyRow(ctx, rowLimit)
 		if err != nil {
 			return false, err
 		}
@@ -314,6 +315,11 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 			if err := c.recordConflictIdentity(ctx, proposed.Values); err != nil {
 				return false, err
 			}
+		}
+	}
+	if c.rlsInsertCheck != nil {
+		if err := c.checkRLS(ctx, c.rlsInsertCheck, route, proposed.Values); err != nil {
+			return false, err
 		}
 	}
 	if err := o.Transaction.ApplyPreparedInsert(ctx, candidate); err != nil {

@@ -120,7 +120,7 @@ workers. It is safe to call repeatedly and reports the first error while still
 releasing every owned collaborator.
 
 
-#### `func (database *Catalog) CopyFrom(ctx context.Context, statement string, source io.Reader, options CopyOptions) (Outcome, error)`
+#### `func (database *Catalog) CopyFrom(ctx context.Context, statement string, source io.Reader, options CopyOptions) (CopyResult, error)`
 
 CopyFrom executes one COPY ... FROM STDIN statement, reading records from
 source until EOF. The caller keeps ownership of source; the engine never
@@ -128,7 +128,7 @@ closes it. Server-side COPY FROM 'file' and FROM PROGRAM are excluded
 features and fail with SQLSTATE 0A000.
 
 
-#### `func (database *Catalog) CopyTo(ctx context.Context, statement string, sink io.Writer, options CopyOptions) (Outcome, error)`
+#### `func (database *Catalog) CopyTo(ctx context.Context, statement string, sink io.Writer, options CopyOptions) (CopyResult, error)`
 
 CopyTo executes one COPY ... TO STDOUT statement, writing records to sink.
 The caller keeps ownership of sink; the engine never closes it. Server-side
@@ -150,17 +150,6 @@ closed frontier.
 Directory reports the database directory this instance was opened on.
 
 
-#### `func (database *Catalog) Exec(ctx context.Context, sql string, maxRows int) (Outcome, error)`
-
-Exec runs every statement in sql through the session stack and reports the
-last statement's outcome. Result rows are materialized up to maxRows; maxRows
-<= 0 accepts every produced row. Statements bind and plan against a certified
-current snapshot and then run under the dependencies their own plan declares.
-AS OF SYSTEM TIME sidecars route the statement to the fixed-snapshot
-historical path; transaction-level temporal clauses route to the session's
-transaction commands.
-
-
 #### `func (database *Catalog) MaintenanceError() error`
 
 MaintenanceError reports the most recent background maintenance failure, or
@@ -169,34 +158,63 @@ and delivers it to Close; a long-running host observes the same error here
 without closing the database.
 
 
-### `type Column`
+### `type CompactionConfig`
 
-Column describes one result column of an executed statement.
+CompactionConfig carries the storage backend resource envelope, including
+resident handles, WAL, compaction run preparation, read budgets, and plan
+budgets. Any zero field inherits its DefaultCompactionConfig value when
+passed to Open or RestoreCheckpoint, so callers may override individual
+fields without specifying the entire struct.
 
 
 ```go
-// Column describes one result column of an executed statement.
-type Column struct {
-	Name		string
-	Type		model.Type
-	Layout		model.TypeLayout
-	Nullable	bool
+// CompactionConfig carries the storage backend resource envelope, including
+// resident handles, WAL, compaction run preparation, read budgets, and plan
+// budgets. Any zero field inherits its DefaultCompactionConfig value when
+// passed to Open or RestoreCheckpoint, so callers may override individual
+// fields without specifying the entire struct.
+type CompactionConfig struct {
+	ResidentBytes		uint64
+	MaxFiles		uint64
+	MaxPins			uint64
+	MetadataBytes		uint64
+	RecoveryFiles		uint64
+	IdentityBytes		uint64
+	WALBytes		uint64
+	WALAllocation		uint64
+	MutationBytes		uint64
+	WriteBytes		uint64
+	SortBytes		uint64
+	BlockBytes		uint64
+	DecodedBlockBytes	uint64
+	ReadBlockBytes		uint64
+	BlockRows		int
+	RunBytes		uint64
+	RunIndexBytes		uint64
+	RunBlocks		uint32
+	Builders		int
+	Runs			uint64
+	PreparationBytes	uint64
+	PublicationBytes	uint64
+	ReadSourceBytes		uint64
+	ReadMergeBytes		uint64
+	KeyBytes		uint64
+	ScanBytes		uint64
+	RowBytes		uint64
+	PredicateBytes		uint64
+	OverlayBytes		uint64
+	OverlayBlockBytes	uint64
+	PlanBytes		uint64
+	BatchRows		int
+	PredicateNodes		int
+	Plans			int
 }
 ```
 
-### `type CompactionConfig`
+#### `func DefaultCompactionConfig() CompactionConfig`
 
-CompactionConfig carries the NeoSepia backend resource envelope, including
-compaction run and preparation bounds. The zero value selects the backend
-defaults.
+DefaultCompactionConfig returns the default storage backend resource envelope.
 
-
-```go
-// CompactionConfig carries the NeoSepia backend resource envelope, including
-// compaction run and preparation bounds. The zero value selects the backend
-// defaults.
-type CompactionConfig = neosepia.Limits
-```
 
 ### `type Connector`
 
@@ -234,8 +252,8 @@ that serves driver.Conn sessions over it.
 
 ##### Example: `OpenConnector`
 
-ExampleOpenConnector runs the README quick start verbatim: OpenConnector owns
-the certified clock, sql.OpenDB adapts it, and the printed account proves the
+ExampleOpenConnector runs the README quick start verbatim: OpenConnector uses
+localclock.New(), sql.OpenDB adapts it, and the printed account proves the
 committed rows read back.
 
 
@@ -246,7 +264,7 @@ if err != nil {
 	panic(err)
 }
 defer os.RemoveAll(dir)
-if err := runReadme(ctx, supersql.NewTestClock(), dir, os.Stdout); err != nil {
+if err := runReadme(ctx, dir, os.Stdout); err != nil {
 	panic(err)
 }
 // Output:
@@ -306,6 +324,21 @@ type CopyOptions struct {
 }
 ```
 
+### `type CopyResult`
+
+CopyResult reports the completed command tag and row count of one CopyFrom or
+CopyTo operation.
+
+
+```go
+// CopyResult reports the completed command tag and row count of one CopyFrom or
+// CopyTo operation.
+type CopyResult struct {
+	Tag		string
+	RowsAffected	uint64
+}
+```
+
 ### `type Driver`
 
 Driver cannot construct a connection by itself: a certified clock is not
@@ -329,6 +362,45 @@ in a DSN. Use OpenConnector.
 #### `func (Driver) OpenConnector(string) (driver.Connector, error)`
 
 OpenConnector always fails with ErrClockRequired. Use OpenConnector.
+
+
+### `type Error`
+
+Error is a structured SQL diagnostic returned by the engine and its
+database/sql driver. Code carries the five-character PostgreSQL SQLSTATE.
+
+
+```go
+// Error is a structured SQL diagnostic returned by the engine and its
+// database/sql driver. Code carries the five-character PostgreSQL SQLSTATE.
+type Error struct {
+	Code		string
+	Message		string
+	Detail		string
+	Hint		string
+	Constraint	string
+	Table		string
+	Column		string
+	FeatureID	string
+	Position	int
+	Cause		error
+}
+```
+
+#### `func (e *Error) Error() string`
+
+Error returns the diagnostic message.
+
+
+#### `func (e *Error) SQLState() string`
+
+SQLState returns the five-character PostgreSQL SQLSTATE code carried by the
+diagnostic.
+
+
+#### `func (e *Error) Unwrap() error`
+
+Unwrap returns the underlying cause error, if any.
 
 
 ### `type MaintenanceConfig`
@@ -375,13 +447,17 @@ provider, because a live database holds fences certified by that provider.
 type OpenOptions struct {
 	// Directory is the database directory. Open creates it when absent.
 	Directory	string
-	// Compaction replaces the NeoSepia default limits when nonzero.
+	// Compaction overrides individual storage backend resource limits when
+	// nonzero; zero fields inherit DefaultCompactionConfig().
 	Compaction	CompactionConfig
 	// Clock is the certified time source borrowed by the database.
 	Clock	clock.Clock
 	// Maintenance bounds the background reclamation loop Open starts. The zero
 	// value selects the defaults; Maintenance.Disabled stops the loop.
 	Maintenance	MaintenanceConfig
+	// HistoryRetention configures the durable MVCC history retention window.
+	// Zero selects the default (24h); negative values are rejected by Open.
+	HistoryRetention	time.Duration
 	// HistoricalReadOnly opens the database without requiring fresh certified
 	// readiness: no writes and no latest reads are accepted, only retained
 	// historical snapshots are served. The clock may be unsynchronized.
@@ -401,115 +477,6 @@ type OpenOptions struct {
 	MaxOperations	int
 }
 ```
-
-### `type Outcome`
-
-Outcome reports one executed statement. Rows carries at most the requested
-row limit. It is the provisional in-tree execution surface: the public driver
-surface (typed parameters and streaming rows) lands with OpenConnector.
-
-
-```go
-// Outcome reports one executed statement. Rows carries at most the requested
-// row limit. It is the provisional in-tree execution surface: the public driver
-// surface (typed parameters and streaming rows) lands with OpenConnector.
-type Outcome struct {
-	Tag		string
-	RowsAffected	uint64
-	Committed	bool
-	Columns		[]Column
-	Rows		[][]model.Value
-	// contains filtered or unexported fields
-}
-```
-
-### `type QueryMetrics`
-
-QueryMetrics reports per-statement execution counters. The native engine
-does not maintain the legacy block-level counters; the fields remain part
-of the QueryResult contract.
-
-
-```go
-// QueryMetrics reports per-statement execution counters. The native engine
-// does not maintain the legacy block-level counters; the fields remain part
-// of the QueryResult contract.
-type QueryMetrics struct {
-	ExecutionTimeMicros	int64
-	BlocksScanned		int
-	BlocksPruned		int
-	RowsScanned		int
-	RowsMatched		int
-}
-```
-
-### `type QueryResult`
-
-QueryResult is the materialized result of one Execute call.
-
-
-```go
-// QueryResult is the materialized result of one Execute call.
-type QueryResult struct {
-	Columns		[]string
-	IntegerBits	[]uint8
-	HiddenColumns	[]bool
-	Rows		[][]any
-	RowsAffected	int
-	Metrics		QueryMetrics
-	Explain		string
-	Message		string
-}
-```
-
-#### `func (r *QueryResult) String() string`
-
-String renders the result for display: the EXPLAIN text when present, the
-command tag when there are no rows, otherwise the materialized row table.
-
-
-### `type SQLQueryEngine`
-
-SQLQueryEngine is a materializing convenience over the native session
-pipeline. It executes SQL text against one catalog through a dedicated
-session: one engine owns one session scope, so transactions, settings,
-prepared statements and cursors persist across Execute calls exactly like a
-database/sql connection. Rows are converted with the same model.Value mapping
-the driver uses. It is not safe for concurrent use; concurrent callers create
-one engine each or go through OpenConnector.
-
-
-```go
-// SQLQueryEngine is a materializing convenience over the native session
-// pipeline. It executes SQL text against one catalog through a dedicated
-// session: one engine owns one session scope, so transactions, settings,
-// prepared statements and cursors persist across Execute calls exactly like a
-// database/sql connection. Rows are converted with the same model.Value mapping
-// the driver uses. It is not safe for concurrent use; concurrent callers create
-// one engine each or go through OpenConnector.
-type SQLQueryEngine struct {
-	// contains filtered or unexported fields
-}
-```
-
-#### `func NewSQLQueryEngineWithCatalog(catalog *Catalog) *SQLQueryEngine`
-
-NewSQLQueryEngineWithCatalog returns an engine bound to catalog. The catalog
-stays owned by its opener; the engine's session is established lazily on the
-first Execute.
-
-
-#### `func (engine *SQLQueryEngine) Close() error`
-
-Close releases the engine's session. The catalog stays open.
-
-
-#### `func (engine *SQLQueryEngine) Execute(ctx context.Context, sqlText string) (*QueryResult, error)`
-
-Execute runs every statement in sqlText through the engine's session and
-returns the last statement's materialized result. Parameters are not part of
-this surface; callers needing $n arguments use OpenConnector.
-
 
 ### `type UpgradeRequired`
 

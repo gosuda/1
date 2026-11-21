@@ -5,54 +5,123 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+const maxTierBlockCoalescers = 16
+
+type tierWindowKey struct {
+	tier   runTier
+	window uint64
+}
+
 // Inputs need not cover the whole table. Point and range tombstones stay active
 // so an omitted lower level cannot resurrect a deleted key.
 func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Timestamp, limits blockLimits, maxKeyBytes uint64, output *compactedRuns) (err error) {
-	var lease *blockLease
+	coalescers := make(map[tierWindowKey]*paxBlockCoalescer)
 	defer func() {
-		if lease != nil { err = errors.Join(err, lease.release()) }
+		for key, c := range coalescers {
+			err = errors.Join(err, c.Close())
+			delete(coalescers, key)
+		}
 		err = errors.Join(err, source.Close())
 	}()
 	if maxKeyBytes > limits.MaxDecodedBytes || uint64(limits.MaxRows) > (limits.MaxDecodedBytes-maxKeyBytes)/4 {
 		return columnar.ErrBatchBudget
 	}
-	limits.MaxDecodedBytes -= maxKeyBytes + uint64(limits.MaxRows)*4
+	limits.MaxDecodedBytes -= maxKeyBytes
 	key := make([]byte, 0, int(maxKeyBytes))
-	order := make([]uint32, 0, limits.MaxRows)
 	var haveKey bool
-	var newer, historyUntil model.Timestamp
-	var tier runTier
-	var window uint64
-	var emit func([]uint32) error
-	emit = func(selected []uint32) error {
-		encoded, err := rewriteBlock(ctx, lease.block, selected, limits)
-		if errors.Is(err, columnar.ErrBatchBudget) && len(selected) > 1 {
-			middle := len(selected)/2
-			if err := emit(selected[:middle]); err != nil { return err }
-			return emit(selected[middle:])
+	var newer model.Timestamp
+	var touchSeq uint64
+	totalBudget := limits.MaxDecodedBytes / 2
+	if totalBudget == 0 {
+		totalBudget = limits.MaxDecodedBytes
+	}
+	perCoalescerBudget := limits.MaxDecodedBytes
+
+	emitFor := func(tw tierWindowKey) coalescedBlockEmit {
+		return func(target storage.ObjectRef, data []byte, blobs []toastBlob, rows uint64, historyUntil model.Timestamp) error {
+			return output.appendTierBlockWithBlobs(ctx, target, data, blobs, rows, tw.tier, tw.window, historyUntil)
 		}
-		if err != nil { return err }
-		return output.appendTierBlock(ctx, lease.block.Target(), encoded, uint64(len(selected)), tier, window, historyUntil)
 	}
-	flush := func() error {
-		if lease == nil { return nil }
-		if err := emit(order); err != nil { return err }
-		err := lease.release()
-		lease = nil
-		order = order[:0]
-		historyUntil = 0
-		return err
+
+	evictOne := func(keep tierWindowKey, closeAfter bool) error {
+		var victimKey tierWindowKey
+		var victim *paxBlockCoalescer
+		for k, c := range coalescers {
+			if k == keep {
+				continue
+			}
+			if closeAfter && c.rows() == 0 {
+				victimKey, victim = k, c
+				break
+			}
+			if !closeAfter && c.rows() == 0 {
+				continue
+			}
+			if victim == nil || c.touch < victim.touch {
+				victimKey, victim = k, c
+			}
+		}
+		if victim == nil {
+			return nil
+		}
+		if err := victim.flush(ctx, emitFor(victimKey)); err != nil {
+			return err
+		}
+		if closeAfter {
+			if err := victim.Close(); err != nil {
+				return err
+			}
+			delete(coalescers, victimKey)
+		}
+		return nil
 	}
+
+	flushAll := func() error {
+		if len(coalescers) == 0 {
+			return nil
+		}
+		keys := make([]tierWindowKey, 0, len(coalescers))
+		for k := range coalescers {
+			keys = append(keys, k)
+		}
+		slices.SortFunc(keys, func(a, b tierWindowKey) int {
+			if a.tier != b.tier {
+				if a.tier < b.tier {
+					return -1
+				}
+				return 1
+			}
+			if a.window < b.window {
+				return -1
+			}
+			if a.window > b.window {
+				return 1
+			}
+			return 0
+		})
+		for _, k := range keys {
+			if err := coalescers[k].flush(ctx, emitFor(k)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	for {
 		row, nextErr := source.Next(ctx)
-		if nextErr == io.EOF { return flush() }
-		if nextErr != nil { return nextErr }
+		if nextErr == io.EOF {
+			return flushAll()
+		}
+		if nextErr != nil {
+			return nextErr
+		}
 		rowTier, rowWindow, until := activeTier, uint64(0), model.Timestamp(0)
 		if row.kind == storage.MutationDeleteRange {
 			if source.ranges.suppresses(row.timestamp, row.ordinal) {
@@ -62,14 +131,18 @@ func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Tim
 				}
 			}
 			if until == 0 {
-				if err := source.ranges.add(row.end, row.timestamp, row.ordinal); err != nil { return err }
+				if err := source.ranges.add(row.end, row.timestamp, row.ordinal); err != nil {
+					return err
+				}
 			}
 		} else {
 			if haveKey && bytes.Equal(key, row.key) {
 				until = newer
 				newer = row.timestamp
 			} else {
-				if uint64(len(row.key)) > maxKeyBytes { return columnar.ErrBatchBudget }
+				if uint64(len(row.key)) > maxKeyBytes {
+					return columnar.ErrBatchBudget
+				}
 				key = append(key[:0], row.key...)
 				haveKey, newer = true, row.timestamp
 			}
@@ -78,18 +151,46 @@ func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Tim
 			}
 		}
 		if until != 0 {
-			if until <= floor || until == row.timestamp { continue }
+			if until <= floor || until == row.timestamp {
+				continue
+			}
 			rowTier = inactiveTier
-			rowWindow = uint64(row.timestamp)/inactiveWindowWidth
+			rowWindow = uint64(row.timestamp) / inactiveWindowWidth
 		}
-		if lease != row.lease || len(order) == cap(order) || tier != rowTier || window != rowWindow {
-			if err := flush(); err != nil { return err }
+		tw := tierWindowKey{tier: rowTier, window: rowWindow}
+		coalescer := coalescers[tw]
+		if coalescer == nil {
+			if len(coalescers) >= maxTierBlockCoalescers {
+				if err := evictOne(tw, true); err != nil {
+					return err
+				}
+			}
+			coalescer = newPAXBlockCoalescer(limits, perCoalescerBudget)
+			coalescers[tw] = coalescer
 		}
-		if lease == nil {
-			lease = row.lease.retain()
-			tier, window = rowTier, rowWindow
+		if err := coalescer.appendRow(ctx, row.lease.block, row.row, row.key, row.end, row.timestamp, row.ordinal, row.kind, until, emitFor(tw)); err != nil {
+			return err
 		}
-		historyUntil = max(historyUntil, until)
-		order = append(order, uint32(row.row))
+		touchSeq++
+		coalescer.touch = touchSeq
+		if len(coalescers) > 1 {
+			var buffered uint64
+			for _, c := range coalescers {
+				buffered += c.arenaBytes()
+			}
+			for buffered > totalBudget && len(coalescers) > 1 {
+				prev := buffered
+				if err := evictOne(tw, true); err != nil {
+					return err
+				}
+				buffered = 0
+				for _, c := range coalescers {
+					buffered += c.arenaBytes()
+				}
+				if buffered >= prev {
+					break
+				}
+			}
+		}
 	}
 }

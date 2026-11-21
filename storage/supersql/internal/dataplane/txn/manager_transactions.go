@@ -49,7 +49,7 @@ func (manager *Manager) Begin(ctx context.Context, options TransactionOptions) (
 	// statement's declared read set grows with the catalog, so a single view
 	// must be able to use the whole allowance when it is the only one open.
 	transaction.metadataLimit = options.MemoryBytes / 8
-	transaction.scratchBytes = options.MemoryBytes / 8
+	transaction.scratchBytes = options.MemoryBytes
 	transaction.viewSpace.limit = options.MemoryBytes / 4
 	if transaction.metadataLimit < uint64(unsafe.Sizeof(Transaction{}))+uint64(options.MaxViews)*16+uint64(unsafe.Sizeof(model.PublicationOwner{})) || transaction.viewSpace.limit < 1024 {
 		return nil, errTransactionBudget
@@ -61,11 +61,11 @@ func (manager *Manager) Begin(ctx context.Context, options TransactionOptions) (
 	transaction.views = make([]*transactionView, 0, options.MaxViews)
 	if options.Mode == ReadWrite {
 		var err error
-		transaction.log, err = newMutationLog(mutationLogLimits{MemoryBytes: options.MemoryBytes / 8, SpillBytes: options.SpillBytes, CursorBytes: options.MemoryBytes / 16, MaxCursors: 2, SpillDirectory: options.SpillDirectory, DisableSpill: options.DisableSpill})
+		transaction.log, err = newMutationLog(mutationLogLimits{MemoryBytes: options.MemoryBytes / 8, SpillBytes: options.SpillBytes, CursorBytes: options.MemoryBytes, MaxCursors: 2, SpillDirectory: options.SpillDirectory, DisableSpill: options.DisableSpill})
 		if err != nil {
 			return nil, err
 		}
-		transaction.overlay, err = NewOverlay(options.MemoryBytes / 4)
+		transaction.overlay, err = newTransactionOverlay(options.MemoryBytes/4, options.SpillBytes, transaction.log)
 		if err != nil {
 			return nil, errors.Join(err, transaction.log.Close())
 		}

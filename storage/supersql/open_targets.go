@@ -65,7 +65,7 @@ var (
 		{ID: "E051", Name: "Basic query specification", Supported: true},
 		{ID: "E061", Name: "Basic predicates and search conditions", Supported: true},
 		{ID: "E071", Name: "Basic query expressions", Supported: true},
-		{ID: "E081", Name: "Basic Privileges", Supported: true},
+		{ID: "E081", Name: "Basic Privileges", Supported: false},
 		{ID: "E091", Name: "Set functions", Supported: true},
 		{ID: "E101", Name: "Basic data manipulation", Supported: true},
 		{ID: "E111", Name: "Single row SELECT statement", Supported: true},

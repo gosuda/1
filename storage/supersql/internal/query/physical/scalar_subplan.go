@@ -66,7 +66,7 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 			if !seen[found] {
 				subplan := n.ScalarSubplans[found]
 				body := p.nodes[subplan.Root-1]
-				if body.Logical != (RelRef{Graph: ref.Graph, Rel: scalar.Relation}) {
+				if !implementsLogical(graph, ref.Graph, scalar.Relation, body) {
 					return invalid("scalar body identity")
 				}
 				switch scalar.SubqueryKind {
@@ -139,7 +139,7 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 			walkErr = visit(ScalarRef{Graph: n.Logical.Graph, Scalar: id}, 0)
 		}
 	}
-	for _, id := range [...]ir.ScalarID{logical.Predicate, logical.Offset, logical.Count, logical.ConflictPredicate, logical.Frame.Start.Offset, logical.Frame.End.Offset, logical.Recursion.CycleValue, logical.Recursion.CycleDefault, logical.Recursion.CycleContinue} {
+	for _, id := range [...]ir.ScalarID{logical.Predicate, logical.Offset, logical.Count, logical.ConflictPredicate, logical.RLSInsertCheck, logical.RLSUpdateCheck, logical.Frame.Start.Offset, logical.Frame.End.Offset, logical.Recursion.CycleValue, logical.Recursion.CycleDefault, logical.Recursion.CycleContinue} {
 		add(id)
 	}
 	for i := range logical.ExpressionCount() {
@@ -254,7 +254,7 @@ func (p *Plan) scalarCaptureAvailable(n NodeSpec, capture Slot, remaining *uint6
 	if logical.Kind != ir.Modify || capture.Graph != n.Logical.Graph {
 		return false, nil
 	}
-	if capture.ID != logical.OldRow && capture.ID != logical.NewRow && capture.ID != logical.ExcludedRow && capture.ID != logical.MergeResultRow && capture.ID != logical.MergeActionSlot {
+	if capture.ID != logical.OldRow && capture.ID != logical.NewRow && capture.ID != logical.ExcludedRow && capture.ID != logical.RLSRow && capture.ID != logical.MergeResultRow && capture.ID != logical.MergeActionSlot {
 		return false, nil
 	}
 	info, ok := g.Slot(capture.ID)

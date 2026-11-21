@@ -195,7 +195,7 @@ func (c *scopeClone) relation(id ir.RelID, depth uint32) ir.RelID {
 	}
 	spec.MarkSlot = c.slot(spec.MarkSlot)
 	spec.OldRow, spec.NewRow = c.slot(spec.OldRow), c.slot(spec.NewRow)
-	spec.ExcludedRow = c.slot(spec.ExcludedRow)
+	spec.ExcludedRow, spec.RLSRow = c.slot(spec.ExcludedRow), c.slot(spec.RLSRow)
 	spec.SourceObject = c.slot(spec.SourceObject)
 	spec.OldTableOID, spec.NewTableOID = c.slot(spec.OldTableOID), c.slot(spec.NewTableOID)
 	spec.MergeTableOID = c.slot(spec.MergeTableOID)
@@ -211,6 +211,8 @@ func (c *scopeClone) relation(id ir.RelID, depth uint32) ir.RelID {
 		}
 	}
 	spec.ConflictPredicate = c.scalar(spec.ConflictPredicate, depth+1)
+	spec.RLSInsertCheck = c.scalar(spec.RLSInsertCheck, depth+1)
+	spec.RLSUpdateCheck = c.scalar(spec.RLSUpdateCheck, depth+1)
 	for i := range spec.Actions {
 		action := &spec.Actions[i]
 		action.Condition = c.scalar(action.Condition, depth+1)

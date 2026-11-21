@@ -666,9 +666,10 @@ type Rel struct {
 	ModifyTarget                                                                                                                                       ModifyTargetKind
 	Conflict                                                                                                                                           ConflictAction
 	ConflictPredicate                                                                                                                                  ScalarID
+	RLSInsertCheck, RLSUpdateCheck                                                                                                                     ScalarID
 	OldRow, NewRow, SourceObject, OldTableOID, NewTableOID                                                                                              model.SlotID
 	LogicalView                                                                                                                                        model.ObjectID
-	ExcludedRow                                                                                                                                        model.SlotID
+	ExcludedRow, RLSRow                                                                                                                                model.SlotID
 	conflictArbiters                                                                                                                                   extent
 	MergeSourcePresent, MergeTargetPresent                                                                                                             model.SlotID
 	MergeResultRow, MergeActionSlot, MergeTableOID                                                                                                     model.SlotID

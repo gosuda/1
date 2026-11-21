@@ -49,6 +49,9 @@ type decDescriptor struct {
 type paxBlock struct {
 	mu           sync.Mutex
 	data         []byte
+	shared       *cachedPAXBlock
+	blobReader   paxBlobReader
+	blobs        []sstBlobEntry
 	memory       *sourceMemory
 	encodedBytes uint64
 	target       storage.ObjectRef
@@ -344,7 +347,7 @@ func allowedPAXEncoding(st model.DataType, enc columnEncoding) bool {
 	case model.TypeInt64, model.TypeTimestamp, model.TypeBoolean:
 		return enc == encodingPlain || enc == encodingRLE || enc == encodingDelta
 	case model.TypeString, model.TypeBytes, model.TypeJSONB, model.TypeUUID, model.TypeNumeric:
-		return enc == encodingPlain || enc == encodingDictionary
+		return enc == encodingPlain || enc == encodingDictionary || enc == encodingLOB
 	case model.TypeFloat64, model.TypeInterval, model.TypeVectorF32, model.TypeArray, model.TypeComposite:
 		return enc == encodingPlain
 	}
@@ -380,6 +383,30 @@ func (b *paxBlock) Version(row int) (key, end []byte, ts model.Timestamp, ordina
 	return b.vis[keyOffset : keyOffset+keyLength], b.vis[endOffset : endOffset+endLength],
 		model.Timestamp(int64(binary.LittleEndian.Uint64(rec))),
 		binary.LittleEndian.Uint64(rec[8:]), storage.MutationOp(rec[16]), nil
+}
+
+// searchKey binary searches sorted block visibility keys for the first row
+// whose key is >= targetKey. Returns b.rows if all keys are strictly smaller.
+func (b *paxBlock) searchKey(targetKey []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, storage.ErrClosed
+	}
+	lo, hi := 0, b.rows
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		rec := b.vis[mid*paxVersionSize:]
+		keyOffset := uint64(binary.LittleEndian.Uint32(rec[24:]))
+		keyLength := uint64(binary.LittleEndian.Uint32(rec[28:]))
+		candidate := b.vis[keyOffset : keyOffset+keyLength]
+		if bytes.Compare(candidate, targetKey) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo, nil
 }
 
 func (b *paxBlock) findColumn(id model.ColumnID) int {
@@ -454,6 +481,15 @@ func (b *paxBlock) Column(ctx context.Context, id model.ColumnID) (columnar.Vect
 			return b.cache[i].vector, nil
 		}
 	}
+	if b.shared != nil {
+		if vec, ok := b.shared.getColumn(id); ok {
+			if err := b.reserveCacheLocked(); err != nil {
+				return columnar.Vector{}, err
+			}
+			b.cache = append(b.cache, cachedPAXColumn{id: id, vector: vec})
+			return vec, nil
+		}
+	}
 	i := b.findColumn(id)
 	if i < 0 {
 		return columnar.Vector{}, errColumnMissing
@@ -474,6 +510,9 @@ func (b *paxBlock) Column(ctx context.Context, id model.ColumnID) (columnar.Vect
 		return columnar.Vector{}, err
 	}
 	b.cache = append(b.cache, cachedPAXColumn{id: id, vector: v})
+	if b.shared != nil && descriptor.encoding != encodingLOB && descriptor.storage != model.TypeArray && descriptor.storage != model.TypeComposite {
+		b.shared.putColumn(id, v)
+	}
 	b.memory.observe(storage.ScanObservation{DecodedBytes: storage.ObservationCount{Value: descriptor.length, Known: true}})
 	return v, nil
 }
@@ -500,6 +539,9 @@ func (b *paxBlock) Close() error {
 	memory := b.memory
 	released := b.encodedBytes + b.used
 	b.data = nil
+	b.shared = nil
+	b.blobReader = nil
+	b.blobs = nil
 	b.descriptors = nil
 	b.vis = nil
 	b.cache = nil

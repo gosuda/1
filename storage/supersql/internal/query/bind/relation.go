@@ -215,8 +215,15 @@ func (b *binder) view(d *model.Descriptor, view *model.ViewMetadata, alias *zpgp
 	}
 	b.views[d.ID()] = true
 	defer delete(b.views, d.ID())
+	// PostgreSQL view security semantics: security_invoker = true evaluates
+	// underlying RLS under the calling user; otherwise under the view owner.
+	savedRole := b.options.CurrentRole
+	if !view.SecurityInvoker {
+		b.options.CurrentRole = view.OwnerName
+	}
 	isolated := &scope{id: s.id, parent: s.parent, ctes: make(map[string]cteBinding)}
 	rel, err := b.selectStatementWithRowLocks(parsed.Stmt.GetSelectStmt(), isolated, nil, pushed)
+	b.options.CurrentRole = savedRole
 	if err != nil {
 		return rel, err
 	}

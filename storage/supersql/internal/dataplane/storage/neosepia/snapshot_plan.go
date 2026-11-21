@@ -112,6 +112,13 @@ func (reader *snapshotReader) PlanScan(ctx context.Context, request storage.Push
 	}); err != nil {
 		return storage.PushdownPlan{}, err
 	}
+	if reader.mem != nil && len(spans) != 0 && reader.spec.Timestamp >= reader.mem.firstCommitTS {
+		if state := reader.mem.targets[targetGeneration(owned.Target)]; state != nil && state.rows > 0 {
+			plan.Estimate.Rows += float64(state.rows)
+			plan.Estimate.VisibilityChecks += float64(state.rows)
+			plan.Estimate.ReadBytes += float64(state.bytes)
+		}
+	}
 	digest, err := storage.HashPushdownPlan(ctx, plan, limits.PlanBytes)
 	if err != nil {
 		return storage.PushdownPlan{}, err

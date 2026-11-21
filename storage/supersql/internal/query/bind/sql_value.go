@@ -22,7 +22,11 @@ func (b *binder) sqlValueFunction(node *zpgparse.SQLValueFunction, s *scope) (ex
 		value := model.StringVal(name)
 		return b.addScalar(s, expression{typ: b.primitive(19), value: value, position: position}, ir.Scalar{Kind: ir.Const}, nil)
 	case zpgparse.SQLValueFunctionOp_SVFOP_SESSION_USER:
-		value := model.StringVal((model.Principal{}).Name())
+		name := (model.Principal{}).Name()
+		if b.options.SessionUser != "" && b.options.SessionUser != "none" {
+			name = b.options.SessionUser
+		}
+		value := model.StringVal(name)
 		return b.addScalar(s, expression{typ: b.primitive(19), value: value, position: position}, ir.Scalar{Kind: ir.Const}, nil)
 	case zpgparse.SQLValueFunctionOp_SVFOP_CURRENT_DATE:
 		target = 1082

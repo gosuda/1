@@ -75,6 +75,7 @@ type Options struct {
 	ExtendedStatistics   ExtendedStatistics
 	StatisticsLimits     statistics.Limits
 	StatisticsKeyEncoder storage.KeyEncoder
+	DefaultCollation     model.CollationID
 	Required             physical.Properties
 }
 
@@ -162,6 +163,10 @@ func optimize(ctx context.Context, graph *ir.Graph, options Options, reorder boo
 		preparation.MaxWork = preparationWork
 	}
 	graph, err = prepareGraph(ctx, graph, preparation)
+	if err != nil {
+		return Result{}, err
+	}
+	graph, err = normalizeJoinPredicates(ctx, graph, options)
 	if err != nil {
 		return Result{}, err
 	}
