@@ -18,9 +18,9 @@ func compileFloatCore(signature Signature) scalarKernel {
 	case 233, 1347:
 		return floatCoreExp
 	case 234, 1341:
-		return floatCoreLogarithm(math.Log)
+		return floatCoreLogarithm(math.Log, 54*math.Ln2)
 	case 1194, 1339, 1340:
-		return floatCoreLogarithm(math.Log10)
+		return floatCoreLogarithm(math.Log10, 54*math.Log10(2))
 	default:
 		return nil
 	}
@@ -123,9 +123,9 @@ func floatCoreExp(_ context.Context, args []model.Value, callBudget CallBudget) 
 		return model.Float64Val(0), nil
 	}
 	var result float64
-	if input < -1022*math.Ln2 {
-		// Round once into the subnormal range instead of losing the last bit
-		// while Exp scales a normal intermediate by a large negative exponent.
+	if input < -1022*math.Ln2 || input > 709.0 {
+		// Split extreme exponents so subnormal rounding and the last finite
+		// binade (near ln(MaxFloat64)) stay accurate across Go math kernels.
 		half := math.Exp(input / 2)
 		result = half * half
 	} else {
@@ -140,7 +140,7 @@ func floatCoreExp(_ context.Context, args []model.Value, callBudget CallBudget) 
 	return model.Float64Val(result), nil
 }
 
-func floatCoreLogarithm(logarithm func(float64) float64) scalarKernel {
+func floatCoreLogarithm(logarithm func(float64) float64, scaleShift float64) scalarKernel {
 	return func(_ context.Context, args []model.Value, callBudget CallBudget) (model.Value, error) {
 		input := args[0].FloatVal
 		if input == 0 {
@@ -149,7 +149,14 @@ func floatCoreLogarithm(logarithm func(float64) float64) scalarKernel {
 		if input < 0 {
 			return model.Value{}, sqlError("2201E", "cannot take logarithm of a negative number")
 		}
-		result := logarithm(input)
+		var result float64
+		if input < 0x1p-1022 {
+			// Normalize subnormal inputs before calling math.Log/Log10 so
+			// platform kernels that flush or mis-scale subnormals stay exact.
+			result = logarithm(input*0x1p54) - scaleShift
+		} else {
+			result = logarithm(input)
+		}
 		if math.IsInf(result, 0) && !math.IsInf(input, 0) {
 			return model.Value{}, sqlError("22003", "value out of range: overflow")
 		}

@@ -401,10 +401,18 @@ func (c *cursor) configure(ctx context.Context) error {
 		spoolPeak += (spoolWork + o.PartitionMemoryBytes) * 2
 	}
 	if c.hasDistinct || c.hasOrder {
-		c.sortWork = o.WorkBytes / 2
-		spoolPeak += o.BatchBytes
+		c.sortBatchBytes = o.BatchBytes
+		if maxSortBatch := o.WorkBytes / 16; maxSortBatch > 0 && c.sortBatchBytes > maxSortBatch {
+			c.sortBatchBytes = max(maxSortBatch, min(o.BatchBytes, o.MaxRecordBytes))
+		}
+		spoolPeak += c.sortBatchBytes
+		if fixed <= o.WorkBytes && spoolPeak < o.WorkBytes-fixed {
+			c.sortWork = min(o.WorkBytes/2, o.WorkBytes-fixed-spoolPeak)
+		} else {
+			c.sortWork = o.WorkBytes / 2
+		}
 	}
-	if fixed > o.WorkBytes || spoolPeak > o.WorkBytes-fixed || c.sortWork > o.WorkBytes-fixed-spoolPeak {
+	if fixed > o.WorkBytes || spoolPeak > o.WorkBytes-fixed || c.sortWork > o.WorkBytes-fixed-spoolPeak || ((c.hasDistinct || c.hasOrder) && c.sortWork == 0) {
 		return resource("aggregate work limit cannot admit partitions", nil)
 	}
 	if err := claim.Resize(fixed); err != nil {

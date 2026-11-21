@@ -27,7 +27,8 @@ jobs:
       - name: "Vet (accepted baseline: generated ragel scanner unreachable code)"
         run: |
           set -eu
-          findings="$(go vet ./... 2>&1 | grep -v '^#' | grep -v 'scan\.rl:[0-9]*: unreachable code$' || true)"
+          go mod download
+          findings="$(go vet ./... 2>&1 | grep -v '^#' | grep -v '^go: downloading ' | grep -v 'scan\.rl:[0-9]*: unreachable code$' || true)"
           if [ -n "$findings" ]; then
             printf '%s\n' "$findings"
             exit 1

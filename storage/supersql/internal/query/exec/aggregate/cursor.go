@@ -37,8 +37,9 @@ type cursor struct {
 	maxGroups     int
 	perGroup      uint64
 	metadata      uint64
-	sortWork      uint64
-	hasDistinct   bool
+	sortWork       uint64
+	sortBatchBytes uint64
+	hasDistinct    bool
 	hasNumeric    bool
 	hasOrder      bool
 	hasOrderedSet bool

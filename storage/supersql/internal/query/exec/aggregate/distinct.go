@@ -46,7 +46,7 @@ func (c *cursor) prepareDistinctCall(ctx context.Context, index int) error {
 		if err != nil {
 			return err
 		}
-		builder, err := columnar.NewBuilder(c.layouts, columnar.BuilderOptions{MaxRows: c.options.BatchRows, MaxBytes: c.options.BatchBytes, Allocator: c.options.Query.Allocator(runtime.WorkMemory)})
+		builder, err := columnar.NewBuilder(c.layouts, columnar.BuilderOptions{MaxRows: c.options.BatchRows, MaxBytes: c.sortBatchBytes, Allocator: c.options.Query.Allocator(runtime.WorkMemory)})
 		if err != nil {
 			return errors.Join(err, reader.Close())
 		}
@@ -54,7 +54,7 @@ func (c *cursor) prepareDistinctCall(ctx context.Context, index int) error {
 	}
 	input := c.input
 	c.input = nil
-	sorted, err := externalsort.New(ctx, input, externalsort.Options{Layouts: c.layouts, Keys: keys, Encoder: c.options.Encoder, Query: c.options.Query, BatchRows: c.options.BatchRows, BatchBytes: c.options.BatchBytes, MaxRecordBytes: c.options.MaxRecordBytes, RunBytes: c.options.PartitionMemoryBytes, MaxRuns: c.options.MaxPartitions, MergeFanIn: 2, WorkBytes: c.sortWork})
+	sorted, err := externalsort.New(ctx, input, externalsort.Options{Layouts: c.layouts, Keys: keys, Encoder: c.options.Encoder, Query: c.options.Query, BatchRows: c.options.BatchRows, BatchBytes: c.sortBatchBytes, MaxRecordBytes: c.options.MaxRecordBytes, RunBytes: c.options.PartitionMemoryBytes, MaxRuns: c.sortMaxRuns(), MergeFanIn: 2, WorkBytes: c.sortWork})
 	if err != nil {
 		return err
 	}

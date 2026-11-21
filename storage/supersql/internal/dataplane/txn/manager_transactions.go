@@ -59,6 +59,7 @@ func (manager *Manager) Begin(ctx context.Context, options TransactionOptions) (
 	transaction.publications.limit = (transaction.metadataLimit - transaction.metadataUsed) / 4
 	transaction.metadataUsed += transaction.publications.limit
 	transaction.views = make([]*transactionView, 0, options.MaxViews)
+	transaction.encoder = options.KeyEncoder
 	if options.Mode == ReadWrite {
 		var err error
 		transaction.log, err = newMutationLog(mutationLogLimits{MemoryBytes: options.MemoryBytes / 8, SpillBytes: options.SpillBytes, CursorBytes: options.MemoryBytes, MaxCursors: 2, SpillDirectory: options.SpillDirectory, DisableSpill: options.DisableSpill})
@@ -69,7 +70,7 @@ func (manager *Manager) Begin(ctx context.Context, options TransactionOptions) (
 		if err != nil {
 			return nil, errors.Join(err, transaction.log.Close())
 		}
-		transaction.resolver, transaction.encoder = options.Resolver, options.KeyEncoder
+		transaction.resolver = options.Resolver
 	}
 	if _, err := rand.Read(transaction.id[:]); err != nil {
 		return nil, errors.Join(err, transaction.closeConstruction())

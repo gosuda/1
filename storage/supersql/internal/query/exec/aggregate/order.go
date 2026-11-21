@@ -109,7 +109,7 @@ func (c *cursor) prepareOrder(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	builder, err := columnar.NewBuilder(c.layouts, columnar.BuilderOptions{MaxRows: c.options.BatchRows, MaxBytes: c.options.BatchBytes, Allocator: c.options.Query.Allocator(runtime.WorkMemory)})
+	builder, err := columnar.NewBuilder(c.layouts, columnar.BuilderOptions{MaxRows: c.options.BatchRows, MaxBytes: c.sortBatchBytes, Allocator: c.options.Query.Allocator(runtime.WorkMemory)})
 	if err != nil {
 		return errors.Join(err, reader.Close())
 	}
@@ -122,12 +122,27 @@ func (c *cursor) prepareOrder(ctx context.Context) error {
 	if c.sourceOrdinal >= 0 {
 		keys = append(keys, externalsort.Key{Column: c.sourceOrdinal})
 	}
-	c.input, err = externalsort.New(c.ctx, input, externalsort.Options{Layouts: c.layouts, Keys: keys, Encoder: c.options.Encoder, Query: c.options.Query, BatchRows: c.options.BatchRows, BatchBytes: c.options.BatchBytes, MaxRecordBytes: c.options.MaxRecordBytes, RunBytes: c.options.PartitionMemoryBytes, MaxRuns: c.options.MaxPartitions, MergeFanIn: 2, WorkBytes: c.sortWork})
+	c.input, err = externalsort.New(c.ctx, input, externalsort.Options{Layouts: c.layouts, Keys: keys, Encoder: c.options.Encoder, Query: c.options.Query, BatchRows: c.options.BatchRows, BatchBytes: c.sortBatchBytes, MaxRecordBytes: c.options.MaxRecordBytes, RunBytes: c.options.PartitionMemoryBytes, MaxRuns: c.sortMaxRuns(), MergeFanIn: 2, WorkBytes: c.sortWork})
 	if err != nil {
 		return err
 	}
 	c.orderTag = width
 	return nil
+}
+
+func (c *cursor) sortMaxRuns() int {
+	// Bound MaxRuns so (MaxRuns + MergeFanIn(2) + 3) * spoolWork fits inside
+	// c.sortWork even when work_mem is reduced below the default 64 MiB.
+	spoolWork := c.metadata + c.options.MaxRecordBytes*9 + 8192
+	fixed := c.metadata + c.options.PartitionMemoryBytes*3 + c.options.MaxRecordBytes*9
+	if spoolWork == 0 || c.sortWork <= fixed {
+		return c.options.MaxPartitions
+	}
+	admissible := int((c.sortWork-fixed)/spoolWork) - 5
+	if admissible < 2 {
+		return min(c.options.MaxPartitions, 2)
+	}
+	return min(c.options.MaxPartitions, admissible)
 }
 
 func (c *cursor) finishOrderSpool(ctx context.Context, layouts []model.TypeLayout) error {

@@ -20,6 +20,8 @@ func (e *MissingKeyImplementationError) Error() string {
 	return fmt.Sprintf("SQL key implementation missing for type %d", e.Type.ID)
 }
 
+func (e *MissingKeyImplementationError) MissingKeyImplementation() bool { return true }
+
 // KeyEncoder implements canonical SQL ordering for supported scalar types,
 // JSONB, and recursively declared arrays and composites.
 // Text uses C/POSIX byte ordering; bpchar ignores trailing U+0020. The default

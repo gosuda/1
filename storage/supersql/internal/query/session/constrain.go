@@ -52,6 +52,22 @@ func constrainEnvironment(environment *exec.Environment, workBytes, spillBytes i
 	environment.Modify.SortRunBytes = scaleWorkBudget(environment.Modify.SortRunBytes, max(environment.Modify.WorkBytes/8, 1))
 	environment.Modify.SpoolMemoryBytes = scaleWorkBudget(environment.Modify.SpoolMemoryBytes, max(work/4, 1))
 	environment.Spool.MemoryBytes = scaleWorkBudget(environment.Spool.MemoryBytes, max(work/4, 1))
+	maxRecordCap := max(work/1024, 4096)
+	if environment.Aggregate.MaxRecordBytes > maxRecordCap {
+		environment.Aggregate.MaxRecordBytes = maxRecordCap
+	}
+	if environment.Sort.MaxRecordBytes > maxRecordCap {
+		environment.Sort.MaxRecordBytes = maxRecordCap
+	}
+	if environment.Join.MaxRecordBytes > maxRecordCap {
+		environment.Join.MaxRecordBytes = maxRecordCap
+	}
+	if environment.Set.MaxRecordBytes > maxRecordCap {
+		environment.Set.MaxRecordBytes = maxRecordCap
+	}
+	if environment.Window.MaxRecordBytes > maxRecordCap {
+		environment.Window.MaxRecordBytes = maxRecordCap
+	}
 
 	// Spill capacity is a separate session limit; only lower it.
 	environment.Set.MaxSpillBytes = min(environment.Set.MaxSpillBytes, spill)

@@ -366,3 +366,35 @@ func TestPublicParseErrorState(t *testing.T) {
 		}
 	}
 }
+
+// TestAggregateDistinctOrderDefaultWorkMem pins regression coverage for
+// DISTINCT and ORDER BY aggregates when Limits.BatchBytes (32 MiB for TOAST)
+// is large relative to default work_mem (64 MiB) or reduced session work_mem.
+func TestAggregateDistinctOrderDefaultWorkMem(t *testing.T) {
+	ctx := t.Context()
+	database, err := Open(ctx, OpenOptions{Directory: testDirectory(t), Clock: newTestClock()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer database.Close()
+
+	execSQL(t, ctx, database, `CREATE TABLE diff_agg (id int PRIMARY KEY, v int, t text, b bool)`)
+	execSQL(t, ctx, database, `INSERT INTO diff_agg VALUES (1, 10, 'alpha', true), (2, 20, 'beta', false), (3, NULL, NULL, NULL)`)
+
+	out, err := database.exec(ctx, `SELECT count(DISTINCT b), string_agg(t, ',' ORDER BY t), array_agg(v ORDER BY v)::text FROM diff_agg`, 0)
+	if err != nil {
+		t.Fatalf("distinct/ordered aggregate at default work_mem: %v", err)
+	}
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 2 || out.Rows[0][1].StrVal != "alpha,beta" || out.Rows[0][2].StrVal != "{10,20,NULL}" {
+		t.Fatalf("unexpected aggregate result: %+v", out.Rows)
+	}
+
+	execSQL(t, ctx, database, `SET work_mem = '8MB'`)
+	out, err = database.exec(ctx, `SELECT count(DISTINCT b), string_agg(t, ',' ORDER BY t), array_agg(v ORDER BY v)::text FROM diff_agg`, 0)
+	if err != nil {
+		t.Fatalf("distinct/ordered aggregate at 8MB work_mem: %v", err)
+	}
+	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 2 || out.Rows[0][1].StrVal != "alpha,beta" || out.Rows[0][2].StrVal != "{10,20,NULL}" {
+		t.Fatalf("unexpected aggregate result at 8MB work_mem: %+v", out.Rows)
+	}
+}

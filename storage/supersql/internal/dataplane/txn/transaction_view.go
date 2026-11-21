@@ -86,8 +86,10 @@ func (budget *viewBudget) remaining(charged uint64) uint64 {
 }
 
 type transactionPlan struct {
-	binding [32]byte
-	bytes   uint64
+	binding      [32]byte
+	bytes        uint64
+	backendPlan  *storage.PushdownPlan
+	publicDigest [32]byte
 }
 
 func (view *transactionView) Timestamp() model.Timestamp { return view.timestamp }
@@ -259,9 +261,48 @@ func (view *transactionView) PlanScan(ctx context.Context, request storage.Pushd
 		return storage.PushdownPlan{}, err
 	}
 	plan, err := view.reader.PlanScan(operation, owned)
+	var backendPlan *storage.PushdownPlan
+	var publicDigest [32]byte
 	if err != nil {
 		view.transaction.viewSpace.release(charged)
-		return storage.PushdownPlan{}, transactionError(err)
+		if isMissingKeyImplementation(err) && len(request.Spans) != 0 && len(request.EncodedSpans) == 0 && view.transaction.encoder != nil {
+			encodedSpans, encErr := view.encodeDeclaredSpans(operation, request, view.transaction.viewSpace.remaining(view.used))
+			if encErr != nil {
+				return storage.PushdownPlan{}, transactionError(encErr)
+			}
+			encodedReq := request
+			encodedReq.Spans = nil
+			encodedReq.EncodedSpans = encodedSpans
+			available = view.transaction.viewSpace.available()
+			if overhead+registryGrowth > available {
+				return storage.PushdownPlan{}, errTransactionBudget
+			}
+			encodedOwned, encBytes, copyErr := storage.CopyPushdownRequest(operation, encodedReq, (available-overhead-registryGrowth)/3)
+			if copyErr != nil {
+				return storage.PushdownPlan{}, errors.Join(errTransactionBudget, copyErr)
+			}
+			charged = encBytes*3 + overhead + registryGrowth
+			if chargeErr := view.transaction.viewSpace.charge(charged); chargeErr != nil {
+				return storage.PushdownPlan{}, chargeErr
+			}
+			plan, err = view.reader.PlanScan(operation, encodedOwned)
+			if err != nil {
+				view.transaction.viewSpace.release(charged)
+				return storage.PushdownPlan{}, transactionError(err)
+			}
+			bp := plan
+			backendPlan = &bp
+			plan.Request.Spans = owned.Spans
+			plan.Request.EncodedSpans = nil
+			publicDigest, err = storage.HashPushdownPlan(operation, plan, max(charged, uint64(64<<10)))
+			if err != nil {
+				_ = view.reader.ReleasePlan(bp)
+				view.transaction.viewSpace.release(charged)
+				return storage.PushdownPlan{}, transactionError(err)
+			}
+		} else {
+			return storage.PushdownPlan{}, transactionError(err)
+		}
 	}
 	if registryGrowth != 0 {
 		plans := make([]transactionPlan, len(view.plans), len(view.plans)+1)
@@ -269,7 +310,7 @@ func (view *transactionView) PlanScan(ctx context.Context, request storage.Pushd
 		view.plans = plans
 	}
 	view.used += charged
-	view.plans = append(view.plans, transactionPlan{binding: plan.Binding, bytes: charged - registryGrowth})
+	view.plans = append(view.plans, transactionPlan{binding: plan.Binding, bytes: charged - registryGrowth, backendPlan: backendPlan, publicDigest: publicDigest})
 	return plan, nil
 }
 
@@ -299,10 +340,57 @@ func (view *transactionView) NegotiateScan(ctx context.Context, request storage.
 	if err == nil || plan.Binding != ([32]byte{}) {
 		err = errors.Join(err, view.reader.ReleasePlan(plan))
 	}
+	if err != nil && isMissingKeyImplementation(err) && len(request.Spans) != 0 && len(request.EncodedSpans) == 0 && view.transaction.encoder != nil {
+		encodedSpans, encErr := view.encodeDeclaredSpans(operation, request, available/3)
+		if encErr != nil {
+			return storage.PushdownPlan{}, transactionError(encErr)
+		}
+		encodedReq := request
+		encodedReq.Spans = nil
+		encodedReq.EncodedSpans = encodedSpans
+		encodedOwned, _, copyErr := storage.CopyPushdownRequest(operation, encodedReq, available/3)
+		if copyErr != nil {
+			return storage.PushdownPlan{}, errors.Join(errTransactionBudget, copyErr)
+		}
+		plan, err = view.reader.PlanScan(operation, encodedOwned)
+		if err == nil || plan.Binding != ([32]byte{}) {
+			err = errors.Join(err, view.reader.ReleasePlan(plan))
+		}
+		if err == nil {
+			plan.Request.Spans = owned.Spans
+			plan.Request.EncodedSpans = nil
+		}
+	}
 	if err != nil {
 		return storage.PushdownPlan{}, transactionError(err)
 	}
 	return plan, nil
+}
+
+func isMissingKeyImplementation(err error) bool {
+	var missing interface{ MissingKeyImplementation() bool }
+	return errors.As(err, &missing) && missing.MissingKeyImplementation()
+}
+
+func (view *transactionView) encodeDeclaredSpans(ctx context.Context, request storage.PushdownRequest, budget uint64) ([]storage.EncodedKeySpan, error) {
+	unit := uint64(unsafe.Sizeof(storage.EncodedKeySpan{}))
+	if uint64(len(request.Spans)) > budget/unit {
+		return nil, errTransactionBudget
+	}
+	used := uint64(len(request.Spans)) * unit
+	encoded := make([]storage.EncodedKeySpan, len(request.Spans))
+	for i, span := range request.Spans {
+		req, bytes, err := encodeDependencySpan(ctx, view.transaction.encoder, request.Target, request.KeyLayout, span, budget-used)
+		if err != nil {
+			return nil, err
+		}
+		used += bytes
+		encoded[i] = storage.EncodedKeySpan{
+			Lower: storageEncodedLockBound(req.Lower),
+			Upper: storageEncodedLockBound(req.Upper),
+		}
+	}
+	return encoded, nil
 }
 
 func (view *transactionView) admittedEncodedSpans(ctx context.Context, request storage.PushdownRequest) ([]storage.EncodedKeySpan, error) {
@@ -391,7 +479,11 @@ func (view *transactionView) ReleasePlan(plan storage.PushdownPlan) error {
 			return storage.ErrInvalidScanPlan
 		}
 	}
-	if err := view.reader.ReleasePlan(plan); err != nil {
+	releaseTarget := plan
+	if view.plans[index].backendPlan != nil {
+		releaseTarget = *view.plans[index].backendPlan
+	}
+	if err := view.reader.ReleasePlan(releaseTarget); err != nil {
 		return transactionError(err)
 	}
 	view.used -= view.plans[index].bytes
@@ -411,10 +503,19 @@ func (view *transactionView) VectorizedScan(ctx context.Context, plan storage.Pu
 	if err := context.Cause(operation); err != nil {
 		return nil, transactionError(err)
 	}
-	if !slices.ContainsFunc(view.plans, func(registered transactionPlan) bool {
+	index := slices.IndexFunc(view.plans, func(registered transactionPlan) bool {
 		return registered.binding == plan.Binding
-	}) {
+	})
+	if index < 0 {
 		return nil, storage.ErrInvalidScanPlan
+	}
+	scanPlan := plan
+	if registered := view.plans[index]; registered.backendPlan != nil {
+		digest, err := storage.HashPushdownPlan(operation, plan, max(registered.bytes, uint64(64<<10)))
+		if err != nil || digest != registered.publicDigest {
+			return nil, storage.ErrInvalidScanPlan
+		}
+		scanPlan = *registered.backendPlan
 	}
 	retained := view.cursors[:0]
 	for _, cursor := range view.cursors {
@@ -427,7 +528,7 @@ func (view *transactionView) VectorizedScan(ctx context.Context, plan storage.Pu
 	if !view.transaction.reserveResource() {
 		return nil, errTransactionBudget
 	}
-	cursor, err := view.reader.VectorizedScan(operation, plan)
+	cursor, err := view.reader.VectorizedScan(operation, scanPlan)
 	if err != nil {
 		view.transaction.resources.Add(-1)
 		return nil, transactionError(err)

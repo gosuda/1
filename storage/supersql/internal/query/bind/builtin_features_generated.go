@@ -265,8 +265,6 @@ func builtinSettingFeature(name string) (FeatureID, bool) {
 	switch name {
 	case "is_superuser":
 		return "authorization", true
-	case "role":
-		return "authorization", true
 	case "session_authorization":
 		return "authorization", true
 	case "allow_alter_system":
