@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -66,6 +67,9 @@ func RestorePITR(ctx context.Context, baseBackupDir string, walArchiveDir string
 func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir string, targetTS model.Timestamp, options RestoreOptions) (result PITRResult, err error) {
 	if err := options.Limits.Validate(); err != nil {
 		return result, err
+	}
+	if options.MaxWALBytes == 0 || options.MaxWALBytes > uint64(math.MaxInt)-2*pitrCommitHeaderSize {
+		return result, ErrLimit
 	}
 	if nilDependency(options.Verifier) || len(chainDirs) == 0 || walArchiveDir == "" || targetTS <= 0 {
 		return result, ErrInvalid
@@ -181,6 +185,9 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
+		if pos != expectedPos {
+			return result, fmt.Errorf("missing archived WAL segment at position %d (found %d): %w", expectedPos, pos, ErrCorrupt)
+		}
 		meta, hasMeta, err := readWALMetaSidecar(archiveRoot, pos)
 		if err != nil {
 			return result, err
@@ -194,17 +201,10 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 					return result, ErrInvalidEncryptionKey
 				}
 			}
-			if meta.CommitTS > targetTS {
-				// Cleanly stop before the first commit past targetTS.
-				break
-			}
-		}
-		if pos != expectedPos {
-			return result, fmt.Errorf("missing archived WAL segment at position %d (found %d): %w", expectedPos, pos, ErrCorrupt)
 		}
 
 		walName := pitrCommitName(pos)
-		plainWAL, err := readArchivedWALSegment(ctx, archiveRoot, walName, meta, hasMeta, archiveCipher, options.Limits)
+		plainWAL, err := readArchivedWALSegment(ctx, archiveRoot, walName, meta, hasMeta, archiveCipher, options.Limits, options.MaxWALBytes)
 		if err != nil {
 			return result, err
 		}
@@ -222,6 +222,7 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 			return result, fmt.Errorf("archived WAL %q non-monotonic commitTS %d <= %d: %w", walName, walCommitTS, recoveredTS, ErrCorrupt)
 		}
 		if walCommitTS > targetTS {
+			// Only a verified segment can establish the recovery cutoff.
 			break
 		}
 
@@ -320,7 +321,7 @@ func readWALMetaSidecar(archiveRoot *os.Root, pos uint64) (meta archivedWALMeta,
 	return meta, true, nil
 }
 
-func readArchivedWALSegment(ctx context.Context, archiveRoot *os.Root, walName string, meta archivedWALMeta, hasMeta bool, archiveCipher *backupCipher, limits Limits) (_ []byte, err error) {
+func readArchivedWALSegment(ctx context.Context, archiveRoot *os.Root, walName string, meta archivedWALMeta, hasMeta bool, archiveCipher *backupCipher, limits Limits, maxWALBytes uint64) (_ []byte, err error) {
 	f, err := openRegular(archiveRoot, walName)
 	if err != nil {
 		return nil, err
@@ -336,28 +337,43 @@ func readArchivedWALSegment(ctx context.Context, archiveRoot *os.Root, walName s
 	if hasMeta && uint64(info.Size()) != meta.Size {
 		return nil, ErrCorrupt
 	}
-	raw := make([]byte, int(info.Size()))
-	if _, err := io.ReadFull(f, raw); err != nil {
+	var magic [4]byte
+	if _, err := f.ReadAt(magic[:], 0); err != nil {
 		return nil, errors.Join(ErrCorrupt, err)
 	}
-	if hasMeta && meta.SHA256 != "" {
-		sum := sha256.Sum256(raw)
-		if hex.EncodeToString(sum[:]) != meta.SHA256 {
-			return nil, ErrCorrupt
-		}
+	encrypted := string(magic[:]) == encryptionMagic
+	if hasMeta && encrypted != meta.Encrypted {
+		return nil, ErrCorrupt
 	}
-	if string(raw[:4]) == encryptionMagic {
+	digest := sha256.New()
+	source := io.TeeReader(f, digest)
+	maxPlain := maxWALBytes + 2*pitrCommitHeaderSize
+	var raw []byte
+	if encrypted {
 		if archiveCipher == nil {
 			return nil, ErrInvalidEncryptionKey
 		}
 		var plain bytes.Buffer
-		limit := limits.MaxFileBytes
-		if _, _, err := decryptStreamWithCipher(ctx, &plain, bytes.NewReader(raw), archiveCipher, &limit); err != nil {
+		// The encrypted input is streamed. Its declared file size must never
+		// determine an allocation; the configured WAL body limit bounds the
+		// plaintext buffer before each authenticated chunk is appended.
+		if _, _, err := decryptStreamWithCipher(ctx, &plain, source, archiveCipher, &maxPlain); err != nil {
 			return nil, err
 		}
-		return plain.Bytes(), nil
+		raw = plain.Bytes()
+	} else {
+		if uint64(info.Size()) > maxPlain {
+			return nil, ErrLimit
+		}
+		raw = make([]byte, int(info.Size()))
+		if _, err := io.ReadFull(source, raw); err != nil {
+			return nil, errors.Join(ErrCorrupt, err)
+		}
+		if err := requireEOF(ctx, source); err != nil {
+			return nil, err
+		}
 	}
-	if hasMeta && meta.Encrypted {
+	if hasMeta && meta.SHA256 != "" && hex.EncodeToString(digest.Sum(nil)) != meta.SHA256 {
 		return nil, ErrCorrupt
 	}
 	return raw, nil
