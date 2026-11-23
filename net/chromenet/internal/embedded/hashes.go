@@ -6,7 +6,7 @@ import "gosuda.org/hqq/secureexec"
 
 const (
 	// Version is the release that built the embedded binaries.
-	Version = "v0.2.101570810307800"
+	Version = "v0.2.101570810307801"
 	// ChromiumVersion is the Chromium release whose network stack they contain.
 	ChromiumVersion = "157.0.8103.78"
 )
@@ -14,12 +14,12 @@ const (
 // ReleaseHashes maps "<GOOS>/<GOARCH>" to the SHA-256 digest of the embedded
 // chrome_net_server binary.
 var ReleaseHashes = map[string]secureexec.Hash{
-	"darwin/amd64":  mustHash("8b15e8185b17de0f3b072f7d11b9be431de343bc77e9babf7079713e44f0b84b"),
-	"darwin/arm64":  mustHash("9c5e9a4de69c6f7caf4e5e0bfbf36973477a54920971864ab678dae05033298e"),
-	"linux/amd64":   mustHash("f087e5610285c3b471d3c82a5a54bc4e0795705173787e90419e65008c2f10d5"),
-	"linux/arm64":   mustHash("0fa2d74b6cd453fafc372835cae6c33badfa971db072b03011390beb971290b5"),
-	"windows/amd64": mustHash("a51084a11228476be30f248dc674b4356d8c8e505de6fc928088fafbf5111f4f"),
-	"windows/arm64": mustHash("1ae66c6451a46ee692c131184c92610249fde2e36faedc9689822be1dc9b7b00"),
+	"darwin/amd64":  mustHash("20082de31eadd9f42f2ddd8feabe0e66d444b269bffe5f851758af953e5e19c9"),
+	"darwin/arm64":  mustHash("5e94473f55f4e804af0f20d8b43e8c6bb9e0677694229f38859a9f9b7bda3e7e"),
+	"linux/amd64":   mustHash("b4bfca1d14685412f0a77a6ee307bc946392c1c52ad6c7e5a5c5760faa96ee91"),
+	"linux/arm64":   mustHash("1c9f1bf31c2c7fef8ec558efcc31e2daa60cf3c0dc44264e39ba93d0b2ae0eb4"),
+	"windows/amd64": mustHash("b10f005e1abf81da64714b5fc0e4f16f270084c4c7f8a9991b28b0b4d6f58467"),
+	"windows/arm64": mustHash("afacd01451a9006239319a9d987f3085ff653e5f18d5287557bdeb6b0965e80c"),
 }
 
 // ExpectedHash returns the pinned SHA-256 digest of chrome_net_server for goos/goarch.
