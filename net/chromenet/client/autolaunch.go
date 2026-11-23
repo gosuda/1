@@ -65,17 +65,30 @@ func StartServer(ctx context.Context, args ...string) (*launch.Server, error) {
 }
 
 // defaultPoolSize bounds the requests in flight through DefaultPool: each request holds one
-// engine session until its response body is closed.
-const defaultPoolSize = 64
+// engine session until its response body is closed. Surplus idle sessions above defaultPoolMaxIdle
+// are closed after defaultPoolIdleTimeout to bound idle memory and thread count in the worker.
+const (
+	defaultPoolSize        = 64
+	defaultPoolMaxIdle     = 4
+	defaultPoolIdleTimeout = 60 * time.Second
+)
 
-var (
-	sharedMu   sync.Mutex
-	sharedSrv  *launch.Server
-	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
-		return Open(ctx)
+func newManagedPool(max int, opts rt.Options) *rt.Pool[*Client] {
+	p := rt.NewPool(max, func(ctx context.Context) (*Client, error) {
+		return OpenWith(ctx, opts)
 	}, func(c *Client) error {
+		evictSessionEngine(c)
 		return c.Close()
 	})
+	p.SetIdleTimeout(defaultPoolMaxIdle, defaultPoolIdleTimeout)
+	return p
+}
+
+var (
+	sharedMu         sync.Mutex
+	sharedSrv        *launch.Server
+	sharedPool       = newManagedPool(defaultPoolSize, DefaultOptions())
+	sharedUploadPool = newManagedPool(defaultPoolSize, DefaultOptions())
 )
 
 // EnsureRunning guarantees that a shared server process is active and ready
@@ -146,13 +159,17 @@ func DefaultPool() *rt.Pool[*Client] {
 	return sharedPool
 }
 
+// defaultUploadPool returns the dedicated process-wide pool used by concurrent request body
+// uploads so streaming uploads cannot deadlock DefaultPool under high concurrency.
+func defaultUploadPool() *rt.Pool[*Client] {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	return sharedUploadPool
+}
+
 // NewClientPool returns a dedicated client connection pool with at most max connections.
 func NewClientPool(max int, opts rt.Options) *rt.Pool[*Client] {
-	return rt.NewPool(max, func(ctx context.Context) (*Client, error) {
-		return OpenWith(ctx, opts)
-	}, func(c *Client) error {
-		return c.Close()
-	})
+	return newManagedPool(max, opts)
 }
 
 // Shutdown terminates the shared background server and closes pooled client sessions.
@@ -160,11 +177,9 @@ func Shutdown() error {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 	_ = sharedPool.Close()
-	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
-		return Open(ctx)
-	}, func(c *Client) error {
-		return c.Close()
-	})
+	_ = sharedUploadPool.Close()
+	sharedPool = newManagedPool(defaultPoolSize, DefaultOptions())
+	sharedUploadPool = newManagedPool(defaultPoolSize, DefaultOptions())
 	if sharedSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -180,11 +195,9 @@ func ResetSharedServerForTesting() {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 	_ = sharedPool.Close()
-	sharedPool = rt.NewPool(defaultPoolSize, func(ctx context.Context) (*Client, error) {
-		return Open(ctx)
-	}, func(c *Client) error {
-		return c.Close()
-	})
+	_ = sharedUploadPool.Close()
+	sharedPool = newManagedPool(defaultPoolSize, DefaultOptions())
+	sharedUploadPool = newManagedPool(defaultPoolSize, DefaultOptions())
 	if sharedSrv != nil {
 		_ = sharedSrv.Close()
 		sharedSrv = nil

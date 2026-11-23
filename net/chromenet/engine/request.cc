@@ -28,6 +28,7 @@
 #include "net/traffic_annotation/network_traffic_annotation.h"
 #include "net/url_request/redirect_info.h"
 #include "net/url_request/url_request_context.h"
+#include "third_party/chromenet/chrome_net.h"
 #include "third_party/chromenet/internal.h"
 
 namespace chromenet {
@@ -90,10 +91,33 @@ void RequestCore::CompleteRead(const char* data, int result) {
   cv_.Broadcast();
 }
 
-void RequestCore::CompleteWrite(int result) {
+void RequestCore::CompleteWrite(uint32_t epoch, int result) {
   base::AutoLock hold(lock_);
+  if (!write_pending_ || write_epoch_ != epoch) {
+    return;
+  }
   write_pending_ = false;
   write_result_ = result;
+  cv_.Broadcast();
+}
+
+void RequestCore::RequestRewind(uint32_t new_epoch) {
+  base::AutoLock hold(lock_);
+  if (finished_) {
+    return;
+  }
+  current_epoch_ = new_epoch;
+  write_pending_ = false;
+  cv_.Broadcast();
+}
+
+void RequestCore::UploadDestroyed() {
+  base::AutoLock hold(lock_);
+  upload_closed_ = true;
+  if (write_pending_) {
+    write_pending_ = false;
+    write_result_ = finished_ ? error_ : net::ERR_ABORTED;
+  }
   cv_.Broadcast();
 }
 
@@ -136,24 +160,50 @@ size_t RequestCore::WaitRead(char* buf, size_t cap, bool* eof, int* net_error) {
   return 0;
 }
 
-void RequestCore::BeginWrite() {
+int RequestCore::BeginWrite(uint32_t epoch) {
   base::AutoLock hold(lock_);
+  if (finished_) {
+    return error_ != net::OK ? error_ : net::ERR_ABORTED;
+  }
+  if (epoch < current_epoch_) {
+    return CHROME_NET_REWIND;
+  }
+  if (epoch > current_epoch_) {
+    return net::ERR_INVALID_ARGUMENT;
+  }
+  if (upload_closed_) {
+    return net::ERR_ABORTED;
+  }
+  write_epoch_ = epoch;
   write_result_ = net::OK;
-  write_pending_ = !finished_;
+  write_pending_ = true;
+  return net::OK;
 }
 
-int RequestCore::WaitWrite() {
+int RequestCore::WaitWrite(uint32_t epoch, bool wait_for_head) {
   base::AutoLock hold(lock_);
-  while (write_pending_ && !finished_) {
+  for (;;) {
+    if (finished_) {
+      write_pending_ = false;
+      return error_;
+    }
+    if (current_epoch_ > epoch) {
+      write_pending_ = false;
+      return CHROME_NET_REWIND;
+    }
+    if (!write_pending_) {
+      if (write_result_ != net::OK) {
+        return write_result_;
+      }
+      if (!wait_for_head || head_ready_ || upload_closed_) {
+        return net::OK;
+      }
+    } else if (upload_closed_) {
+      write_pending_ = false;
+      return net::ERR_ABORTED;
+    }
     cv_.Wait();
   }
-  if (write_pending_) {
-    // The request ended before the network stack consumed the chunk. A clean end (the server
-    // answered without reading the whole body) drops the rest of the body.
-    write_pending_ = false;
-    return error_;
-  }
-  return write_result_;
 }
 
 // ParseRequestHead --------------------------------------------------------------------------
@@ -201,22 +251,87 @@ bool ParseRequestHead(const char* data, size_t len, RequestParams* out) {
   return true;
 }
 
+// MemoryUpload ------------------------------------------------------------------------------
+
+// An in-memory upload body delivered inline with chrome_request_start. Supports unlimited rewinds
+// natively without round-tripping to the Go client.
+class MemoryUpload : public net::UploadDataStream {
+ public:
+  explicit MemoryUpload(std::string data)
+      : net::UploadDataStream(/*is_chunked=*/false, /*identifier=*/0), data_(std::move(data)) {}
+  MemoryUpload(const MemoryUpload&) = delete;
+  MemoryUpload& operator=(const MemoryUpload&) = delete;
+  ~MemoryUpload() override = default;
+
+ private:
+  int InitInternal(const net::NetLogWithSource& net_log) override {
+    offset_ = 0;
+    SetSize(data_.size());
+    return net::OK;
+  }
+
+  int ReadInternal(net::IOBuffer* buf, int buf_len) override {
+    size_t n = std::min(data_.size() - offset_, static_cast<size_t>(buf_len));
+    if (n > 0) {
+      memcpy(buf->data(), data_.data() + offset_, n);
+      offset_ += n;
+    }
+    return static_cast<int>(n);
+  }
+
+  void ResetInternal() override { offset_ = 0; }
+
+  const std::string data_;
+  size_t offset_ = 0;
+};
+
 // PipeUpload --------------------------------------------------------------------------------
 
-// An upload body that the session thread feeds one chunk at a time. A chunk is acknowledged
-// (RequestCore::CompleteWrite) once the network stack consumed all of it, so a session never has
-// more than one chunk in flight. The stream cannot rewind.
+// An upload body that a session thread feeds one chunk at a time. A chunk is acknowledged
+// (RequestCore::CompleteWrite) once the network stack consumed all of it, so a writer never has
+// more than one chunk in flight. When `can_rewind` is true, InitInternal() after a retry asks
+// the Go client to replay the body from byte 0 at epoch+1.
 class PipeUpload : public net::UploadDataStream {
  public:
-  PipeUpload(int64_t body_len, scoped_refptr<RequestCore> core)
+  PipeUpload(int64_t body_len, bool can_rewind, scoped_refptr<RequestCore> core)
       : net::UploadDataStream(/*is_chunked=*/body_len < 0, /*identifier=*/0),
         size_(body_len < 0 ? 0 : static_cast<uint64_t>(body_len)),
+        can_rewind_(can_rewind),
         core_(std::move(core)) {}
   PipeUpload(const PipeUpload&) = delete;
   PipeUpload& operator=(const PipeUpload&) = delete;
-  ~PipeUpload() override = default;
+  ~PipeUpload() override { core_->UploadDestroyed(); }
 
-  void Append(std::string data, bool eof) {
+  void Append(uint32_t epoch, std::string data, bool eof) {
+    if (epoch != epoch_) {
+      // Stale chunk from an older epoch; RequestCore already woke the caller with CHROME_NET_REWIND.
+      return;
+    }
+    if (waiting_for_rewind_) {
+      if (data.empty() && !eof) {
+        core_->CompleteWrite(epoch_, net::OK);
+        return;
+      }
+      waiting_for_rewind_ = false;
+      offset_ = 0;
+      final_ = false;
+      if (data.empty()) {
+        chunk_.clear();
+        outstanding_ = false;
+        eof_ = true;
+        pending_empty_eof_ = true;
+      } else {
+        chunk_ = std::move(data);
+        outstanding_ = true;
+        eof_ = eof;
+        pending_empty_eof_ = false;
+      }
+      if (!is_chunked()) {
+        SetSize(size_);
+      }
+      OnInitCompleted(net::OK);
+      return;
+    }
     chunk_ = std::move(data);
     offset_ = 0;
     if (chunk_.empty()) {
@@ -224,10 +339,13 @@ class PipeUpload : public net::UploadDataStream {
         MarkFinal();
         if (pending_buf_) {
           pending_buf_ = nullptr;
+          pending_len_ = 0;
+          core_->CompleteWrite(epoch_, net::OK);
           OnReadCompleted(0);
+          return;
         }
       }
-      core_->CompleteWrite(net::OK);
+      core_->CompleteWrite(epoch_, net::OK);
       return;
     }
     eof_ = eof;
@@ -235,14 +353,32 @@ class PipeUpload : public net::UploadDataStream {
     if (pending_buf_) {
       int n = Fill(pending_buf_.get(), pending_len_);
       pending_buf_ = nullptr;
+      pending_len_ = 0;
       OnReadCompleted(n);
     }
   }
 
  private:
+  static constexpr int kMaxRewinds = 5;
+
   int InitInternal(const net::NetLogWithSource& net_log) override {
     if (started_) {
-      return net::ERR_UPLOAD_STREAM_REWIND_NOT_SUPPORTED;
+      if (!can_rewind_ || rewind_count_ >= kMaxRewinds) {
+        return net::ERR_UPLOAD_STREAM_REWIND_NOT_SUPPORTED;
+      }
+      rewind_count_++;
+      epoch_++;
+      chunk_.clear();
+      offset_ = 0;
+      outstanding_ = false;
+      eof_ = false;
+      final_ = false;
+      pending_empty_eof_ = false;
+      pending_buf_ = nullptr;
+      pending_len_ = 0;
+      waiting_for_rewind_ = true;
+      core_->RequestRewind(epoch_);
+      return net::ERR_IO_PENDING;
     }
     if (!is_chunked()) {
       SetSize(size_);
@@ -255,6 +391,12 @@ class PipeUpload : public net::UploadDataStream {
     if (outstanding_) {
       return Fill(buf, buf_len);
     }
+    if (pending_empty_eof_) {
+      pending_empty_eof_ = false;
+      MarkFinal();
+      core_->CompleteWrite(epoch_, net::OK);
+      return 0;
+    }
     if (final_) {
       return 0;
     }
@@ -266,6 +408,7 @@ class PipeUpload : public net::UploadDataStream {
   void ResetInternal() override {
     pending_buf_ = nullptr;
     pending_len_ = 0;
+    waiting_for_rewind_ = false;
   }
 
   int Fill(net::IOBuffer* buf, int buf_len) {
@@ -279,7 +422,7 @@ class PipeUpload : public net::UploadDataStream {
       if (eof_) {
         MarkFinal();
       }
-      core_->CompleteWrite(net::OK);
+      core_->CompleteWrite(epoch_, net::OK);
     }
     return static_cast<int>(n);
   }
@@ -295,7 +438,12 @@ class PipeUpload : public net::UploadDataStream {
   }
 
   const uint64_t size_;
+  const bool can_rewind_;
   const scoped_refptr<RequestCore> core_;
+  uint32_t epoch_ = 0;
+  int rewind_count_ = 0;
+  bool waiting_for_rewind_ = false;
+  bool pending_empty_eof_ = false;
   std::string chunk_;
   size_t offset_ = 0;
   bool outstanding_ = false;
@@ -308,8 +456,11 @@ class PipeUpload : public net::UploadDataStream {
 
 // Job ---------------------------------------------------------------------------------------
 
-Job::Job(scoped_refptr<SharedContext> shared, scoped_refptr<RequestCore> core)
-    : shared_(std::move(shared)), core_(std::move(core)) {}
+Job::Job(scoped_refptr<SharedContext> shared, scoped_refptr<RequestCore> core, bool can_rewind)
+    : base::RefCountedDeleteOnSequence<Job>(NetRunner()),
+      shared_(std::move(shared)),
+      core_(std::move(core)),
+      can_rewind_(can_rewind) {}
 
 Job::~Job() {
   upload_ = nullptr;
@@ -318,6 +469,9 @@ Job::~Job() {
 }
 
 void Job::Start(RequestParams params) {
+  if (done_) {
+    return;
+  }
   net::URLRequestContext* context = shared_->context();
   if (!context) {
     Fail(net::ERR_FAILED);
@@ -328,8 +482,12 @@ void Job::Start(RequestParams params) {
   request_->set_method(params.method);
   request_->SetExtraRequestHeaders(params.headers);
   request_->SetLoadFlags(net::LOAD_DISABLE_CACHE | net::LOAD_DO_NOT_SAVE_COOKIES);
-  if (params.body_len != 0) {
-    auto upload = std::make_unique<PipeUpload>(params.body_len, core_);
+  if (params.body_complete) {
+    if (!params.initial_body.empty()) {
+      request_->set_upload(std::make_unique<MemoryUpload>(std::move(params.initial_body)));
+    }
+  } else if (params.body_len != 0) {
+    auto upload = std::make_unique<PipeUpload>(params.body_len, params.can_rewind, core_);
     upload_ = upload.get();
     request_->set_upload(std::move(upload));
   }
@@ -354,12 +512,12 @@ void Job::Read(size_t cap) {
   }
 }
 
-void Job::Write(std::string data, bool eof) {
+void Job::Write(uint32_t epoch, std::string data, bool eof) {
   if (done_ || !upload_) {
-    core_->CompleteWrite(upload_ ? net::OK : net::ERR_UNEXPECTED);
+    core_->CompleteWrite(epoch, upload_ ? net::OK : net::ERR_UNEXPECTED);
     return;
   }
-  upload_->Append(std::move(data), eof);
+  upload_->Append(epoch, std::move(data), eof);
 }
 
 void Job::Cancel() {

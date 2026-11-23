@@ -9,11 +9,20 @@ service chrome_net;
 include "chrome_net.h";
 
 const CHROME_NET_OK: i32 = 0;
+const CHROME_NET_REWIND: i32 = 1;
 const CHROME_NET_MAX_OPTS: u32 = 65536;
 const CHROME_NET_MAX_HEAD: u32 = 1048576;
 const CHROME_NET_MAX_CHUNK: u32 = 1048576;
 const CHROME_NET_MAX_DATAGRAM: u32 = 65536;
 const CHROME_NET_MAX_REASON: u32 = 1024;
+
+// Flags for chrome_request_start.
+const CHROME_REQ_CAN_REWIND: u32 = 1;
+const CHROME_REQ_BODY_COMPLETE: u32 = 2;
+
+// Flags for chrome_request_write.
+const CHROME_WRITE_EOF: u32 = 1;
+const CHROME_WRITE_ABORT: u32 = 2;
 
 // An engine is one shared URLRequestContext (connection pools, HTTP/2 and QUIC sessions, DNS
 // cache). Engines created with identical options in different sessions share that context.
@@ -34,15 +43,23 @@ fn chrome_engine_create(opts: bytes<=CHROME_NET_MAX_OPTS, opts_len: size @len_of
 fn chrome_engine_destroy(e: Engine) -> i32;
 
 // head is "METHOD URL\n" followed by "Name: value\n" header lines. body_len is -1 for a chunked
-// body, 0 for no body, or the exact body length.
+// body, 0 for no body, or the exact body length. When CHROME_REQ_BODY_COMPLETE is set in flags,
+// init_body holds the entire request body and no chrome_request_write calls follow. Otherwise, when
+// body_len != 0, out id identifies the request for chrome_request_write calls (which may run
+// concurrently on another session). CHROME_REQ_CAN_REWIND tells the engine that the caller can
+// replay the body from byte 0 if chrome_request_write returns CHROME_NET_REWIND.
 @error(null)
 fn chrome_request_start(e: Engine, head: bytes<=CHROME_NET_MAX_HEAD, head_len: size @len_of(head),
-                        body_len: i64) -> Request;
+                        body_len: i64, flags: u32,
+                        init_body: bytes<=CHROME_NET_MAX_CHUNK, init_body_len: size @len_of(init_body),
+                        out id: u64) -> Request;
 
-// Appends request body bytes and returns once the network stack consumed them, or the request
-// ended. Returns 0 or a negative net::Error code.
-fn chrome_request_write(r: Request, data: bytes<=CHROME_NET_MAX_CHUNK, data_len: size @len_of(data),
-                        eof: bool) -> i32;
+// Appends request body bytes for request `id` at `epoch` (0 initially, incremented after each
+// CHROME_NET_REWIND). flags may include CHROME_WRITE_EOF or CHROME_WRITE_ABORT. Returns 0,
+// CHROME_NET_REWIND (1) when the network stack needs the body replayed from byte 0 at epoch+1, or
+// a negative net::Error code.
+fn chrome_request_write(id: u64, epoch: u32, flags: u32,
+                        data: bytes<=CHROME_NET_MAX_CHUNK, data_len: size @len_of(data)) -> i32;
 
 // Waits for the response head and returns 0 or a negative net::Error code. The head is
 // "CODE PROTOCOL REDIRECT\nSTATUS TEXT\n" followed by "Name: value\n" header lines.

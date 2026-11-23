@@ -12,6 +12,13 @@ extern "C" {
 #endif
 
 #define CHROME_NET_OK 0
+#define CHROME_NET_REWIND 1
+
+#define CHROME_REQ_CAN_REWIND 1u
+#define CHROME_REQ_BODY_COMPLETE 2u
+
+#define CHROME_WRITE_EOF 1u
+#define CHROME_WRITE_ABORT 2u
 
 typedef struct chrome_engine chrome_engine_t;
 typedef struct chrome_request chrome_request_t;
@@ -22,8 +29,10 @@ chrome_engine_t *chrome_engine_create(const void *opts, size_t opts_len);
 int32_t chrome_engine_destroy(chrome_engine_t *e);
 
 chrome_request_t *chrome_request_start(chrome_engine_t *e, const void *head, size_t head_len,
-                                       int64_t body_len);
-int32_t chrome_request_write(chrome_request_t *r, const void *data, size_t data_len, bool eof);
+                                       int64_t body_len, uint32_t flags, const void *init_body,
+                                       size_t init_body_len, uint64_t *id);
+int32_t chrome_request_write(uint64_t id, uint32_t epoch, uint32_t flags, const void *data,
+                             size_t data_len);
 int32_t chrome_request_wait(chrome_request_t *r, void *head, size_t head_cap, size_t *head_len);
 size_t chrome_request_read(chrome_request_t *r, void *buf, size_t buf_cap, bool *eof,
                            int32_t *net_error);

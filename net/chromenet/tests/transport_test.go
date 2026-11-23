@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -763,5 +765,447 @@ func TestTransport_EarlyBodyCloseReleasesSession(t *testing.T) {
 		if err := resp.Body.Close(); err != nil {
 			t.Fatalf("Close %d: %v", i, err)
 		}
+	}
+}
+
+func TestTransport_SequentialConnectionReuse(t *testing.T) {
+	t.Run("HTTP/1.1", func(t *testing.T) {
+		var mu sync.Mutex
+		var addrs []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			addrs = append(addrs, r.RemoteAddr)
+			mu.Unlock()
+			_, _ = io.WriteString(w, "ok")
+		}))
+		defer srv.Close()
+
+		tr := newTransport(t, client.Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		for i := range 5 {
+			resp, body := roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, srv.URL, nil))
+			if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+				t.Fatalf("req %d: got %d %q", i, resp.StatusCode, body)
+			}
+			// Brief idle gap so in-flight concurrency drops to 0 between requests.
+			time.Sleep(15 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(addrs) != 5 {
+			t.Fatalf("got %d requests; want 5", len(addrs))
+		}
+		for i := 1; i < len(addrs); i++ {
+			if addrs[i] != addrs[0] {
+				t.Errorf("request %d used RemoteAddr %s; want reused %s (all: %v)", i, addrs[i], addrs[0], addrs)
+			}
+		}
+	})
+
+	t.Run("HTTP/2", func(t *testing.T) {
+		var mu sync.Mutex
+		var addrs []string
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			addrs = append(addrs, r.RemoteAddr)
+			mu.Unlock()
+			_, _ = io.WriteString(w, "h2")
+		}))
+		srv.EnableHTTP2 = true
+		srv.StartTLS()
+		defer srv.Close()
+
+		tr := newTransport(t, client.Options{InsecureSkipVerify: true, DisableQUIC: true})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		for i := range 5 {
+			resp, body := roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, srv.URL, nil))
+			if resp.ProtoMajor != 2 || string(body) != "h2" {
+				t.Fatalf("req %d: proto=%d body=%q", i, resp.ProtoMajor, body)
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(addrs) != 5 {
+			t.Fatalf("got %d requests; want 5", len(addrs))
+		}
+		for i := 1; i < len(addrs); i++ {
+			if addrs[i] != addrs[0] {
+				t.Errorf("request %d used RemoteAddr %s; want reused %s (all: %v)", i, addrs[i], addrs[0], addrs)
+			}
+		}
+	})
+
+	t.Run("survives zero active engine handles", func(t *testing.T) {
+		var mu sync.Mutex
+		var addrs []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			addrs = append(addrs, r.RemoteAddr)
+			mu.Unlock()
+			_, _ = io.WriteString(w, "ok")
+		}))
+		defer srv.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		// Use a dedicated options value and close the pool between requests so active engine
+		// handles on the server drop to 0; the server's idle SharedContext TTL must preserve the
+		// keep-alive socket.
+		ua := fmt.Sprintf("chromenet-ttl-test-%d", time.Now().UnixNano())
+		for i := range 2 {
+			pool := client.NewClientPool(1, client.DefaultOptions())
+			tr := client.NewTransport(client.Options{UserAgent: ua, Pool: pool})
+			_, body := roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, srv.URL, nil))
+			if string(body) != "ok" {
+				t.Fatalf("req %d: body=%q", i, body)
+			}
+			_ = tr.Close()
+			_ = pool.Close()
+			time.Sleep(50 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(addrs) != 2 || addrs[0] != addrs[1] {
+			t.Errorf("expected connection reuse across zero active handles; got RemoteAddrs %v", addrs)
+		}
+	})
+}
+
+// startDropOnceUploadServer accepts HTTP/1.1 connections:
+//   - On conn 1: answers GET /warm with keep-alive, then reads headers + dropAfterBytes of the
+//     next POST /upload and closes the socket with no response (simulating a stale keep-alive drop).
+//   - On conn 2: reads the full POST /upload body and responds 200 with "<len> <sha256>".
+func startDropOnceUploadServer(t *testing.T, dropAfterBytes int64) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	readHTTPHead := func(br *bufio.Reader) (string, int64, error) {
+		reqLine, err := br.ReadString('\n')
+		if err != nil {
+			return "", 0, err
+		}
+		var cl int64
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return "", 0, err
+			}
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				break
+			}
+			if k, v, ok := strings.Cut(trimmed, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "Content-Length") {
+				cl, _ = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			}
+		}
+		return strings.TrimSpace(reqLine), cl, nil
+	}
+
+	var connNum atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			id := connNum.Add(1)
+			go func(conn net.Conn, connID int32) {
+				defer conn.Close()
+				br := bufio.NewReaderSize(conn, 64<<10)
+				for {
+					reqLine, cl, err := readHTTPHead(br)
+					if err != nil {
+						return
+					}
+					if strings.HasPrefix(reqLine, "GET /warm ") {
+						_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok")
+						continue
+					}
+					if connID == 1 {
+						// Drop the reused keep-alive connection during/after reading dropAfterBytes.
+						toRead := cl
+						if dropAfterBytes >= 0 && dropAfterBytes < toRead {
+							toRead = dropAfterBytes
+						}
+						if toRead > 0 {
+							_, _ = io.CopyN(io.Discard, br, toRead)
+						}
+						return
+					}
+					body := make([]byte, cl)
+					if _, err := io.ReadFull(br, body); err != nil {
+						return
+					}
+					reply := fmt.Sprintf("%d %s", len(body), sha256Hex(body))
+					_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reply), reply)
+					return
+				}
+			}(c, id)
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+func TestTransport_UploadRewind(t *testing.T) {
+	t.Run("inline small body rewinds without GetBody", func(t *testing.T) {
+		baseURL := startDropOnceUploadServer(t, -1)
+		tr := newTransport(t, client.Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		_, body := roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, baseURL+"/warm", nil))
+		if string(body) != "ok" {
+			t.Fatalf("warm body = %q", body)
+		}
+
+		payload := pseudoRandomBytes(64<<10+13, 11)
+		req := newRequest(t, ctx, http.MethodPost, baseURL+"/upload", io.NopCloser(bytes.NewReader(payload)))
+		req.ContentLength = int64(len(payload))
+		req.GetBody = nil
+
+		resp, got := roundTrip(t, tr, req)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d; body %q", resp.StatusCode, got)
+		}
+		if want := fmt.Sprintf("%d %s", len(payload), sha256Hex(payload)); string(got) != want {
+			t.Errorf("server received %q; want %q", got, want)
+		}
+	})
+
+	t.Run("streaming body mid-upload rewind with GetBody", func(t *testing.T) {
+		baseURL := startDropOnceUploadServer(t, 64<<10)
+		tr := newTransport(t, client.Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		_, _ = roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, baseURL+"/warm", nil))
+
+		payload := pseudoRandomBytes(2<<20+31, 12)
+		var getBodyCalls atomic.Int32
+		req := newRequest(t, ctx, http.MethodPost, baseURL+"/upload", bytes.NewReader(payload))
+		req.GetBody = func() (io.ReadCloser, error) {
+			getBodyCalls.Add(1)
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		}
+
+		resp, got := roundTrip(t, tr, req)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d; body %q", resp.StatusCode, got)
+		}
+		if want := fmt.Sprintf("%d %s", len(payload), sha256Hex(payload)); string(got) != want {
+			t.Errorf("server received %q; want %q", got, want)
+		}
+		if getBodyCalls.Load() < 1 {
+			t.Errorf("GetBody called %d times; want >= 1", getBodyCalls.Load())
+		}
+	})
+
+	t.Run("streaming body post-EOF rewind with GetBody", func(t *testing.T) {
+		baseURL := startDropOnceUploadServer(t, -1)
+		tr := newTransport(t, client.Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		_, _ = roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, baseURL+"/warm", nil))
+
+		payload := pseudoRandomBytes(2<<20+7, 13)
+		var getBodyCalls atomic.Int32
+		req := newRequest(t, ctx, http.MethodPost, baseURL+"/upload", bytes.NewReader(payload))
+		req.GetBody = func() (io.ReadCloser, error) {
+			getBodyCalls.Add(1)
+			return io.NopCloser(bytes.NewReader(payload)), nil
+		}
+
+		resp, got := roundTrip(t, tr, req)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d; body %q", resp.StatusCode, got)
+		}
+		if want := fmt.Sprintf("%d %s", len(payload), sha256Hex(payload)); string(got) != want {
+			t.Errorf("server received %q; want %q", got, want)
+		}
+		if getBodyCalls.Load() < 1 {
+			t.Errorf("GetBody called %d times; want >= 1", getBodyCalls.Load())
+		}
+	})
+
+	t.Run("streaming body without GetBody returns ERR_UPLOAD_STREAM_REWIND_NOT_SUPPORTED", func(t *testing.T) {
+		baseURL := startDropOnceUploadServer(t, 64<<10)
+		tr := newTransport(t, client.Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		_, _ = roundTrip(t, tr, newRequest(t, ctx, http.MethodGet, baseURL+"/warm", nil))
+
+		payload := pseudoRandomBytes(2<<20+19, 14)
+		req := newRequest(t, ctx, http.MethodPost, baseURL+"/upload", io.NopCloser(bytes.NewReader(payload)))
+		req.ContentLength = int64(len(payload))
+		req.GetBody = nil
+
+		resp, err := tr.RoundTrip(req)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatal("RoundTrip succeeded without GetBody although reused connection dropped mid-upload")
+		}
+		var ne *client.NetError
+		if !errors.As(err, &ne) {
+			t.Fatalf("error = %T %v; want *client.NetError", err, err)
+		}
+		if ne.Code != -25 {
+			t.Errorf("NetError = %s (%d); want ERR_UPLOAD_STREAM_REWIND_NOT_SUPPORTED (-25)", ne.Name, ne.Code)
+		}
+	})
+}
+
+func TestTransport_EarlyResponseDuringUpload(t *testing.T) {
+	run := func(t *testing.T, h2 bool) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			buf := make([]byte, 16)
+			_, _ = io.ReadFull(r.Body, buf)
+			if !h2 {
+				w.Header().Set("Connection", "close")
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, "too large")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		})
+		var srv *httptest.Server
+		var opts client.Options
+		if h2 {
+			srv = httptest.NewUnstartedServer(handler)
+			srv.EnableHTTP2 = true
+			srv.StartTLS()
+			opts = client.Options{InsecureSkipVerify: true, DisableQUIC: true}
+		} else {
+			srv = httptest.NewServer(handler)
+		}
+		defer srv.Close()
+
+		tr := newTransport(t, opts)
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		defer cancel()
+
+		pr, pw := io.Pipe()
+		unblock := make(chan struct{})
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			defer pw.Close()
+			if _, err := pw.Write([]byte("0123456789abcdef")); err != nil {
+				return
+			}
+			// Keep writing until the pipe is closed or test finishes.
+			chunk := bytes.Repeat([]byte("A"), 16<<10)
+			for {
+				select {
+				case <-unblock:
+					return
+				default:
+					if _, err := pw.Write(chunk); err != nil {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}()
+		defer func() {
+			close(unblock)
+			_ = pw.Close()
+			<-writerDone
+		}()
+
+		start := time.Now()
+		resp, err := tr.RoundTrip(newRequest(t, ctx, http.MethodPost, srv.URL, pr))
+		if err != nil {
+			t.Fatalf("RoundTrip: %v", err)
+		}
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			resp.Body.Close()
+			t.Fatalf("status = %d; want 413", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			resp.Body.Close()
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if string(body) != "too large" {
+			t.Errorf("body = %q; want %q", body, "too large")
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Errorf("early 413 response took %v; want < 5s", d)
+		}
+	}
+
+	t.Run("HTTP/1.1", func(t *testing.T) { run(t, false) })
+	t.Run("HTTP/2", func(t *testing.T) { run(t, true) })
+}
+
+func TestTransport_HTTP2FullDuplex(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		sc := bufio.NewScanner(r.Body)
+		for sc.Scan() {
+			_, _ = fmt.Fprintf(w, "echo:%s\n", sc.Text())
+			flusher.Flush()
+		}
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	tr := newTransport(t, client.Options{InsecureSkipVerify: true, DisableQUIC: true})
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	// RoundTrip must return 200 OK headers while the request body pipe is still open and empty.
+	resp, err := tr.RoundTrip(newRequest(t, ctx, http.MethodPost, srv.URL, pr))
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
+		t.Fatalf("got HTTP/%d status %d; want HTTP/2 200", resp.ProtoMajor, resp.StatusCode)
+	}
+
+	br := bufio.NewReader(resp.Body)
+	for i := range 5 {
+		msg := fmt.Sprintf("ping-%d", i)
+		if _, err := fmt.Fprintf(pw, "%s\n", msg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if want := "echo:" + msg + "\n"; line != want {
+			t.Errorf("round %d: got %q; want %q", i, line, want)
+		}
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close upload pipe: %v", err)
+	}
+	if rest, err := io.ReadAll(br); err != nil || len(rest) != 0 {
+		t.Errorf("trailing response = %q, %v; want empty EOF", rest, err)
 	}
 }

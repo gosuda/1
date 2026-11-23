@@ -1,11 +1,11 @@
 module gosuda.org/chromenet
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/quic-go/quic-go v0.62.0
 	github.com/quic-go/webtransport-go v0.13.0
-	gosuda.org/hqq v0.7.0
+	gosuda.org/hqq v0.7.1-0.20261123034544-cf951cab1124
 )
 
 require (

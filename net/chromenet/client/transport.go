@@ -101,10 +101,24 @@ func (e *NetError) Error() string {
 var ErrTransportClosed = errors.New("chromenet: transport closed")
 
 const (
-	netErrAborted = -3
-	maxChunk      = 1 << 20
-	headCap       = 1 << 20
+	netErrAborted   = -3
+	maxChunk        = 1 << 20
+	headCap         = 1 << 20
+	inlineBodyLimit = 256 << 10
 )
+
+type cachedEngine struct {
+	opts string
+	eng  Engine
+}
+
+// sessionEngines caches one Engine handle per pooled *Client session so sequential requests skip
+// ChromeEngineCreate / ChromeEngineDestroy RPCs and keep their URLRequestContext warm.
+var sessionEngines sync.Map // *Client -> *cachedEngine
+
+func evictSessionEngine(cl *Client) {
+	sessionEngines.Delete(cl)
+}
 
 // Transport implements net/http.RoundTripper on Chromium's network stack (HTTP/1.1, HTTP/2,
 // QUIC/HTTP/3 and BoringSSL) running in the chrome_net_server worker. It does not follow
@@ -128,6 +142,14 @@ func (t *Transport) pool() *rt.Pool[*Client] {
 	return DefaultPool()
 }
 
+// uploadPool returns the pool used by concurrent request body uploads.
+func (t *Transport) uploadPool() *rt.Pool[*Client] {
+	if t.opts.Pool != nil {
+		return t.opts.Pool
+	}
+	return defaultUploadPool()
+}
+
 // Close makes later RoundTrip calls fail. Responses already returned stay readable.
 func (t *Transport) Close() error {
 	t.closed.Store(true)
@@ -136,9 +158,10 @@ func (t *Transport) Close() error {
 
 // RoundTrip sends req through the Chromium network stack.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	bodyOwnedByUpload := false
 	if req.Body != nil {
 		defer func() {
-			if req.Body != nil {
+			if !bodyOwnedByUpload && req.Body != nil {
 				_ = req.Body.Close()
 			}
 		}()
@@ -170,11 +193,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	stop := context.AfterFunc(ctx, x.cancel)
 	x.stop = stop
 
-	resp, err := x.start(req, head)
+	resp, err := x.start(req, head, &bodyOwnedByUpload)
 	if err != nil {
 		x.release()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
+		}
+		if uerr := x.getUploadErr(); uerr != nil {
+			return nil, uerr
 		}
 		return nil, err
 	}
@@ -184,16 +210,62 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // exchange is one request on one engine session. The session stays checked out of the pool until
 // the response body is closed.
 type exchange struct {
-	t        *Transport
-	pool     *rt.Pool[*Client]
-	cl       *Client
-	ctx      context.Context
-	stop     func() bool
-	eng      Engine
-	req      Request
-	broken   bool
-	canceled atomic.Bool
-	once     sync.Once
+	t            *Transport
+	pool         *rt.Pool[*Client]
+	cl           *Client
+	ctx          context.Context
+	stop         func() bool
+	eng          Engine
+	req          Request
+	broken       bool
+	canceled     atomic.Bool
+	closing      atomic.Bool
+	once         sync.Once
+	uploadCancel context.CancelFunc
+	uploadDone   chan struct{}
+
+	uploadErrMu sync.Mutex
+	uploadErr   error
+
+	bodyMu  sync.Mutex
+	curBody io.Closer
+}
+
+func (x *exchange) setUploadErr(err error) {
+	if err == nil {
+		return
+	}
+	x.uploadErrMu.Lock()
+	if x.uploadErr == nil {
+		x.uploadErr = err
+	}
+	x.uploadErrMu.Unlock()
+}
+
+func (x *exchange) getUploadErr() error {
+	x.uploadErrMu.Lock()
+	defer x.uploadErrMu.Unlock()
+	return x.uploadErr
+}
+
+func (x *exchange) setCurrentBody(c io.Closer) {
+	x.bodyMu.Lock()
+	x.curBody = c
+	closed := x.closing.Load()
+	x.bodyMu.Unlock()
+	if closed && c != nil {
+		_ = c.Close()
+	}
+}
+
+func (x *exchange) closeCurrentBody() {
+	x.bodyMu.Lock()
+	c := x.curBody
+	x.curBody = nil
+	x.bodyMu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
 }
 
 func (x *exchange) cancel() {
@@ -201,10 +273,33 @@ func (x *exchange) cancel() {
 	_ = x.cl.Conn().Cancel()
 }
 
-func (x *exchange) start(req *http.Request, head []byte) (*http.Response, error) {
+func (x *exchange) acquireEngine() (Engine, error) {
+	optsStr := string(x.t.engOpts)
+	if v, ok := sessionEngines.Load(x.cl); ok {
+		ce := v.(*cachedEngine)
+		if ce.opts == optsStr && !ce.eng.IsNil() {
+			return ce.eng, nil
+		}
+		sessionEngines.Delete(x.cl)
+		if !ce.eng.IsNil() {
+			if err := x.cl.ChromeEngineDestroy(ce.eng); err != nil {
+				x.broken = true
+				return Engine{}, err
+			}
+		}
+	}
 	eng, err := x.cl.ChromeEngineCreate(x.t.engOpts)
 	if err != nil {
 		x.broken = true
+		return Engine{}, err
+	}
+	sessionEngines.Store(x.cl, &cachedEngine{opts: optsStr, eng: eng})
+	return eng, nil
+}
+
+func (x *exchange) start(req *http.Request, head []byte, bodyOwnedByUpload *bool) (*http.Response, error) {
+	eng, err := x.acquireEngine()
+	if err != nil {
 		return nil, err
 	}
 	x.eng = eng
@@ -216,17 +311,41 @@ func (x *exchange) start(req *http.Request, head []byte) (*http.Response, error)
 			bodyLen = -1 // unknown length: chunked upload
 		}
 	}
-	r, err := x.cl.ChromeRequestStart(eng, head, bodyLen)
+
+	var (
+		flags    uint32
+		initBody []byte
+	)
+	if bodyLen > 0 && bodyLen <= inlineBodyLimit {
+		// Small known-length body fast path: read inline so the engine uses a rewindable
+		// in-memory upload stream with zero extra RPCs or upload sessions.
+		b, rerr := io.ReadAll(io.LimitReader(req.Body, bodyLen+1))
+		if rerr != nil {
+			return nil, fmt.Errorf("chromenet: read request body: %w", rerr)
+		}
+		if int64(len(b)) != bodyLen {
+			return nil, fmt.Errorf("chromenet: ContentLength=%d with Body length %d", bodyLen, len(b))
+		}
+		initBody = b
+		flags = CHROME_REQ_BODY_COMPLETE
+	} else if bodyLen != 0 && req.GetBody != nil {
+		flags = CHROME_REQ_CAN_REWIND
+	}
+
+	r, reqID, err := x.cl.ChromeRequestStart(eng, head, bodyLen, flags, initBody)
 	if err != nil {
 		x.broken = true
 		return nil, err
 	}
 	x.req = r
 
-	if bodyLen != 0 {
-		if err := x.upload(req.Body, bodyLen); err != nil {
-			return nil, err
-		}
+	if bodyLen != 0 && (flags&CHROME_REQ_BODY_COMPLETE) == 0 {
+		uploadCtx, uploadCancel := context.WithCancel(x.ctx)
+		x.uploadCancel = uploadCancel
+		x.uploadDone = make(chan struct{})
+		*bodyOwnedByUpload = true
+		x.setCurrentBody(req.Body)
+		go x.runUpload(uploadCtx, req, bodyLen, reqID, req.GetBody != nil)
 	}
 
 	code, raw, err := x.cl.ChromeRequestWait(r, make([]byte, headCap))
@@ -246,34 +365,111 @@ func (x *exchange) start(req *http.Request, head []byte) (*http.Response, error)
 	return resp, nil
 }
 
-// upload streams the request body. bodyLen is the declared length, or -1 for a chunked body; a
-// body that does not match its declared length fails the request, as with http.Transport.
-func (x *exchange) upload(body io.Reader, bodyLen int64) error {
-	if bodyLen > 0 {
-		body = io.LimitReader(body, bodyLen+1)
+// runUpload streams the request body concurrently on a dedicated upload session while the main
+// session waits for response headers / reads the response body. When Chromium requests a rewind
+// (ChromeNetRewind), it reopens the body via req.GetBody and replays from byte 0 at epoch+1.
+func (x *exchange) runUpload(uploadCtx context.Context, req *http.Request, bodyLen int64, reqID uint64, canRewind bool) {
+	defer close(x.uploadDone)
+	defer x.closeCurrentBody()
+
+	upPool := x.t.uploadPool()
+	ucl, err := upPool.Get(uploadCtx)
+	if err != nil {
+		if !x.closing.Load() {
+			x.setUploadErr(err)
+			_ = x.cl.Conn().Cancel()
+		}
+		return
 	}
+	broken := false
+	stopCancel := context.AfterFunc(uploadCtx, func() {
+		_ = ucl.Conn().Cancel()
+	})
+	defer func() {
+		stopCancel()
+		if broken {
+			evictSessionEngine(ucl)
+			upPool.Discard(ucl)
+		} else {
+			upPool.Put(ucl)
+		}
+	}()
+
 	buf := make([]byte, maxChunk)
-	var sent int64
+	var epoch uint32
+	curBody := req.Body
+
 	for {
-		n, rerr := io.ReadFull(body, buf)
-		eof := rerr == io.EOF || rerr == io.ErrUnexpectedEOF
-		if rerr != nil && !eof {
-			return fmt.Errorf("chromenet: read request body: %w", rerr)
+		var reader io.Reader = curBody
+		if bodyLen > 0 {
+			reader = io.LimitReader(curBody, bodyLen+1)
 		}
-		sent += int64(n)
-		if bodyLen > 0 && (sent > bodyLen || (eof && sent != bodyLen)) {
-			return fmt.Errorf("chromenet: ContentLength=%d with Body length %d", bodyLen, sent)
+		var sent int64
+		rewound := false
+		for {
+			n, rerr := reader.Read(buf)
+			eof := rerr == io.EOF
+			if rerr != nil && !eof {
+				if !x.closing.Load() {
+					x.setUploadErr(fmt.Errorf("chromenet: read request body: %w", rerr))
+					if _, werr := ucl.ChromeRequestWrite(reqID, epoch, CHROME_WRITE_ABORT, nil); werr != nil {
+						broken = true
+					}
+				}
+				return
+			}
+			sent += int64(n)
+			if bodyLen > 0 && (sent > bodyLen || (eof && sent != bodyLen)) {
+				x.setUploadErr(fmt.Errorf("chromenet: ContentLength=%d with Body length %d", bodyLen, sent))
+				if _, werr := ucl.ChromeRequestWrite(reqID, epoch, CHROME_WRITE_ABORT, nil); werr != nil {
+					broken = true
+				}
+				return
+			}
+			if n == 0 && !eof {
+				continue
+			}
+			var wflags uint32
+			if eof {
+				wflags |= CHROME_WRITE_EOF
+			}
+			code, werr := ucl.ChromeRequestWrite(reqID, epoch, wflags, buf[:n])
+			if werr != nil {
+				broken = true
+				if !x.closing.Load() {
+					x.setUploadErr(werr)
+					_ = x.cl.Conn().Cancel()
+				}
+				return
+			}
+			if code == CHROME_NET_REWIND {
+				if !canRewind {
+					return
+				}
+				x.closeCurrentBody()
+				nextBody, gerr := req.GetBody()
+				if gerr != nil {
+					x.setUploadErr(fmt.Errorf("chromenet: rewind request body: %w", gerr))
+					if _, awerr := ucl.ChromeRequestWrite(reqID, epoch, CHROME_WRITE_ABORT, nil); awerr != nil {
+						broken = true
+					}
+					return
+				}
+				curBody = nextBody
+				x.setCurrentBody(curBody)
+				epoch++
+				rewound = true
+				break
+			}
+			if code != 0 {
+				return
+			}
+			if eof {
+				return
+			}
 		}
-		code, err := x.cl.ChromeRequestWrite(x.req, buf[:n], eof)
-		if err != nil {
-			x.broken = true
-			return err
-		}
-		if code != 0 {
-			return x.netError(code)
-		}
-		if eof {
-			return nil
+		if !rewound {
+			return
 		}
 	}
 }
@@ -292,10 +488,11 @@ func (x *exchange) netError(code int32) error {
 	return &NetError{Code: code, Name: name}
 }
 
-// release destroys the request and engine handles and returns the session to the pool. A session
-// whose RPC failed is discarded.
+// release destroys the request handle, stops any concurrent upload, and returns the session to the
+// pool (keeping its cached Engine handle warm). A session whose RPC failed is discarded.
 func (x *exchange) release() {
 	x.once.Do(func() {
+		x.closing.Store(true)
 		if x.stop != nil {
 			x.stop()
 		}
@@ -304,12 +501,15 @@ func (x *exchange) release() {
 				x.broken = true
 			}
 		}
-		if !x.broken && !x.eng.IsNil() {
-			if err := x.cl.ChromeEngineDestroy(x.eng); err != nil {
-				x.broken = true
-			}
+		if x.uploadCancel != nil {
+			x.uploadCancel()
+		}
+		x.closeCurrentBody()
+		if x.uploadDone != nil {
+			<-x.uploadDone
 		}
 		if x.broken {
+			evictSessionEngine(x.cl)
 			x.pool.Discard(x.cl)
 			return
 		}
@@ -343,6 +543,12 @@ func (b *engineBody) Read(p []byte) (int, error) {
 			b.x.broken = true
 			b.err = err
 		case code != 0:
+			if code == netErrAborted {
+				if uerr := b.x.getUploadErr(); uerr != nil && b.x.ctx.Err() == nil {
+					b.err = uerr
+					break
+				}
+			}
 			b.err = b.x.netError(code)
 		case eof:
 			b.err = io.EOF

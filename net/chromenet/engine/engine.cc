@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "base/at_exit.h"
 #include "base/command_line.h"
@@ -31,6 +32,7 @@
 #include "base/synchronization/waitable_event.h"
 #include "base/task/thread_pool/thread_pool_instance.h"
 #include "base/threading/thread.h"
+#include "base/time/time.h"
 #include "build/build_config.h"
 #include "net/base/net_errors.h"
 #include "net/cert/cert_verifier.h"
@@ -124,13 +126,20 @@ bool ParseBool(std::string_view v, bool* out) {
   return false;
 }
 
-// Engines with identical options share one SharedContext, so connection pools, HTTP/2 sessions
-// and QUIC sessions are reused across HQQ sessions.
+// Engines with identical options share one SharedContext, so connection pools, HTTP/2 sessions,
+// QUIC sessions, and the host cache are reused across HQQ sessions and sequential requests.
+// Idle contexts (engines == 0) stay alive for kIdleContextTTL (capped at kMaxIdleContexts LRU)
+// so sequential requests don't lose TCP/TLS/H2/QUIC pools or DNS entries when concurrency hits 0.
+constexpr base::TimeDelta kIdleContextTTL = base::Seconds(90);
+constexpr size_t kMaxIdleContexts = 32;
+
 struct Registry {
   base::Lock lock;
   struct Entry {
     scoped_refptr<SharedContext> shared;
     int engines = 0;
+    uint64_t generation = 0;
+    base::TimeTicks idle_since;
   };
   std::map<std::string, Entry> entries;
 };
@@ -138,6 +147,41 @@ struct Registry {
 Registry& GetRegistry() {
   static base::NoDestructor<Registry> registry;
   return *registry;
+}
+
+void EvictIdleContext(std::string key, uint64_t generation) {
+  Registry& registry = GetRegistry();
+  scoped_refptr<SharedContext> dropped;
+  {
+    base::AutoLock hold(registry.lock);
+    auto it = registry.entries.find(key);
+    if (it != registry.entries.end() && it->second.engines == 0 &&
+        it->second.generation == generation) {
+      dropped = std::move(it->second.shared);
+      registry.entries.erase(it);
+    }
+  }
+}
+
+struct RequestRegistry {
+  base::Lock lock;
+  uint64_t next_id = 1;
+  std::map<uint64_t, scoped_refptr<Job>> jobs;
+};
+
+RequestRegistry& GetRequestRegistry() {
+  static base::NoDestructor<RequestRegistry> registry;
+  return *registry;
+}
+
+scoped_refptr<Job> FindJob(uint64_t id) {
+  if (id == 0) {
+    return nullptr;
+  }
+  RequestRegistry& registry = GetRequestRegistry();
+  base::AutoLock hold(registry.lock);
+  auto it = registry.jobs.find(id);
+  return it != registry.jobs.end() ? it->second : nullptr;
 }
 
 }  // namespace
@@ -228,7 +272,8 @@ net::URLRequestContext* SharedContext::context() {
 
 struct chrome_request {
   scoped_refptr<chromenet::RequestCore> core;
-  chromenet::Job* job;  // deleted on the network thread
+  scoped_refptr<chromenet::Job> job;
+  uint64_t id = 0;
 };
 
 extern "C" {
@@ -270,54 +315,140 @@ chrome_engine_t* chrome_engine_create(const void* opts, size_t opts_len) {
     return nullptr;
   }
   std::string key(static_cast<const char*>(opts), opts_len);
-  chromenet::Registry& registry = chromenet::GetRegistry();
-  base::AutoLock hold(registry.lock);
-  chromenet::Registry::Entry& entry = registry.entries[key];
-  if (!entry.shared) {
-    entry.shared = base::MakeRefCounted<chromenet::SharedContext>(std::move(config));
+  scoped_refptr<chromenet::SharedContext> shared;
+  {
+    chromenet::Registry& registry = chromenet::GetRegistry();
+    base::AutoLock hold(registry.lock);
+    chromenet::Registry::Entry& entry = registry.entries[key];
+    if (!entry.shared) {
+      entry.shared = base::MakeRefCounted<chromenet::SharedContext>(std::move(config));
+    }
+    entry.engines++;
+    entry.generation++;
+    entry.idle_since = base::TimeTicks();
+    shared = entry.shared;
   }
-  entry.engines++;
-  return new chrome_engine{key, entry.shared};
+  return new chrome_engine{std::move(key), std::move(shared)};
 }
 
 int32_t chrome_engine_destroy(chrome_engine_t* e) {
+  std::vector<scoped_refptr<chromenet::SharedContext>> evicted;
+  bool schedule_evict = false;
+  std::string key = e->key;
+  uint64_t gen = 0;
   {
     chromenet::Registry& registry = chromenet::GetRegistry();
     base::AutoLock hold(registry.lock);
     auto it = registry.entries.find(e->key);
     if (it != registry.entries.end() && --it->second.engines == 0) {
-      registry.entries.erase(it);
+      gen = ++it->second.generation;
+      it->second.idle_since = base::TimeTicks::Now();
+      schedule_evict = true;
+      size_t idle_count = 0;
+      for (const auto& [k, ent] : registry.entries) {
+        if (ent.engines == 0) {
+          idle_count++;
+        }
+      }
+      while (idle_count > chromenet::kMaxIdleContexts) {
+        auto oldest = registry.entries.end();
+        for (auto iter = registry.entries.begin(); iter != registry.entries.end(); ++iter) {
+          if (iter->second.engines == 0 &&
+              (oldest == registry.entries.end() ||
+               iter->second.idle_since < oldest->second.idle_since)) {
+            oldest = iter;
+          }
+        }
+        if (oldest == registry.entries.end()) {
+          break;
+        }
+        if (oldest->first == key) {
+          schedule_evict = false;
+        }
+        evicted.push_back(std::move(oldest->second.shared));
+        registry.entries.erase(oldest);
+        idle_count--;
+      }
     }
   }
   delete e;
+  evicted.clear();
+  if (schedule_evict) {
+    chromenet::NetRunner()->PostDelayedTask(
+        FROM_HERE, base::BindOnce(&chromenet::EvictIdleContext, std::move(key), gen),
+        chromenet::kIdleContextTTL);
+  }
   return CHROME_NET_OK;
 }
 
 chrome_request_t* chrome_request_start(chrome_engine_t* e,
                                        const void* head,
                                        size_t head_len,
-                                       int64_t body_len) {
+                                       int64_t body_len,
+                                       uint32_t flags,
+                                       const void* init_body,
+                                       size_t init_body_len,
+                                       uint64_t* id) {
+  *id = 0;
+  const bool can_rewind = (flags & CHROME_REQ_CAN_REWIND) != 0;
+  const bool body_complete = (flags & CHROME_REQ_BODY_COMPLETE) != 0;
   auto core = base::MakeRefCounted<chromenet::RequestCore>();
-  auto* job = new chromenet::Job(e->shared, core);
-  auto* r = new chrome_request{core, job};
+  auto job = base::MakeRefCounted<chromenet::Job>(e->shared, core, can_rewind);
+  auto* r = new chrome_request{core, job, 0};
   chromenet::RequestParams params;
   if (body_len < -1 ||
+      (body_complete && (body_len < 0 || static_cast<uint64_t>(body_len) != init_body_len)) ||
+      (!body_complete && init_body_len != 0) ||
       !chromenet::ParseRequestHead(static_cast<const char*>(head), head_len, &params)) {
     core->Finish(net::ERR_INVALID_ARGUMENT);
     return r;
   }
   params.body_len = body_len;
+  params.can_rewind = can_rewind;
+  params.body_complete = body_complete;
+  if (init_body_len > 0 && init_body != nullptr) {
+    params.initial_body.assign(static_cast<const char*>(init_body), init_body_len);
+  }
+  if (body_len != 0 && !body_complete) {
+    chromenet::RequestRegistry& reg = chromenet::GetRequestRegistry();
+    base::AutoLock hold(reg.lock);
+    uint64_t req_id = reg.next_id++;
+    reg.jobs[req_id] = job;
+    r->id = req_id;
+    *id = req_id;
+  }
   chromenet::NetRunner()->PostTask(
-      FROM_HERE, base::BindOnce(&chromenet::Job::Start, base::Unretained(job), std::move(params)));
+      FROM_HERE, base::BindOnce(&chromenet::Job::Start, job, std::move(params)));
   return r;
 }
 
-int32_t chrome_request_write(chrome_request_t* r, const void* data, size_t data_len, bool eof) {
-  r->core->BeginWrite();
+int32_t chrome_request_write(uint64_t id,
+                             uint32_t epoch,
+                             uint32_t flags,
+                             const void* data,
+                             size_t data_len) {
+  scoped_refptr<chromenet::Job> job = chromenet::FindJob(id);
+  if (!job) {
+    return net::ERR_ABORTED;
+  }
+  if ((flags & CHROME_WRITE_ABORT) != 0) {
+    job->core()->Finish(net::ERR_ABORTED);
+    chromenet::NetRunner()->PostTask(FROM_HERE, base::BindOnce(&chromenet::Job::Cancel, job));
+    return net::ERR_ABORTED;
+  }
+  base::AutoLock write_hold(job->core()->write_lock());
+  int pre = job->core()->BeginWrite(epoch);
+  if (pre != net::OK) {
+    return pre;
+  }
+  bool eof = (flags & CHROME_WRITE_EOF) != 0;
+  std::string chunk;
+  if (data_len > 0 && data != nullptr) {
+    chunk.assign(static_cast<const char*>(data), data_len);
+  }
   chromenet::NetRunner()->PostTask(
-      FROM_HERE, base::BindOnce(&chromenet::Job::Write, base::Unretained(r->job),
-                                std::string(static_cast<const char*>(data), data_len), eof));
-  return r->core->WaitWrite();
+      FROM_HERE, base::BindOnce(&chromenet::Job::Write, job, epoch, std::move(chunk), eof));
+  return job->core()->WaitWrite(epoch, /*wait_for_head=*/eof && job->can_rewind());
 }
 
 int32_t chrome_request_wait(chrome_request_t* r, void* head, size_t head_cap, size_t* head_len) {
@@ -347,8 +478,8 @@ size_t chrome_request_read(chrome_request_t* r,
     return 0;
   }
   r->core->BeginRead();
-  chromenet::NetRunner()->PostTask(
-      FROM_HERE, base::BindOnce(&chromenet::Job::Read, base::Unretained(r->job), buf_cap));
+  chromenet::NetRunner()->PostTask(FROM_HERE,
+                                   base::BindOnce(&chromenet::Job::Read, r->job, buf_cap));
   int err = net::OK;
   size_t n = r->core->WaitRead(static_cast<char*>(buf), buf_cap, eof, &err);
   *net_error = err;
@@ -357,8 +488,7 @@ size_t chrome_request_read(chrome_request_t* r,
 
 void chrome_request_cancel(chrome_request_t* r) {
   r->core->Finish(net::ERR_ABORTED);
-  chromenet::NetRunner()->PostTask(
-      FROM_HERE, base::BindOnce(&chromenet::Job::Cancel, base::Unretained(r->job)));
+  chromenet::NetRunner()->PostTask(FROM_HERE, base::BindOnce(&chromenet::Job::Cancel, r->job));
 }
 
 const char* chrome_net_error_name(int32_t error) {
@@ -371,8 +501,13 @@ const char* chrome_net_error_name(int32_t error) {
 }
 
 int32_t chrome_request_destroy(chrome_request_t* r) {
+  if (r->id != 0) {
+    chromenet::RequestRegistry& reg = chromenet::GetRequestRegistry();
+    base::AutoLock hold(reg.lock);
+    reg.jobs.erase(r->id);
+  }
   r->core->Finish(net::ERR_ABORTED);
-  chromenet::NetRunner()->DeleteSoon(FROM_HERE, r->job);
+  chromenet::NetRunner()->PostTask(FROM_HERE, base::BindOnce(&chromenet::Job::Cancel, r->job));
   delete r;
   return CHROME_NET_OK;
 }

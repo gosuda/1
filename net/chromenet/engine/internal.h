@@ -86,8 +86,12 @@ class RequestCore : public base::RefCountedThreadSafe<RequestCore> {
   // Network thread: the outstanding read completed with `result` bytes from `data` (0 = end of
   // body, < 0 = error).
   void CompleteRead(const char* data, int result);
-  // Network thread: the outstanding write was consumed (net::OK) or failed.
-  void CompleteWrite(int result);
+  // Network thread: the outstanding write for `epoch` was consumed (net::OK) or failed.
+  void CompleteWrite(uint32_t epoch, int result);
+  // Network thread: the upload stream needs to rewind and replay from byte 0 at `new_epoch`.
+  void RequestRewind(uint32_t new_epoch);
+  // Network thread: the upload stream was destroyed; wake any writer waiting for consumption.
+  void UploadDestroyed();
 
   // Session thread. Returns net::OK with the head, or the error that ended the request.
   int WaitHead(std::string* head);
@@ -95,13 +99,21 @@ class RequestCore : public base::RefCountedThreadSafe<RequestCore> {
   // the network thread completed it or the request ended.
   void BeginRead();
   size_t WaitRead(char* buf, size_t cap, bool* eof, int* net_error);
-  void BeginWrite();
-  int WaitWrite();
+
+  base::Lock& write_lock() { return write_mu_; }
+  // Session thread (under write_lock). Returns net::OK when a write for `epoch` may be posted,
+  // CHROME_NET_REWIND when the stream moved to a newer epoch, or a negative net::Error.
+  int BeginWrite(uint32_t epoch);
+  // Session thread (under write_lock). Blocks until the write is consumed, the stream rewinds,
+  // or the request ends. When `wait_for_head` is true, also waits until response headers arrive
+  // (or a rewind/error occurs) so a post-EOF connection reset can trigger a rewind.
+  int WaitWrite(uint32_t epoch, bool wait_for_head);
 
  private:
   friend class base::RefCountedThreadSafe<RequestCore>;
   ~RequestCore();
 
+  base::Lock write_mu_;  // serializes concurrent chrome_request_write calls
   base::Lock lock_;
   base::ConditionVariable cv_;
   bool head_ready_ = false;
@@ -111,7 +123,10 @@ class RequestCore : public base::RefCountedThreadSafe<RequestCore> {
   bool read_pending_ = false;
   std::vector<char> read_data_;
   int read_result_ = 0;
+  uint32_t current_epoch_ = 0;
+  bool upload_closed_ = false;
   bool write_pending_ = false;
+  uint32_t write_epoch_ = 0;
   int write_result_ = 0;
 };
 
@@ -120,6 +135,9 @@ struct RequestParams {
   GURL url;
   net::HttpRequestHeaders headers;
   int64_t body_len = 0;  // -1: chunked, 0: none, > 0: exact length
+  bool can_rewind = false;
+  bool body_complete = false;
+  std::string initial_body;
 };
 
 // Parses "METHOD URL\nName: value\n..." into `out`. Returns false on malformed input.
@@ -128,17 +146,19 @@ bool ParseRequestHead(const char* data, size_t len, RequestParams* out);
 class PipeUpload;
 
 // Owns one URLRequest. Constructed on a session thread; every other member function, and the
-// destructor, run on the network thread in the order the session thread posted them.
-class Job : public net::URLRequest::Delegate {
+// destructor, run on the network thread.
+class Job : public base::RefCountedDeleteOnSequence<Job>, public net::URLRequest::Delegate {
  public:
-  Job(scoped_refptr<SharedContext> shared, scoped_refptr<RequestCore> core);
+  Job(scoped_refptr<SharedContext> shared, scoped_refptr<RequestCore> core, bool can_rewind);
   Job(const Job&) = delete;
   Job& operator=(const Job&) = delete;
-  ~Job() override;
+
+  const scoped_refptr<RequestCore>& core() const { return core_; }
+  bool can_rewind() const { return can_rewind_; }
 
   void Start(RequestParams params);
   void Read(size_t cap);
-  void Write(std::string data, bool eof);
+  void Write(uint32_t epoch, std::string data, bool eof);
   void Cancel();
 
   // net::URLRequest::Delegate:
@@ -157,12 +177,17 @@ class Job : public net::URLRequest::Delegate {
   void OnReadCompleted(net::URLRequest* request, int bytes_read) override;
 
  private:
+  friend class base::RefCountedDeleteOnSequence<Job>;
+  friend class base::DeleteHelper<Job>;
+  ~Job() override;
+
   std::string BuildHead(bool redirect) const;
   void ReadCompleted(int result);
   void Fail(int error);
 
   scoped_refptr<SharedContext> shared_;
   scoped_refptr<RequestCore> core_;
+  const bool can_rewind_;
   std::unique_ptr<net::URLRequest> request_;
   PipeUpload* upload_ = nullptr;  // owned by request_
   scoped_refptr<net::IOBuffer> read_buf_;
