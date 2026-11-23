@@ -1,113 +1,217 @@
 # Backup, At-Rest Encryption, WAL Archiving & PITR
 
-SuperSQL supports online hot backups, incremental backup chains, continuous WAL archiving, Point-in-Time Recovery (PITR), and optional pure-Go **AES-256-GCM** (`NSE1`) encryption for both live storage and backups.
+SuperSQL supports online hot backups, incremental backup chains, continuous WAL
+archiving, Point-in-Time Recovery (PITR), and pure-Go AES-256-GCM encryption.
 
----
+The examples use a `context.Context` named `ctx`, an open `*supersql.Catalog`
+named `db`, and these imports:
 
-## 1. Pure-Go AES-256-GCM At-Rest Encryption
+```go
+import (
+	"fmt"
 
-Provide a 32-byte key in `OpenOptions.EncryptionKey` (generate with `crypto/rand`, store in your KMS/secret manager—SuperSQL never writes the raw key to disk):
+	"github.com/gosuda/supersql-alpha"
+	localclock "github.com/gosuda/supersql-alpha/clock/local"
+)
+```
+
+Backup and restore destinations must be missing or empty, and their parent
+directories must exist. Each restore function returns an open `*supersql.Catalog`;
+close it when finished. Check every returned error before using the catalog.
+
+## 1. At-Rest Encryption
+
+Supply a 32-byte key through `OpenOptions.EncryptionKey`. Generate keys with
+`crypto/rand` and keep them in your key manager; SuperSQL does not write the raw
+key to disk.
 
 ```go
 db, err := supersql.Open(ctx, supersql.OpenOptions{
 	Directory:     "/var/lib/myapp/db",
 	Clock:         localclock.New(),
-	EncryptionKey: liveKey32Bytes,
+	EncryptionKey: liveKey,
 })
+if err != nil {
+	return err
+}
+defer db.Close()
 ```
 
-- All newly written WAL segments (`commits/*.wal`) and PAX v2 SST runs (`runs/*.sst`) are transparently encrypted in authenticated 64 KiB `NSE1` AES-256-GCM chunks bound with chunk-index AAD.
-- `encryption.meta` stores only a key fingerprint so opening an encrypted directory with a missing or wrong key fails fast with `supersql.ErrInvalidEncryptionKey`.
-- Existing unencrypted directories remain byte-for-byte compatible when `EncryptionKey == nil`.
+New WAL segments (`commits/*.wal`) and SST runs (`runs/*.sst`) use authenticated
+64 KiB `NSE1` AES-256-GCM chunks. `encryption.meta` records a key fingerprint;
+opening an encrypted database with a missing or incorrect key returns
+`supersql.ErrInvalidEncryptionKey`. Leave `EncryptionKey` empty for an
+unencrypted database.
 
----
+Live encryption and backup encryption have separate keys. A backup preserves
+the source database's live encryption; backup encryption adds another layer to
+the files copied into the backup. Restore therefore needs the original live key
+as well as the backup key when both layers are enabled.
 
-## 2. Online Hot Backups (Plain or Encrypted)
+## 2. Online Hot Backups
 
-Hot backups capture a consistent snapshot without blocking readers or writers, including MVCC catalog descriptors, roles, ACLs, RLS policies, and `fence.secret`:
+Hot backups capture a consistent closed snapshot, including catalog descriptors,
+roles, privileges, row security policies, and `fence.secret`, while the database
+continues serving queries.
 
 ```go
-// Unencrypted hot backup
-err := db.Backup(ctx, "/backups/full-2026-05-01")
-
-// Encrypted hot backup (can use a separate backup encryption key)
-err = db.CreateHotBackupWithOptions(ctx, "/backups/full-enc-2026-05-01", supersql.BackupOptions{
-	EncryptionKey: backupKey32Bytes,
-})
+if err := db.CreateHotBackup(ctx, plainBackupDir); err != nil {
+	return err
+}
+if err := db.CreateHotBackupWithOptions(ctx, encryptedBackupDir, supersql.BackupOptions{
+	EncryptionKey: backupKey,
+}); err != nil {
+	return err
+}
 ```
 
-Restoring a checkpoint into an empty destination directory:
+Restore a backup without additional backup encryption:
 
 ```go
-// Unencrypted backup (pass LiveEncryptionKey via OpenOptions if the live DB itself was encrypted)
-err := supersql.RestoreCheckpoint(ctx, "/backups/full-2026-05-01", "/restore/db", supersql.OpenOptions{
+restored, err := supersql.RestoreCheckpoint(ctx, plainBackupDir, supersql.OpenOptions{
+	Directory:     restoreDir,
 	Clock:         localclock.New(),
-	EncryptionKey: liveKey32Bytes, // nil if live DB was unencrypted
+	EncryptionKey: liveKey, // Empty if the source database was unencrypted.
 })
-
-// Encrypted backup
-err = supersql.RestoreEncryptedCheckpoint(ctx, "/backups/full-enc-2026-05-01", "/restore/db", supersql.OpenOptions{
-	Clock:         localclock.New(),
-	EncryptionKey: liveKey32Bytes, // nil if live DB was unencrypted
-}, backupKey32Bytes)
+if err != nil {
+	return err
+}
+defer restored.Close()
 ```
 
----
+Restore an encrypted backup by passing its key before `OpenOptions`:
+
+```go
+restored, err := supersql.RestoreEncryptedCheckpoint(ctx, encryptedBackupDir, backupKey, supersql.OpenOptions{
+	Directory:     restoreDir,
+	Clock:         localclock.New(),
+	EncryptionKey: liveKey,
+})
+if err != nil {
+	return err
+}
+defer restored.Close()
+```
+
+Restoration verifies file checksums and the certified read fence before
+publishing the destination. It then opens the recovered catalog under the
+readiness rules in `OpenOptions`.
 
 ## 3. Incremental Backup Chains
 
-Incremental backups copy only SST runs and WAL segments added since a base backup (`incremental.json`), minimizing backup I/O and storage:
+An incremental backup copies changed files and records unchanged files as
+inherited references in `backup.manifest`. Keep the full backup and every
+intermediate hop needed by the chain.
 
 ```go
-// 1. Take a full base backup
-err := db.CreateHotBackupWithOptions(ctx, baseDir, supersql.BackupOptions{
+if err := db.CreateHotBackupWithOptions(ctx, baseDir, supersql.BackupOptions{
 	EncryptionKey: backupKey,
-})
+}); err != nil {
+	return err
+}
 
-// 2. After additional writes, take incremental hop 1 (and optionally hop 2...)
-info1, err := db.CreateIncrementalBackup(ctx, baseDir, inc1Dir, supersql.IncrementalBackupOptions{
+// Take each incremental backup after the next set of application writes.
+if _, err := db.CreateIncrementalBackup(ctx, baseDir, supersql.IncrementalBackupOptions{
+	Destination:   inc1Dir,
 	EncryptionKey: backupKey,
-})
-info2, err := db.CreateIncrementalBackup(ctx, inc1Dir, inc2Dir, supersql.IncrementalBackupOptions{
+}); err != nil {
+	return err
+}
+if _, err := db.CreateIncrementalBackup(ctx, inc1Dir, supersql.IncrementalBackupOptions{
+	Destination:   inc2Dir,
 	EncryptionKey: backupKey,
-})
-
-// 3. Restore the full chain in order: [base, inc1, inc2]
-err = supersql.RestoreIncremental(ctx, []string{baseDir, inc1Dir, inc2Dir}, restoreDir, supersql.IncrementalRestoreOptions{
-	Open:          supersql.OpenOptions{Clock: clk, EncryptionKey: liveKey},
-	EncryptionKey: backupKey,
-})
+}); err != nil {
+	return err
+}
 ```
 
----
+Restore the complete chain in order:
 
-## 4. Continuous WAL Archiving & Point-in-Time Recovery (PITR)
+```go
+restored, err := supersql.RestoreIncremental(ctx, []string{baseDir, inc1Dir, inc2Dir}, supersql.IncrementalRestoreOptions{
+	Open: supersql.OpenOptions{
+		Directory:     restoreDir,
+		Clock:         localclock.New(),
+		EncryptionKey: liveKey,
+	},
+	EncryptionKey: backupKey,
+})
+if err != nil {
+	return err
+}
+defer restored.Close()
+```
 
-Enable WAL archiving either at `Open` time or dynamically on a live `*Catalog`:
+The restore validates parent lineage, file ownership and checksums, encryption
+keys, and the certified read fence. Use the same backup key for encrypted hops
+in one chain; `IncrementalRestoreOptions` supplies one backup key.
+
+## 4. WAL Archiving and Point-in-Time Recovery
+
+Enable archiving when opening the live database:
 
 ```go
 db, err := supersql.Open(ctx, supersql.OpenOptions{
 	Directory:     dataDir,
-	Clock:         clk,
-	EncryptionKey: liveKey,       // optional
-	WALArchiveDir: walArchiveDir, // continuously archives every committed WAL segment
-	WALArchiveKey: archiveKey,    // optional 32-byte key for archived WAL files
+	Clock:         localclock.New(),
+	EncryptionKey: liveKey,
+	WALArchiveDir: archiveDir,
+	WALArchiveKey: archiveKey,
 })
-
-// Or attach/change WAL archiving at runtime:
-err = db.EnableWALArchive(walArchiveDir, archiveKey)
+if err != nil {
+	return err
+}
+defer db.Close()
 ```
 
-To recover a database to an exact timestamp (or log position) from a base backup + archived WAL directory:
+Or enable it on an existing catalog:
 
 ```go
-res, err := supersql.RestorePITR(ctx, baseDir, walArchiveDir, restoreDir, supersql.PITRRestoreOptions{
-	Open:            supersql.OpenOptions{Clock: clk, EncryptionKey: liveKey},
-	EncryptionKey:   backupKey,  // key used for baseDir backup (if encrypted)
-	WALArchiveKey:   archiveKey, // key used for WAL archive (if encrypted)
-	TargetTimestamp: targetTime, // replays WAL segments up to targetTime
-	// TargetLogPosition: 42,   // alternative: exact log-position cutoff
-})
+if err := db.EnableWALArchive(ctx, archiveDir, archiveKey); err != nil {
+	return err
+}
 ```
 
-For an incremental chain + WAL archive, call `supersql.RestorePITRFromChain(ctx, []string{baseDir, inc1Dir}, walArchiveDir, restoreDir, opts)`.
+Archiving copies existing unretired WAL segments and subsequent durable commit
+segments before their local copies can be retired. Enable it before taking the
+base backup. A failed archive update leaves the previous destination active.
+When `WALArchiveKey` is empty, an encrypted live database uses its
+live key for archived WAL; an unencrypted database writes plaintext archives.
+
+The PITR target is a `clock.Instant` in the database's clock scale. It is a
+positional argument, not a field in `PITRRestoreOptions`. Recovery replays
+contiguous WAL through the last commit at or before that target:
+
+```go
+restored, result, err := supersql.RestorePITR(ctx, baseDir, archiveDir, targetTS, supersql.PITRRestoreOptions{
+	Open: supersql.OpenOptions{
+		Directory:     restoreDir,
+		Clock:         localclock.New(),
+		EncryptionKey: liveKey,
+	},
+	EncryptionKey: backupKey,
+	WALArchiveKey: archiveKey,
+})
+if err != nil {
+	return err
+}
+defer restored.Close()
+fmt.Printf("Restored through timestamp %d at log position %d\n",
+	result.RecoveredCommitTS, result.RecoveredLogPosition)
+```
+
+Pass the archive's actual key explicitly when it differs from the backup key.
+For a chain, use
+`RestorePITRFromChain(ctx, []string{baseDir, inc1Dir, inc2Dir}, archiveDir, targetTS, opts)`
+with the same `PITRRestoreOptions`.
+
+PITR rejects targets earlier than the base snapshot, missing intermediate WAL,
+corrupt segments, and inconsistent archive metadata. The first segment beyond
+the target is also verified before its timestamp can establish the stopping
+point. `PITRResult` reports the last recovered commit; a later requested timestamp
+does not imply that the archive contains commits through that time.
+
+Recovery bounds each decoded WAL body by `Open.Compaction.WALBytes`, using the
+storage default when unset. Set this limit high enough to read the source
+database's committed WAL segments. Encrypted archives are authenticated in
+chunks and checked against the same plaintext limit.

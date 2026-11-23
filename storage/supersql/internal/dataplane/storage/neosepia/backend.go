@@ -99,7 +99,7 @@ func openBackend(ctx context.Context, config Config, maxCommitTS model.Timestamp
 	if err != nil {
 		return nil, err
 	}
-	archiver, err := newWALArchiver(config.WALArchiveDir, dbCipher, archiveCipher, config.WALArchiveHook)
+	archiver, err := newWALArchiver(config.WALArchiveDir, dbCipher, archiveCipher, config.Limits.recovery().Batch, config.WALArchiveHook)
 	if err != nil {
 		return nil, err
 	}

@@ -281,15 +281,17 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 	if len(archiveKey) == 0 && len(options.EncryptionKey) == 0 {
 		archiveKey = options.Open.EncryptionKey
 	}
+	limits := mergeCompactionConfig(options.Open.Compaction)
 	pitrRes, err := maintenance.RestorePITRFromChain(ctx, chainDirs, walArchiveDir, model.Timestamp(targetTS), maintenance.RestoreOptions{
 		Destination:       options.Open.Directory,
 		Limits:            backupLimits,
 		EncryptionKey:     options.EncryptionKey,
 		LiveEncryptionKey: options.Open.EncryptionKey,
 		WALArchiveKey:     archiveKey,
+		MaxWALBytes:       limits.WALBytes,
 		Verifier: neosepia.CheckpointVerifier{
 			FenceVerifier: authority,
-			Limits:        mergeCompactionConfig(options.Open.Compaction),
+			Limits:        limits,
 			ExtraFiles:    []string{nativeFenceSecretFile},
 			EncryptionKey: options.Open.EncryptionKey,
 		},

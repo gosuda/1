@@ -85,6 +85,9 @@ type RestoreOptions struct {
 	EncryptionKey     []byte
 	LiveEncryptionKey []byte
 	WALArchiveKey     []byte
+	// MaxWALBytes is required for PITR and bounds each encoded mutation body.
+	// The two fixed commit frames are accounted for separately.
+	MaxWALBytes uint64
 }
 
 func nilDependency(value any) bool {

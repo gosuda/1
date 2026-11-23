@@ -461,6 +461,7 @@ func TestF5PITREndToEnd(t *testing.T) {
 			// Target before base backup fails cleanly.
 			if _, err := maintenance.RestorePITR(t.Context(), baseDir, archiveDir, 50, maintenance.RestoreOptions{
 				Destination: filepath.Join(t.TempDir(), "too-early"), Limits: backupLimits(), Verifier: verifier, EncryptionKey: key, WALArchiveKey: archiveKey,
+				MaxWALBytes: neosepia.DefaultLimits().WALBytes,
 			}); !errors.Is(err, maintenance.ErrInvalid) {
 				t.Fatalf("PITR before base err = %v, want ErrInvalid", err)
 			}
@@ -473,6 +474,7 @@ func TestF5PITREndToEnd(t *testing.T) {
 				Verifier:      verifier,
 				EncryptionKey: key,
 				WALArchiveKey: archiveKey,
+				MaxWALBytes:   neosepia.DefaultLimits().WALBytes,
 			})
 			if err != nil {
 				t.Fatalf("RestorePITR: %v", err)
