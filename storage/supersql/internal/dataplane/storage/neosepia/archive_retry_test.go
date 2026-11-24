@@ -1,6 +1,7 @@
 package neosepia
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -209,5 +210,37 @@ func TestWALRetirementRepairsMetadataWithoutReplacingWAL(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(archiveDir, walMetaName(1))); err != nil {
 		t.Fatalf("retry did not recover archive metadata: %v", err)
+	}
+}
+
+func TestWALArchiveAcceptsPlaintextAfterKeyAdded(t *testing.T) {
+	fixture := openBackendFixture(t)
+	archiveDir := t.TempDir()
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 1, 20, 100, 200)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(archiveDir, commitName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) >= 4 && string(before[:4]) == encryptionMagic {
+		t.Fatal("expected plaintext archive before key was added")
+	}
+	key := bytes.Repeat([]byte{7}, encryptionKeySize)
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, key); err != nil {
+		t.Fatalf("EnableWALArchive with key over plaintext archive: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(archiveDir, commitName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("retry replaced the plaintext archive instead of verifying it")
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, walMetaName(1))); err != nil {
+		t.Fatalf("plaintext archive lost its metadata: %v", err)
 	}
 }
