@@ -1115,7 +1115,18 @@ func (a *walArchiver) archivedCommitMetadata(ctx context.Context, commitsRoot, a
 		return meta, err
 	}
 	defer func() { err = errors.Join(err, source.Close()) }()
-	archived, err := openCommitWithCipher(ctx, archiveRoot, position, a.limits, a.archiveCipher)
+	// Archives may hold plaintext segments written before a key was added;
+	// the PITR reader accepts such mixed archives, so verify with the cipher
+	// the stored bytes actually use rather than the current archive cipher.
+	verifyCipher := a.archiveCipher
+	if peek, peekErr := archiveRoot.Open(commitName(position)); peekErr == nil {
+		var prefix [4]byte
+		if _, readErr := peek.ReadAt(prefix[:], 0); readErr == nil && string(prefix[:]) != encryptionMagic {
+			verifyCipher = nil
+		}
+		_ = peek.Close()
+	}
+	archived, err := openCommitWithCipher(ctx, archiveRoot, position, a.limits, verifyCipher)
 	if err != nil {
 		return meta, errors.Join(storage.ErrCorruptStorage, err)
 	}

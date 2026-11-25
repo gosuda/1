@@ -321,6 +321,24 @@ func readWALMetaSidecar(archiveRoot *os.Root, pos uint64) (meta archivedWALMeta,
 	return meta, true, nil
 }
 
+// walPlainLimitWriter bounds the decrypted WAL plaintext without letting the
+// ciphertext size dictate the allocation. Writes beyond the remaining budget
+// fail with ErrLimit so an over-limit archive stays a limit, while framing
+// and authentication failures from the decryptor stay ErrCorrupt.
+type walPlainLimitWriter struct {
+	buf       *bytes.Buffer
+	remaining uint64
+}
+
+func (w *walPlainLimitWriter) Write(p []byte) (int, error) {
+	if uint64(len(p)) > w.remaining {
+		return 0, ErrLimit
+	}
+	n, err := w.buf.Write(p)
+	w.remaining -= uint64(n)
+	return n, err
+}
+
 func readArchivedWALSegment(ctx context.Context, archiveRoot *os.Root, walName string, meta archivedWALMeta, hasMeta bool, archiveCipher *backupCipher, limits Limits, maxWALBytes uint64) (_ []byte, err error) {
 	f, err := openRegular(archiveRoot, walName)
 	if err != nil {
@@ -356,8 +374,13 @@ func readArchivedWALSegment(ctx context.Context, archiveRoot *os.Root, walName s
 		var plain bytes.Buffer
 		// The encrypted input is streamed. Its declared file size must never
 		// determine an allocation; the configured WAL body limit bounds the
-		// plaintext buffer before each authenticated chunk is appended.
-		if _, _, err := decryptStreamWithCipher(ctx, &plain, source, archiveCipher, &maxPlain); err != nil {
+		// plaintext buffer before each authenticated chunk is appended. The
+		// limit is enforced by the writer so an over-limit archive reports
+		// ErrLimit while framing and authentication failures stay ErrCorrupt;
+		// checkpoint copies that pass an expected file size keep their
+		// existing ErrCorrupt mapping untouched.
+		limited := &walPlainLimitWriter{buf: &plain, remaining: maxPlain}
+		if _, _, err := decryptStreamWithCipher(ctx, limited, source, archiveCipher, nil); err != nil {
 			return nil, err
 		}
 		raw = plain.Bytes()
