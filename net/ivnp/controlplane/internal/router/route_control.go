@@ -1,0 +1,1254 @@
+package router
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdh"
+	"encoding/binary"
+	"errors"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	controlplanenetdb "gosuda.org/ivnp/controlplane/internal/netdb"
+	controlplanetunnel "gosuda.org/ivnp/controlplane/internal/tunnel"
+	"gosuda.org/ivnp/cryptography"
+	"gosuda.org/ivnp/dataplane"
+	"gosuda.org/ivnp/foundation"
+	"gosuda.org/ivnp/observability"
+)
+
+const (
+	streamingSeedCacheCapacity  = 64
+	streamingSeedFailureBackoff = 10_000
+)
+
+type StreamingTunnelSenderConfig struct {
+	Owner    foundation.Hash
+	Database *controlplanenetdb.Database
+	Requests *controlplanenetdb.RequestManager
+	// Garlic is retained solely for explicitly stored legacy remote LeaseSets.
+	// Local destinations use Ratchet and LS2/ELS2 by default.
+	Garlic  *dataplane.GarlicSessionManager
+	Ratchet *dataplane.GarlicRatchetManager
+	// RemoteELS authorizes ELS2 lookup and decryption for an unblinded remote
+	// destination. Presence forbids plaintext LS2 or legacy downgrade.
+	RemoteELS           map[foundation.Hash]RemoteELSContext
+	Tunnels             *dataplane.TunnelRuntime
+	Pool                *controlplanetunnel.Pool
+	SeedRouterInfo      controlplanetunnel.RouterInfoSeeder
+	PrepareTunnel       func(context.Context, foundation.Hash) error
+	AwaitControl        func(context.Context) error
+	Now                 func() uint64
+	NextID              dataplane.RouterMessageIDSource
+	Limiter             *dataplane.RouterDestinationBandwidthLimiter
+	Metrics             *observability.Registry
+	Logger              *slog.Logger
+	RouteCapacity       int
+	PreparationCapacity int
+	WaiterCapacity      int
+	PreparationTimeout  time.Duration
+}
+
+// RemoteELSContext supplies the unblinded identity, blinding secret, and
+// optional DH or PSK credential for one remote encrypted LeaseSet.
+type RemoteELSContext struct {
+	Identity      foundation.Identity
+	Secret        []byte
+	Authorization controlplanenetdb.ELSClientAuthorization
+}
+
+// StreamingTunnelSender coordinates route resolution, reply reservations, and
+// failure exclusions for a destination's outbound tunnel sends.
+//
+// Lock order: lifecycleMu -> replyPolicyMu -> remoteMu -> seedMu.
+type StreamingTunnelSender struct {
+	execution      *dataplane.RouterPreparedRouteSender
+	owner          foundation.Hash
+	database       *controlplanenetdb.Database
+	requests       *controlplanenetdb.RequestManager
+	pool           *controlplanetunnel.Pool
+	seedRouterInfo controlplanetunnel.RouterInfoSeeder
+	prepareTunnel  func(context.Context, foundation.Hash) error
+	awaitControl   func(context.Context) error
+	tunnels        *dataplane.TunnelRuntime
+	replySlots     chan struct{}
+	replies        sync.WaitGroup
+	// +checklocks:remoteMu
+	replyGates map[foundation.Hash]*ratchetReplyGate
+	// +checklocks:lifecycleMu
+	// +checklocks:remoteMu
+	replyGateCapacity int
+	logger            *slog.Logger
+	now               func() uint64
+	lifecycleMu       sync.RWMutex
+	// +checklocks:lifecycleMu
+	released      bool
+	remoteMu      sync.RWMutex
+	replyPolicyMu sync.RWMutex
+	// +checklocks:remoteMu
+	remoteELS map[foundation.Hash]RemoteELSContext
+	// +checklocks:remoteMu
+	generation uint64
+	// +checklocks:replyPolicyMu
+	// +checklocks:remoteMu
+	// +checklocksreadany
+	policyGeneration uint64
+	// +checklocks:remoteMu
+	localPublication foundation.Hash
+	// +checklocks:remoteMu
+	localPublicationType foundation.I2NPStoreType
+	// +checklocks:remoteMu
+	pending map[routePreparationKey]*routePreparation
+	// +checklocks:remoteMu
+	pendingCapacity int
+	// +checklocks:remoteMu
+	waiterCapacity int
+	// +checklocks:remoteMu
+	waiters            int
+	preparationTimeout time.Duration
+	preparationCtx     context.Context
+	cancelPreparation  context.CancelFunc
+	preparing          sync.WaitGroup
+	seedMu             sync.Mutex
+	// +checklocks:seedMu
+	seedCache [streamingSeedCacheCapacity]streamingSeedCacheEntry
+	// +checklocks:seedMu
+	seedNext  uint8
+	leaseNext atomic.Uint64
+	// +checklocks:remoteMu
+	failedRoutes map[failedRoutePath]uint64
+	// +checklocks:remoteMu
+	failedLeases map[failedLeasePath]failedLeaseEvidence
+	// +checklocks:remoteMu
+	failedRouteCapacity int
+}
+
+type routePreparationKey struct {
+	remote     foundation.Hash
+	generation uint64
+}
+type routePreparation struct {
+	done    chan struct{}
+	err     error
+	cancel  context.CancelFunc
+	waiters int
+}
+
+type failedRoutePath struct {
+	remote   foundation.Hash
+	circuit  dataplane.TunnelCircuitToken
+	gateway  foundation.Hash
+	tunnelID uint32
+}
+
+// failedLeasePath identifies only the remote side of a route (the lease a
+// remote LeaseSet advertises). Silence observed under a single local circuit
+// is ambiguous (the circuit may be dead), so the lease is excluded only
+// after distinct circuits each produced a silent handshake: no single dead
+// local circuit can explain that. Accumulating evidence by remote path
+// rather than per (lease, circuit) pair keeps the exclusion reachable under
+// outbound churn, where pair-keyed marks would never cover the matrix.
+type failedLeasePath struct {
+	remote   foundation.Hash
+	gateway  foundation.Hash
+	tunnelID uint32
+}
+
+type failedLeaseEvidence struct {
+	expires  uint64
+	circuits map[dataplane.TunnelCircuitToken]struct{}
+}
+
+// silentLeaseCircuitThreshold is how many distinct local circuits must each
+// produce a silent handshake before the remote lease itself is excluded.
+const silentLeaseCircuitThreshold = 2
+
+type streamingHandshakeFeedback struct {
+	sender  *StreamingTunnelSender
+	receipt dataplane.RouterPreparedRouteReceipt
+}
+
+func (s *StreamingTunnelSender) PrepareHandshake(ctx context.Context, remote foundation.Hash) (dataplane.StreamingTunnelHandshakeFeedback, error) {
+	if receipt, ok := s.execution.RouteReceipt(remote); ok {
+		if !s.routeStillUsable(receipt) {
+			s.retireUnresponsiveRoute(receipt, receipt.Expires)
+		} else if !receipt.Confirmed() {
+			// A fresh handshake must not pin an installation a previous
+			// attempt never confirmed, but an unconfirmed route is not a
+			// silent one: no response timeout has been observed, so detach
+			// it without penalizing the path.
+			s.execution.RetireUnresponsiveRoute(receipt)
+		}
+	}
+	if err := s.PrepareDestination(ctx, remote); err != nil {
+		return nil, err
+	}
+	receipt, ok := s.execution.RouteReceipt(remote)
+	if !ok {
+		return nil, dataplane.RouterErrPreparedRouteMissing
+	}
+	return &streamingHandshakeFeedback{sender: s, receipt: receipt}, nil
+}
+
+func (f *streamingHandshakeFeedback) SendTunnel(ctx context.Context, delivery dataplane.StreamingTunnelDelivery) error {
+	s := f.sender
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	if err := s.waitForRatchetReply(ctx, delivery.To); err != nil {
+		return err
+	}
+	err := s.execution.SendTunnelOnRoute(ctx, delivery, f.receipt)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, dataplane.RouterErrPreparedRouteMissing) {
+		// The payload was admitted to the failed installation; replaying it on
+		// a replacement route would duplicate the delivery.
+		return s.retireFailedRoute(f.receipt, err)
+	}
+	// The pinned installation may churn between preparation and SYN
+	// retransmission; refresh the receipt onto the current route so terminal
+	// feedback still retires the installation actually used.
+	if err = s.prepare(ctx, delivery.To); err != nil && !errors.Is(err, dataplane.RouterErrRouteGeneration) {
+		return err
+	}
+	receipt, ok := s.execution.RouteReceipt(delivery.To)
+	if !ok {
+		return dataplane.RouterErrPreparedRouteMissing
+	}
+	f.receipt = receipt
+	err = s.execution.SendTunnelOnRoute(ctx, delivery, f.receipt)
+	if err != nil {
+		s.retireUnresponsiveRoute(f.receipt, min(f.receipt.Expires, s.now()+sendFailureMarkMillis))
+	}
+	return err
+}
+
+func (f *streamingHandshakeFeedback) Established() {
+	s := f.sender
+	// A proven path vindicates the lease: silence marks recorded for it
+	// were misattributed to the remote and must not keep it excluded.
+	s.remoteMu.Lock()
+	leasePath := failedLeasePath{remote: f.receipt.Remote, gateway: f.receipt.Gateway, tunnelID: f.receipt.TunnelID}
+	delete(s.failedLeases, leasePath)
+	for path := range s.failedRoutes {
+		if path.remote == leasePath.remote && path.gateway == leasePath.gateway && path.tunnelID == leasePath.tunnelID {
+			delete(s.failedRoutes, path)
+		}
+	}
+	s.remoteMu.Unlock()
+	s.execution.MarkRouteResponsive(f.receipt)
+}
+
+func (f *streamingHandshakeFeedback) NoResponse() {
+	s := f.sender
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		return
+	}
+	// A silent path absorbed a full handshake: the remote lease stays
+	// excluded for the route's remaining validity, otherwise the next
+	// attempt repicks it before exhaustion can force a LeaseSet refresh.
+	s.retireSilentRoute(f.receipt)
+}
+
+// sendFailureMarkMillis bounds the exclusion recorded for a send error:
+// transport failures can be transient, so the mark only needs to outlive the
+// immediate re-resolution that follows the failed send.
+const sendFailureMarkMillis = 10_000
+
+// The caller holds lifecycleMu; reacquiring it can deadlock behind release.
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) retireUnresponsiveRoute(receipt dataplane.RouterPreparedRouteReceipt, markExpires uint64) {
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	if s.execution.RetireUnresponsiveRoute(receipt) {
+		s.recordFailedRouteLocked(receipt, markExpires)
+	}
+}
+
+// retireSilentRoute retires the installation and records silence evidence
+// for the remote lease it used: the pair mark forces the next attempt onto
+// a different circuit, and once distinct circuits each went silent the
+// lease itself is excluded for the route's remaining validity.
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) retireSilentRoute(receipt dataplane.RouterPreparedRouteReceipt) {
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	if s.execution.RetireUnresponsiveRoute(receipt) {
+		s.recordFailedRouteLocked(receipt, receipt.Expires)
+		s.recordFailedLeaseLocked(receipt)
+	}
+}
+
+// +checklocks:s.remoteMu
+func (s *StreamingTunnelSender) recordFailedRouteLocked(receipt dataplane.RouterPreparedRouteReceipt, markExpires uint64) {
+	now := s.now()
+	var oldest failedRoutePath
+	var earliest uint64
+	for path, expires := range s.failedRoutes {
+		if expires <= now {
+			delete(s.failedRoutes, path)
+			continue
+		}
+		if earliest == 0 || expires < earliest {
+			oldest, earliest = path, expires
+		}
+	}
+	if len(s.failedRoutes) >= s.failedRouteCapacity {
+		delete(s.failedRoutes, oldest)
+	}
+	s.failedRoutes[failedRoutePath{remote: receipt.Remote, circuit: receipt.Circuit, gateway: receipt.Gateway, tunnelID: receipt.TunnelID}] = markExpires
+}
+
+// +checklocks:s.remoteMu
+func (s *StreamingTunnelSender) recordFailedLeaseLocked(receipt dataplane.RouterPreparedRouteReceipt) {
+	now := s.now()
+	path := failedLeasePath{remote: receipt.Remote, gateway: receipt.Gateway, tunnelID: receipt.TunnelID}
+	evidence := s.failedLeases[path]
+	if evidence.circuits == nil {
+		evidence.circuits = make(map[dataplane.TunnelCircuitToken]struct{}, silentLeaseCircuitThreshold)
+	}
+	evidence.circuits[receipt.Circuit] = struct{}{}
+	evidence.expires = max(evidence.expires, receipt.Expires)
+	if len(s.failedLeases) < s.failedRouteCapacity {
+		s.failedLeases[path] = evidence
+		return
+	}
+	var oldest failedLeasePath
+	var earliest uint64
+	for candidate, ev := range s.failedLeases {
+		if ev.expires <= now {
+			delete(s.failedLeases, candidate)
+			continue
+		}
+		if earliest == 0 || ev.expires < earliest {
+			oldest, earliest = candidate, ev.expires
+		}
+	}
+	if len(s.failedLeases) >= s.failedRouteCapacity {
+		delete(s.failedLeases, oldest)
+	}
+	s.failedLeases[path] = evidence
+}
+
+// clearFailureMarks drops recorded send and silence evidence for remote after
+// a completed refresh. An identical LeaseSet means the marks measured
+// transient loss rather than a dead remote path; a rotated LeaseSet cannot
+// match their (gateway, tunnelID) keys anyway.
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) clearFailureMarks(remote foundation.Hash) {
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	for path := range s.failedRoutes {
+		if path.remote == remote {
+			delete(s.failedRoutes, path)
+		}
+	}
+	for path := range s.failedLeases {
+		if path.remote == remote {
+			delete(s.failedLeases, path)
+		}
+	}
+}
+
+func NewStreamingTunnelSender(config StreamingTunnelSenderConfig) (*StreamingTunnelSender, error) {
+	missingResolution := config.Database == nil || config.Requests == nil
+	missingTunnels := config.Tunnels == nil || config.Pool == nil
+	invalidBounds := config.PreparationCapacity < 0 || config.WaiterCapacity < 0 || config.PreparationTimeout < 0
+	if missingResolution || missingTunnels || invalidBounds {
+		return nil, dataplane.RouterErrDataPlaneConfig
+	}
+	policies, err := cloneValidatedRemoteELS(config.RemoteELS)
+	if err != nil {
+		return nil, err
+	}
+	execution, err := dataplane.RouterNewPreparedRouteSender(dataplane.RouterPreparedRouteSenderConfig{
+		Owner: config.Owner, Garlic: config.Garlic, Ratchet: config.Ratchet, Tunnels: config.Tunnels,
+		Now: config.Now, NextID: config.NextID, Limiter: config.Limiter, Metrics: config.Metrics, Logger: config.Logger, RouteCapacity: config.RouteCapacity,
+	})
+	if err != nil {
+		releaseRemoteELSPolicies(policies)
+		return nil, err
+	}
+	if config.PreparationCapacity == 0 {
+		config.PreparationCapacity = 16
+	}
+	if config.RouteCapacity == 0 {
+		config.RouteCapacity = 64
+	}
+	if config.WaiterCapacity == 0 {
+		config.WaiterCapacity = 256
+	}
+	if config.PreparationTimeout == 0 {
+		config.PreparationTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	publication, publicationType := localPublicationFingerprint(config.Database, config.Owner)
+	return &StreamingTunnelSender{
+		execution: execution, owner: config.Owner, database: config.Database, requests: config.Requests, pool: config.Pool,
+		tunnels: config.Tunnels, prepareTunnel: config.PrepareTunnel, replySlots: make(chan struct{}, config.PreparationCapacity), logger: config.Logger,
+		awaitControl: config.AwaitControl,
+		replyGates:   make(map[foundation.Hash]*ratchetReplyGate), replyGateCapacity: config.RouteCapacity,
+		failedRoutes: make(map[failedRoutePath]uint64), failedLeases: make(map[failedLeasePath]failedLeaseEvidence), failedRouteCapacity: config.RouteCapacity,
+		seedRouterInfo: config.SeedRouterInfo, now: config.Now, remoteELS: policies, generation: 1, policyGeneration: 1,
+		localPublication: publication, localPublicationType: publicationType,
+		pending: make(map[routePreparationKey]*routePreparation), pendingCapacity: config.PreparationCapacity,
+		waiterCapacity: config.WaiterCapacity, preparationTimeout: config.PreparationTimeout, preparationCtx: ctx, cancelPreparation: cancel,
+	}, nil
+}
+
+func (s *StreamingTunnelSender) BandwidthSnapshot() dataplane.RouterDestinationBandwidthSnapshot {
+	if s == nil {
+		return dataplane.RouterDestinationBandwidthSnapshot{}
+	}
+	return s.execution.BandwidthSnapshot()
+}
+
+// MaintainScratch shrinks this destination's pooled send-scratch buffers that
+// grew for a large message but have gone unused at that size since the last
+// periodic maintenance pass. See PreparedRouteSender.MaintainScratch.
+func (s *StreamingTunnelSender) MaintainScratch() {
+	if s == nil {
+		return
+	}
+	s.execution.MaintainScratch()
+}
+
+func (s *StreamingTunnelSender) UpdateRemoteELS(policies map[foundation.Hash]RemoteELSContext) error {
+	if s == nil {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	updated, err := cloneValidatedRemoteELS(policies)
+	if err != nil {
+		return err
+	}
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		releaseRemoteELSPolicies(updated)
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	s.replyPolicyMu.Lock()
+	defer s.replyPolicyMu.Unlock()
+	s.remoteMu.Lock()
+	previous := s.remoteELS
+	s.remoteELS = updated
+	s.policyGeneration++
+	s.generation++
+	generation := s.generation
+	releaseRemoteELSPolicies(previous)
+	s.remoteMu.Unlock()
+	s.execution.InvalidateRoutes(generation)
+	return nil
+}
+
+// RefreshLocalLeaseSet invalidates bundled publication and circuit snapshots.
+// Call after replacing this destination's advertised inbound leases.
+func (s *StreamingTunnelSender) RefreshLocalLeaseSet() error {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	generation, changed := s.advanceLocalPublication()
+	if !changed {
+		return nil
+	}
+	s.execution.InvalidateRoutes(generation)
+	return nil
+}
+
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) advanceLocalPublication() (uint64, bool) {
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	publication, kind := localPublicationFingerprint(s.database, s.owner)
+	if publication == s.localPublication && kind == s.localPublicationType {
+		return 0, false
+	}
+	s.localPublication, s.localPublicationType = publication, kind
+	s.generation++
+	return s.generation, true
+}
+
+func localPublicationFingerprint(database *controlplanenetdb.Database, owner foundation.Hash) (foundation.Hash, foundation.I2NPStoreType) {
+	kind, raw, ok := database.StoredLeaseSet(owner)
+	if !ok {
+		return foundation.Hash{}, 0
+	}
+	return foundation.Sum(raw), kind
+}
+
+func (s *StreamingTunnelSender) ReleaseSensitive() {
+	if s == nil {
+		return
+	}
+	if s.cancelPreparation != nil {
+		s.cancelPreparation()
+	}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.released {
+		return
+	}
+	s.released = true
+	s.releaseReplyReservations()
+	s.replies.Wait()
+	s.preparing.Wait()
+	s.execution.ReleaseSensitive()
+	s.remoteMu.Lock()
+	releaseRemoteELSPolicies(s.remoteELS)
+	s.remoteELS = nil
+	clear(s.replyGates)
+	clear(s.failedRoutes)
+	clear(s.failedLeases)
+	s.remoteMu.Unlock()
+	s.seedMu.Lock()
+	clear(s.seedCache[:])
+	s.seedMu.Unlock()
+}
+
+func (s *StreamingTunnelSender) SendTunnel(ctx context.Context, delivery dataplane.StreamingTunnelDelivery) error {
+	if s == nil || delivery.Protocol == 0 {
+		return dataplane.StreamingTunnelErrTunnelProtocol
+	}
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	if delivery.From != s.owner {
+		return dataplane.RouterErrGarlicDestination
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.waitForRatchetReply(ctx, delivery.To); err != nil {
+			return err
+		}
+		receipt, ok := s.execution.RouteReceipt(delivery.To)
+		err := dataplane.RouterErrPreparedRouteMissing
+		if ok {
+			err = s.execution.SendTunnelOnRoute(ctx, delivery, receipt)
+		}
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, dataplane.RouterErrPreparedRouteMissing) {
+			if s.logger != nil {
+				s.logger.Debug("streaming tunnel send failed", "target", foundation.EncodeI2PBase64(delivery.To[:]), "error", err)
+			}
+			// The payload was admitted to the failed installation; replaying
+			// it on a re-acquired route would duplicate the delivery.
+			return s.retireFailedRoute(receipt, err)
+		}
+		// A missing or superseded route has not transmitted this payload.
+		// Publication renewal may replace it while preparation is in flight.
+		if err = s.prepare(ctx, delivery.To); err != nil && !errors.Is(err, dataplane.RouterErrRouteGeneration) {
+			if s.logger != nil {
+				s.logger.Debug("streaming route preparation failed", "target", foundation.EncodeI2PBase64(delivery.To[:]), "error", err)
+			}
+			return err
+		}
+	}
+}
+
+func (s *StreamingTunnelSender) retireFailedRoute(receipt dataplane.RouterPreparedRouteReceipt, err error) error {
+	if errors.Is(err, dataplane.TunnelErrCircuitNotFound) || errors.Is(err, dataplane.RouterErrSessionUnavailable) ||
+		errors.Is(err, dataplane.RouterErrSSU2Session) || errors.Is(err, dataplane.RouterErrSSU2SendStalled) {
+		s.retireUnresponsiveRoute(receipt, min(receipt.Expires, s.now()+sendFailureMarkMillis))
+	}
+	return err
+}
+
+// PrepareDestination resolves and caches a route without sending application data.
+// The last departing waiter cancels and joins its coalesced preparation worker.
+func (s *StreamingTunnelSender) PrepareDestination(ctx context.Context, remote foundation.Hash) error {
+	if s == nil {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.released {
+		return dataplane.RouterErrDataPlaneConfig
+	}
+	for {
+		err := s.prepare(ctx, remote)
+		if !errors.Is(err, dataplane.RouterErrRouteGeneration) {
+			return err
+		}
+	}
+}
+
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) prepare(ctx context.Context, remote foundation.Hash) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.remoteMu.Lock()
+	if s.waiters >= s.waiterCapacity {
+		s.remoteMu.Unlock()
+		return dataplane.RouterErrRoutePreparationBusy
+	}
+	s.waiters++
+	s.remoteMu.Unlock()
+	defer func() { s.remoteMu.Lock(); s.waiters--; s.remoteMu.Unlock() }()
+	pending, err := s.startPreparation(remote)
+	if err != nil {
+		return err
+	}
+	if pending == nil {
+		return nil
+	}
+	defer func() {
+		s.remoteMu.Lock()
+		pending.waiters--
+		last := pending.waiters == 0
+		if last {
+			pending.cancel()
+		}
+		s.remoteMu.Unlock()
+		if last {
+			<-pending.done
+		}
+	}()
+	select {
+	case <-pending.done:
+		return pending.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// +checklocksexclude:s.remoteMu
+func (s *StreamingTunnelSender) startPreparation(remote foundation.Hash) (*routePreparation, error) {
+	s.remoteMu.Lock()
+	defer s.remoteMu.Unlock()
+	key := routePreparationKey{remote: remote, generation: s.generation}
+	if pending, ok := s.pending[key]; ok {
+		pending.waiters++
+		return pending, nil
+	}
+	if s.execution.HasRoute(remote, s.generation) {
+		if receipt, ok := s.execution.RouteReceipt(remote); ok && s.routeStillUsable(receipt) {
+			return nil, nil
+		}
+		if receipt, ok := s.execution.RouteReceipt(remote); ok {
+			if s.execution.RetireUnresponsiveRoute(receipt) {
+				s.recordFailedRouteLocked(receipt, receipt.Expires)
+			}
+		}
+	}
+	if len(s.pending) >= s.pendingCapacity {
+		return nil, dataplane.RouterErrRoutePreparationBusy
+	}
+	policy, encrypted := s.remoteELS[remote]
+	if encrypted {
+		policy.Secret = append([]byte(nil), policy.Secret...)
+	}
+	ctx, cancel := context.WithTimeout(s.preparationCtx, s.preparationTimeout)
+	pending := &routePreparation{done: make(chan struct{}), cancel: cancel, waiters: 1}
+	s.pending[key] = pending
+	s.preparing.Add(1)
+	go func() {
+		defer close(pending.done)
+		defer s.preparing.Done()
+		defer clear(policy.Secret)
+		defer clear(policy.Authorization.DHPrivate[:])
+		defer clear(policy.Authorization.PSK[:])
+		defer cancel()
+		route, err := s.resolveRoute(ctx, remote, key.generation, policy, encrypted)
+		if err == nil {
+			s.remoteMu.RLock()
+			if s.generation != key.generation {
+				err = dataplane.RouterErrRouteGeneration
+			}
+			s.remoteMu.RUnlock()
+			if err == nil {
+				err = s.execution.InstallRoute(route)
+			}
+		}
+		clear(route.KeyData)
+		clear(route.LegacyKey[:])
+		clear(route.LocalLeaseSet)
+		s.remoteMu.Lock()
+		pending.err = err
+		delete(s.pending, key)
+		s.remoteMu.Unlock()
+	}()
+	return pending, nil
+}
+
+func (s *StreamingTunnelSender) resolveRoute(ctx context.Context, remote foundation.Hash, generation uint64, policy RemoteELSContext, encrypted bool) (dataplane.RouterPreparedRoute, error) {
+	route := dataplane.RouterPreparedRoute{Owner: s.owner, Remote: remote, Generation: generation}
+	var set2 *foundation.NetworkDatabaseLeaseSet2
+	var legacy *foundation.NetworkDatabaseLeaseSet
+	var err error
+	var encryptedExpires uint64
+	if encrypted {
+		set2, encryptedExpires, err = s.resolveEncryptedLeaseSet(ctx, policy)
+	} else {
+		set2, legacy, err = s.resolveLeaseSet(ctx, remote)
+	}
+	if err != nil {
+		return route, err
+	}
+	if encrypted {
+		defer clear(set2.Bytes())
+	}
+	now := s.now()
+	var lease foundation.NetworkDatabaseLease
+	var outbound controlplanetunnel.Entry
+	var circuit dataplane.TunnelCircuitInfo
+	var entries []controlplanetunnel.Entry
+	found, exhausted := false, false
+	for pass := 0; ; pass++ {
+		pick := s.leaseNext.Add(1) - 1
+		leaseCount := 0
+		if set2 != nil {
+			key, keyErr := set2.SelectUsableEncryptionKey(now, foundation.CryptoX25519, foundation.CryptoMLKEM1024X25519, foundation.CryptoMLKEM768X25519)
+			if keyErr != nil {
+				return route, keyErr
+			}
+			route.KeyType, route.KeyData = key.Type, append([]byte(nil), key.Data...)
+			lease, err = selectLease2(*set2, now, pick)
+			leaseCount = set2.LeaseCount()
+			route.Expires = leaseSet2Deadline(*set2)
+			if encrypted {
+				route.Expires = min(route.Expires, encryptedExpires)
+			}
+		} else {
+			route.Legacy = true
+			lease, route.LegacyKey, err = selectLegacyLease(*legacy, now, pick)
+			leaseCount = legacy.LeaseCount()
+			route.Expires = lease.EndDate
+		}
+		if err != nil {
+			return route, err
+		}
+		entries = s.pool.SelectableOutbound(now)
+		found, exhausted = false, false
+		for attempt := 0; attempt < leaseCount && !found; attempt++ {
+			if attempt != 0 {
+				if set2 != nil {
+					lease, err = selectLease2(*set2, now, pick+uint64(attempt))
+				} else {
+					lease, _, err = selectLegacyLease(*legacy, now, pick+uint64(attempt))
+				}
+				if err != nil {
+					return route, err
+				}
+			}
+			s.remoteMu.RLock()
+			leaseEvidence, leaseMarked := s.failedLeases[failedLeasePath{remote: remote, gateway: lease.Gateway, tunnelID: lease.TunnelID}]
+			s.remoteMu.RUnlock()
+			if leaseMarked && leaseEvidence.expires > now && len(leaseEvidence.circuits) >= silentLeaseCircuitThreshold {
+				// Distinct circuits each absorbed a silent handshake: no
+				// single local failure explains that, so the remote path
+				// is dead and every further attempt on it will agree.
+				exhausted = true
+				continue
+			}
+			var outboundFailures int
+			for _, entry := range entries {
+				if entry.Direction != controlplanetunnel.Outbound || entry.Owner != s.owner {
+					continue
+				}
+				candidate, ok := s.tunnels.InspectCircuit(entry.ID)
+				if !ok || candidate.Token != entry.Circuit || candidate.Owner != s.owner {
+					continue
+				}
+				if candidate.ExpiresAt != 0 && candidate.ExpiresAt <= now {
+					continue
+				}
+				s.remoteMu.RLock()
+				failedUntil := s.failedRoutes[failedRoutePath{remote: remote, circuit: entry.Circuit, gateway: lease.Gateway, tunnelID: lease.TunnelID}]
+				entryFailures := s.activeCircuitFailuresLocked(remote, entry.Circuit, now)
+				s.remoteMu.RUnlock()
+				if failedUntil > now {
+					exhausted = true
+					continue
+				}
+				if found && !preferOutboundCircuit(entry, entryFailures, outbound, outboundFailures) {
+					continue
+				}
+				outbound, circuit, outboundFailures, found = entry, candidate, entryFailures, true
+			}
+		}
+		if found || pass > 0 || !exhausted || encrypted {
+			break
+		}
+		// Every usable (lease, circuit) combination is failure-marked. The
+		// cached LeaseSet may predate a peer-side tunnel rebuild, so refresh it
+		// once and re-resolve before reporting exhaustion.
+		if !s.refreshRemoteLeaseSet(ctx, remote) {
+			break
+		}
+		if refreshed, ok := s.database.LeaseSet2(remote); ok {
+			set2, legacy, route.Legacy = &refreshed, nil, false
+		} else if refreshed, ok := s.database.LeaseSet(remote); ok {
+			set2, legacy, route.Legacy = nil, &refreshed, true
+		} else {
+			break
+		}
+		// The fetched copy is the current truth even when byte-identical to
+		// the cached one: retrying its leases is how recovery is observed.
+		s.clearFailureMarks(remote)
+	}
+	if !found {
+		if s.logger != nil {
+			matched, marked := 0, 0
+			for _, entry := range entries {
+				if entry.Direction != controlplanetunnel.Outbound || entry.Owner != s.owner {
+					continue
+				}
+				matched++
+				candidate, ok := s.tunnels.InspectCircuit(entry.ID)
+				if !ok || candidate.Token != entry.Circuit || candidate.Owner != s.owner {
+					continue
+				}
+				s.remoteMu.RLock()
+				failedUntil := s.failedRoutes[failedRoutePath{remote: remote, circuit: entry.Circuit, gateway: lease.Gateway, tunnelID: lease.TunnelID}]
+				s.remoteMu.RUnlock()
+				if failedUntil > now {
+					marked++
+				}
+			}
+			s.logger.Debug("route resolve exhausted: circuit not found", "remote", foundation.EncodeI2PBase64(remote[:]), "entries", len(entries), "owner_matched", matched, "failure_marked", marked, "exhausted", exhausted)
+		}
+		return route, dataplane.TunnelErrCircuitNotFound
+	}
+	if route.Legacy {
+		route.Expires = lease.EndDate
+	}
+	if circuit.ExpiresAt != 0 {
+		route.Expires = min(route.Expires, circuit.ExpiresAt)
+	}
+	route.Gateway, route.TunnelID, route.Circuit = lease.Gateway, lease.TunnelID, outbound.Circuit
+	route.Expires = min(route.Expires, lease.EndDate, outbound.Expires)
+	if storeType, stored, ok := s.database.StoredLeaseSet(s.owner); ok {
+		if route.Legacy || storeType == foundation.I2NPStoreLeaseSet2 {
+			localExpires, deadlineErr := localLeaseSetDeadline(storeType, stored, now)
+			if deadlineErr != nil {
+				return route, deadlineErr
+			}
+			route.Expires = min(route.Expires, localExpires)
+			route.LocalLeaseSet, err = foundation.NetworkDatabaseMarshalDatabaseStore(s.owner, storeType, stored, 0, foundation.Hash{}, 0)
+			if err != nil {
+				return route, err
+			}
+			route.LocalLeaseSet2 = storeType == foundation.I2NPStoreLeaseSet2
+		}
+	}
+	if route.Expires <= now {
+		return route, dataplane.RouterErrLeaseSetExpired
+	}
+	if s.prepareTunnel != nil {
+		if err := s.prepareTunnel(ctx, circuit.FirstHop); err != nil {
+			return route, err
+		}
+	}
+	s.seedLeaseGateway(ctx, outbound, lease.Gateway)
+	return route, nil
+}
+
+func preferOutboundCircuit(candidate controlplanetunnel.Entry, candidateFailures int, current controlplanetunnel.Entry, currentFailures int) bool {
+	if candidateFailures != currentFailures {
+		return candidateFailures < currentFailures
+	}
+	return candidate.Expires > current.Expires
+}
+
+// +checklocksread:s.remoteMu
+func (s *StreamingTunnelSender) activeCircuitFailuresLocked(remote foundation.Hash, circuit dataplane.TunnelCircuitToken, now uint64) int {
+	failures := 0
+	for path, until := range s.failedRoutes {
+		if path.remote == remote && path.circuit == circuit && until > now {
+			failures++
+		}
+	}
+	return failures
+}
+
+func leaseSet2Deadline(set foundation.NetworkDatabaseLeaseSet2) uint64 {
+	expires := (uint64(set.Header.Published) + uint64(set.Header.Expires)) * 1000
+	if set.Header.Offline.Present() {
+		expires = min(expires, uint64(set.Header.Offline.Expires)*1000)
+	}
+	return expires
+}
+
+func localLeaseSetDeadline(kind foundation.I2NPStoreType, raw []byte, now uint64) (uint64, error) {
+	if kind == foundation.I2NPStoreLeaseSet2 {
+		set, err := foundation.NetworkDatabaseParseLeaseSet2(raw)
+		if err != nil {
+			return 0, err
+		}
+		var latest uint64
+		leases := set.Leases()
+		for {
+			lease, ok, err := leases.Next()
+			if err != nil {
+				return 0, err
+			}
+			if !ok {
+				break
+			}
+			latest = max(latest, uint64(lease.EndDate)*1000)
+		}
+		expires := min(leaseSet2Deadline(set), latest)
+		if expires <= now {
+			return 0, dataplane.RouterErrLeaseSetExpired
+		}
+		return expires, nil
+	}
+	set, err := foundation.NetworkDatabaseParseLeaseSet(raw)
+	if err != nil {
+		return 0, err
+	}
+	var expires uint64
+	leases := set.Leases()
+	for {
+		lease, ok, err := leases.Next()
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			break
+		}
+		expires = max(expires, lease.EndDate)
+	}
+	if expires <= now {
+		return 0, dataplane.RouterErrLeaseSetExpired
+	}
+	return expires, nil
+}
+
+type streamingSeedCacheEntry struct {
+	endpoint   foundation.Hash
+	gateway    foundation.Hash
+	expires    uint64
+	retryAfter uint64
+}
+
+func ValidateRemoteELSContexts(policies map[foundation.Hash]RemoteELSContext) error {
+	validated, err := cloneValidatedRemoteELS(policies)
+	releaseRemoteELSPolicies(validated)
+	return err
+}
+
+func cloneValidatedRemoteELS(policies map[foundation.Hash]RemoteELSContext) (map[foundation.Hash]RemoteELSContext, error) {
+	updated := make(map[foundation.Hash]RemoteELSContext, len(policies))
+	for hash, policy := range policies {
+		cloneValidatedRemoteELSSelected := hash == (foundation.Hash{}) || policy.Identity.Hash() != hash || len(policy.Identity.Bytes()) == 0 || len(policy.Secret) > 0xffff
+		if !cloneValidatedRemoteELSSelected {
+			cloneValidatedRemoteELSSelected = (policy.Authorization.UseDH && policy.Authorization.UsePSK)
+		}
+		if cloneValidatedRemoteELSSelected {
+			releaseRemoteELSPolicies(updated)
+			return nil, dataplane.RouterErrDataPlaneConfig
+		}
+		if policy.Authorization.UseDH {
+			private, privateErr := ecdh.X25519().NewPrivateKey(policy.Authorization.DHPrivate[:])
+			public, publicErr := ecdh.X25519().NewPublicKey(policy.Authorization.DHPublic[:])
+			if privateErr != nil || publicErr != nil || !bytes.Equal(private.PublicKey().Bytes(), public.Bytes()) {
+				releaseRemoteELSPolicies(updated)
+				return nil, dataplane.RouterErrDataPlaneConfig
+			}
+		}
+		identity, consumed, err := foundation.ParseIdentity(append([]byte(nil), policy.Identity.Bytes()...))
+		if err != nil || consumed != len(policy.Identity.Bytes()) {
+			releaseRemoteELSPolicies(updated)
+			return nil, dataplane.RouterErrDataPlaneConfig
+		}
+		policy.Identity = identity
+		policy.Secret = append([]byte(nil), policy.Secret...)
+		updated[hash] = policy
+	}
+	return updated, nil
+}
+
+func releaseRemoteELSPolicies(policies map[foundation.Hash]RemoteELSContext) {
+	for hash, policy := range policies {
+		clear(policy.Secret)
+		clear(policy.Authorization.DHPrivate[:])
+		clear(policy.Authorization.DHPublic[:])
+		clear(policy.Authorization.PSK[:])
+		policies[hash] = policy
+		delete(policies, hash)
+	}
+}
+
+// +checklocksexclude:s.seedMu
+func (s *StreamingTunnelSender) seedLeaseGateway(ctx context.Context, outbound controlplanetunnel.Entry, gateway foundation.Hash) {
+	if s.seedRouterInfo == nil || outbound.HopCount == 0 || gateway == (foundation.Hash{}) {
+		return
+	}
+	endpoint := outbound.Hops[outbound.HopCount-1]
+	if endpoint == (foundation.Hash{}) {
+		return
+	}
+	now := s.now()
+	s.seedMu.Lock()
+	slot := -1
+	for index := range s.seedCache {
+		entry := s.seedCache[index]
+		if entry.endpoint == endpoint && entry.gateway == gateway {
+			if entry.expires > now || entry.retryAfter > now {
+				s.seedMu.Unlock()
+				return
+			}
+			slot = index
+			break
+		}
+		if slot == -1 && entry.expires <= now && entry.retryAfter <= now {
+			slot = index
+		}
+	}
+	if slot == -1 {
+		slot = int(s.seedNext) % len(s.seedCache)
+		s.seedNext = uint8((slot + 1) % len(s.seedCache))
+	}
+	entry := streamingSeedCacheEntry{endpoint: endpoint, gateway: gateway}
+	if err := s.seedRouterInfo(ctx, endpoint, gateway); err != nil {
+		entry.retryAfter = routeDeadline(now, streamingSeedFailureBackoff)
+	} else {
+		entry.expires = outbound.Expires
+		if entry.expires <= now {
+			entry.expires = routeDeadline(now, streamingSeedFailureBackoff)
+		}
+	}
+	s.seedCache[slot] = entry
+	s.seedMu.Unlock()
+}
+
+func (s *StreamingTunnelSender) routeStillUsable(receipt dataplane.RouterPreparedRouteReceipt) bool {
+	now := s.now()
+	circuitValid := false
+	for _, entry := range s.pool.SelectableOutbound(now) {
+		if entry.Direction == controlplanetunnel.Outbound && entry.Owner == s.owner && entry.Circuit == receipt.Circuit {
+			if candidate, ok := s.tunnels.InspectCircuit(entry.ID); ok && candidate.Token == entry.Circuit && candidate.Owner == s.owner {
+				if candidate.ExpiresAt == 0 || candidate.ExpiresAt > now {
+					circuitValid = true
+					break
+				}
+			}
+		}
+	}
+	if !circuitValid {
+		return false
+	}
+	if set2, ok := s.database.LeaseSet2(receipt.Remote); ok {
+		iter := set2.Leases()
+		for {
+			lease, ok, err := iter.Next()
+			if !ok || err != nil {
+				break
+			}
+			if uint64(lease.EndDate)*1000 > now && lease.Gateway == receipt.Gateway && lease.TunnelID == receipt.TunnelID {
+				return true
+			}
+		}
+		return false
+	}
+	if set, ok := s.database.LeaseSet(receipt.Remote); ok {
+		iter := set.Leases()
+		for {
+			lease, ok, err := iter.Next()
+			if !ok || err != nil {
+				break
+			}
+			if lease.EndDate > now && lease.Gateway == receipt.Gateway && lease.TunnelID == receipt.TunnelID {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func (s *StreamingTunnelSender) resolveLeaseSet(ctx context.Context, target foundation.Hash) (*foundation.NetworkDatabaseLeaseSet2, *foundation.NetworkDatabaseLeaseSet, error) {
+	if err := s.lookupLeaseSet(ctx, target); err != nil {
+		return nil, nil, err
+	}
+	if set, ok := s.database.LeaseSet2(target); ok {
+		return &set, nil, nil
+	}
+	if set, ok := s.database.LeaseSet(target); ok {
+		return nil, &set, nil
+	}
+	return nil, nil, dataplane.RouterErrLeaseSetUnavailable
+}
+
+func (s *StreamingTunnelSender) resolveEncryptedLeaseSet(ctx context.Context, policy RemoteELSContext) (*foundation.NetworkDatabaseLeaseSet2, uint64, error) {
+	key, err := encryptedLeaseSetDHTKey(policy.Identity, policy.Secret, s.now())
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.lookupLeaseSet(ctx, key); err != nil {
+		return nil, 0, err
+	}
+	set, found := s.database.EncryptedLeaseSet(key)
+	if !found {
+		return nil, 0, dataplane.RouterErrLeaseSetUnavailable
+	}
+	inner, err := controlplanenetdb.DecryptEncryptedLeaseSet(set, policy.Identity, policy.Secret, policy.Authorization, s.now())
+	if err != nil {
+		return nil, 0, err
+	}
+	expires := (uint64(set.Published) + uint64(set.Expires)) * 1000
+	if set.Offline.Present() {
+		expires = min(expires, uint64(set.Offline.Expires)*1000)
+	}
+	// Blinding keys change at UTC midnight even if an outer record lives longer.
+	expires = min(expires, (s.now()/86_400_000+1)*86_400_000)
+	return &inner, expires, nil
+}
+
+func (s *StreamingTunnelSender) lookupLeaseSet(ctx context.Context, key foundation.Hash) error {
+	result, err := s.requests.LookupLeaseSet(ctx, key)
+	if err != nil {
+		return err
+	}
+	select {
+	case outcome, ok := <-result:
+		if !ok {
+			return dataplane.RouterErrLeaseSetUnavailable
+		}
+		return outcome.Err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// refreshRemoteLeaseSet forces one uncached LeaseSet lookup. A false return
+// leaves the previously cached copy in place.
+func (s *StreamingTunnelSender) refreshRemoteLeaseSet(ctx context.Context, remote foundation.Hash) bool {
+	result, err := s.requests.LookupLeaseSetFresh(ctx, remote)
+	if err != nil {
+		return false
+	}
+	select {
+	case outcome, ok := <-result:
+		// A completed lookup may still carry a terminal error; only fresh
+		// data justifies retrying marked combinations.
+		return ok && outcome.Err == nil
+	case <-ctx.Done():
+		return false
+	}
+}
+func encryptedLeaseSetDHTKey(identity foundation.Identity, secret []byte, now uint64) (foundation.Hash, error) {
+	kind := identity.SigningKeyType()
+	public, rest := identity.SigningKeyParts()
+	if len(rest) != 0 {
+		return foundation.Hash{}, controlplanenetdb.ErrEncryptedLeaseSet
+	}
+	blinded, err := foundation.BlindEncryptedLeaseSetPublic(kind, public, time.UnixMilli(int64(now)), secret)
+	if err != nil {
+		return foundation.Hash{}, err
+	}
+	var input [34]byte
+	binary.BigEndian.PutUint16(input[:2], uint16(foundation.SigningRedDSASHA512Ed25519))
+	copy(input[2:], blinded[:])
+	return foundation.Sum(input[:]), nil
+}
+
+func selectLease2(set foundation.NetworkDatabaseLeaseSet2, now uint64, pick uint64) (foundation.NetworkDatabaseLease, error) {
+	iterator := set.Leases()
+	var usable uint64
+	for {
+		lease, ok, err := iterator.Next()
+		if err != nil {
+			return foundation.NetworkDatabaseLease{}, err
+		}
+		if !ok {
+			break
+		}
+		if uint64(lease.EndDate)*1000 > now {
+			usable++
+		}
+	}
+	if usable == 0 {
+		return foundation.NetworkDatabaseLease{}, dataplane.RouterErrLeaseSetExpired
+	}
+
+	selected := pick % usable
+	iterator = set.Leases()
+	for {
+		lease, ok, err := iterator.Next()
+		if err != nil {
+			return foundation.NetworkDatabaseLease{}, err
+		}
+		if !ok {
+			return foundation.NetworkDatabaseLease{}, dataplane.RouterErrLeaseSetExpired
+		}
+		end := uint64(lease.EndDate) * 1000
+		if end <= now {
+			continue
+		}
+		if selected == 0 {
+			return foundation.NetworkDatabaseLease{Gateway: lease.Gateway, TunnelID: lease.TunnelID, EndDate: end}, nil
+		}
+		selected--
+	}
+}
+
+func selectLegacyLease(set foundation.NetworkDatabaseLeaseSet, now uint64, pick uint64) (foundation.NetworkDatabaseLease, cryptography.ElGamalPublicKey, error) {
+	if len(set.EncryptionKey) != cryptography.ElGamalPublicKeySize {
+		return foundation.NetworkDatabaseLease{}, cryptography.ElGamalPublicKey{}, dataplane.RouterErrUnsupportedEncryption
+	}
+	var recipient cryptography.ElGamalPublicKey
+	copy(recipient[:], set.EncryptionKey)
+
+	iterator := set.Leases()
+	var usable uint64
+	for {
+		lease, ok, err := iterator.Next()
+		if err != nil {
+			return foundation.NetworkDatabaseLease{}, cryptography.ElGamalPublicKey{}, err
+		}
+		if !ok {
+			break
+		}
+		if lease.EndDate > now {
+			usable++
+		}
+	}
+	if usable == 0 {
+		return foundation.NetworkDatabaseLease{}, cryptography.ElGamalPublicKey{}, dataplane.RouterErrLeaseSetExpired
+	}
+
+	selected := pick % usable
+	iterator = set.Leases()
+	for {
+		lease, ok, err := iterator.Next()
+		if err != nil {
+			return foundation.NetworkDatabaseLease{}, cryptography.ElGamalPublicKey{}, err
+		}
+		if !ok {
+			return foundation.NetworkDatabaseLease{}, cryptography.ElGamalPublicKey{}, dataplane.RouterErrLeaseSetExpired
+		}
+		if lease.EndDate <= now {
+			continue
+		}
+		if selected == 0 {
+			return lease, recipient, nil
+		}
+		selected--
+	}
+}
+
+func routeDeadline(now, lifetime uint64) uint64 {
+	if ^uint64(0)-now < lifetime {
+		return ^uint64(0)
+	}
+	return now + lifetime
+}
