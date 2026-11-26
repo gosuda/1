@@ -5,9 +5,14 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Run tests and build without publishing to Cloudflare
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: azure-magpie-production
   cancel-in-progress: false
 
 jobs:
@@ -27,6 +32,7 @@ jobs:
         run: bun run build.ts
 
       - name: Ensure Cloudflare Pages Project Exists
+        if: ${{ !inputs.verify_only }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -34,6 +40,7 @@ jobs:
           npx wrangler pages project create azure-magpie --production-branch=main 2>/dev/null || true
 
       - name: Sync GitHub App Secrets to Cloudflare Pages
+        if: ${{ !inputs.verify_only }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -62,6 +69,7 @@ jobs:
           rm -f /tmp/worker-secrets.json
 
       - name: Deploy Bundle to Cloudflare Pages
+        if: ${{ !inputs.verify_only }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
