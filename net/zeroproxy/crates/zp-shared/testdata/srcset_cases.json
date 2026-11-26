@@ -1,0 +1,246 @@
+{
+  "__doc": [
+    "Parity fixture for `srcset` candidate splitting across Rust `split_srcset_candidates`",
+    "(`zp-htmltx`) and page-realm `splitSrcsetCandidates` (`runtime-prelude`).",
+    "",
+    "Each candidate entry is `[lead, url, tail]`, where `lead` is the leading whitespace",
+    "and separator run, `url` is the candidate URL token, and `tail` is the descriptor",
+    "(`1x`, `320w`) up to the next candidate separator. Concatenating all triples",
+    "reconstructs the input string byte-for-byte."
+  ],
+  "cases": [
+    {
+      "id": "plain-2",
+      "input": "/img/one.png 1x, /img/two.png 2x",
+      "candidates": [
+        [
+          "",
+          "/img/one.png",
+          " 1x"
+        ],
+        [
+          ", ",
+          "/img/two.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "single-no-descriptor",
+      "input": "a.png",
+      "candidates": [
+        [
+          "",
+          "a.png",
+          ""
+        ]
+      ]
+    },
+    {
+      "id": "width-descriptors",
+      "input": "s.png 320w,m.png 640w,l.png 1280w",
+      "candidates": [
+        [
+          "",
+          "s.png",
+          " 320w"
+        ],
+        [
+          ",",
+          "m.png",
+          " 640w"
+        ],
+        [
+          ",",
+          "l.png",
+          " 1280w"
+        ]
+      ]
+    },
+    {
+      "id": "data-svg-with-commas",
+      "input": "data:image/svg+xml;utf8,<svg width=\"2\"></svg> 1x, /img/real.png 2x",
+      "candidates": [
+        [
+          "",
+          "data:image/svg+xml;utf8,<svg",
+          " width=\"2\"></svg> 1x"
+        ],
+        [
+          ", ",
+          "/img/real.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "data-base64",
+      "input": "data:image/gif;base64,R0lGODlhAQABAAAAACw= 1x, b.png 2x",
+      "candidates": [
+        [
+          "",
+          "data:image/gif;base64,R0lGODlhAQABAAAAACw=",
+          " 1x"
+        ],
+        [
+          ", ",
+          "b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "data-only",
+      "input": "data:image/gif;base64,R0lGODlhAQABAAAAACw=",
+      "candidates": [
+        [
+          "",
+          "data:image/gif;base64,R0lGODlhAQABAAAAACw=",
+          ""
+        ]
+      ]
+    },
+    {
+      "id": "data-uppercase-scheme",
+      "input": "DATA:image/gif;base64,AAA= 1x, b.png 2x",
+      "candidates": [
+        [
+          "",
+          "DATA:image/gif;base64,AAA=",
+          " 1x"
+        ],
+        [
+          ", ",
+          "b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "leading-and-stray-commas",
+      "input": "  ,, a.png 1x ,, b.png 2x",
+      "candidates": [
+        [
+          "  ,, ",
+          "a.png",
+          " 1x "
+        ],
+        [
+          ",, ",
+          "b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "newline-separated",
+      "input": "a.png 1x,\n  b.png 2x",
+      "candidates": [
+        [
+          "",
+          "a.png",
+          " 1x"
+        ],
+        [
+          ",\n  ",
+          "b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "trailing-comma",
+      "input": "a.png 1x,",
+      "candidates": [
+        [
+          "",
+          "a.png",
+          " 1x"
+        ],
+        [
+          ",",
+          "",
+          ""
+        ]
+      ]
+    },
+    {
+      "id": "empty",
+      "input": "",
+      "candidates": []
+    },
+    {
+      "id": "whitespace-only",
+      "input": "   ",
+      "candidates": [
+        [
+          "   ",
+          "",
+          ""
+        ]
+      ]
+    },
+    {
+      "id": "absolute-cross-origin",
+      "input": "https://cdn.example/a.png 1x, //cdn.example/b.png 2x",
+      "candidates": [
+        [
+          "",
+          "https://cdn.example/a.png",
+          " 1x"
+        ],
+        [
+          ", ",
+          "//cdn.example/b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "query-commas-cnn",
+      "__why": "Image query strings may contain commas (q=h_1080,w_1920,c_fill); splitting at the first comma truncates the URL.",
+      "input": "https://media.cnn.com/a.jpg?c=16x9&q=h_1080,w_1920,c_fill 1x, https://media.cnn.com/b.jpg?c=16x9&q=h_2160,w_3840,c_fill 2x",
+      "candidates": [
+        [
+          "",
+          "https://media.cnn.com/a.jpg?c=16x9&q=h_1080,w_1920,c_fill",
+          " 1x"
+        ],
+        [
+          ", ",
+          "https://media.cnn.com/b.jpg?c=16x9&q=h_2160,w_3840,c_fill",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "trailing-comma-no-space",
+      "__why": "A comma inside a non-whitespace token is part of the URL; only a trailing comma separates candidates.",
+      "input": "a.png,b.png 2x",
+      "candidates": [
+        [
+          "",
+          "a.png,b.png",
+          " 2x"
+        ]
+      ]
+    },
+    {
+      "id": "comma-then-space",
+      "__why": "A comma followed by whitespace terminates the candidate URL and separates candidates.",
+      "input": "a.png, b.png 2x",
+      "candidates": [
+        [
+          "",
+          "a.png",
+          ""
+        ],
+        [
+          ", ",
+          "b.png",
+          " 2x"
+        ]
+      ]
+    }
+  ]
+}
