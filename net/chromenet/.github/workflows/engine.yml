@@ -5,25 +5,8 @@ name: Engine
 # macOS engines build natively. release.yml calls this workflow to produce release binaries.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'engine/**'
-      - 'scripts/engine/**'
-      - 'third_party/chromium/**'
-      - 'chrome_net.idl'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/engine.yml'
-  pull_request:
-    paths:
-      - 'engine/**'
-      - 'scripts/engine/**'
-      - 'third_party/chromium/**'
-      - 'chrome_net.idl'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/engine.yml'
+  schedule:
+    - cron: '47 4 * * 1'
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -36,6 +19,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: engine-${{ github.event_name }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-linux-host:
     name: build ${{ matrix.target }}
@@ -43,23 +30,23 @@ jobs:
       fail-fast: false
       matrix:
         target: [linux-amd64, linux-arm64, windows-amd64, windows-arm64]
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-go@v6.4.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.27.3'
-          cache: false
+          cache: true
       - name: Use the runner's scratch disk
         run: |
           sudo mkdir -p /mnt/chromenet-engine
           sudo chown "$(id -u):$(id -g)" /mnt/chromenet-engine
           df -h / /mnt
       - name: Cache the rungv release archive
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /mnt/chromenet-engine/rungv-*.tar.gz
           key: rungv-${{ hashFiles('scripts/engine/BUILDENV') }}
@@ -67,7 +54,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/engine/build.sh -w /mnt/chromenet-engine -d dist ${{ matrix.target }}
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: engine-${{ matrix.target }}
           path: dist/*
@@ -79,16 +66,28 @@ jobs:
       fail-fast: false
       matrix:
         target: [darwin-arm64, darwin-amd64]
-    runs-on: macos-26
+    # GitHub-hosted macOS builds queue behind the shared pool while six
+    # full engine rebuilds set an 89-minute wall; the Depot macOS runner
+    # (Apple silicon) builds both Darwin targets with identical steps.
+    runs-on: depot-macos-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-go@v6.4.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.27.3'
-          cache: false
+          cache: true
+      # The work directory holds the pinned source, toolchains and ninja
+      # outputs; the scripts skip downloads and unchanged compiles when it
+      # is warm. Keyed on every pinned input, per target, exact match only:
+      # a stale revision must never be reused.
+      - name: Cache the engine work directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/chromenet-engine
+          key: engine-work-darwin-${{ matrix.target }}-${{ hashFiles('third_party/chromium/VERSION', 'third_party/chromium/SHA256', 'third_party/chromium/patches/**', 'scripts/engine/BUILDENV', 'scripts/engine/*.py', 'scripts/engine/*.sh', 'go.mod', 'go.sum') }}
       - name: Select the newest Xcode
         run: |
           xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
@@ -97,42 +96,67 @@ jobs:
           xcrun --sdk macosx --show-sdk-version
       - name: Build ${{ matrix.target }}
         run: scripts/engine/build.sh -w "$RUNNER_TEMP/chromenet-engine" -d dist ${{ matrix.target }}
-      - uses: actions/upload-artifact@v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: engine-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
-  test:
+  test-linux-windows:
     name: test ${{ matrix.target }}
-    needs: [build-linux-host, build-macos]
+    needs: [build-linux-host]
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-amd64
-            runner: ubuntu-24.04
+            runner: depot-ubuntu-24.04
           - target: linux-arm64
-            runner: ubuntu-24.04-arm
-          - target: darwin-arm64
-            runner: macos-15
-          - target: darwin-amd64
-            runner: macos-15-intel
+            runner: depot-ubuntu-24.04-arm
           - target: windows-amd64
-            runner: windows-2025
-          - target: windows-arm64
-            runner: windows-11-arm
+            runner: depot-windows-2025
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-go@v6.4.0
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.27.3'
-          cache: false
-      - uses: actions/download-artifact@v8.0.2
+          cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist
+      - name: Go tests against the fresh engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=$(ls "$PWD"/dist/chrome_net_server_*)
+          chmod +x "$bin"
+          HQQ_CHROME_NET_SERVER="$bin" GOWORK=off go test -count=1 -timeout 15m ./...
+
+  test-macos:
+    name: test ${{ matrix.target }}
+    needs: [build-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: depot-macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: engine-${{ matrix.target }}
           path: dist
