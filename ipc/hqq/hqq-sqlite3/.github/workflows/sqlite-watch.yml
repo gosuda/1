@@ -27,6 +27,7 @@ concurrency:
 
 env:
   GOCACHEPROG: ""
+  GOENV: "off"
 
 jobs:
   check:
@@ -46,6 +47,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Verify release Go cache isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_program=$(go env GOCACHEPROG)
+          test -z "$cache_program"
+
       - name: Check sqlite.org/download.html
         id: check
         env:
@@ -88,6 +96,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Verify release Go cache isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_program=$(go env GOCACHEPROG)
+          test -z "$cache_program"
+
       - name: Install Ninja
         run: |
           if [ "$(uname -s)" = "Linux" ]; then
@@ -127,6 +142,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Verify release Go cache isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_program=$(go env GOCACHEPROG)
+          test -z "$cache_program"
+
       - name: Update SQLite pins and metadata
         run: go run ./scripts/release/sync-sqlite -apply -force
       - name: Commit and push SQLite update
