@@ -327,7 +327,7 @@ func (builder *checkpointBuilder) finishCoalescedCommit(ctx context.Context, com
 }
 
 func (builder *checkpointBuilder) finishBase(ctx context.Context, runs *os.Root, generation *runGeneration, scratch []byte, seen []bool) error {
-	base, err := loadRunBase(ctx, runs, generation.baseGeneration, builder.limits.MetadataBytes, builder.limits.IdentityBytes, builder.limits.MaxFiles)
+	base, err := loadRunBaseWithCipher(ctx, runs, generation.baseGeneration, builder.limits.MetadataBytes, builder.limits.IdentityBytes, builder.limits.MaxFiles, builder.cipher)
 	if err != nil {
 		return err
 	}

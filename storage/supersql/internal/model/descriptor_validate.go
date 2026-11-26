@@ -375,6 +375,9 @@ func validateDescriptor(d DescriptorSpec) error {
 		if d.CompositeRelation == nil || d.CompositeRelation.Owner == 0 || d.CompositeRelation.RowType == 0 {
 			return ErrInvalidDescriptor
 		}
+		if d.CompositeRelation.OwnerName != "" && (!validDescriptorText(d.CompositeRelation.OwnerName) || d.CompositeRelation.OwnerName != strings.ToLower(d.CompositeRelation.OwnerName)) {
+			return ErrInvalidDescriptor
+		}
 		for _, column := range d.CompositeRelation.Columns {
 			if column.SystemIdentity {
 				return ErrInvalidDescriptor
@@ -522,6 +525,9 @@ func validateTextSearchDictionary(dictionary *TextSearchDictionaryMetadata) erro
 	if dictionary == nil || dictionary.Owner == 0 || !utf8.ValidString(dictionary.InitOptions) || strings.IndexByte(dictionary.InitOptions, 0) >= 0 {
 		return ErrInvalidDescriptor
 	}
+	if dictionary.OwnerName != "" && (!validDescriptorText(dictionary.OwnerName) || dictionary.OwnerName != strings.ToLower(dictionary.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
 	if dictionary.StopWordsLanguage != "" && !HasNativeTextSearchStopWords(dictionary.StopWordsLanguage) {
 		return ErrInvalidDescriptor
 	}
@@ -566,6 +572,9 @@ func validateTextSearchConfiguration(configuration *TextSearchConfigurationMetad
 	if configuration == nil || configuration.Owner == 0 || configuration.Parser != 3722 {
 		return ErrInvalidDescriptor
 	}
+	if configuration.OwnerName != "" && (!validDescriptorText(configuration.OwnerName) || configuration.OwnerName != strings.ToLower(configuration.OwnerName)) {
+		return ErrInvalidDescriptor
+	}
 	last := uint16(0)
 	for _, mapping := range configuration.Mappings {
 		if mapping.TokenType <= last || mapping.TokenType > 23 || !uniqueIDs(mapping.Dictionaries) {
@@ -578,6 +587,9 @@ func validateTextSearchConfiguration(configuration *TextSearchConfigurationMetad
 
 func validateCastMetadata(cast *CastMetadata) error {
 	if cast == nil || cast.Owner == 0 {
+		return ErrInvalidDescriptor
+	}
+	if cast.OwnerName != "" && (!validDescriptorText(cast.OwnerName) || cast.OwnerName != strings.ToLower(cast.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
 	if err := cast.Source.Validate(); err != nil {
@@ -615,6 +627,9 @@ func validAggregateFinalModify(modify AggregateFinalModify) bool {
 
 func validateOperatorMetadata(operator *OperatorMetadata) error {
 	if operator == nil || operator.Owner == 0 || operator.Name == "" || strings.IndexByte(operator.Name, 0) >= 0 {
+		return ErrInvalidDescriptor
+	}
+	if operator.OwnerName != "" && (!validDescriptorText(operator.OwnerName) || operator.OwnerName != strings.ToLower(operator.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
 	if operator.Left.Type.ID != 0 {
@@ -666,6 +681,9 @@ func PseudoTypeArrayElement(id TypeID) (TypeID, bool) {
 
 func validateAggregateMetadata(aggregate *AggregateMetadata) error {
 	if aggregate == nil || aggregate.Owner == 0 {
+		return ErrInvalidDescriptor
+	}
+	if aggregate.OwnerName != "" && (!validDescriptorText(aggregate.OwnerName) || aggregate.OwnerName != strings.ToLower(aggregate.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
 	if aggregate.Kind < AggregateOrdinary || aggregate.Kind > AggregateHypotheticalSet {
@@ -1472,6 +1490,9 @@ func validateRoutineLayout(layout TypeLayout, internal, parameter bool) error {
 
 func validateTypeMetadata(metadata *TypeMetadata) error {
 	if metadata == nil {
+		return ErrInvalidDescriptor
+	}
+	if metadata.OwnerName != "" && (!validDescriptorText(metadata.OwnerName) || metadata.OwnerName != strings.ToLower(metadata.OwnerName)) {
 		return ErrInvalidDescriptor
 	}
 	if err := metadata.Layout.Validate(); err != nil {

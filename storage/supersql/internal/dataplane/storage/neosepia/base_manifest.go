@@ -354,7 +354,11 @@ func decodeRunBase(ctx context.Context, data []byte, expectedGeneration, metadat
 	return base, nil
 }
 
-func writeRunBase(ctx context.Context, root *os.Root, base runBase, metadataBytes, identityBytes, maxFiles uint64) (err error) {
+func writeRunBase(ctx context.Context, root *os.Root, base runBase, metadataBytes, identityBytes, maxFiles uint64) error {
+	return writeRunBaseWithCipher(ctx, root, base, metadataBytes, identityBytes, maxFiles, nil)
+}
+
+func writeRunBaseWithCipher(ctx context.Context, root *os.Root, base runBase, metadataBytes, identityBytes, maxFiles uint64, c *storageCipher) (err error) {
 	data, err := encodeRunBase(ctx, base, metadataBytes, identityBytes, maxFiles)
 	if err != nil {
 		return err
@@ -378,12 +382,21 @@ func writeRunBase(ctx context.Context, root *os.Root, base runBase, metadataByte
 			}
 		}
 	}()
+	var dst io.Writer = file
+	var encWriter *encryptStreamWriter
+	if c != nil {
+		encWriter, err = newEncryptStreamWriter(file, c)
+		if err != nil {
+			return err
+		}
+		dst = encWriter
+	}
 	for offset := 0; offset < len(data); {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		end := offset + min(len(data)-offset, 64<<10)
-		n, err := file.Write(data[offset:end])
+		n, err := dst.Write(data[offset:end])
 		if err != nil {
 			return err
 		}
@@ -391,6 +404,11 @@ func writeRunBase(ctx context.Context, root *os.Root, base runBase, metadataByte
 			return io.ErrShortWrite
 		}
 		offset = end
+	}
+	if encWriter != nil {
+		if err := encWriter.Close(); err != nil {
+			return err
+		}
 	}
 	if err := file.Sync(); err != nil {
 		return err
@@ -406,7 +424,11 @@ func writeRunBase(ctx context.Context, root *os.Root, base runBase, metadataByte
 	return syncCommitDirectory(root)
 }
 
-func loadRunBase(ctx context.Context, root *os.Root, generation, metadataBytes, identityBytes, maxFiles uint64) (_ runBase, err error) {
+func loadRunBase(ctx context.Context, root *os.Root, generation, metadataBytes, identityBytes, maxFiles uint64) (runBase, error) {
+	return loadRunBaseWithCipher(ctx, root, generation, metadataBytes, identityBytes, maxFiles, nil)
+}
+
+func loadRunBaseWithCipher(ctx context.Context, root *os.Root, generation, metadataBytes, identityBytes, maxFiles uint64, c *storageCipher) (_ runBase, err error) {
 	file, err := root.Open(baseManifestName(generation))
 	if err != nil {
 		return runBase{}, err
@@ -416,7 +438,33 @@ func loadRunBase(ctx context.Context, root *os.Root, generation, metadataBytes, 
 	if err != nil {
 		return runBase{}, err
 	}
-	if !info.Mode().IsRegular() || info.Size() < baseManifestHeader+sha256.Size || info.Size() > int64(math.MaxInt) {
+	if !info.Mode().IsRegular() || info.Size() < 4 {
+		return runBase{}, storage.ErrCorruptStorage
+	}
+	var prefix [4]byte
+	if _, err := file.ReadAt(prefix[:], 0); err != nil {
+		return runBase{}, errors.Join(storage.ErrCorruptStorage, err)
+	}
+	if string(prefix[:]) == encryptionMagic {
+		if c == nil {
+			return runBase{}, fmt.Errorf("%w: encrypted base manifest requires EncryptionKey", ErrInvalidEncryptionKey)
+		}
+		maxPlain := uint64(math.MaxInt)
+		if metadataBytes < maxPlain {
+			if identityBytes < maxPlain-metadataBytes {
+				maxPlain = metadataBytes + identityBytes
+			}
+		}
+		data, err := decryptStreamToBytes(ctx, file, c, maxPlain)
+		if err != nil {
+			return runBase{}, err
+		}
+		return decodeRunBase(ctx, data, generation, metadataBytes, identityBytes, maxFiles)
+	}
+	if c != nil {
+		return runBase{}, fmt.Errorf("%w: unencrypted base manifest in encrypted database", ErrInvalidEncryptionKey)
+	}
+	if info.Size() < baseManifestHeader+sha256.Size || info.Size() > int64(math.MaxInt) {
 		return runBase{}, storage.ErrCorruptStorage
 	}
 	var header [baseManifestHeader]byte

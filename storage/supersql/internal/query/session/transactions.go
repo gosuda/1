@@ -116,6 +116,7 @@ type Transactions struct {
 	randomState   [2]uint64
 
 	active                  bool
+	implicitReadOnly        bool
 	historical              model.Timestamp
 	transaction             *txn.Transaction
 	generation              uint64
@@ -280,7 +281,11 @@ func (transactions *Transactions) enter(ctx context.Context) (context.Context, f
 func (transactions *Transactions) enterOperation(ctx context.Context, recovery bool) (context.Context, func(), error) {
 	if token, ok := ctx.Value(sessionTransactionKey{}).(*sessionTransactionOperation); ok && token.owner == transactions && token.active.Load() {
 		if _, allowed := transactions.routineReentry(ctx); allowed && !recovery {
-			return ctx, func() {}, nil
+			previousTypes := transactions.statementTypes
+			transactions.statementTypes = nil
+			return ctx, func() {
+				transactions.statementTypes = previousTypes
+			}, nil
 		}
 		return nil, nil, errSessionTransactionReentry
 	}
@@ -319,8 +324,11 @@ func (transactions *Transactions) enterOperation(ctx context.Context, recovery b
 	token := &sessionTransactionOperation{owner: transactions}
 	token.active.Store(true)
 	operation := context.WithValue(ctx, sessionTransactionKey{}, token)
+	previousTypes := transactions.statementTypes
+	transactions.statementTypes = nil
 	if recovery && transactions.closed {
 		return operation, func() {
+			transactions.statementTypes = previousTypes
 			token.active.Store(false)
 			<-transactions.gate
 		}, nil
@@ -346,6 +354,7 @@ func (transactions *Transactions) enterOperation(ctx context.Context, recovery b
 		if transactions.active && !transactions.closed && context.Cause(transactions.life) == nil {
 			transactions.idleTimer = transactions.startTimeout(transactions.settings.Resources().IdleInTransactionTimeout, "25P03", "terminating connection due to idle-in-transaction timeout")
 		}
+		transactions.statementTypes = previousTypes
 		token.active.Store(false)
 		if stop() {
 			close(joined)
@@ -393,6 +402,14 @@ func (transactions *Transactions) MarkFailed(err error) {
 	transactions.gate <- struct{}{}
 	defer func() { <-transactions.gate }()
 	transactions.markFailed(err)
+}
+
+func (transactions *Transactions) markFailedIn(ctx context.Context, err error) {
+	if token, ok := ctx.Value(sessionTransactionKey{}).(*sessionTransactionOperation); ok && token.owner == transactions && token.active.Load() {
+		transactions.markFailed(err)
+		return
+	}
+	transactions.MarkFailed(err)
 }
 
 func (transactions *Transactions) markFailed(err error) {
@@ -513,6 +530,7 @@ func (transactions *Transactions) begin(ctx context.Context, start TransactionSt
 	}
 	transactions.settings.commitStaged(staged)
 	transactions.active, transactions.transaction = true, transaction
+	transactions.implicitReadOnly = start.ImplicitReadOnly
 	transactions.generation++
 	clear(transactions.advisoryMarks)
 	transactions.advisoryMarks = transactions.advisoryMarks[:0]
@@ -674,6 +692,7 @@ func (transactions *Transactions) finishSettings(committed bool) error {
 		transactions.fence = errors.Join(transactions.fence, errSessionTransactionState, err)
 	}
 	transactions.active, transactions.transaction = false, nil
+	transactions.implicitReadOnly = false
 	transactions.historical = 0
 	transactions.temporal.transaction = sqlMoment{}
 	transactions.failure = nil

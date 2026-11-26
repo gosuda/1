@@ -343,7 +343,7 @@ func (transactions *Transactions) prepareCursorsForCommit(ctx context.Context) e
 	if transactions.transaction == nil {
 		return nil
 	}
-	return transactions.routineAtomicStatement(ctx, func(statementContext context.Context) error {
+	return transactions.routineAtomicStatement(txn.WithLockTimeout(ctx, transactions.settings.Resources().LockTimeout), func(statementContext context.Context) error {
 		var err error
 		for name, cursor := range transactions.named.cursors {
 			if cursor.transaction != transactions.transaction {
@@ -440,7 +440,7 @@ func (transactions *Transactions) fetchCursor(ctx context.Context, command bind.
 	if cursor.transaction != nil && cursor.transaction != transactions.transaction {
 		err = &model.Error{Code: "34000", Message: "cursor does not exist in this transaction"}
 	} else {
-		err = transactions.routineAtomicStatement(ctx, func(statementContext context.Context) error {
+		err = transactions.routineAtomicStatement(txn.WithLockTimeout(ctx, transactions.settings.Resources().LockTimeout), func(statementContext context.Context) error {
 			source, sourceErr := cursor.newFetchSource(statementContext, command)
 			if sourceErr != nil {
 				return sourceErr

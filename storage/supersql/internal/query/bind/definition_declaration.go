@@ -177,6 +177,11 @@ func definitionSchema(ctx context.Context, b *binder, snapshot CatalogSnapshot, 
 		}
 		return nil, err
 	}
+	if kind != definitionCast {
+		if err := b.checkSchemaCreate(schema.Descriptor, 0); err != nil {
+			return nil, err
+		}
+	}
 	b.dependency(schema.Descriptor, 0)
 	return schema.Descriptor, nil
 }
@@ -263,6 +268,18 @@ func mergeDependencies(edited, recorded []model.Dependency, self model.ObjectID,
 			return slices.Contains(dropped, dependency.Object)
 		})
 	}
+	result = slices.DeleteFunc(result, func(dependency model.Dependency) bool {
+		return dependency.Object == self
+	})
+	latest := make(map[model.ObjectID]uint64, len(result))
+	for _, dependency := range result {
+		if dependency.Version > latest[dependency.Object] {
+			latest[dependency.Object] = dependency.Version
+		}
+	}
+	for i := range result {
+		result[i].Version = latest[result[i].Object]
+	}
 	slices.SortFunc(result, func(a, b model.Dependency) int {
 		if order := cmp.Compare(a.Object, b.Object); order != 0 {
 			return order
@@ -272,10 +289,7 @@ func mergeDependencies(edited, recorded []model.Dependency, self model.ObjectID,
 		}
 		return cmp.Compare(a.Column, b.Column)
 	})
-	result = slices.Compact(result)
-	return slices.DeleteFunc(result, func(dependency model.Dependency) bool {
-		return dependency.Object == self
-	})
+	return slices.Compact(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +352,12 @@ func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot Cata
 			return definitionFunction{}, false, scanErr
 		}
 		if selected != nil {
+			if err := b.checkSchemaUsage(namespace.Descriptor, 0); err != nil {
+				return definitionFunction{}, false, err
+			}
+			if err := b.checkObjectPrivilege(selected, model.PrivilegeExecute, 0); err != nil {
+				return definitionFunction{}, false, err
+			}
 			spec, err := b.descriptorSpec(selected)
 			if err != nil {
 				return definitionFunction{}, false, err
@@ -649,7 +669,7 @@ func bindCreateCast(ctx context.Context, statement *zpgparse.CreateCastStmt, sna
 	if _, builtinPair := builtin.LookupCast(source.Type.ID, target.Type.ID); builtinPair {
 		return nil, bindError("42710", "cast from type to type already exists", 0)
 	}
-	metadata := model.CastMetadata{Owner: options.Owner, Source: source, Target: target}
+	metadata := model.CastMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Source: source, Target: target}
 	switch {
 	case statement.Inout:
 		metadata.Method = 'i'
@@ -687,9 +707,30 @@ func bindCreateCast(ctx context.Context, statement *zpgparse.CreateCastStmt, sna
 		metadata.Function = function.id
 	}
 	if metadata.Method == 'b' {
+		if err := b.requireSuperuser("create a binary-coercible cast", 0); err != nil {
+			return nil, err
+		}
 		// A binary-coercible cast must agree on physical representation.
 		if source.Type.Storage != target.Type.Storage {
 			return nil, bindError("42P17", "a binary-coercible cast requires the same physical representation", 0)
+		}
+	} else if normalizeRoleName(b.options.CurrentRole) != "" {
+		roles, roleErr := b.cachedRoles()
+		if roleErr != nil {
+			return nil, roleErr
+		}
+		if !roleIsSuperuser(roles, b.options.CurrentRole) {
+			ownsSource, ownErr := b.ownsCastType(roles, source.Type.ID)
+			if ownErr != nil {
+				return nil, ownErr
+			}
+			ownsTarget, ownErr := b.ownsCastType(roles, target.Type.ID)
+			if ownErr != nil {
+				return nil, ownErr
+			}
+			if !ownsSource && !ownsTarget {
+				return nil, bindError("42501", "must be owner of source or target type to create cast", 0)
+			}
 		}
 	}
 	descriptor, err := definitionDescriptor(ctx, b, options, definitionIdentity{}, schema, definitionCast, name, "", func(spec *model.DescriptorSpec) error {
@@ -700,6 +741,27 @@ func bindCreateCast(ctx context.Context, statement *zpgparse.CreateCastStmt, sna
 		return nil, err
 	}
 	return &BoundObjectCommand{tag: "CREATE CAST", creates: []*model.Descriptor{descriptor}, dependencies: slices.Clone(b.dependencies), warnings: slices.Clone(b.warnings)}, ctx.Err()
+}
+
+func (b *binder) ownsCastType(roles map[string]model.RoleMetadata, typeID model.TypeID) (bool, error) {
+	desc, err := b.findNamedType(typeID, 0)
+	if err != nil || desc == nil {
+		return false, err
+	}
+	ownerName := desc.OwnerName()
+	if ownerName == "" {
+		if meta, ok := desc.DeclaredType(); ok && meta.Relation != 0 {
+			parent, parentErr := b.catalog.Descriptor(b.ctx, meta.Relation)
+			if parentErr != nil {
+				return false, parentErr
+			}
+			if parent.Descriptor != nil {
+				b.dependency(parent.Descriptor, 0)
+				ownerName = parent.Descriptor.OwnerName()
+			}
+		}
+	}
+	return ownerName != "" && roleIsOwner(roles, b.options.CurrentRole, ownerName), nil
 }
 
 func castContext(context zpgparse.CoercionContext) byte {
@@ -794,7 +856,7 @@ func bindCreateOperator(ctx context.Context, statement *zpgparse.DefineStmt, sna
 	if err != nil {
 		return nil, err
 	}
-	metadata := model.OperatorMetadata{Owner: options.Owner, Name: name}
+	metadata := model.OperatorMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Name: name}
 	var expected []model.TypeLayout
 	if left != nil {
 		metadata.Left, err = b.typeName(left)
@@ -943,6 +1005,13 @@ func operatorOptionText(option *zpgparse.DefElem) string {
 	if value := option.Arg.GetString_(); value != nil {
 		return value.Sval
 	}
+	if name := option.Arg.GetTypeName(); name != nil {
+		parts, err := names(name.Names)
+		if err != nil {
+			return ""
+		}
+		return strings.Join(parts, ".")
+	}
 	if list := option.Arg.GetList(); list != nil {
 		parts := make([]string, 0, len(list.Items))
 		for _, item := range list.Items {
@@ -1089,6 +1158,9 @@ func bindAlterOperator(ctx context.Context, statement *zpgparse.AlterOperatorStm
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	next, err := definitionMutation(ctx, b, base, options, nil, func(spec *model.DescriptorSpec) error {
 		if spec.Operator == nil {
 			return model.ErrInvalidDescriptor
@@ -1181,13 +1253,14 @@ func resolveOperatorDescriptor(ctx context.Context, b *binder, snapshot CatalogS
 		if err != nil {
 			return nil, err
 		}
-		if left.Type.ID != 0 {
-			return nil, bindError("42809", "postfix operators are not supported", 0)
-		}
 	}
-	right, err = b.typeName(object.Objargs[1].GetTypeName())
-	if err != nil {
-		return nil, err
+	if argument := object.Objargs[1].GetTypeName(); argument != nil {
+		right, err = b.typeName(argument)
+		if err != nil {
+			return nil, err
+		}
+	} else if left.Type.ID != 0 {
+		return nil, bindError("42809", "postfix operators are not supported", 0)
 	}
 	if right.Type.ID == 0 {
 		return nil, bindError("42601", "operator reference requires both argument types", 0)
@@ -1394,7 +1467,7 @@ func aggregateStateLayout(layout model.TypeLayout) model.TypeLayout {
 
 func bindAggregateOptions(ctx context.Context, b *binder, snapshot CatalogSnapshot, statement *zpgparse.DefineStmt, options CreateDeclarationOptions, arguments []model.TypeLayout, direct uint16, star bool, kind model.AggregateKind) (model.AggregateMetadata, error) {
 	metadata := model.AggregateMetadata{
-		Owner: options.Owner, Kind: kind, Arguments: arguments, DirectArguments: direct,
+		Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Kind: kind, Arguments: arguments, DirectArguments: direct,
 		Volatility: "immutable", Parallel: "unsafe",
 		FinalModify: model.AggregateFinalReadOnly,
 	}
@@ -1872,6 +1945,9 @@ func bindDropDefinition(ctx context.Context, statement *zpgparse.DropStmt, kind 
 			}
 			return nil, resolveErr
 		}
+		if err := b.requireTableOwner(descriptor, 0); err != nil {
+			return nil, err
+		}
 		if seen[descriptor.ID()] {
 			continue
 		}
@@ -1896,6 +1972,9 @@ func bindRenameDefinition(ctx context.Context, statement *zpgparse.RenameStmt, s
 	}
 	base, err := resolveAggregateReference(ctx, b, snapshot, statement.Object.GetObjectWithArgs())
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	next, err := definitionMutation(ctx, b, base, options, nil, func(spec *model.DescriptorSpec) error {
@@ -1927,11 +2006,17 @@ func bindSetDefinitionSchema(ctx context.Context, statement *zpgparse.AlterObjec
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	destination, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newschema})
 	if err != nil {
 		if isMissingObject(err) {
 			return nil, bindError("3F000", "schema does not exist", 0)
 		}
+		return nil, err
+	}
+	if err := b.checkSchemaCreate(destination.Descriptor, 0); err != nil {
 		return nil, err
 	}
 	b.dependency(destination.Descriptor, 0)
@@ -1965,6 +2050,9 @@ func bindCommentDefinition(ctx context.Context, statement *zpgparse.CommentStmt,
 	}
 	base, err := resolveDefinitionDescriptor(ctx, b, snapshot, statement.Object, kind)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	next, err := definitionMutation(ctx, b, base, options, nil, func(spec *model.DescriptorSpec) error {

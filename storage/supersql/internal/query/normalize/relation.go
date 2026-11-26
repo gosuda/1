@@ -365,6 +365,7 @@ func (n *normalizer) relation(id ir.RelID, depth uint32) relResult {
 	spec.ConflictPredicate = n.scalar(source.ConflictPredicate, depth+1).id
 	spec.RLSInsertCheck = n.scalar(source.RLSInsertCheck, depth+1).id
 	spec.RLSUpdateCheck = n.scalar(source.RLSUpdateCheck, depth+1).id
+	spec.RLSConflictCheck = n.scalar(source.RLSConflictCheck, depth+1).id
 	spec.Frame.Start.Offset = n.scalar(source.Frame.Start.Offset, depth+1).id
 	spec.Frame.End.Offset = n.scalar(source.Frame.End.Offset, depth+1).id
 	spec.Aggregates = allocate[ir.AggregateSpec](n, uint64(source.AggregateCount()))
@@ -527,6 +528,7 @@ func (n *normalizer) relationScalarEffects(spec ir.RelSpec, base ir.Effects) ir.
 	union(spec.ConflictPredicate)
 	union(spec.RLSInsertCheck)
 	union(spec.RLSUpdateCheck)
+	union(spec.RLSConflictCheck)
 	union(spec.Count)
 	union(spec.Offset)
 	union(spec.RecursionSpec.CycleValue)

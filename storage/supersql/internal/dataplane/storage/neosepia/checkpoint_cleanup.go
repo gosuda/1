@@ -69,7 +69,11 @@ func cleanupCheckpointDirectory(ctx context.Context, parent *os.Root, name strin
 	if err != nil {
 		return false, err
 	}
-	defer func() { err = errors.Join(err, root.Close()) }()
+	defer func() {
+		if root != nil {
+			err = errors.Join(err, root.Close())
+		}
+	}()
 	lock, err := root.OpenFile(".lock", os.O_RDWR, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		empty, err := emptyNativeDirectory(parent, name)
@@ -79,12 +83,21 @@ func cleanupCheckpointDirectory(ctx context.Context, parent *os.Root, name strin
 		if !empty {
 			return false, ErrIncompatibleFormat
 		}
+		closeErr := root.Close()
+		root = nil
+		if closeErr != nil {
+			return false, closeErr
+		}
 		return true, parent.Remove(name)
 	}
 	if err != nil {
 		return false, err
 	}
-	defer func() { err = errors.Join(err, lock.Close()) }()
+	defer func() {
+		if lock != nil {
+			err = errors.Join(err, lock.Close())
+		}
+	}()
 	if err := lockDatabaseFile(lock); err != nil {
 		if errors.Is(err, ErrDatabaseLocked) {
 			return false, nil
@@ -122,15 +135,27 @@ func cleanupCheckpointDirectory(ctx context.Context, parent *os.Root, name strin
 			return false, ErrIncompatibleFormat
 		}
 	}
-	return true, removeCheckpointDirectory(parent, root, name)
+	return true, removeCheckpointDirectory(parent, &root, &lock, name)
 }
 
 // removeCheckpointDirectory empties a staging directory whose entire contents
 // are checkpoint-owned: known subtrees plus any composition-declared root
 // extras. Entries are enumerated rather than listed so new checkpoint members
-// cannot strand the directory.
-func removeCheckpointDirectory(parent, root *os.Root, name string) error {
-	directory, err := root.Open(".")
+// cannot strand the directory. Handles are closed and cleared before unlinking
+// .lock and removing the directory so cleanup succeeds on Windows as well as
+// Unix.
+func removeCheckpointDirectory(parent *os.Root, root **os.Root, lock **os.File, name string) error {
+	if root == nil || *root == nil {
+		if lock != nil && *lock != nil {
+			closeErr := (*lock).Close()
+			*lock = nil
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+		return parent.Remove(name)
+	}
+	directory, err := (*root).Open(".")
 	if err != nil {
 		return err
 	}
@@ -150,10 +175,34 @@ func removeCheckpointDirectory(parent, root *os.Root, name string) error {
 	if err := directory.Close(); err != nil {
 		return err
 	}
+	hasLock := false
 	for _, entry := range names {
-		if err := root.RemoveAll(entry); err != nil {
+		if entry == ".lock" {
+			hasLock = true
+			continue
+		}
+		if err := (*root).RemoveAll(entry); err != nil {
 			return err
 		}
+	}
+	if lock != nil && *lock != nil {
+		closeErr := (*lock).Close()
+		*lock = nil
+		if closeErr != nil {
+			return closeErr
+		}
+		if err := (*root).Remove(".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else if hasLock {
+		if err := (*root).Remove(".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	rootCloseErr := (*root).Close()
+	*root = nil
+	if rootCloseErr != nil {
+		return rootCloseErr
 	}
 	return parent.Remove(name)
 }

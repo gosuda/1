@@ -16,11 +16,12 @@ type sequencingClock interface {
 // The gate stays held through durable submission and publication. Reservations
 // survive failed waits, so a later attempt cannot reuse an abandoned timestamp.
 type commitSequencer struct {
-	provider sequencingClock
-	history  [32]byte
-	reserved model.Timestamp
-	anchored bool
-	gate     chan struct{}
+	provider      sequencingClock
+	history       [32]byte
+	reserved      model.Timestamp
+	anchored      bool
+	anchoredEpoch clock.Epoch
+	gate          chan struct{}
 }
 
 func newCommitSequencer(provider sequencingClock, recovered model.Timestamp, history [32]byte) (*commitSequencer, error) {
@@ -90,7 +91,9 @@ func (sequencer *commitSequencer) fenceLocked(ctx context.Context, exact model.T
 		return clock.ErrClockRange
 	}
 	sequencer.reserved = max(sequencer.reserved, timestamp)
-	if !sequencer.anchored {
+	if !sequencer.anchored || sequencer.anchoredEpoch != reading.Epoch {
+		sequencer.anchored = false
+		sequencer.anchoredEpoch = clock.Epoch{}
 		if err := sequencer.provider.WaitUntilAfter(ctx, clock.Instant(timestamp), reading.Epoch); err != nil {
 			return err
 		}
@@ -98,6 +101,7 @@ func (sequencer *commitSequencer) fenceLocked(ctx context.Context, exact model.T
 			return err
 		}
 		sequencer.anchored = true
+		sequencer.anchoredEpoch = reading.Epoch
 	}
 	return publish(ctx, timestamp, reading.Epoch)
 }

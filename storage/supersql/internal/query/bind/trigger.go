@@ -384,6 +384,11 @@ func resolveTriggerRoutine(ctx context.Context, b *binder, snapshot CatalogSnaps
 		namespace, resolveErr := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: schemaName})
 		if isMissingObject(resolveErr) { continue }
 		if resolveErr != nil { return nil, 0, resolveErr }
+		if len(parts) == 2 {
+			if err := b.checkSchemaUsage(namespace.Descriptor, 0); err != nil {
+				return nil, 0, err
+			}
+		}
 		var selected *model.Descriptor
 		err = snapshot.ScanNamespace(ctx, namespace.Descriptor.ID(), model.ObjectRoutine, func(p catalog.PublishedDescriptor) error {
 			if p.Descriptor.Name().Name != name { return nil }
@@ -396,7 +401,16 @@ func resolveTriggerRoutine(ctx context.Context, b *binder, snapshot CatalogSnaps
 			return nil
 		})
 		if err != nil { return nil, 0, err }
-		if selected != nil { b.dependency(namespace.Descriptor, 0); return selected, model.FunctionID(selected.OID()), nil }
+		if selected != nil {
+			b.dependency(namespace.Descriptor, 0)
+			if err := b.checkSchemaUsage(namespace.Descriptor, 0); err != nil {
+				return nil, 0, err
+			}
+			if err := b.checkObjectPrivilege(selected, model.PrivilegeExecute, 0); err != nil {
+				return nil, 0, err
+			}
+			return selected, model.FunctionID(selected.OID()), nil
+		}
 	}
 	return nil, 0, bindError("42883", "trigger function does not exist", 0)
 }

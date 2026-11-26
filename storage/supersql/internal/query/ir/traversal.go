@@ -53,7 +53,7 @@ func (g *Graph) walkRelScalars(ctx context.Context, n Rel, active CTEID, depth u
 			}
 		}
 	}
-	for _, id := range [...]ScalarID{n.Predicate, n.Offset, n.Count, n.ConflictPredicate, n.RLSInsertCheck, n.RLSUpdateCheck, n.Frame.Start.Offset, n.Frame.End.Offset, n.Recursion.CycleValue, n.Recursion.CycleDefault, n.Recursion.CycleContinue} {
+	for _, id := range [...]ScalarID{n.Predicate, n.Offset, n.Count, n.ConflictPredicate, n.RLSInsertCheck, n.RLSUpdateCheck, n.RLSConflictCheck, n.Frame.Start.Offset, n.Frame.End.Offset, n.Recursion.CycleValue, n.Recursion.CycleDefault, n.Recursion.CycleContinue} {
 		if id != 0 {
 			if err := g.walkScalar(ctx, id, active, depth, state); err != nil {
 				return err

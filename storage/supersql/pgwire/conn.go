@@ -3,7 +3,6 @@ package pgwire
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
@@ -117,8 +116,9 @@ type clientConn struct {
 	txStatus byte
 	inError  bool
 
-	stmts   map[string]*preparedStmt
-	portals map[string]*portal
+	stmts       map[string]*preparedStmt
+	portals     map[string]*portal
+	broadcastCh chan Notification
 
 	cancelMu     sync.Mutex
 	activeCancel context.CancelFunc
@@ -189,13 +189,41 @@ func (c *clientConn) writeAndFlush(frame []byte) error {
 	return c.bw.Flush()
 }
 
+func (c *clientConn) writeAndFlushWithDeadline(frame []byte, timeout time.Duration) error {
+	c.writeMu.Lock()
+	if c.closed {
+		c.writeMu.Unlock()
+		return net.ErrClosed
+	}
+	rc := c.currentConn()
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	_, err := c.bw.Write(frame)
+	if err == nil {
+		err = c.bw.Flush()
+	}
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		// Prevent partial-frame wire corruption on stalled or failed peers.
+		c.closed = true
+		c.writeMu.Unlock()
+		c.forceClose()
+		return err
+	}
+	c.writeMu.Unlock()
+	return nil
+}
+
 func (c *clientConn) sendNotification(n Notification) error {
 	pid := n.PID
 	if pid == 0 {
 		pid = c.pid
 	}
 	frame := encodeNotificationResponse(pid, n.Channel, n.Payload)
-	return c.writeAndFlush(frame)
+	return c.writeAndFlushWithDeadline(frame, defaultNotifyWriteTimeout)
 }
 
 func (c *clientConn) setActiveCancel(cancel context.CancelFunc) {
@@ -285,17 +313,6 @@ func (c *clientConn) serve(ctx context.Context) {
 		return
 	}
 
-	// 2. Enforce MaxConnections after CancelRequest so cancellations always succeed.
-	if !c.server.acquireSlot() {
-		_ = c.writeAndFlush(encodeErrorResponse(wireError{
-			Severity: "FATAL",
-			Code:     "53300",
-			Message:  "sorry, too many clients already",
-		}))
-		return
-	}
-	defer c.server.releaseSlot()
-
 	c.user = params["user"]
 	if c.user == "" {
 		c.user = "postgres"
@@ -312,10 +329,23 @@ func (c *clientConn) serve(ctx context.Context) {
 		c.timeZone = tz
 	}
 
-	// 3. Authentication.
+	// 2. Authentication (still under pre-auth slot so stalled unauthenticated
+	// clients cannot starve MaxConnections).
 	if err := c.authenticate(ctx); err != nil {
 		return
 	}
+
+	// 3. Enforce MaxConnections immediately after authentication succeeds and
+	// before opening a SuperSQL session.
+	if !c.server.acquireSlot() {
+		_ = c.writeAndFlush(encodeErrorResponse(wireError{
+			Severity: "FATAL",
+			Code:     "53300",
+			Message:  "sorry, too many clients already",
+		}))
+		return
+	}
+	defer c.server.releaseSlot()
 
 	// 4. Open isolated SuperSQL session for this TCP connection.
 	dc, err := c.server.connector.Connect(ctx)
@@ -344,11 +374,41 @@ func (c *clientConn) serve(ctx context.Context) {
 		return
 	}
 
-	// 7. Wire optional LISTEN/NOTIFY hook and automatic session hub push.
+	// 7. Wire optional LISTEN/NOTIFY hook, broadcast drain, and session hub push.
 	if c.server.cfg.NotifyHandler != nil {
 		if cleanup := c.server.cfg.NotifyHandler(ctx, c.pid, c.sendNotification); cleanup != nil {
 			defer cleanup()
 		}
+	}
+	if c.broadcastCh != nil {
+		broadcastStop := make(chan struct{})
+		broadcastDone := make(chan struct{})
+		go func() {
+			defer close(broadcastDone)
+			defer func() {
+				if r := recover(); r != nil {
+					c.server.logf("pgwire: recovered panic in broadcast notifier pid=%d: %v\n%s", c.pid, r, debug.Stack())
+				}
+			}()
+			for {
+				select {
+				case <-broadcastStop:
+					return
+				case <-ctx.Done():
+					return
+				case n := <-c.broadcastCh:
+					if err := c.sendNotification(n); err != nil {
+						return
+					}
+				}
+			}
+		}()
+		defer func() {
+			close(broadcastStop)
+			// Unblock any write/flush in progress on a stalled TCP peer before waiting.
+			c.forceClose()
+			<-broadcastDone
+		}()
 	}
 	if nc, ok := c.driverConn.(notificationDriverConn); ok {
 		watchCtx, cancelWatch := context.WithCancel(ctx)
@@ -394,8 +454,8 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 	var sawSSL, sawGSS, tlsUpgraded bool
 	for {
 		rc := c.currentConn()
-		if c.server.cfg.ReadTimeout > 0 {
-			_ = rc.SetReadDeadline(time.Now().Add(c.server.cfg.ReadTimeout))
+		if c.server.readTimeout > 0 {
+			_ = rc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
 		}
 		pkt, err := readStartupPacket(rc)
 		if err != nil {
@@ -411,8 +471,18 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 				if _, err := rc.Write([]byte{'S'}); err != nil {
 					return nil, false, err
 				}
+				_ = rc.SetReadDeadline(time.Time{})
 				tlsConn := tls.Server(rc, c.server.cfg.TLSConfig.Clone())
-				if err := tlsConn.HandshakeContext(ctx); err != nil {
+				hsCtx := ctx
+				var cancelHS context.CancelFunc
+				if c.server.readTimeout > 0 {
+					hsCtx, cancelHS = context.WithTimeout(ctx, c.server.readTimeout)
+				}
+				err := tlsConn.HandshakeContext(hsCtx)
+				if cancelHS != nil {
+					cancelHS()
+				}
+				if err != nil {
 					return nil, false, err
 				}
 				if err := c.setConn(tlsConn); err != nil {
@@ -437,6 +507,14 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 			return nil, true, nil
 		case protocolVersion30:
 			_ = rc.SetReadDeadline(time.Time{})
+			if (c.server.cfg.TLSConfig != nil || c.server.cfg.RequireTLS) && !tlsUpgraded {
+				_ = c.writeAndFlush(encodeErrorResponse(wireError{
+					Severity: "FATAL",
+					Code:     "28000",
+					Message:  "no pg_hba.conf entry for host, SSL off",
+				}))
+				return nil, false, errors.New("TLS required for client connection")
+			}
 			return pkt.Params, false, nil
 		default:
 			_ = c.writeAndFlush(encodeErrorResponse(wireError{
@@ -450,23 +528,27 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 }
 
 func (c *clientConn) authenticate(ctx context.Context) error {
-	if c.server.cfg.AuthFunc == nil && c.server.cfg.Password == "" {
+	switch {
+	case c.server.cfg.PasswordLookup != nil:
+		return c.authenticateSCRAM(ctx, c.server.cfg.PasswordLookup)
+	case c.server.cfg.AuthFunc != nil:
+		return c.authenticateCleartext(ctx)
+	case c.server.cfg.Password != "":
+		pw := c.server.cfg.Password
+		return c.authenticateSCRAM(ctx, func(_ context.Context, _, _ string) (string, error) {
+			return pw, nil
+		})
+	default:
 		return c.writeFrame(encodeAuthMessage(authTypeOk))
 	}
+}
+
+func (c *clientConn) authenticateCleartext(ctx context.Context) error {
 	if err := c.writeAndFlush(encodeAuthMessage(authTypeCleartextPassword)); err != nil {
 		return err
 	}
-	if c.server.cfg.ReadTimeout > 0 {
-		rc := c.currentConn()
-		_ = rc.SetReadDeadline(time.Now().Add(c.server.cfg.ReadTimeout))
-		defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
-	}
-	msgType, body, err := readFrontendMessageWithLimit(c.br, maxPasswordMessageBytes)
+	msgType, body, err := c.readAuthFrame()
 	if err != nil {
-		var we *wireError
-		if errors.As(err, &we) {
-			_ = c.writeAndFlush(encodeErrorResponse(*we))
-		}
 		return err
 	}
 	if msgType != 'p' {
@@ -481,13 +563,7 @@ func (c *clientConn) authenticate(ctx context.Context) error {
 	if !ok {
 		password = string(body)
 	}
-	var authErr error
-	if c.server.cfg.AuthFunc != nil {
-		authErr = c.server.cfg.AuthFunc(ctx, c.user, c.database, password)
-	} else if subtle.ConstantTimeCompare([]byte(password), []byte(c.server.cfg.Password)) != 1 {
-		authErr = fmt.Errorf("password authentication failed for user %q", c.user)
-	}
-	if authErr != nil {
+	if authErr := c.server.cfg.AuthFunc(ctx, c.user, c.database, password); authErr != nil {
 		we := wireError{
 			Severity: "FATAL",
 			Code:     "28P01",
@@ -690,8 +766,8 @@ func (c *clientConn) commandLoop(ctx context.Context) {
 		}
 		rc := c.currentConn()
 		// Apply IdleTimeout while waiting for the first byte of the next message.
-		if c.server.cfg.IdleTimeout > 0 {
-			_ = rc.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+		if c.server.idleTimeout > 0 {
+			_ = rc.SetReadDeadline(time.Now().Add(c.server.idleTimeout))
 		} else {
 			_ = rc.SetReadDeadline(time.Time{})
 		}
@@ -707,8 +783,8 @@ func (c *clientConn) commandLoop(ctx context.Context) {
 		}
 
 		// Apply ReadTimeout for the remainder of the incoming message frame.
-		if c.server.cfg.ReadTimeout > 0 {
-			_ = rc.SetReadDeadline(time.Now().Add(c.server.cfg.ReadTimeout))
+		if c.server.readTimeout > 0 {
+			_ = rc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
 		} else {
 			_ = rc.SetReadDeadline(time.Time{})
 		}
@@ -1054,6 +1130,13 @@ func (c *clientConn) handleParse(ctx context.Context, body []byte) error {
 			}
 		}
 	}
+	if _, overwriting := c.stmts[stmtName]; !overwriting && c.server != nil && c.server.maxPreparedStmts > 0 && len(c.stmts) >= c.server.maxPreparedStmts {
+		return &wireError{
+			Severity: "ERROR",
+			Code:     "54000",
+			Message:  "too many prepared statements",
+		}
+	}
 
 	raw, err := parseSingleStatement(queryStr)
 	if err != nil {
@@ -1138,6 +1221,13 @@ func (c *clientConn) handleBind(ctx context.Context, body []byte) error {
 				Code:     "42P03",
 				Message:  fmt.Sprintf("cursor %q already exists", portalName),
 			}
+		}
+	}
+	if _, overwriting := c.portals[portalName]; !overwriting && c.server != nil && c.server.maxPortals > 0 && len(c.portals) >= c.server.maxPortals {
+		return &wireError{
+			Severity: "ERROR",
+			Code:     "54000",
+			Message:  "too many open portals",
 		}
 	}
 

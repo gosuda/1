@@ -55,8 +55,16 @@ type namedPreparedStatement struct {
 }
 
 type temporaryCatalogChange struct {
-	before *model.Descriptor
-	after  *model.Descriptor
+	before       *model.Descriptor
+	after        *model.Descriptor
+	hasTarget    bool
+	targetID     model.ObjectID
+	beforeTarget execution.MutationTarget
+	beforeHasTgt bool
+	hasRow       bool
+	rowID        model.ObjectID
+	beforeRow    *txn.RowNormalizer
+	beforeHasRow bool
 }
 
 type sessionNamedObjects struct {

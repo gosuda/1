@@ -264,6 +264,18 @@ func (b *binder) requireTableOwner(table *model.Descriptor, position int) error 
 		b.dependency(parent.Descriptor, 0)
 		ownerName = parent.Descriptor.OwnerName()
 	}
+	if table.Kind() == model.ObjectType && ownerName == "" {
+		if meta, ok := table.DeclaredType(); ok && meta.Relation != 0 {
+			parent, err := b.catalog.Descriptor(b.ctx, meta.Relation)
+			if err != nil {
+				return err
+			}
+			if parent.Descriptor != nil {
+				b.dependency(parent.Descriptor, 0)
+				ownerName = parent.Descriptor.OwnerName()
+			}
+		}
+	}
 	if ownerName != "" && roleIsOwner(roles, b.options.CurrentRole, ownerName) {
 		return nil
 	}
@@ -290,6 +302,14 @@ func ownerObjectKindLabel(kind model.ObjectKind) string {
 		return "collation"
 	case model.ObjectType:
 		return "type"
+	case model.ObjectCast:
+		return "cast"
+	case model.ObjectOperator:
+		return "operator"
+	case model.ObjectTextSearchDictionary:
+		return "text search dictionary"
+	case model.ObjectTextSearchConfiguration:
+		return "text search configuration"
 	default:
 		return "relation"
 	}

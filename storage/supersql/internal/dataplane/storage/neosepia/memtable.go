@@ -23,10 +23,19 @@ const (
 	defaultMemtableMaxBytes     = uint64(4 << 20)
 	defaultMemtableMaxMutations = uint64(4096)
 	minMemtableBudgetBytes      = uint64(16 << 10)
+	defaultMemtableNodeBudget   = uint64(64 << 20)
 )
 
 func memtableMaxBytes(limits Limits) uint64 {
 	return min(defaultMemtableMaxBytes, limits.WriteBytes/4, limits.OverlayBytes/2, limits.ResidentBytes/4, limits.PublicationBytes/4)
+}
+
+func memtableHardMaxBytes(limits Limits) uint64 {
+	return max(saturatingMulU64(memtableMaxBytes(limits), 4), limits.ResidentBytes)
+}
+
+func memtableNodeBudget(limits Limits) uint64 {
+	return max(defaultMemtableNodeBudget, limits.ResidentBytes)
 }
 
 func memtableEnabled(limits Limits) bool {
@@ -260,7 +269,7 @@ func (m *memtable) validateFence(fence storage.ReadFence) (handled bool, err err
 	return false, nil
 }
 
-func copyObjectLayout(ctx context.Context, layout storage.ObjectLayout) (storage.ObjectLayout, error) {
+func copyObjectLayout(ctx context.Context, layout storage.ObjectLayout, maxRowBytes uint64) (storage.ObjectLayout, error) {
 	cols := make([]storage.ColumnLayout, len(layout.Columns))
 	for i, c := range layout.Columns {
 		cols[i] = c
@@ -268,7 +277,7 @@ func copyObjectLayout(ctx context.Context, layout storage.ObjectLayout) (storage
 			cols[i].Children = slices.Clone(c.Children)
 		}
 		if c.HasMissingValue {
-			v, _, err := model.CopyValue(ctx, c.MissingValue, 64<<20)
+			v, _, err := model.CopyValue(ctx, c.MissingValue, maxRowBytes)
 			if err != nil {
 				return storage.ObjectLayout{}, err
 			}
@@ -280,6 +289,10 @@ func copyObjectLayout(ctx context.Context, layout storage.ObjectLayout) (storage
 
 // stageBatch copies a durably WAL-committed MutationBatch into the memtable.
 func (m *memtable) stageBatch(ctx context.Context, decision runDecision, epoch clock.Epoch, batch storage.MutationBatch, maxRowBytes uint64) error {
+	return m.stageBatchWithBudget(ctx, decision, epoch, batch, maxRowBytes, memtableNodeBudget(Limits{}))
+}
+
+func (m *memtable) stageBatchWithBudget(ctx context.Context, decision runDecision, epoch clock.Epoch, batch storage.MutationBatch, maxRowBytes, nodeBudget uint64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -293,7 +306,10 @@ func (m *memtable) stageBatch(ctx context.Context, decision runDecision, epoch c
 	defer func() { _ = cursor.Close() }()
 
 	if maxRowBytes == 0 {
-		maxRowBytes = 64 << 20
+		maxRowBytes = defaultMemtableNodeBudget
+	}
+	if nodeBudget == 0 {
+		nodeBudget = defaultMemtableNodeBudget
 	}
 	addedTargets := make(map[objectGeneration]*memTargetState)
 	var addedBytes uint64
@@ -317,7 +333,7 @@ func (m *memtable) stageBatch(ctx context.Context, decision runDecision, epoch c
 			if !ok {
 				return storage.ErrInvalidLayout
 			}
-			ownedLayout, err := copyObjectLayout(ctx, layout)
+			ownedLayout, err := copyObjectLayout(ctx, layout, maxRowBytes)
 			if err != nil {
 				return err
 			}
@@ -336,18 +352,20 @@ func (m *memtable) stageBatch(ctx context.Context, decision runDecision, epoch c
 			entry.columnIDs = slices.Clone(mut.ColumnIDs)
 			entry.values = make([]model.Value, len(mut.Values))
 			entryBytes += uint64(len(entry.columnIDs))*4 + uint64(len(entry.values))*uint64(unsafe.Sizeof(model.Value{}))
+			remainingRowBytes := maxRowBytes
 			for i, v := range mut.Values {
-				owned, alloc, err := model.CopyValue(ctx, v, maxRowBytes)
+				owned, alloc, err := model.CopyValue(ctx, v, remainingRowBytes)
 				if err != nil {
 					return err
 				}
 				entry.values[i] = owned
+				remainingRowBytes -= alloc
 				entryBytes += alloc
 			}
 		}
 		entry.bytes = entryBytes
 		vk := memVersionKey{key: entry.key, commitTS: entry.commitTS, ordinal: entry.ordinal}
-		nextTree, _, err := state.entries.Set(vk, entry, 64<<20)
+		nextTree, _, err := state.entries.Set(vk, entry, nodeBudget)
 		if err != nil {
 			return err
 		}
@@ -712,7 +730,7 @@ func encodeMemEntriesBlock(ctx context.Context, layout storage.ObjectLayout, ent
 		layouts[i+2] = model.TypeLayout{Type: c.Type, Children: c.Children}
 		colIDs[i] = c.ID
 	}
-	builderBudget := max(limits.MaxDecodedBytes, uint64(64<<20))
+	builderBudget := max(limits.MaxDecodedBytes, defaultMemtableNodeBudget)
 	builder, err := columnar.NewBuilder(layouts, columnar.BuilderOptions{MaxRows: count, MaxBytes: builderBudget})
 	if err != nil {
 		return nil, err
@@ -972,6 +990,7 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 	// Trim flushed prefix [firstPos .. maxPos] and retain suffix [maxPos+1 .. lastPos].
 	remainingCommits := slices.Clone(m.commits[flushCount:])
 	nextTargets := make(map[objectGeneration]*memTargetState)
+	nodeBudget := memtableNodeBudget(limits)
 	var nextBytes, nextMuts uint64
 	for tk, state := range m.targets {
 		var kept *memTargetState
@@ -990,7 +1009,7 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 			if layout, ok := state.layouts[e.target.DescriptorVersion]; ok {
 				kept.layouts[e.target.DescriptorVersion] = layout
 			}
-			t, _, err := kept.entries.Set(k, e, 64<<20)
+			t, _, err := kept.entries.Set(k, e, nodeBudget)
 			if err != nil {
 				return err
 			}

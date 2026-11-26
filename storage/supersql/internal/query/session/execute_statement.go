@@ -57,13 +57,6 @@ func (execution statementExecution) timestamp() model.Timestamp {
 // SQL text interpolation. The consumer borrows Rows and may retain immutable
 // Prepared metadata. Statement controls no public/legacy dispatch or fallback.
 func (transactions *Transactions) RunStatement(ctx context.Context, statement *zpgparse.RawStmt, options StatementExecution, consume func(context.Context, *Prepared, *Rows) error) (result ExecutionResult, err error) {
-	// The session key encoder resolves declared types only for the statement
-	// that pinned them; a path that skips activation must see no resolver
-	// rather than a previous statement's snapshot. Routine bodies re-enter
-	// RunStatement on this session, so the enclosing pin is restored on exit.
-	previous := transactions.statementTypes
-	transactions.statementTypes = nil
-	defer func() { transactions.statementTypes = previous }()
 	var root *zpgparse.Node
 	if statement != nil {
 		root = statement.Stmt
@@ -76,7 +69,7 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 		// aborts the transaction, and later commands report 25P02 until ROLLBACK
 		// or ROLLBACK TO a savepoint. Every post-dispatch path marks failure;
 		// this pre-dispatch gate must not silently keep the block usable.
-		transactions.markFailed(err)
+		transactions.markFailedIn(ctx, err)
 		return ExecutionResult{}, rejectPreparedEnvironment(options.Execution.Environment, err)
 	}
 	statement = normalizeSelectInto(statement)
@@ -310,9 +303,6 @@ func (transactions *Transactions) RunStatement(ctx context.Context, statement *z
 // snapshot (including uncommitted DDL and temporary tables) without acquiring
 // data-table locks, executing the query, or altering transaction failure state.
 func (transactions *Transactions) DescribeStatement(ctx context.Context, statement *zpgparse.RawStmt, options StatementExecution) (columns []bind.ResultColumn, err error) {
-	previous := transactions.statementTypes
-	transactions.statementTypes = nil
-	defer func() { transactions.statementTypes = previous }()
 	if statement == nil || statement.Stmt == nil || options.Execution.Catalog == nil || options.Planning == nil {
 		return nil, errPreparedInvocation
 	}

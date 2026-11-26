@@ -186,7 +186,7 @@ func RestoreEncryptedCheckpoint(ctx context.Context, backupDir string, encryptio
 	if options.Directory == "" || backupDir == "" {
 		return nil, ErrDirectoryRequired
 	}
-	secret, err := readChainFenceSecret(ctx, []string{backupDir}, encryptionKey)
+	secret, err := readChainFenceSecret(ctx, []string{backupDir}, encryptionKey, options.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +223,7 @@ func RestoreIncremental(ctx context.Context, chainDirs []string, options Increme
 	if options.Open.Directory == "" || len(chainDirs) == 0 {
 		return nil, ErrDirectoryRequired
 	}
-	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey)
+	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey, options.Open.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +269,7 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 	if options.Open.Directory == "" || len(chainDirs) == 0 || walArchiveDir == "" {
 		return nil, PITRResult{}, ErrDirectoryRequired
 	}
-	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey)
+	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey, options.Open.EncryptionKey)
 	if err != nil {
 		return nil, PITRResult{}, err
 	}
@@ -313,16 +313,19 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 	}, nil
 }
 
-func readChainFenceSecret(ctx context.Context, chainDirs []string, encryptionKey []byte) ([nativeFenceSecretSize]byte, error) {
+func readChainFenceSecret(ctx context.Context, chainDirs []string, backupEncKey, liveEncKey []byte) ([nativeFenceSecretSize]byte, error) {
 	var secret [nativeFenceSecretSize]byte
-	raw, err := maintenance.ReadChainFile(ctx, chainDirs, nativeFenceSecretFile, backupLimits, encryptionKey)
+	raw, err := maintenance.ReadChainFile(ctx, chainDirs, nativeFenceSecretFile, backupLimits, backupEncKey)
 	if err != nil {
 		return secret, backupError(err)
 	}
-	if len(raw) != nativeFenceSecretSize {
-		return secret, fmt.Errorf("%w: %s has invalid size %d", ErrCorruptBackup, nativeFenceSecretFile, len(raw))
+	secret, corrupt, err := decodeFenceSecret(raw, liveEncKey)
+	if err != nil {
+		return secret, err
 	}
-	copy(secret[:], raw)
+	if corrupt {
+		return secret, fmt.Errorf("%w: %s is corrupt", ErrCorruptBackup, nativeFenceSecretFile)
+	}
 	return secret, nil
 }
 

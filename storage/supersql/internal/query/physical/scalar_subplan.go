@@ -139,7 +139,7 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 			walkErr = visit(ScalarRef{Graph: n.Logical.Graph, Scalar: id}, 0)
 		}
 	}
-	for _, id := range [...]ir.ScalarID{logical.Predicate, logical.Offset, logical.Count, logical.ConflictPredicate, logical.RLSInsertCheck, logical.RLSUpdateCheck, logical.Frame.Start.Offset, logical.Frame.End.Offset, logical.Recursion.CycleValue, logical.Recursion.CycleDefault, logical.Recursion.CycleContinue} {
+	for _, id := range [...]ir.ScalarID{logical.Predicate, logical.Offset, logical.Count, logical.ConflictPredicate, logical.RLSInsertCheck, logical.RLSUpdateCheck, logical.RLSConflictCheck, logical.Frame.Start.Offset, logical.Frame.End.Offset, logical.Recursion.CycleValue, logical.Recursion.CycleDefault, logical.Recursion.CycleContinue} {
 		add(id)
 	}
 	for i := range logical.ExpressionCount() {

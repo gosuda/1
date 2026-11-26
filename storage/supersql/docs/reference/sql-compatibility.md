@@ -686,7 +686,7 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:370 | `only B-tree exclusion constraints are supported` |
 | internal/query/bind/declaration_constraint.go:394 | `only equality exclusion operators are supported` |
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
-| internal/query/bind/definition_declaration.go:307 | `support function arguments must be inferred from the declaration` |
+| internal/query/bind/definition_declaration.go:321 | `support function arguments must be inferred from the declaration` |
 | internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/function.go:217 | `ordered-set aggregates cannot be used as window functions` |
 | internal/query/bind/function.go:542 | `routine dependency is no longer available` |
@@ -721,7 +721,7 @@ No resolved catalog objects.
 | internal/query/bind/object_declaration.go:409 | `WITH CHECK OPTION is supported only on automatically updatable views` |
 | internal/query/bind/ordinary_alter.go:593 | `WITH CHECK OPTION is supported only on automatically updatable views` |
 | internal/query/bind/ordinary_alter.go:667 | `statistics target can only be set for an index expression` |
-| internal/query/bind/ordinary_reindex.go:220 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
+| internal/query/bind/ordinary_reindex.go:223 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
 | internal/query/bind/partition_alter.go:174 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
 | internal/query/bind/partition_alter.go:185 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
 | internal/query/bind/partition_alter.go:680 | `CONCURRENTLY requires DETACH PARTITION` |
@@ -765,19 +765,19 @@ No resolved catalog objects.
 | internal/query/bind/subquery_compare.go:45 | `cannot compare rows of zero length` |
 | internal/query/bind/subquery_compare.go:80 | `row comparison operators must belong to compatible btree families` |
 | internal/query/bind/temporal_literal.go:47 | `temporal literal has inconsistent coercions` |
-| internal/query/bind/text_search_declaration.go:470 | `external text search stop-word files are unavailable` |
-| internal/query/bind/text_search_declaration.go:487 | `external text search stop-word files are unavailable` |
-| internal/query/bind/text_search_declaration.go:502 | `external text search stop-word files are unavailable` |
-| internal/query/bind/text_search_declaration.go:542 | `unsupported native text search dictionary template` |
-| internal/query/bind/text_search_declaration.go:702 | `model.Error{Code: "0A000"}` |
-| internal/query/bind/text_search_declaration.go:822 | `unsupported ALTER TEXT SEARCH CONFIGURATION action` |
-| internal/query/bind/trigger.go:444 | `trigger WHEN condition cannot contain a subquery` |
-| internal/query/bind/type_declaration.go:1325 | `serial is not valid for a composite attribute` |
-| internal/query/bind/type_declaration.go:1362 | `serial is not valid for a composite attribute` |
-| internal/query/bind/type_declaration.go:1374 | `unsupported ALTER TYPE attribute command` |
-| internal/query/bind/type_declaration.go:260 | `only shell CREATE TYPE declarations are supported` |
-| internal/query/bind/type_declaration.go:370 | `serial is not valid for a composite attribute` |
-| internal/query/bind/type_declaration.go:575 | `domain constraints cannot be DEFERRABLE` |
+| internal/query/bind/text_search_declaration.go:482 | `external text search stop-word files are unavailable` |
+| internal/query/bind/text_search_declaration.go:499 | `external text search stop-word files are unavailable` |
+| internal/query/bind/text_search_declaration.go:514 | `external text search stop-word files are unavailable` |
+| internal/query/bind/text_search_declaration.go:554 | `unsupported native text search dictionary template` |
+| internal/query/bind/text_search_declaration.go:714 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/text_search_declaration.go:834 | `unsupported ALTER TEXT SEARCH CONFIGURATION action` |
+| internal/query/bind/trigger.go:458 | `trigger WHEN condition cannot contain a subquery` |
+| internal/query/bind/type_declaration.go:1351 | `serial is not valid for a composite attribute` |
+| internal/query/bind/type_declaration.go:1388 | `serial is not valid for a composite attribute` |
+| internal/query/bind/type_declaration.go:1400 | `unsupported ALTER TYPE attribute command` |
+| internal/query/bind/type_declaration.go:265 | `only shell CREATE TYPE declarations are supported` |
+| internal/query/bind/type_declaration.go:375 | `serial is not valid for a composite attribute` |
+| internal/query/bind/type_declaration.go:580 | `domain constraints cannot be DEFERRABLE` |
 | internal/query/bind/utility.go:388 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/utility.go:706 | `cannot update a non-updatable view column` |
 | internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
@@ -795,12 +795,12 @@ No resolved catalog objects.
 | internal/query/builtin/key_opclass.go:162 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
-| internal/query/exec/modify/options.go:172 | `model.Error{Code: "0A000"}` |
+| internal/query/exec/modify/options.go:173 | `model.Error{Code: "0A000"}` |
 | internal/query/session/execute_prepared.go:31 | `model.Error{Code: "0A000"}` |
 | internal/query/session/named_execute.go:340 | `model.Error{Code: "0A000"}` |
 | internal/query/session/prepare.go:111 | `model.Error{Code: "0A000"}` |
 | internal/query/session/prepare.go:113 | `model.Error{Code: "0A000"}` |
 | internal/query/session/sequence_runtime.go:194 | `model.Error{Code: "0A000"}` |
 | internal/query/session/settings_values.go:207 | `model.Error{Code: "0A000"}` |
-| pgwire/conn.go:444 | `model.Error{Code: "0A000"}` |
+| pgwire/conn.go:522 | `model.Error{Code: "0A000"}` |
 

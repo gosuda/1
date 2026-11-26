@@ -146,7 +146,7 @@ func (backend *Backend) resolveMetadata(ctx context.Context) error {
 	var recoveredBase runBase
 	var recoveredFence coveredFenceIndex
 	if state.BaseGeneration != previous.BaseGeneration {
-		base, err := loadRunBase(ctx, backend.directory.runs, state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles)
+		base, err := loadRunBaseWithCipher(ctx, backend.directory.runs, state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles, backend.cipher)
 		if err != nil {
 			return err
 		}

@@ -267,25 +267,41 @@ func (g *Group) Run(ctx context.Context, task Task) error {
 }
 
 func (j *job) execute() {
-	err := context.Cause(j.ctx)
+	var err error
+	completed := false
+	cleaned := false
+	defer func() {
+		if !completed && err == nil {
+			err = ErrClosed
+		}
+		j.task = Task{}
+		j.future.cancel(nil)
+		j.future.err = err
+		g := j.group
+		g.mu.Lock()
+		g.active--
+		if err != nil && g.first == nil {
+			// Keep one causal chain, not an ever-growing history of failed tasks.
+			g.first = err
+			g.cancel(err)
+		}
+		g.mu.Unlock()
+		close(j.future.done)
+		g.pending.Done()
+	}()
+	defer func() {
+		if !cleaned {
+			cleaned = true
+			err = j.task.cleanup(ErrClosed)
+		}
+	}()
+	err = context.Cause(j.ctx)
 	if err == nil {
 		err = j.task.Run(j.ctx)
 	}
+	cleaned = true
 	err = j.task.cleanup(err)
-	j.task = Task{}
-	j.future.cancel(nil)
-	j.future.err = err
-	g := j.group
-	g.mu.Lock()
-	g.active--
-	if err != nil && g.first == nil {
-		// Keep one causal chain, not an ever-growing history of failed tasks.
-		g.first = err
-		g.cancel(err)
-	}
-	g.mu.Unlock()
-	close(j.future.done)
-	g.pending.Done()
+	completed = true
 }
 
 // Wait seals admission and joins all admitted tasks/producers. It returns the

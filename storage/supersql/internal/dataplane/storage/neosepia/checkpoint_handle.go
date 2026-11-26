@@ -123,8 +123,12 @@ func (handle *checkpointHandle) Close() error {
 	if handle.parent != nil && handle.directory != "" {
 		var cleanupErr error
 		if handle.root != nil {
-			cleanupErr = removeCheckpointDirectory(handle.parent, handle.root, handle.directory)
+			cleanupErr = removeCheckpointDirectory(handle.parent, &handle.root, &handle.lock, handle.directory)
 		} else {
+			if handle.lock != nil {
+				err = errors.Join(err, handle.lock.Close())
+				handle.lock = nil
+			}
 			cleanupErr = handle.parent.Remove(handle.directory)
 		}
 		err = errors.Join(err, cleanupErr)

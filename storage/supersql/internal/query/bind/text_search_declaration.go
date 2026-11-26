@@ -51,6 +51,9 @@ func BindCreateTextSearch(ctx context.Context, statement *zpgparse.DefineStmt, s
 	if err != nil {
 		return nil, err
 	}
+	if err := b.checkSchemaCreate(schema, 0); err != nil {
+		return nil, err
+	}
 	b.dependency(schema, 0)
 	identity := model.NamespaceName{Parent: schema.ID(), Kind: kind, Name: name}
 	published, err := snapshot.Resolve(ctx, identity)
@@ -66,12 +69,14 @@ func BindCreateTextSearch(ctx context.Context, statement *zpgparse.DefineStmt, s
 	}
 	spec := model.DescriptorSpec{ID: id, OID: oid, Name: identity, Version: 1, State: model.StatePublic}
 	semanticDependencies := []*model.Descriptor{schema}
+	ownerName := normalizeOwnerName(options.Bind.CurrentRole)
 	switch kind {
 	case model.ObjectTextSearchDictionary:
 		metadata, template, parseErr := bindTextSearchDictionaryDefinition(b, statement.Definition, options.Owner)
 		if parseErr != nil {
 			return nil, parseErr
 		}
+		metadata.OwnerName = ownerName
 		if template != nil {
 			semanticDependencies = append(semanticDependencies, template)
 		}
@@ -81,6 +86,7 @@ func BindCreateTextSearch(ctx context.Context, statement *zpgparse.DefineStmt, s
 		if parseErr != nil {
 			return nil, parseErr
 		}
+		metadata.OwnerName = ownerName
 		for _, dependency := range dependencies {
 			b.dependency(dependency, 0)
 		}
@@ -113,6 +119,9 @@ func BindAlterTextSearchDictionary(ctx context.Context, statement *zpgparse.Alte
 	}
 	if descriptor.State() != model.StatePublic {
 		return nil, bindError("42704", "text search dictionary does not exist", 0)
+	}
+	if err := b.requireTableOwner(descriptor, 0); err != nil {
+		return nil, err
 	}
 	b.dependency(descriptor, 0)
 	spec, err := descriptor.Spec(ctx)
@@ -316,6 +325,9 @@ func BindAlterTextSearchConfiguration(ctx context.Context, statement *zpgparse.A
 	}
 	if descriptor.State() != model.StatePublic {
 		return nil, bindError("42704", "text search configuration does not exist", 0)
+	}
+	if err := b.requireTableOwner(descriptor, 0); err != nil {
+		return nil, err
 	}
 	b.dependency(descriptor, 0)
 	spec, err := descriptor.Spec(ctx)

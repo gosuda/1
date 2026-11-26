@@ -310,7 +310,7 @@ func (check *checkpointVerification) verifyBase(ctx context.Context, runs *os.Ro
 		return recoveredPosition{}, err
 	}
 	metadata := min(check.limits.PreparationBytes, check.limits.MetadataBytes-check.metadata)
-	base, err := loadRunBase(ctx, runs, state.BaseGeneration, metadata, check.limits.IdentityBytes, min(check.limits.MaxFiles, check.limits.Runs))
+	base, err := loadRunBaseWithCipher(ctx, runs, state.BaseGeneration, metadata, check.limits.IdentityBytes, min(check.limits.MaxFiles, check.limits.Runs), check.cipher)
 	if err != nil {
 		return recoveredPosition{}, err
 	}

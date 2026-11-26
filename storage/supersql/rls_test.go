@@ -289,12 +289,9 @@ func TestRLSProductionCompleteness(t *testing.T) {
 	if out.Rows[0][0].StrVal != "s1-updated" {
 		t.Fatalf("ON CONFLICT DO UPDATE own row = %q, want s1-updated", out.Rows[0][0].StrVal)
 	}
-	// Attempting to overwrite another tenant's row (id = 2, tenant_id = 't2') is filtered by USING:
-	out = mustExec(`INSERT INTO tenant_secrets VALUES (2, 't1', 'hijacked')
-		ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret`)
-	if out.RowsAffected != 0 {
-		t.Fatalf("cross-tenant ON CONFLICT DO UPDATE affected %d rows, want 0", out.RowsAffected)
-	}
+	// Attempting to overwrite another tenant's row (id = 2, tenant_id = 't2') violates UPDATE/SELECT USING (42501):
+	requireErrCode(`INSERT INTO tenant_secrets VALUES (2, 't1', 'hijacked')
+		ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret`, "42501")
 	// Attempting to change own row's tenant_id to 't2' via ON CONFLICT DO UPDATE violates WITH CHECK (42501):
 	requireErrCode(`INSERT INTO tenant_secrets VALUES (1, 't1', 's1')
 		ON CONFLICT (id) DO UPDATE SET tenant_id = 't2'`, "42501")
@@ -1114,6 +1111,131 @@ func TestNativeRLSPenetrationMatrix(t *testing.T) {
 	}
 	if _, err := conn2.ExecContext(ctx, `FETCH 1 FROM pool_leak_cur`); err == nil || SQLState(err) != "34000" {
 		t.Fatalf("pooled connection leaked held cursor: err=%v, want SQLSTATE 34000", err)
+	}
+}
+
+func TestRLSOnConflictExistenceOracleAndUsingCheck(t *testing.T) {
+	ctx := t.Context()
+	db, err := Open(ctx, OpenOptions{Directory: testDirectory(t), Clock: newTestClock()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	mustExec := func(sqlText string) outcome {
+		t.Helper()
+		out, err := db.exec(ctx, sqlText, 0)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", sqlText, err)
+		}
+		return out
+	}
+	requireErrCode := func(sqlText, wantCode string) error {
+		t.Helper()
+		_, err := db.exec(ctx, sqlText, 0)
+		if err == nil {
+			t.Fatalf("%s: expected SQLSTATE %s, got nil", sqlText, wantCode)
+		}
+		if got := sqlStateOf(err); got != wantCode {
+			t.Fatalf("%s: expected SQLSTATE %s, got %q (%v)", sqlText, wantCode, got, err)
+		}
+		return err
+	}
+
+	mustExec(`CREATE ROLE conflict_user`)
+
+	// Table 1: standard tenant isolation (FOR ALL USING + WITH CHECK).
+	mustExec(`CREATE TABLE conflict_docs (
+		id bigint PRIMARY KEY,
+		tenant_id text NOT NULL,
+		val text NOT NULL
+	)`)
+	mustExec(`INSERT INTO conflict_docs VALUES (1, 't1', 'own-1'), (2, 't2', 'other-2')`)
+	mustExec(`ALTER TABLE conflict_docs ENABLE ROW LEVEL SECURITY`)
+	mustExec(`CREATE POLICY docs_pol ON conflict_docs
+		FOR ALL TO conflict_user
+		USING (tenant_id = current_setting('app.tenant_id', true))
+		WITH CHECK (tenant_id = current_setting('app.tenant_id', true))`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE ON conflict_docs TO conflict_user`)
+
+	// Table 2: separate SELECT USING (val <> 'hidden_sel') and UPDATE USING (true)
+	// to verify DO UPDATE enforces SELECT USING as well as UPDATE USING.
+	mustExec(`CREATE TABLE conflict_sel_using (
+		id bigint PRIMARY KEY,
+		val text NOT NULL
+	)`)
+	mustExec(`INSERT INTO conflict_sel_using VALUES (1, 'visible'), (2, 'hidden_sel')`)
+	mustExec(`ALTER TABLE conflict_sel_using ENABLE ROW LEVEL SECURITY`)
+	mustExec(`CREATE POLICY sel_hide ON conflict_sel_using FOR SELECT TO conflict_user USING (val <> 'hidden_sel')`)
+	mustExec(`CREATE POLICY ins_allow ON conflict_sel_using FOR INSERT TO conflict_user WITH CHECK (true)`)
+	mustExec(`CREATE POLICY upd_allow ON conflict_sel_using FOR UPDATE TO conflict_user USING (true) WITH CHECK (true)`)
+	mustExec(`GRANT SELECT, INSERT, UPDATE ON conflict_sel_using TO conflict_user`)
+
+	mustExec(`SET ROLE conflict_user`)
+	mustExec(`SET app.tenant_id = 't1'`)
+
+	// 1. Existence oracle fix: INSERT ... ON CONFLICT DO NOTHING with a proposed
+	// row violating INSERT WITH CHECK MUST fail with 42501 BOTH when the key does
+	// NOT exist and when the key ALREADY exists.
+	requireErrCode(`INSERT INTO conflict_docs VALUES (999, 't2', 'probe-missing') ON CONFLICT (id) DO NOTHING`, "42501")
+	requireErrCode(`INSERT INTO conflict_docs VALUES (2, 't2', 'probe-existing-other') ON CONFLICT (id) DO NOTHING`, "42501")
+	requireErrCode(`INSERT INTO conflict_docs VALUES (1, 't2', 'probe-existing-own') ON CONFLICT (id) DO NOTHING`, "42501")
+
+	// Same for ON CONFLICT DO UPDATE (even with WHERE false): INSERT WITH CHECK
+	// runs before conflict lookup, so violating proposed rows always fail with 42501.
+	requireErrCode(`INSERT INTO conflict_docs VALUES (999, 't2', 'probe-missing') ON CONFLICT (id) DO UPDATE SET val = 'x' WHERE false`, "42501")
+	requireErrCode(`INSERT INTO conflict_docs VALUES (2, 't2', 'probe-existing') ON CONFLICT (id) DO UPDATE SET val = 'x' WHERE false`, "42501")
+
+	// A proposed row satisfying INSERT WITH CHECK on an existing key with DO NOTHING
+	// still succeeds cleanly with 0 rows affected.
+	out := mustExec(`INSERT INTO conflict_docs VALUES (2, 't1', 'noop') ON CONFLICT (id) DO NOTHING`)
+	if out.RowsAffected != 0 {
+		t.Fatalf("ON CONFLICT DO NOTHING allowed proposed row affected %d rows, want 0", out.RowsAffected)
+	}
+
+	// 2. DO UPDATE USING enforcement: targeting an existing row hidden by UPDATE/SELECT
+	// USING policy MUST raise 42501 even when user supplies DO UPDATE ... WHERE false!
+	err = requireErrCode(`INSERT INTO conflict_docs VALUES (2, 't1', 'hijack')
+		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE false`, "42501")
+	if !strings.Contains(err.Error(), "USING expression") {
+		t.Fatalf("expected USING expression error message, got: %v", err)
+	}
+
+	// Also when UPDATE USING is true but SELECT USING hides the conflicting row:
+	err = requireErrCode(`INSERT INTO conflict_sel_using VALUES (2, 'hijack')
+		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE false`, "42501")
+	if !strings.Contains(err.Error(), "USING expression") {
+		t.Fatalf("expected USING expression error message for SELECT USING, got: %v", err)
+	}
+
+	// 3. When both UPDATE USING and SELECT USING allow the conflicting row, user's
+	// DO UPDATE ... WHERE false skips the update cleanly (0 rows affected), and a
+	// matching DO UPDATE updates the row normally.
+	out = mustExec(`INSERT INTO conflict_docs VALUES (1, 't1', 'skipped')
+		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE false`)
+	if out.RowsAffected != 0 {
+		t.Fatalf("ON CONFLICT DO UPDATE WHERE false on visible row affected %d rows, want 0", out.RowsAffected)
+	}
+	out = mustExec(`INSERT INTO conflict_docs VALUES (1, 't1', 'updated-1')
+		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE conflict_docs.val = 'own-1'`)
+	if out.RowsAffected != 1 {
+		t.Fatalf("ON CONFLICT DO UPDATE on visible row affected %d rows, want 1", out.RowsAffected)
+	}
+	out = mustExec(`INSERT INTO conflict_sel_using VALUES (1, 'still-visible')
+		ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE false`)
+	if out.RowsAffected != 0 {
+		t.Fatalf("conflict_sel_using WHERE false on visible row affected %d rows, want 0", out.RowsAffected)
+	}
+
+	// Verify hidden rows remain completely untouched as superuser.
+	mustExec(`RESET ROLE`)
+	out = mustExec(`SELECT id, tenant_id, val FROM conflict_docs ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][2].StrVal != "updated-1" || out.Rows[1][1].StrVal != "t2" || out.Rows[1][2].StrVal != "other-2" {
+		t.Fatalf("conflict_docs final rows = %+v, want [(1,t1,updated-1), (2,t2,other-2)]", out.Rows)
+	}
+	out = mustExec(`SELECT id, val FROM conflict_sel_using ORDER BY id`)
+	if len(out.Rows) != 2 || out.Rows[0][1].StrVal != "visible" || out.Rows[1][1].StrVal != "hidden_sel" {
+		t.Fatalf("conflict_sel_using final rows = %+v, want [(1,visible), (2,hidden_sel)]", out.Rows)
 	}
 }
 

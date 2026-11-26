@@ -213,6 +213,7 @@ func (c *scopeClone) relation(id ir.RelID, depth uint32) ir.RelID {
 	spec.ConflictPredicate = c.scalar(spec.ConflictPredicate, depth+1)
 	spec.RLSInsertCheck = c.scalar(spec.RLSInsertCheck, depth+1)
 	spec.RLSUpdateCheck = c.scalar(spec.RLSUpdateCheck, depth+1)
+	spec.RLSConflictCheck = c.scalar(spec.RLSConflictCheck, depth+1)
 	for i := range spec.Actions {
 		action := &spec.Actions[i]
 		action.Condition = c.scalar(action.Condition, depth+1)

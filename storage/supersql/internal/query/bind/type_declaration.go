@@ -149,6 +149,9 @@ func newTypeDeclarationState(ctx context.Context, node *zpgparse.Node, parts []s
 	if parent == nil {
 		return nil, "", bindError("3F000", "no schema selected for creation", 0)
 	}
+	if err := b.checkSchemaCreate(parent, 0); err != nil {
+		return nil, "", err
+	}
 	b.dependency(parent, 0)
 	state := &typeDeclarationState{b: b, options: options, parent: parent}
 	state.alloc = declarationState{b: b, options: options, parent: parent.ID(), ids: make(map[model.ObjectID]bool), oids: make(map[model.OID]bool), names: make(map[string]bool), reserved: make(map[string]bool)}
@@ -225,8 +228,10 @@ func (s *typeDeclarationState) allocatePair(name, arrayName string, layout model
 	if err != nil {
 		return nil, err
 	}
+	ownerName := normalizeOwnerName(s.options.Bind.CurrentRole)
 	layout.Type.ID = model.TypeID(oid)
 	metadata.Owner = s.options.Owner
+	metadata.OwnerName = ownerName
 	metadata.Layout = layout
 	metadata.Array = arrayID
 	dependencies = typeDependencies(dependencies, model.Dependency{Object: s.parent.ID(), Version: s.parent.Version()})
@@ -235,7 +240,7 @@ func (s *typeDeclarationState) allocatePair(name, arrayName string, layout model
 		return nil, err
 	}
 	arrayLayout := model.TypeLayout{Type: model.Type{ID: model.TypeID(arrayOID), Modifier: -1, Storage: model.TypeArray}, Children: []model.TypeLayout{layout}}
-	arrayMetadata := &model.TypeMetadata{Kind: model.TypeKindArray, Owner: s.options.Owner, Layout: arrayLayout, Base: id, BaseLayout: layout}
+	arrayMetadata := &model.TypeMetadata{Kind: model.TypeKindArray, Owner: s.options.Owner, OwnerName: ownerName, Layout: arrayLayout, Base: id, BaseLayout: layout}
 	arrayDependencies := typeDependencies([]model.Dependency{{Object: s.parent.ID(), Version: s.parent.Version()}}, model.Dependency{Object: id, Version: 1})
 	array, err := model.NewDescriptor(s.b.ctx, model.DescriptorSpec{ID: arrayID, OID: arrayOID, Name: model.NamespaceName{Parent: s.parent.ID(), Kind: model.ObjectType, Name: arrayName}, Version: 1, State: model.StatePublic, Dependencies: arrayDependencies, Type: arrayMetadata}, s.options.Descriptors)
 	if err != nil {
@@ -279,7 +284,7 @@ func bindCreateShellType(ctx context.Context, statement *zpgparse.DefineStmt, sn
 		ID: id, OID: oid, Version: 1, State: model.StatePublic,
 		Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: name},
 		Dependencies: []model.Dependency{{Object: state.parent.ID(), Version: state.parent.Version()}},
-		Type: &model.TypeMetadata{Kind: model.TypeKindShell, Owner: options.Owner, Layout: layout},
+		Type: &model.TypeMetadata{Kind: model.TypeKindShell, Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Layout: layout},
 	}, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -396,7 +401,7 @@ func bindCreateComposite(ctx context.Context, statement *zpgparse.CompositeTypeS
 		ID: relationID, OID: relationOID, Version: 1, State: model.StatePublic,
 		Name:              model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectCompositeRelation, Name: name},
 		Dependencies:      []model.Dependency{{Object: state.parent.ID(), Version: state.parent.Version()}},
-		CompositeRelation: &model.CompositeRelationMetadata{Owner: options.Owner, RowType: created[0].ID(), FieldIDHighWatermark: model.ColumnID(len(fields)), Columns: fields},
+		CompositeRelation: &model.CompositeRelationMetadata{Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), RowType: created[0].ID(), FieldIDHighWatermark: model.ColumnID(len(fields)), Columns: fields},
 	}, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -607,6 +612,9 @@ func bindCreateRange(ctx context.Context, statement *zpgparse.CreateRangeStmt, s
 			return nil, bindError("42710", "type already exists", 0)
 		}
 		shell = published.Descriptor
+		if err := state.b.requireTableOwner(shell, 0); err != nil {
+			return nil, err
+		}
 		state.b.dependency(shell, 0)
 	} else if !isMissingObject(resolveErr) {
 		return nil, resolveErr
@@ -728,14 +736,16 @@ func bindCreateRange(ctx context.Context, statement *zpgparse.CreateRangeStmt, s
 	parentDependency := model.Dependency{Object: state.parent.ID(), Version: state.parent.Version()}
 	subtypeDependencies := externalTypeDependencies(state.b.dependencies, rangeID)
 	rangeOwner := options.Owner
+	rangeOwnerName := normalizeOwnerName(options.Bind.CurrentRole)
 	if shell != nil {
 		shellSpec, err := shell.SpecWithin(ctx, options.Descriptors)
 		if err != nil {
 			return nil, err
 		}
 		rangeOwner = shellSpec.Type.Owner
+		rangeOwnerName = shellSpec.Type.OwnerName
 	}
-	rangeType := &model.TypeMetadata{Kind: model.TypeKindRange, Owner: rangeOwner, Layout: rangeLayout, Array: rangeArrayID, Range: rangeMetadata}
+	rangeType := &model.TypeMetadata{Kind: model.TypeKindRange, Owner: rangeOwner, OwnerName: rangeOwnerName, Layout: rangeLayout, Array: rangeArrayID, Range: rangeMetadata}
 	var rangeDescriptor *model.Descriptor
 	if shell == nil {
 		rangeDescriptor, err = model.NewDescriptor(ctx, model.DescriptorSpec{ID: rangeID, OID: rangeOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: name}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies(subtypeDependencies, parentDependency), Type: rangeType}, options.Descriptors)
@@ -750,17 +760,17 @@ func bindCreateRange(ctx context.Context, statement *zpgparse.CreateRangeStmt, s
 		return nil, err
 	}
 	rangeArrayLayout := model.TypeLayout{Type: model.Type{ID: model.TypeID(rangeArrayOID), Modifier: -1, Storage: model.TypeArray}, Children: []model.TypeLayout{rangeLayout}}
-	rangeArray, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: rangeArrayID, OID: rangeArrayOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: arrayTypeName(name)}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies([]model.Dependency{parentDependency}, model.Dependency{Object: rangeID, Version: rangeDescriptor.Version()}), Type: &model.TypeMetadata{Kind: model.TypeKindArray, Owner: rangeOwner, Layout: rangeArrayLayout, Base: rangeID, BaseLayout: rangeLayout}}, options.Descriptors)
+	rangeArray, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: rangeArrayID, OID: rangeArrayOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: arrayTypeName(name)}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies([]model.Dependency{parentDependency}, model.Dependency{Object: rangeID, Version: rangeDescriptor.Version()}), Type: &model.TypeMetadata{Kind: model.TypeKindArray, Owner: rangeOwner, OwnerName: rangeOwnerName, Layout: rangeArrayLayout, Base: rangeID, BaseLayout: rangeLayout}}, options.Descriptors)
 	if err != nil {
 		return nil, err
 	}
 	multirangeMetadata := *rangeMetadata
-	multirangeDescriptor, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: multirangeID, OID: multirangeOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: multirangeName}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies(subtypeDependencies, parentDependency, model.Dependency{Object: rangeID, Version: rangeDescriptor.Version()}), Type: &model.TypeMetadata{Kind: model.TypeKindMultirange, Owner: rangeOwner, Layout: multirangeLayout, Array: multirangeArrayID, Range: &multirangeMetadata}}, options.Descriptors)
+	multirangeDescriptor, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: multirangeID, OID: multirangeOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: multirangeName}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies(subtypeDependencies, parentDependency, model.Dependency{Object: rangeID, Version: rangeDescriptor.Version()}), Type: &model.TypeMetadata{Kind: model.TypeKindMultirange, Owner: rangeOwner, OwnerName: rangeOwnerName, Layout: multirangeLayout, Array: multirangeArrayID, Range: &multirangeMetadata}}, options.Descriptors)
 	if err != nil {
 		return nil, err
 	}
 	multirangeArrayLayout := model.TypeLayout{Type: model.Type{ID: model.TypeID(multirangeArrayOID), Modifier: -1, Storage: model.TypeArray}, Children: []model.TypeLayout{multirangeLayout}}
-	multirangeArray, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: multirangeArrayID, OID: multirangeArrayOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: arrayTypeName(multirangeName)}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies([]model.Dependency{parentDependency}, model.Dependency{Object: multirangeID, Version: 1}), Type: &model.TypeMetadata{Kind: model.TypeKindArray, Owner: rangeOwner, Layout: multirangeArrayLayout, Base: multirangeID, BaseLayout: multirangeLayout}}, options.Descriptors)
+	multirangeArray, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: multirangeArrayID, OID: multirangeArrayOID, Name: model.NamespaceName{Parent: state.parent.ID(), Kind: model.ObjectType, Name: arrayTypeName(multirangeName)}, Version: 1, State: model.StatePublic, Dependencies: typeDependencies([]model.Dependency{parentDependency}, model.Dependency{Object: multirangeID, Version: 1}), Type: &model.TypeMetadata{Kind: model.TypeKindArray, Owner: rangeOwner, OwnerName: rangeOwnerName, Layout: multirangeArrayLayout, Base: multirangeID, BaseLayout: multirangeLayout}}, options.Descriptors)
 	if err != nil {
 		return nil, err
 	}
@@ -900,10 +910,16 @@ func (s *typeDeclarationState) resolveRangeRoutine(node *zpgparse.Node, paramete
 }
 
 func typeNameFromNode(node *zpgparse.Node) ([]string, error) {
-	if node == nil || node.GetTypeName() == nil {
+	if node == nil {
 		return nil, bindError("42601", "invalid type name", 0)
 	}
-	return names(node.GetTypeName().Names)
+	if typeName := node.GetTypeName(); typeName != nil {
+		return names(typeName.Names)
+	}
+	if list := node.GetList(); list != nil {
+		return names(list.Items)
+	}
+	return nil, bindError("42601", "invalid type name", 0)
 }
 
 func resolveTypeDescriptor(ctx context.Context, b *binder, parts []string) (*model.Descriptor, error) {
@@ -988,6 +1004,7 @@ func companionCompositeRelationMutation(ctx context.Context, b *binder, snapshot
 	}
 	spec.Version++
 	spec.CompositeRelation.Owner = typeSpec.Type.Owner
+	spec.CompositeRelation.OwnerName = typeSpec.Type.OwnerName
 	spec.CompositeRelation.FieldIDHighWatermark = typeSpec.Type.FieldIDHighWatermark
 	spec.CompositeRelation.Columns = slices.Clone(typeSpec.Type.Fields)
 	next, err := model.NewDescriptor(ctx, spec, options.Descriptors)
@@ -1025,6 +1042,9 @@ func bindAlterEnum(ctx context.Context, statement *zpgparse.AlterEnumStmt, snaps
 	}
 	base, err := resolveTypeDescriptor(ctx, b, parts)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	baseSpec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -1105,6 +1125,9 @@ func bindAlterDomain(ctx context.Context, statement *zpgparse.AlterDomainStmt, s
 	}
 	base, err := resolveTypeDescriptor(ctx, b, parts)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -1289,6 +1312,9 @@ func bindAlterComposite(ctx context.Context, statement *zpgparse.AlterTableStmt,
 		if statement.MissingOk && isUndefinedType(err) {
 			return &BoundTypeCommand{warnings: []model.Error{{Code: "42704", Message: "type does not exist, skipping"}}, tag: "ALTER TYPE"}, nil
 		}
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	baseSpec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -1503,6 +1529,9 @@ func bindRenameDomainConstraint(ctx context.Context, statement *zpgparse.RenameS
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -1556,6 +1585,9 @@ func bindRenameCompositeAttribute(ctx context.Context, statement *zpgparse.Renam
 	}
 	base, err := resolveTypeDescriptor(ctx, b, parts)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -1625,6 +1657,9 @@ func bindRenameType(ctx context.Context, statement *zpgparse.RenameStmt, snapsho
 	}
 	base, err := resolveTypeDescriptor(ctx, b, parts)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	if statement.RenameType == zpgparse.ObjectType_OBJECT_DOMAIN {
@@ -1748,6 +1783,9 @@ func bindSetTypeSchema(ctx context.Context, statement *zpgparse.AlterObjectSchem
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	if statement.ObjectType == zpgparse.ObjectType_OBJECT_DOMAIN {
 		spec, err := base.SpecWithin(ctx, options.Descriptors)
 		if err != nil {
@@ -1772,6 +1810,9 @@ func bindSetTypeSchema(ctx context.Context, statement *zpgparse.AlterObjectSchem
 	}
 	parent, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newschema})
 	if err != nil {
+		return nil, err
+	}
+	if err := b.checkSchemaCreate(parent.Descriptor, 0); err != nil {
 		return nil, err
 	}
 	owned, err := ownedTypeDescriptors(ctx, snapshot, base, options)

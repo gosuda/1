@@ -70,12 +70,20 @@ func (set *runSet) admitDecision(ctx context.Context, root *os.Root, decision ru
 			return nil, storage.ErrCorruptStorage
 		}
 		rows += descriptor.Rows
-		run, openErr := openPreparedRun(ctx, root, descriptor, limits, maxBytes-used, scratch)
+		nativeBytes := uint64(unsafe.Sizeof(sstFile{}))
+		if used > maxBytes || nativeBytes >= maxBytes-used {
+			return nil, columnar.ErrBatchBudget
+		}
+		run, openErr := openPreparedRun(ctx, root, descriptor, limits, maxBytes-used-nativeBytes, scratch)
 		if openErr != nil {
 			return nil, openErr
 		}
 		opened = append(opened, run)
-		used += run.residentCost()
+		cost := run.residentCost()
+		if cost > maxBytes-used {
+			return nil, columnar.ErrBatchBudget
+		}
+		used += cost
 	}
 	if rows != decision.MutationCount {
 		return nil, storage.ErrCorruptStorage
@@ -135,12 +143,20 @@ func (set *runSet) admitCoalescedDecision(ctx context.Context, root *os.Root, de
 			return nil, storage.ErrCorruptStorage
 		}
 		rows += descriptor.Rows
-		run, openErr := openPreparedRun(ctx, root, descriptor, limits, maxBytes-used, scratch)
+		nativeBytes := uint64(unsafe.Sizeof(sstFile{}))
+		if used > maxBytes || nativeBytes >= maxBytes-used {
+			return nil, columnar.ErrBatchBudget
+		}
+		run, openErr := openPreparedRun(ctx, root, descriptor, limits, maxBytes-used-nativeBytes, scratch)
 		if openErr != nil {
 			return nil, openErr
 		}
 		opened = append(opened, run)
-		used += run.residentCost()
+		cost := run.residentCost()
+		if cost > maxBytes-used {
+			return nil, columnar.ErrBatchBudget
+		}
+		used += cost
 	}
 	if rows != decision.MutationCount {
 		return nil, storage.ErrCorruptStorage

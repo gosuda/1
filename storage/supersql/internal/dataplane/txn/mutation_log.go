@@ -2,6 +2,9 @@ package txn
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
@@ -20,6 +23,11 @@ const mutationLogHeaderBytes = 20
 
 // Reserve the canonical encoder's fixed workspace and bounded file-handle metadata.
 const mutationLogWorkspaceBytes = 8192
+
+const (
+	mutationLogWriteBufferBytes = 64 << 10
+	spillEncryptChunkBytes      = 32 << 10
+)
 
 var (
 	errMutationLogBudget    = &model.Error{Code: "53200", Message: "transaction mutation log resource limit exceeded"}
@@ -53,6 +61,9 @@ type mutationLog struct {
 	limits                                                   mutationLogLimits
 	memoryOverhead                                           uint64
 	buffer                                                   []byte
+	writeBuf                                                 []byte
+	writeBufBase                                             uint64
+	writeDirty                                               bool
 	file                                                     mutationLogFile
 	path                                                     string
 	count, bytes, ordinal, lastFrame, lastSerial, nextSerial uint64
@@ -192,6 +203,11 @@ func (l *mutationLog) append(ctx context.Context, mutations []storage.Mutation) 
 			return errors.Join(err, l.restore(prefix))
 		}
 	}
+	if l.file != nil {
+		if err := l.flushWriteBuf(ctx); err != nil {
+			return errors.Join(err, l.restore(prefix))
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return errors.Join(err, l.restore(prefix))
 	}
@@ -271,17 +287,43 @@ func (l *mutationLog) reserve(ctx context.Context, total, scratch uint64) error 
 	if l.limits.DisableSpill || total > l.limits.SpillBytes {
 		return errMutationLogBudget
 	}
-	file, err := os.CreateTemp(l.limits.SpillDirectory, "supersql-txn-*")
+	rawFile, err := os.CreateTemp(l.limits.SpillDirectory, "supersql-txn-*")
 	if err != nil {
 		return err
+	}
+	file, err := newEncryptedSpillFile(rawFile)
+	if err != nil {
+		return errors.Join(err, rawFile.Close(), os.Remove(rawFile.Name()))
 	}
 	writer := mutationLogWriter{ctx: ctx, file: file, remaining: uint64(len(l.buffer))}
 	_, err = writer.Write(l.buffer)
 	if err != nil {
-		return errors.Join(err, file.Close(), os.Remove(file.Name()))
+		return errors.Join(err, file.Close(), os.Remove(rawFile.Name()))
 	}
-	l.file, l.path = file, file.Name()
+	l.file, l.path = file, rawFile.Name()
+	l.writeBufBase = uint64(len(l.buffer))
 	l.buffer = nil
+	return nil
+}
+
+func (l *mutationLog) flushWriteBuf(ctx context.Context) error {
+	if l.file == nil || len(l.writeBuf) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.writeDirty = true
+	n, err := l.file.WriteAt(l.writeBuf, int64(l.writeBufBase))
+	if err == nil && n != len(l.writeBuf) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return err
+	}
+	l.writeBufBase += uint64(len(l.writeBuf))
+	l.writeBuf = l.writeBuf[:0]
+	l.writeDirty = false
 	return nil
 }
 
@@ -293,32 +335,82 @@ func (l *mutationLog) writeFrame(ctx context.Context, mutation storage.Mutation,
 	var header [mutationLogHeaderBytes]byte
 	binary.LittleEndian.PutUint64(header[:8], size)
 	binary.LittleEndian.PutUint64(header[12:], l.nextSerial)
-	writer := mutationLogWriter{ctx: ctx, file: l.file, offset: start + mutationLogHeaderBytes, remaining: size}
-	writer.checksum = crc32.Update(crc32.ChecksumIEEE(header[:8]), crc32.IEEETable, header[12:])
+	frameBytes := mutationLogHeaderBytes + size
+	checksum := crc32.Update(crc32.ChecksumIEEE(header[:8]), crc32.IEEETable, header[12:])
 	if l.file == nil {
-		l.buffer = l.buffer[:start+mutationLogHeaderBytes+size]
-		writer.buffer = l.buffer[start+mutationLogHeaderBytes:]
-	}
-	if err := storage.EncodeMutation(&writer, mutation); err != nil {
-		return err
-	}
-	if writer.remaining != 0 {
-		return storage.ErrInvalidEncoding
-	}
-	binary.LittleEndian.PutUint32(header[8:12], writer.checksum)
-	if l.file != nil {
-		n, err := l.file.WriteAt(header[:], int64(start))
-		if err != nil {
+		l.buffer = l.buffer[:start+frameBytes]
+		writer := mutationLogWriter{ctx: ctx, buffer: l.buffer[start+mutationLogHeaderBytes:], offset: start + mutationLogHeaderBytes, remaining: size, checksum: checksum}
+		if err := storage.EncodeMutation(&writer, mutation); err != nil {
 			return err
 		}
-		if n != len(header) {
-			return io.ErrShortWrite
+		if writer.remaining != 0 {
+			return storage.ErrInvalidEncoding
 		}
-	} else {
+		binary.LittleEndian.PutUint32(header[8:12], writer.checksum)
 		copy(l.buffer[start:], header[:])
+	} else {
+		if l.writeBuf == nil {
+			l.writeBuf = make([]byte, 0, mutationLogWriteBufferBytes)
+		}
+		if frameBytes <= uint64(cap(l.writeBuf)) {
+			if len(l.writeBuf) == 0 {
+				l.writeBufBase = start
+			} else if l.writeBufBase+uint64(len(l.writeBuf)) != start || uint64(len(l.writeBuf))+frameBytes > uint64(cap(l.writeBuf)) {
+				if err := l.flushWriteBuf(ctx); err != nil {
+					return err
+				}
+				l.writeBufBase = start
+			}
+			oldLen := len(l.writeBuf)
+			frame := l.writeBuf[oldLen : oldLen+int(frameBytes)]
+			writer := mutationLogWriter{ctx: ctx, buffer: frame[mutationLogHeaderBytes:], offset: start + mutationLogHeaderBytes, remaining: size, checksum: checksum}
+			if err := storage.EncodeMutation(&writer, mutation); err != nil {
+				return err
+			}
+			if writer.remaining != 0 {
+				return storage.ErrInvalidEncoding
+			}
+			binary.LittleEndian.PutUint32(header[8:12], writer.checksum)
+			copy(frame[:mutationLogHeaderBytes], header[:])
+			l.writeBuf = l.writeBuf[:oldLen+int(frameBytes)]
+		} else {
+			if err := l.flushWriteBuf(ctx); err != nil {
+				return err
+			}
+			writer := mutationLogWriter{
+				ctx:       ctx,
+				file:      l.file,
+				stage:     l.writeBuf[:0],
+				dirty:     &l.writeDirty,
+				offset:    start + mutationLogHeaderBytes,
+				remaining: size,
+				checksum:  checksum,
+			}
+			if err := storage.EncodeMutation(&writer, mutation); err != nil {
+				return err
+			}
+			if writer.remaining != 0 {
+				return storage.ErrInvalidEncoding
+			}
+			if err := writer.flush(); err != nil {
+				return err
+			}
+			binary.LittleEndian.PutUint32(header[8:12], writer.checksum)
+			l.writeDirty = true
+			n, err := l.file.WriteAt(header[:], int64(start))
+			if err != nil {
+				return err
+			}
+			if n != len(header) {
+				return io.ErrShortWrite
+			}
+			l.writeBuf = l.writeBuf[:0]
+			l.writeBufBase = start + frameBytes
+			l.writeDirty = false
+		}
 	}
 	l.count++
-	l.bytes = start + mutationLogHeaderBytes + size
+	l.bytes = start + frameBytes
 	l.ordinal, l.lastFrame, l.lastSerial = mutation.Ordinal, start, l.nextSerial
 	return nil
 }
@@ -327,8 +419,29 @@ type mutationLogWriter struct {
 	ctx               context.Context
 	file              mutationLogFile
 	buffer            []byte
+	stage             []byte
+	dirty             *bool
 	offset, remaining uint64
 	checksum          uint32
+}
+
+func (w *mutationLogWriter) flush() error {
+	if len(w.stage) == 0 {
+		return nil
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	if w.dirty != nil {
+		*w.dirty = true
+	}
+	base := w.offset - uint64(len(w.stage))
+	n, err := w.file.WriteAt(w.stage, int64(base))
+	if err == nil && n != len(w.stage) {
+		err = io.ErrShortWrite
+	}
+	w.stage = w.stage[:0]
+	return err
 }
 
 func (w *mutationLogWriter) Write(data []byte) (int, error) {
@@ -338,21 +451,48 @@ func (w *mutationLogWriter) Write(data []byte) (int, error) {
 	if uint64(len(data)) > w.remaining {
 		return 0, storage.ErrInvalidEncoding
 	}
-	var n int
-	var err error
-	if w.file != nil {
-		n, err = w.file.WriteAt(data, int64(w.offset))
-	} else {
-		n = copy(w.buffer, data)
+	if w.file == nil {
+		n := copy(w.buffer, data)
 		w.buffer = w.buffer[n:]
+		w.offset += uint64(n)
+		w.remaining -= uint64(n)
+		w.checksum = crc32.Update(w.checksum, crc32.IEEETable, data[:n])
+		if n != len(data) {
+			return n, io.ErrShortWrite
+		}
+		return n, nil
 	}
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
+	if cap(w.stage) == 0 {
+		if w.dirty != nil {
+			*w.dirty = true
+		}
+		n, err := w.file.WriteAt(data, int64(w.offset))
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		w.offset += uint64(n)
+		w.remaining -= uint64(n)
+		w.checksum = crc32.Update(w.checksum, crc32.IEEETable, data[:n])
+		return n, err
 	}
-	w.offset += uint64(n)
-	w.remaining -= uint64(n)
-	w.checksum = crc32.Update(w.checksum, crc32.IEEETable, data[:n])
-	return n, err
+	total := 0
+	for len(data) > 0 {
+		space := cap(w.stage) - len(w.stage)
+		if space == 0 {
+			if err := w.flush(); err != nil {
+				return total, err
+			}
+			space = cap(w.stage)
+		}
+		take := min(len(data), space)
+		w.stage = append(w.stage, data[:take]...)
+		w.offset += uint64(take)
+		w.remaining -= uint64(take)
+		w.checksum = crc32.Update(w.checksum, crc32.IEEETable, data[:take])
+		data = data[take:]
+		total += take
+	}
+	return total, nil
 }
 
 func (l *mutationLog) validatePositionLocked(position mutationLogPosition) error {
@@ -406,9 +546,23 @@ func (l *mutationLog) rollback(ctx context.Context, position mutationLogPosition
 
 func (l *mutationLog) restore(position mutationLogPosition) error {
 	if l.file != nil {
-		if err := l.file.Truncate(int64(position.bytes)); err != nil {
-			l.failure = err
-			return err
+		needTruncate := l.writeDirty
+		if position.bytes <= l.writeBufBase {
+			clear(l.writeBuf)
+			l.writeBuf = l.writeBuf[:0]
+			l.writeBufBase = position.bytes
+			needTruncate = true
+		} else if keep := position.bytes - l.writeBufBase; keep < uint64(len(l.writeBuf)) {
+			clear(l.writeBuf[keep:])
+			l.writeBuf = l.writeBuf[:keep]
+		}
+		if needTruncate {
+			truncSize := min(position.bytes, l.writeBufBase)
+			if err := l.file.Truncate(int64(truncSize)); err != nil {
+				l.failure = err
+				return err
+			}
+			l.writeDirty = false
 		}
 	} else {
 		clear(l.buffer[position.bytes:])
@@ -433,6 +587,13 @@ func (l *mutationLog) seal(ctx context.Context) (storage.MutationSequence, error
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if l.file != nil {
+		if err := l.flushWriteBuf(ctx); err != nil {
+			return nil, err
+		}
+		clear(l.writeBuf)
+		l.writeBuf = nil
 	}
 	l.sealed = true
 	return l, nil
@@ -473,6 +634,22 @@ func (l *mutationLog) readAt(data []byte, offset uint64) error {
 		}
 		copy(data, l.buffer[offset:offset+uint64(len(data))])
 		return nil
+	}
+	if bufLen := uint64(len(l.writeBuf)); bufLen > 0 {
+		bufStart := l.writeBufBase
+		bufEnd := bufStart + bufLen
+		if offset <= math.MaxUint64-uint64(len(data)) {
+			readEnd := offset + uint64(len(data))
+			if offset >= bufStart && readEnd <= bufEnd {
+				copy(data, l.writeBuf[offset-bufStart:readEnd-bufStart])
+				return nil
+			}
+			if readEnd > bufStart && offset < bufEnd {
+				if err := l.flushWriteBuf(context.Background()); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	n, err := l.file.ReadAt(data, int64(offset))
 	if errors.Is(err, io.EOF) {
@@ -578,6 +755,10 @@ func (l *mutationLog) Close() error {
 
 func (l *mutationLog) cleanup() {
 	l.buffer = nil
+	clear(l.writeBuf)
+	l.writeBuf = nil
+	l.writeBufBase = 0
+	l.writeDirty = false
 	l.limits.SpillDirectory = ""
 	if l.file != nil {
 		l.cleanupError = errors.Join(l.cleanupError, l.file.Close(), os.Remove(l.path))
@@ -697,4 +878,186 @@ func (c *mutationLogCursor) Close() error {
 
 func normalizedLogOperation(op storage.MutationOp) bool {
 	return op == storage.MutationUpsert || op == storage.MutationDelete || op == storage.MutationDeleteRange
+}
+
+// encryptedSpillFile wraps an OS temporary spill file with seekable AES-256-CTR
+// encryption using an ephemeral random key and IV. It produces zero byte
+// expansion, never mutates caller buffers in WriteAt, rotates the IV and
+// re-encrypts retained bytes on shrinking Truncate to prevent CTR keystream
+// reuse across savepoint rollbacks, and zeroes key material on Close.
+type encryptedSpillFile struct {
+	mu         sync.Mutex
+	file       *os.File
+	block      cipher.Block
+	key        [32]byte
+	iv         [aes.BlockSize]byte
+	maxWritten int64
+	closed     bool
+}
+
+func newEncryptedSpillFile(file *os.File) (*encryptedSpillFile, error) {
+	e := &encryptedSpillFile{file: file}
+	if _, err := rand.Read(e.key[:]); err != nil {
+		clear(e.key[:])
+		return nil, err
+	}
+	if _, err := rand.Read(e.iv[:]); err != nil {
+		clear(e.key[:])
+		clear(e.iv[:])
+		return nil, err
+	}
+	block, err := aes.NewCipher(e.key[:])
+	if err != nil {
+		clear(e.key[:])
+		clear(e.iv[:])
+		return nil, err
+	}
+	e.block = block
+	return e, nil
+}
+
+func ctrCounter(iv [aes.BlockSize]byte, blockIndex uint64) [aes.BlockSize]byte {
+	hi := binary.BigEndian.Uint64(iv[:8])
+	lo := binary.BigEndian.Uint64(iv[8:])
+	newLo := lo + blockIndex
+	if newLo < lo {
+		hi++
+	}
+	var out [aes.BlockSize]byte
+	binary.BigEndian.PutUint64(out[:8], hi)
+	binary.BigEndian.PutUint64(out[8:], newLo)
+	return out
+}
+
+func ctrXOR(block cipher.Block, iv [aes.BlockSize]byte, dst, src []byte, off int64) {
+	if len(src) == 0 {
+		return
+	}
+	blockIndex := uint64(off) / aes.BlockSize
+	blockOffset := int(uint64(off) % aes.BlockSize)
+	if blockOffset != 0 {
+		counter := ctrCounter(iv, blockIndex)
+		var keystream [aes.BlockSize]byte
+		block.Encrypt(keystream[:], counter[:])
+		take := min(len(src), aes.BlockSize-blockOffset)
+		for i := 0; i < take; i++ {
+			dst[i] = src[i] ^ keystream[blockOffset+i]
+		}
+		dst = dst[take:]
+		src = src[take:]
+		blockIndex++
+	}
+	if len(src) > 0 {
+		counter := ctrCounter(iv, blockIndex)
+		cipher.NewCTR(block, counter[:]).XORKeyStream(dst, src)
+	}
+}
+
+func (e *encryptedSpillFile) ReadAt(p []byte, off int64) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return 0, os.ErrClosed
+	}
+	if off < 0 {
+		return e.file.ReadAt(p, off)
+	}
+	n, err := e.file.ReadAt(p, off)
+	if n > 0 {
+		ctrXOR(e.block, e.iv, p[:n], p[:n], off)
+	}
+	return n, err
+}
+
+func (e *encryptedSpillFile) WriteAt(p []byte, off int64) (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return 0, os.ErrClosed
+	}
+	if off < 0 {
+		return e.file.WriteAt(p, off)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	buf := make([]byte, min(len(p), spillEncryptChunkBytes))
+	written := 0
+	for written < len(p) {
+		take := min(len(buf), len(p)-written)
+		chunk := buf[:take]
+		ctrXOR(e.block, e.iv, chunk, p[written:written+take], off+int64(written))
+		n, err := e.file.WriteAt(chunk, off+int64(written))
+		written += n
+		if end := off + int64(written); end > e.maxWritten {
+			e.maxWritten = end
+		}
+		if err != nil {
+			clear(buf)
+			return written, err
+		}
+		if n != take {
+			clear(buf)
+			return written, io.ErrShortWrite
+		}
+	}
+	clear(buf)
+	return written, nil
+}
+
+func (e *encryptedSpillFile) Truncate(size int64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return os.ErrClosed
+	}
+	if err := e.file.Truncate(size); err != nil {
+		return err
+	}
+	if size < e.maxWritten {
+		var newIV [aes.BlockSize]byte
+		if _, err := rand.Read(newIV[:]); err != nil {
+			return err
+		}
+		if size > 0 {
+			buf := make([]byte, min(size, spillEncryptChunkBytes))
+			defer clear(buf)
+			for pos := int64(0); pos < size; {
+				chunkLen := min(int64(len(buf)), size-pos)
+				chunk := buf[:chunkLen]
+				n, readErr := e.file.ReadAt(chunk, pos)
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					return readErr
+				}
+				if n == 0 {
+					break
+				}
+				chunk = chunk[:n]
+				ctrXOR(e.block, e.iv, chunk, chunk, pos)
+				ctrXOR(e.block, newIV, chunk, chunk, pos)
+				written, writeErr := e.file.WriteAt(chunk, pos)
+				if writeErr != nil {
+					return writeErr
+				}
+				if written != len(chunk) {
+					return io.ErrShortWrite
+				}
+				pos += int64(written)
+			}
+		}
+		e.iv = newIV
+		e.maxWritten = size
+	}
+	return nil
+}
+
+func (e *encryptedSpillFile) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	err := e.file.Close()
+	clear(e.key[:])
+	clear(e.iv[:])
+	e.block = nil
+	e.closed = true
+	return err
 }

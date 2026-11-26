@@ -68,7 +68,7 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options OpenOption
 	// The fence secret travels as an authenticated manifest file; reading it
 	// before staging lets the verifier authenticate the persisted fence, and a
 	// tampered secret fails verification before anything is published.
-	secret, err := readBackupFenceSecret(backupDir)
+	secret, err := readBackupFenceSecret(backupDir, options.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +93,11 @@ func RestoreCheckpoint(ctx context.Context, backupDir string, options OpenOption
 	return Open(ctx, options)
 }
 
-func readBackupFenceSecret(backupDir string) ([nativeFenceSecretSize]byte, error) {
-	secret, corrupt, err := readFenceSecretFile(backupDir)
+func readBackupFenceSecret(backupDir string, encryptionKey []byte) ([nativeFenceSecretSize]byte, error) {
+	secret, corrupt, err := readFenceSecretFileWithKey(backupDir, encryptionKey)
 	switch {
+	case errors.Is(err, ErrInvalidEncryptionKey):
+		return secret, err
 	case corrupt:
 		return secret, fmt.Errorf("%w: %s is corrupt", ErrCorruptBackup, nativeFenceSecretFile)
 	case err != nil:

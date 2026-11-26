@@ -88,32 +88,57 @@ const (
 	lockOwnerEnded
 )
 
+type lockIndexKind uint8
+
+const (
+	lockIndexWide lockIndexKind = iota
+	lockIndexPoint
+	lockIndexPrefix
+)
+
+type lockObjectGen struct {
+	objectID   model.ObjectID
+	generation uint64
+}
+
 type lockOwner struct {
-	registry  *lockRegistry
-	id        model.TxnID
-	age       uint64
-	ctx       context.Context
-	waitOwner locks.WaitOwner
-	cancel    context.CancelCauseFunc
-	state     lockOwnerState
-	pending   int
-	sequence  uint64
-	locks     *lockRecord
+	registry    *lockRegistry
+	id          model.TxnID
+	age         uint64
+	ctx         context.Context
+	waitOwner   locks.WaitOwner
+	cancel      context.CancelCauseFunc
+	state       lockOwnerState
+	pending     int
+	sequence    uint64
+	locks       *lockRecord
+	wideLocks   []*lockRecord
+	pointLocks  map[lockObjectGen]map[string][]*lockRecord
+	prefixLocks map[lockObjectGen]map[string][]*lockRecord
+	schemaLocks map[model.ObjectID][]*lockRecord
 }
 
 type lockRecord struct {
 	owner         *lockOwner
 	request       lockRequest
 	mode          lockMode
+	retainedShare bool
+	indexKind     lockIndexKind
+	inSchemaMap   bool
 	ordinal       uint64
 	size          uint64
 	previous      *lockRecord
 	bucketIndex   int
-	retainedShare bool
+	ownerIndex    int
+	schemaIndex   int
 }
 
 type objectLockBucket struct {
-	records       []*lockRecord
+	wide          []*lockRecord
+	points        map[uint64]map[string][]*lockRecord
+	prefixes      map[uint64]map[string][]*lockRecord
+	ownerCounts   map[*lockOwner]int
+	total         int
 	changed       chan struct{}
 	waiters       int
 	pendingNotify bool
@@ -323,7 +348,7 @@ func (r *lockRegistry) acquireWithConflict(ctx context.Context, owner *lockOwner
 		}
 		r.mu.Lock()
 		bucket.waiters--
-		if len(bucket.records) == 0 && bucket.waiters == 0 {
+		if bucket.total == 0 && bucket.waiters == 0 {
 			delete(r.objects, request.ObjectID)
 		}
 		waitDuration += time.Since(waitStarted)
@@ -391,18 +416,52 @@ func (r *lockRegistry) acquireEligible(ctx context.Context, owner *lockOwner, re
 		return nil, 0, err
 	}
 	conflicts := make([]lockRequest, 0)
-	if bucket := r.objects[request.ObjectID]; bucket != nil {
-		for _, record := range bucket.records {
-			if record.owner == owner {
-				continue
+	if bucket := r.objects[request.ObjectID]; bucket != nil && bucket.total > 0 {
+		if len(bucket.ownerCounts) > 1 || bucket.ownerCounts[owner] == 0 {
+			for _, record := range bucket.wide {
+				if record.owner == owner {
+					continue
+				}
+				if isTableLockMode(record.mode) || !lockRequestsConflict(request, conflictMode, record.request, record.mode) {
+					continue
+				}
+				if len(conflicts) == maxParts {
+					return nil, 0, errLockCapacity
+				}
+				conflicts = append(conflicts, record.request)
 			}
-			if isTableLockMode(record.mode) || !lockRequestsConflict(request, conflictMode, record.request, record.mode) {
-				continue
+			if genPoints := bucket.points[request.Generation]; len(genPoints) != 0 {
+				for _, records := range genPoints {
+					for _, record := range records {
+						if record.owner == owner {
+							continue
+						}
+						if !lockRequestsConflict(request, conflictMode, record.request, record.mode) {
+							continue
+						}
+						if len(conflicts) == maxParts {
+							return nil, 0, errLockCapacity
+						}
+						conflicts = append(conflicts, record.request)
+					}
+				}
 			}
-			if len(conflicts) == maxParts {
-				return nil, 0, errLockCapacity
+			if genPrefixes := bucket.prefixes[request.Generation]; len(genPrefixes) != 0 {
+				for _, records := range genPrefixes {
+					for _, record := range records {
+						if record.owner == owner {
+							continue
+						}
+						if !lockRequestsConflict(request, conflictMode, record.request, record.mode) {
+							continue
+						}
+						if len(conflicts) == maxParts {
+							return nil, 0, errLockCapacity
+						}
+						conflicts = append(conflicts, record.request)
+					}
+				}
 			}
-			conflicts = append(conflicts, record.request)
 		}
 	}
 	slices.SortFunc(conflicts, compareLockRequestLower)
@@ -597,18 +656,107 @@ func lockModeSubsumes(held, requested lockMode) bool {
 	}
 }
 
+func isPointLockRequest(r lockRequest) bool {
+	return !r.Lower.Unbounded && !r.Upper.Unbounded &&
+		r.Lower.Inclusive && r.Upper.Inclusive &&
+		!r.Lower.Prefix && !r.Upper.Prefix &&
+		bytes.Equal(r.Lower.Key, r.Upper.Key)
+}
+
+func isExactPrefixLockRequest(r lockRequest) bool {
+	return !r.Lower.Unbounded && !r.Upper.Unbounded &&
+		r.Lower.Inclusive && r.Upper.Inclusive &&
+		r.Lower.Prefix && r.Upper.Prefix &&
+		bytes.Equal(r.Lower.Key, r.Upper.Key)
+}
+
+func commonPrefixLen(a, b []byte) int {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
+}
+
 func coveredRecord(owner *lockOwner, request lockRequest, grantMode, conflictMode lockMode) (*lockRecord, bool, bool) {
 	var matched *lockRecord
-	for record := owner.locks; record != nil; record = record.previous {
-		if !lockModeSubsumes(record.mode, grantMode) || !lockContains(record.request, request) {
-			continue
+	checkSlice := func(records []*lockRecord, verifyContains bool) (*lockRecord, bool) {
+		for _, record := range records {
+			if !lockModeSubsumes(record.mode, grantMode) {
+				continue
+			}
+			if verifyContains && !lockContains(record.request, request) {
+				continue
+			}
+			if lockModeSubsumes(record.mode, conflictMode) {
+				return record, true
+			}
+			if matched == nil {
+				matched = record
+			}
 		}
-		if lockModeSubsumes(record.mode, conflictMode) {
-			return record, true, true
+		return nil, false
+	}
+	if !isTableLockMode(grantMode) {
+		// lockSchema (ACCESS EXCLUSIVE) conflicts with every lock mode across all
+		// generations and keys of the object, so it subsumes any row lock on that
+		// object. For lockShare we additionally require lockContains so a savepoint
+		// rollback downgrading retainedShare -> lockShare still covers request.
+		// lockTableExclusive does not conflict with lockIntent or row locks and
+		// therefore cannot subsume row locks.
+		if schemas := owner.schemaLocks[request.ObjectID]; len(schemas) != 0 {
+			for _, record := range schemas {
+				if grantMode != lockShare || lockContains(record.request, request) {
+					return record, true, true
+				}
+			}
 		}
-		if matched == nil {
-			matched = record
+		og := lockObjectGen{objectID: request.ObjectID, generation: request.Generation}
+		isPoint := isPointLockRequest(request)
+		if isPoint {
+			if genPoints := owner.pointLocks[og]; genPoints != nil {
+				if rec, full := checkSlice(genPoints[string(request.Lower.Key)], false); full {
+					return rec, true, true
+				}
+			}
 		}
+		if oPrefixes := owner.prefixLocks[og]; len(oPrefixes) != 0 {
+			if isPoint || isExactPrefixLockRequest(request) {
+				key := request.Lower.Key
+				if len(key)+1 <= len(oPrefixes) {
+					for i := len(key); i >= 0; i-- {
+						if rec, full := checkSlice(oPrefixes[string(key[:i])], false); full {
+							return rec, true, true
+						}
+					}
+				} else {
+					for _, recs := range oPrefixes {
+						if rec, full := checkSlice(recs, true); full {
+							return rec, true, true
+						}
+					}
+				}
+			} else if !request.Lower.Unbounded && !request.Upper.Unbounded {
+				prefixLen := commonPrefixLen(request.Lower.Key, request.Upper.Key)
+				if prefixLen+1 <= len(oPrefixes) {
+					for i := prefixLen; i >= 0; i-- {
+						if rec, full := checkSlice(oPrefixes[string(request.Lower.Key[:i])], true); full {
+							return rec, true, true
+						}
+					}
+				} else {
+					for _, recs := range oPrefixes {
+						if rec, full := checkSlice(recs, true); full {
+							return rec, true, true
+						}
+					}
+				}
+			}
+		}
+	}
+	if rec, full := checkSlice(owner.wideLocks, true); full {
+		return rec, true, true
 	}
 	return matched, matched != nil, false
 }
@@ -676,25 +824,103 @@ func compareLockBounds(a, b lockBound, aEdge, bEdge int) int {
 // committing owners retain conflicts until rollback or release removes records.
 func (r *lockRegistry) conflicts(owner *lockOwner, request lockRequest, mode lockMode, wound bool, blockers []locks.WaitOwner) (bool, []locks.WaitOwner) {
 	bucket := r.objects[request.ObjectID]
-	if bucket == nil || len(bucket.records) == 0 {
+	if bucket == nil || bucket.total == 0 {
+		return false, blockers
+	}
+	if len(bucket.ownerCounts) == 1 && bucket.ownerCounts[owner] > 0 {
 		return false, blockers
 	}
 	conflict := false
-	for _, record := range bucket.records {
+	if mode == lockSchema {
+		for holder := range bucket.ownerCounts {
+			if holder == owner {
+				continue
+			}
+			conflict = true
+			if !wound {
+				return true, blockers
+			}
+			if owner.age < holder.age && holder.state == lockOwnerActive {
+				holder.state = lockOwnerAborting
+				holder.cancel(errLockWounded)
+			} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {
+				blockers = append(blockers, holder.waitOwner)
+			}
+		}
+		return conflict, blockers
+	}
+	checkRecord := func(record *lockRecord) bool {
 		holder := record.owner
 		if holder == owner {
-			continue
+			return false
 		}
 		if !lockRequestsConflict(request, mode, record.request, record.mode) {
-			continue
+			return false
 		}
 		conflict = true
-		wounded := wound && owner.age < holder.age && holder.state == lockOwnerActive
-		if wounded {
+		if !wound {
+			return true
+		}
+		if owner.age < holder.age && holder.state == lockOwnerActive {
 			holder.state = lockOwnerAborting
 			holder.cancel(errLockWounded)
 		} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {
 			blockers = append(blockers, holder.waitOwner)
+		}
+		return false
+	}
+	for _, record := range bucket.wide {
+		if checkRecord(record) {
+			return true, blockers
+		}
+	}
+	if isTableLockMode(mode) {
+		return conflict, blockers
+	}
+	genPoints := bucket.points[request.Generation]
+	genPrefixes := bucket.prefixes[request.Generation]
+	if isPointLockRequest(request) {
+		if len(genPoints) != 0 {
+			for _, record := range genPoints[string(request.Lower.Key)] {
+				if checkRecord(record) {
+					return true, blockers
+				}
+			}
+		}
+		if len(genPrefixes) != 0 {
+			key := request.Lower.Key
+			if len(key)+1 <= len(genPrefixes) {
+				for i := len(key); i >= 0; i-- {
+					for _, record := range genPrefixes[string(key[:i])] {
+						if checkRecord(record) {
+							return true, blockers
+						}
+					}
+				}
+			} else {
+				for _, records := range genPrefixes {
+					for _, record := range records {
+						if checkRecord(record) {
+							return true, blockers
+						}
+					}
+				}
+			}
+		}
+		return conflict, blockers
+	}
+	for _, records := range genPoints {
+		for _, record := range records {
+			if checkRecord(record) {
+				return true, blockers
+			}
+		}
+	}
+	for _, records := range genPrefixes {
+		for _, record := range records {
+			if checkRecord(record) {
+				return true, blockers
+			}
 		}
 	}
 	return conflict, blockers
@@ -769,6 +995,9 @@ func (r *lockRegistry) rollbackLocks(owner *lockOwner, position lockPosition, re
 				continue
 			}
 			if record.retainedShare {
+				if record.inSchemaMap {
+					removeOwnerSchemaLock(owner, record)
+				}
 				record.mode = lockShare
 				record.retainedShare = false
 				r.markBucketDirtyLocked(record.request.ObjectID, &dirty)
@@ -777,7 +1006,7 @@ func (r *lockRegistry) rollbackLocks(owner *lockOwner, position lockPosition, re
 			}
 		}
 		*prev = record.previous
-		r.removeRecordLocked(record, &dirty)
+		r.removeRecordLocked(record, &dirty, true)
 	}
 	r.notifyBucketsLocked(dirty)
 	return nil
@@ -812,8 +1041,12 @@ func (r *lockRegistry) release(owner *lockOwner) error {
 	for owner.locks != nil {
 		record := owner.locks
 		owner.locks = record.previous
-		r.removeRecordLocked(record, &dirty)
+		r.removeRecordLocked(record, &dirty, false)
 	}
+	owner.wideLocks = nil
+	owner.pointLocks = nil
+	owner.prefixLocks = nil
+	owner.schemaLocks = nil
 	owner.state = lockOwnerEnded
 	owner.cancel(context.Canceled)
 	owner.cancel = nil
@@ -825,47 +1058,213 @@ func (r *lockRegistry) release(owner *lockOwner) error {
 func (r *lockRegistry) bucketLocked(objectID model.ObjectID) *objectLockBucket {
 	bucket := r.objects[objectID]
 	if bucket == nil {
-		bucket = &objectLockBucket{changed: make(chan struct{})}
+		bucket = &objectLockBucket{
+			ownerCounts: make(map[*lockOwner]int),
+			changed:     make(chan struct{}),
+		}
 		r.objects[objectID] = bucket
 	}
 	return bucket
 }
 
+func insertKeyedLock(target *map[uint64]map[string][]*lockRecord, gen uint64, key string, record *lockRecord) int {
+	if *target == nil {
+		*target = make(map[uint64]map[string][]*lockRecord)
+	}
+	genMap := (*target)[gen]
+	if genMap == nil {
+		genMap = make(map[string][]*lockRecord)
+		(*target)[gen] = genMap
+	}
+	slice := genMap[key]
+	idx := len(slice)
+	genMap[key] = append(slice, record)
+	return idx
+}
+
+func removeKeyedLock(target map[uint64]map[string][]*lockRecord, gen uint64, key string, idx int) {
+	genMap := target[gen]
+	slice := genMap[key]
+	last := len(slice) - 1
+	if idx != last {
+		moved := slice[last]
+		slice[idx] = moved
+		moved.bucketIndex = idx
+	}
+	slice[last] = nil
+	slice = slice[:last]
+	if len(slice) == 0 {
+		delete(genMap, key)
+		if len(genMap) == 0 {
+			delete(target, gen)
+		}
+	} else {
+		genMap[key] = slice
+	}
+}
+
+func insertOwnerKeyedLock(target *map[lockObjectGen]map[string][]*lockRecord, og lockObjectGen, key string, record *lockRecord) int {
+	if *target == nil {
+		*target = make(map[lockObjectGen]map[string][]*lockRecord)
+	}
+	oMap := (*target)[og]
+	if oMap == nil {
+		oMap = make(map[string][]*lockRecord)
+		(*target)[og] = oMap
+	}
+	slice := oMap[key]
+	idx := len(slice)
+	oMap[key] = append(slice, record)
+	return idx
+}
+
+func removeOwnerKeyedLock(target map[lockObjectGen]map[string][]*lockRecord, og lockObjectGen, key string, idx int) {
+	oMap := target[og]
+	slice := oMap[key]
+	last := len(slice) - 1
+	if idx != last {
+		moved := slice[last]
+		slice[idx] = moved
+		moved.ownerIndex = idx
+	}
+	slice[last] = nil
+	slice = slice[:last]
+	if len(slice) == 0 {
+		delete(oMap, key)
+		if len(oMap) == 0 {
+			delete(target, og)
+		}
+	} else {
+		oMap[key] = slice
+	}
+}
+
 func (r *lockRegistry) addRecordLocked(owner *lockOwner, request lockRequest, mode lockMode, size uint64) *lockRecord {
 	owner.sequence++
 	bucket := r.bucketLocked(request.ObjectID)
+	kind := lockIndexWide
+	if !isTableLockMode(mode) {
+		if isPointLockRequest(request) {
+			kind = lockIndexPoint
+		} else if isExactPrefixLockRequest(request) {
+			kind = lockIndexPrefix
+		}
+	}
+	inSchema := mode == lockSchema
 	record := &lockRecord{
 		owner:       owner,
 		request:     request,
 		mode:        mode,
+		indexKind:   kind,
+		inSchemaMap: inSchema,
 		ordinal:     owner.sequence,
 		size:        size,
 		previous:    owner.locks,
-		bucketIndex: len(bucket.records),
 	}
 	owner.locks = record
-	bucket.records = append(bucket.records, record)
+	switch kind {
+	case lockIndexPoint:
+		key := string(request.Lower.Key)
+		og := lockObjectGen{objectID: request.ObjectID, generation: request.Generation}
+		record.bucketIndex = insertKeyedLock(&bucket.points, request.Generation, key, record)
+		record.ownerIndex = insertOwnerKeyedLock(&owner.pointLocks, og, key, record)
+	case lockIndexPrefix:
+		key := string(request.Lower.Key)
+		og := lockObjectGen{objectID: request.ObjectID, generation: request.Generation}
+		record.bucketIndex = insertKeyedLock(&bucket.prefixes, request.Generation, key, record)
+		record.ownerIndex = insertOwnerKeyedLock(&owner.prefixLocks, og, key, record)
+	default:
+		record.bucketIndex = len(bucket.wide)
+		bucket.wide = append(bucket.wide, record)
+		record.ownerIndex = len(owner.wideLocks)
+		owner.wideLocks = append(owner.wideLocks, record)
+	}
+	if inSchema {
+		if owner.schemaLocks == nil {
+			owner.schemaLocks = make(map[model.ObjectID][]*lockRecord)
+		}
+		sSlice := owner.schemaLocks[request.ObjectID]
+		record.schemaIndex = len(sSlice)
+		owner.schemaLocks[request.ObjectID] = append(sSlice, record)
+	}
+	bucket.total++
+	bucket.ownerCounts[owner]++
 	return record
 }
 
-func (r *lockRegistry) removeRecordLocked(record *lockRecord, dirty *[]*objectLockBucket) {
+func removeOwnerSchemaLock(owner *lockOwner, record *lockRecord) {
+	objectID := record.request.ObjectID
+	slice := owner.schemaLocks[objectID]
+	last := len(slice) - 1
+	if record.schemaIndex != last {
+		moved := slice[last]
+		slice[record.schemaIndex] = moved
+		moved.schemaIndex = record.schemaIndex
+	}
+	slice[last] = nil
+	slice = slice[:last]
+	if len(slice) == 0 {
+		delete(owner.schemaLocks, objectID)
+	} else {
+		owner.schemaLocks[objectID] = slice
+	}
+	record.inSchemaMap = false
+}
+
+func (r *lockRegistry) removeRecordLocked(record *lockRecord, dirty *[]*objectLockBucket, updateOwnerIndex bool) {
+	owner := record.owner
 	objectID := record.request.ObjectID
 	if bucket := r.objects[objectID]; bucket != nil {
-		last := len(bucket.records) - 1
-		if record.bucketIndex != last {
-			moved := bucket.records[last]
-			bucket.records[record.bucketIndex] = moved
-			moved.bucketIndex = record.bucketIndex
+		switch record.indexKind {
+		case lockIndexPoint:
+			removeKeyedLock(bucket.points, record.request.Generation, string(record.request.Lower.Key), record.bucketIndex)
+		case lockIndexPrefix:
+			removeKeyedLock(bucket.prefixes, record.request.Generation, string(record.request.Lower.Key), record.bucketIndex)
+		default:
+			last := len(bucket.wide) - 1
+			if record.bucketIndex != last {
+				moved := bucket.wide[last]
+				bucket.wide[record.bucketIndex] = moved
+				moved.bucketIndex = record.bucketIndex
+			}
+			bucket.wide[last] = nil
+			bucket.wide = bucket.wide[:last]
 		}
-		bucket.records[last] = nil
-		bucket.records = bucket.records[:last]
+		bucket.total--
+		if remaining := bucket.ownerCounts[owner] - 1; remaining <= 0 {
+			delete(bucket.ownerCounts, owner)
+		} else {
+			bucket.ownerCounts[owner] = remaining
+		}
 		if bucket.waiters > 0 {
 			if !bucket.pendingNotify {
 				bucket.pendingNotify = true
 				*dirty = append(*dirty, bucket)
 			}
-		} else if len(bucket.records) == 0 {
+		} else if bucket.total == 0 {
 			delete(r.objects, objectID)
+		}
+	}
+	if updateOwnerIndex && owner != nil {
+		switch record.indexKind {
+		case lockIndexPoint:
+			og := lockObjectGen{objectID: objectID, generation: record.request.Generation}
+			removeOwnerKeyedLock(owner.pointLocks, og, string(record.request.Lower.Key), record.ownerIndex)
+		case lockIndexPrefix:
+			og := lockObjectGen{objectID: objectID, generation: record.request.Generation}
+			removeOwnerKeyedLock(owner.prefixLocks, og, string(record.request.Lower.Key), record.ownerIndex)
+		default:
+			last := len(owner.wideLocks) - 1
+			if record.ownerIndex != last {
+				moved := owner.wideLocks[last]
+				owner.wideLocks[record.ownerIndex] = moved
+				moved.ownerIndex = record.ownerIndex
+			}
+			owner.wideLocks[last] = nil
+			owner.wideLocks = owner.wideLocks[:last]
+		}
+		if record.inSchemaMap {
+			removeOwnerSchemaLock(owner, record)
 		}
 	}
 	r.usedBytes -= record.size

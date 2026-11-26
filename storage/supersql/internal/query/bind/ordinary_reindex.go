@@ -69,6 +69,9 @@ func bindReindex(ctx context.Context, statement *zpgparse.ReindexStmt, snapshot 
 	if table == nil || table.State() != model.StatePublic || table.Kind() != model.ObjectTable && table.Kind() != model.ObjectMaterializedView {
 		return nil, model.ErrInvalidDescriptor
 	}
+	if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
+		return nil, err
+	}
 	b.dependency(table, 0)
 	spec, err := table.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
