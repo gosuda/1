@@ -1,6 +1,6 @@
 module gosuda.org/chromenet
 
-go 1.27.3
+go 9.99
 
 require (
 	github.com/quic-go/quic-go v0.62.0
