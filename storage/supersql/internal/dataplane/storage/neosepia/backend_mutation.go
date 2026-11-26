@@ -117,6 +117,7 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 		return
 	}
 	staged := make([]stagedGroupCommit, 0, len(group))
+	stagedByTxID := make(map[recoveryTxnID]int, len(group))
 	stagingTxns := backend.transactions
 	nextPos := backend.frontier.LogPosition
 	minTS := backend.closedTimestamp()
@@ -128,11 +129,19 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 			continue
 		}
 		id := recoveryTxnID(req.batch.TxID)
-		if previous, found := stagingTxns.Get(id); found {
+		if previous, found := backend.transactions.Get(id); found {
 			if previous.Identity != req.validated.identity {
 				req.err = storage.ErrTxnIDReused
 			} else {
 				req.result = previous.Result
+			}
+			continue
+		}
+		if idx, inGroup := stagedByTxID[id]; inGroup {
+			if staged[idx].decision.Identity != req.validated.identity {
+				req.err = storage.ErrTxnIDReused
+			} else {
+				staged[idx].duplicates = append(staged[idx].duplicates, req)
 			}
 			continue
 		}
@@ -171,6 +180,7 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 		stagingTxns = updatedTxns
 		nextPos = position
 		minTS = req.batch.CommitTS
+		stagedByTxID[id] = len(staged)
 		staged = append(staged, stagedGroupCommit{
 			req:      req,
 			position: position,
@@ -212,8 +222,8 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 
 	if walErr != nil {
 		if linked == 0 && !errors.Is(walErr, storage.ErrCommitIndeterminate) {
-			for _, item := range staged {
-				item.req.err = walErr
+			for i := range staged {
+				staged[i].setError(walErr)
 			}
 			return
 		}
@@ -226,22 +236,25 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 		if linked > 0 {
 			backend.metadataUncertain = true
 		}
-		for _, item := range staged {
-			item.req.err = errors.Join(storage.ErrCommitIndeterminate, walErr)
+		indetErr := errors.Join(storage.ErrCommitIndeterminate, walErr)
+		for i := range staged {
+			staged[i].setError(indetErr)
 		}
 		return
 	}
 
 	// Stage every durably WAL-committed batch into the in-memory memtable.
-	for i, item := range staged {
+	for i := range staged {
+		item := &staged[i]
 		if err := backend.memtable.stageBatch(context.Background(), item.decision, item.req.batch.Epoch, item.req.batch, rowBytes); err != nil {
 			// WAL segments staged[i:] are already durable on disk; record them
 			// as pending and mark metadata uncertain so no subsequent commit
 			// can reuse their LogPosition and ResolveCommit can recover them.
 			backend.pending = buildPendingChain(staged[i:])
 			backend.metadataUncertain = true
+			indetErr := errors.Join(storage.ErrCommitIndeterminate, err)
 			for j := i; j < len(staged); j++ {
-				staged[j].req.err = errors.Join(storage.ErrCommitIndeterminate, err)
+				staged[j].setError(indetErr)
 			}
 			return
 		}
@@ -250,15 +263,16 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 		if setErr != nil {
 			backend.pending = buildPendingChain(staged[i:])
 			backend.metadataUncertain = true
+			indetErr := errors.Join(storage.ErrCommitIndeterminate, setErr)
 			for j := i; j < len(staged); j++ {
-				staged[j].req.err = errors.Join(storage.ErrCommitIndeterminate, setErr)
+				staged[j].setError(indetErr)
 			}
 			return
 		}
 		backend.transactions = updated
 		backend.frontier = recoveredPosition{LogPosition: item.result.LogPosition, CommitTS: item.result.CommitTS}
 		backend.publishedEpoch = item.req.batch.Epoch
-		item.req.result = item.result
+		item.setResult(item.result)
 	}
 
 	if backend.memtable.shouldFlush(backend.limits) {

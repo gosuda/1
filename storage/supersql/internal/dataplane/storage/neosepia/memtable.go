@@ -522,6 +522,123 @@ func (snap *memtableSnapshot) targetBlocks(ctx context.Context, target storage.O
 	return blocks, nil
 }
 
+func saturatingAddU64(a, b uint64) uint64 {
+	if b > math.MaxUint64-a {
+		return math.MaxUint64
+	}
+	return a + b
+}
+
+func saturatingMulU64(a, b uint64) uint64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	if a > math.MaxUint64/b {
+		return math.MaxUint64
+	}
+	return a * b
+}
+
+func estimateMemValuePAXBytes(v model.Value) uint64 {
+	if v.IsNull {
+		return 8
+	}
+	switch v.Type {
+	case model.TypeBytes:
+		n := uint64(len(v.BytesVal))
+		if n > toastThreshold {
+			return 13
+		}
+		return saturatingAddU64(5, n)
+	case model.TypeString, model.TypeJSONB, model.TypeUUID, model.TypeNumeric:
+		n := uint64(len(v.StrVal))
+		if n > toastThreshold {
+			return 13
+		}
+		return saturatingAddU64(5, n)
+	case model.TypeVectorF32:
+		return saturatingAddU64(8, saturatingMulU64(uint64(len(v.VectorVal)), 4))
+	case model.TypeArray:
+		total := saturatingAddU64(16, saturatingMulU64(uint64(len(v.Dimensions)), 8))
+		for _, elem := range v.ArrayVal {
+			total = saturatingAddU64(total, estimateMemValuePAXBytes(elem))
+		}
+		return total
+	case model.TypeComposite:
+		total := uint64(8)
+		for _, field := range v.ArrayVal {
+			total = saturatingAddU64(total, estimateMemValuePAXBytes(field))
+		}
+		return total
+	case model.TypeInterval:
+		return 16
+	default:
+		return 8
+	}
+}
+
+func estimateMemEntryPAXBytes(e *memEntry) uint64 {
+	if e == nil {
+		return 0
+	}
+	est := saturatingAddU64(uint64(len(e.key)), uint64(len(e.endKey)))
+	est = saturatingAddU64(est, paxVersionSize+64)
+	if e.op == storage.MutationUpsert {
+		for _, v := range e.values {
+			est = saturatingAddU64(est, estimateMemValuePAXBytes(v))
+		}
+	}
+	return est
+}
+
+func countMemTypeLayoutNodes(layouts []model.TypeLayout) uint64 {
+	var total uint64
+	for _, l := range layouts {
+		total = saturatingAddU64(total, 1)
+		if len(l.Children) > 0 {
+			total = saturatingAddU64(total, countMemTypeLayoutNodes(l.Children))
+		}
+	}
+	return total
+}
+
+func estimateMemLayoutBasePAXBytes(layout storage.ObjectLayout) uint64 {
+	var cols uint64
+	for _, c := range layout.Columns {
+		cols = saturatingAddU64(cols, 1)
+		if len(c.Children) > 0 {
+			cols = saturatingAddU64(cols, countMemTypeLayoutNodes(c.Children))
+		}
+	}
+	return saturatingAddU64(paxHeaderSize, saturatingMulU64(cols, paxColumnSize+8))
+}
+
+func encodeMemEntriesBlocks(ctx context.Context, layout storage.ObjectLayout, entries []*memEntry, limits blockLimits) ([]*memPAXBlock, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	mb, err := encodeMemEntriesBlock(ctx, layout, entries, limits)
+	if errors.Is(err, columnar.ErrBatchBudget) && len(entries) > 1 {
+		mid := len(entries) / 2
+		left, err := encodeMemEntriesBlocks(ctx, layout, entries[:mid], limits)
+		if err != nil {
+			return nil, err
+		}
+		right, err := encodeMemEntriesBlocks(ctx, layout, entries[mid:], limits)
+		if err != nil {
+			return nil, err
+		}
+		return append(left, right...), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return []*memPAXBlock{mb}, nil
+}
+
 // buildMemTargetBlocks encodes all entries in state (optionally capped at
 // maxCommitTS if > 0) into sorted PAX blocks with TOAST blob extraction.
 func buildMemTargetBlocks(ctx context.Context, state *memTargetState, maxCommitTS model.Timestamp, limits blockLimits) ([]*memPAXBlock, error) {
@@ -529,6 +646,10 @@ func buildMemTargetBlocks(ctx context.Context, state *memTargetState, maxCommitT
 	var chunk []*memEntry
 	var chunkDesc uint64
 	var chunkBytes uint64
+	chunkBudget := limits.MaxBytes / 2
+	if limits.MaxDecodedBytes > 0 && limits.MaxDecodedBytes/2 < chunkBudget {
+		chunkBudget = limits.MaxDecodedBytes / 2
+	}
 
 	flushChunk := func() error {
 		if len(chunk) == 0 {
@@ -538,11 +659,11 @@ func buildMemTargetBlocks(ctx context.Context, state *memTargetState, maxCommitT
 		if !ok {
 			return storage.ErrInvalidLayout
 		}
-		mb, err := encodeMemEntriesBlock(ctx, layout, chunk, limits)
+		mbs, err := encodeMemEntriesBlocks(ctx, layout, chunk, limits)
 		if err != nil {
 			return err
 		}
-		blocks = append(blocks, mb)
+		blocks = append(blocks, mbs...)
 		chunk = chunk[:0]
 		chunkBytes = 0
 		return nil
@@ -560,35 +681,18 @@ func buildMemTargetBlocks(ctx context.Context, state *memTargetState, maxCommitT
 		if maxCommitTS > 0 && e.commitTS > maxCommitTS {
 			continue
 		}
-		estBytes := uint64(len(e.key)+len(e.endKey)) + paxVersionSize + 64
-		if e.op == storage.MutationUpsert {
-			for _, v := range e.values {
-				switch v.Type {
-				case model.TypeBytes:
-					if len(v.BytesVal) > toastThreshold {
-						estBytes += 13
-					} else {
-						estBytes += 4 + uint64(len(v.BytesVal))
-					}
-				case model.TypeString:
-					if len(v.StrVal) > toastThreshold {
-						estBytes += 13
-					} else {
-						estBytes += 4 + uint64(len(v.StrVal))
-					}
-				default:
-					estBytes += 16
-				}
-			}
-		}
-		if len(chunk) > 0 && (e.target.DescriptorVersion != chunkDesc || len(chunk) >= limits.MaxRows || chunkBytes+estBytes > limits.MaxBytes/2) {
+		estBytes := estimateMemEntryPAXBytes(e)
+		if len(chunk) > 0 && (e.target.DescriptorVersion != chunkDesc || len(chunk) >= limits.MaxRows || saturatingAddU64(chunkBytes, estBytes) > chunkBudget) {
 			if err := flushChunk(); err != nil {
 				return nil, err
 			}
 		}
-		chunkDesc = e.target.DescriptorVersion
+		if len(chunk) == 0 {
+			chunkDesc = e.target.DescriptorVersion
+			chunkBytes = estimateMemLayoutBasePAXBytes(state.layouts[chunkDesc])
+		}
 		chunk = append(chunk, e)
-		chunkBytes += estBytes
+		chunkBytes = saturatingAddU64(chunkBytes, estBytes)
 	}
 	if err := flushChunk(); err != nil {
 		return nil, err

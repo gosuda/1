@@ -90,98 +90,89 @@ func makeCoalescedDecision(decisions []runDecision) (coalescedDecision, error) {
 }
 
 func runManifestName(position uint64) string { return fmt.Sprintf("%020d.runs", position) }
+func runManifestPendingName(position uint64) string {
+	return fmt.Sprintf(".%020d.runs.pending", position)
+}
 func preparedRunName(position uint64, index int) string {
 	return fmt.Sprintf("%020d-%08x.sst", position, index)
 }
 
 // The manifest is a pre-durability artifact, not the transaction decision. Only
 // a matching validated WAL commit authorizes recovery of its file set.
-func (p *preparedRuns) persistManifest(ctx context.Context, decision runDecision, maximum uint64) (err error) {
+func (p *preparedRuns) persistManifest(ctx context.Context, decision runDecision, maximum uint64) error {
 	if err := decision.validate(); err != nil {
 		return err
 	}
-	if len(p.files) == 0 {
-		return storage.ErrBatchEmpty
-	}
-	const nameBytes = 25
-	if nameBytes > maximum-p.metadataBytes {
-		return columnar.ErrBatchBudget
-	}
-	name := runManifestName(decision.Position)
-	file, err := p.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return err
-	}
-	p.manifest = name
-	p.metadataBytes += nameBytes
-	defer func() { err = errors.Join(err, file.Close()) }()
-	var header [runManifestHeaderBytes]byte
-	if _, err := file.Write(header[:]); err != nil {
-		return err
-	}
-	digest := sha256.New()
-	var entry [runManifestEntryBytes]byte
-	var rows uint64
-	for index, run := range p.files {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if run.Name != preparedRunName(decision.Position, index) || run.Rows == 0 || run.Rows > decision.MutationCount-rows || run.Bytes == 0 {
-			return storage.ErrCorruptStorage
-		}
-		rows += run.Rows
-		encodeRunEntry(entry[:], run)
-		if _, err := file.Write(entry[:]); err != nil {
-			return err
-		}
-		if _, err := digest.Write(entry[:]); err != nil {
-			return err
-		}
-	}
-	if rows != decision.MutationCount {
-		return storage.ErrCorruptStorage
-	}
-	copy(header[:8], runManifestMagic)
-	binary.LittleEndian.PutUint64(header[8:16], uint64(runManifestHeaderBytes)+uint64(len(p.files))*runManifestEntryBytes)
-	binary.LittleEndian.PutUint64(header[16:24], decision.Position)
-	binary.LittleEndian.PutUint64(header[24:32], uint64(decision.CommitTS))
-	copy(header[32:48], decision.TxID[:])
-	copy(header[48:80], decision.Identity[:])
-	binary.LittleEndian.PutUint64(header[80:88], uint64(len(p.files)))
-	digest.Sum(header[88:88:120])
-	binary.LittleEndian.PutUint64(header[120:128], decision.MutationCount)
-	checksum := sha256.Sum256(header[:128])
-	copy(header[128:], checksum[:])
-	if _, err := file.WriteAt(header[:], 0); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return file.Sync()
+	return p.writeManifestAtomic(ctx, decision.Position, maximum, decision.MutationCount, func(header *[runManifestHeaderBytes]byte, bodyDigest [32]byte) {
+		copy(header[:8], runManifestMagic)
+		binary.LittleEndian.PutUint64(header[8:16], uint64(runManifestHeaderBytes)+uint64(len(p.files))*runManifestEntryBytes)
+		binary.LittleEndian.PutUint64(header[16:24], decision.Position)
+		binary.LittleEndian.PutUint64(header[24:32], uint64(decision.CommitTS))
+		copy(header[32:48], decision.TxID[:])
+		copy(header[48:80], decision.Identity[:])
+		binary.LittleEndian.PutUint64(header[80:88], uint64(len(p.files)))
+		copy(header[88:120], bodyDigest[:])
+		binary.LittleEndian.PutUint64(header[120:128], decision.MutationCount)
+	})
 }
 
 // persistCoalescedManifest writes an NSRUNS02 manifest covering contiguous
 // committed positions [decision.FirstPosition .. decision.LastPosition].
-func (p *preparedRuns) persistCoalescedManifest(ctx context.Context, decision coalescedDecision, maximum uint64) (err error) {
+func (p *preparedRuns) persistCoalescedManifest(ctx context.Context, decision coalescedDecision, maximum uint64) error {
 	if decision.FirstPosition == 0 || decision.LastPosition < decision.FirstPosition || decision.FirstCommitTS <= 0 || decision.LastCommitTS < decision.FirstCommitTS || decision.MutationCount == 0 {
 		return storage.ErrInvalidMutation
 	}
+	return p.writeManifestAtomic(ctx, decision.LastPosition, maximum, decision.MutationCount, func(header *[runManifestHeaderBytes]byte, bodyDigest [32]byte) {
+		copy(header[:8], runManifestMagicV2)
+		binary.LittleEndian.PutUint64(header[8:16], uint64(runManifestHeaderBytes)+uint64(len(p.files))*runManifestEntryBytes)
+		binary.LittleEndian.PutUint64(header[16:24], decision.LastPosition)
+		binary.LittleEndian.PutUint64(header[24:32], uint64(decision.LastCommitTS))
+		binary.LittleEndian.PutUint64(header[32:40], decision.FirstPosition)
+		binary.LittleEndian.PutUint64(header[40:48], uint64(decision.FirstCommitTS))
+		copy(header[48:80], decision.Identity[:])
+		binary.LittleEndian.PutUint64(header[80:88], uint64(len(p.files)))
+		copy(header[88:120], bodyDigest[:])
+		binary.LittleEndian.PutUint64(header[120:128], decision.MutationCount)
+	})
+}
+
+func (p *preparedRuns) writeManifestAtomic(
+	ctx context.Context,
+	position uint64,
+	maximum uint64,
+	expectedRows uint64,
+	buildHeader func(header *[runManifestHeaderBytes]byte, bodyDigest [32]byte),
+) (err error) {
 	if len(p.files) == 0 {
 		return storage.ErrBatchEmpty
 	}
 	const nameBytes = 25
-	if nameBytes > maximum-p.metadataBytes {
+	if p.metadataBytes > maximum || nameBytes > maximum-p.metadataBytes {
 		return columnar.ErrBatchBudget
 	}
-	name := runManifestName(decision.LastPosition)
-	file, err := p.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	pendingName := runManifestPendingName(position)
+	finalName := runManifestName(position)
+	if err := p.root.Remove(pendingName); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	file, err := p.root.OpenFile(pendingName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	p.manifest = name
-	p.metadataBytes += nameBytes
-	defer func() { err = errors.Join(err, file.Close()) }()
+	pendingRemoved := false
+	defer func() {
+		if file != nil {
+			err = errors.Join(err, file.Close())
+		}
+		if !pendingRemoved {
+			if removeErr := p.root.Remove(pendingName); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				err = errors.Join(err, removeErr)
+			}
+		}
+	}()
 	var header [runManifestHeaderBytes]byte
 	if _, err := file.Write(header[:]); err != nil {
 		return err
@@ -193,7 +184,7 @@ func (p *preparedRuns) persistCoalescedManifest(ctx context.Context, decision co
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if run.Name != preparedRunName(decision.LastPosition, index) || run.Rows == 0 || run.Rows > decision.MutationCount-rows || run.Bytes == 0 {
+		if run.Name != preparedRunName(position, index) || run.Rows == 0 || run.Rows > expectedRows-rows || run.Bytes == 0 {
 			return storage.ErrCorruptStorage
 		}
 		rows += run.Rows
@@ -205,19 +196,12 @@ func (p *preparedRuns) persistCoalescedManifest(ctx context.Context, decision co
 			return err
 		}
 	}
-	if rows != decision.MutationCount {
+	if rows != expectedRows {
 		return storage.ErrCorruptStorage
 	}
-	copy(header[:8], runManifestMagicV2)
-	binary.LittleEndian.PutUint64(header[8:16], uint64(runManifestHeaderBytes)+uint64(len(p.files))*runManifestEntryBytes)
-	binary.LittleEndian.PutUint64(header[16:24], decision.LastPosition)
-	binary.LittleEndian.PutUint64(header[24:32], uint64(decision.LastCommitTS))
-	binary.LittleEndian.PutUint64(header[32:40], decision.FirstPosition)
-	binary.LittleEndian.PutUint64(header[40:48], uint64(decision.FirstCommitTS))
-	copy(header[48:80], decision.Identity[:])
-	binary.LittleEndian.PutUint64(header[80:88], uint64(len(p.files)))
-	digest.Sum(header[88:88:120])
-	binary.LittleEndian.PutUint64(header[120:128], decision.MutationCount)
+	var bodyDigest [32]byte
+	digest.Sum(bodyDigest[:0])
+	buildHeader(&header, bodyDigest)
 	checksum := sha256.Sum256(header[:128])
 	copy(header[128:], checksum[:])
 	if _, err := file.WriteAt(header[:], 0); err != nil {
@@ -226,7 +210,28 @@ func (p *preparedRuns) persistCoalescedManifest(ctx context.Context, decision co
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return file.Sync()
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	closeErr := file.Close()
+	file = nil
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.root.Link(pendingName, finalName); err != nil {
+		return err
+	}
+	p.manifest = finalName
+	p.metadataBytes += nameBytes
+	removeErr := p.root.Remove(pendingName)
+	pendingRemoved = true
+	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return removeErr
+	}
+	return syncCommitDirectory(p.root)
 }
 
 func encodeRunEntry(entry []byte, run preparedRun) {
