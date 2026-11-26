@@ -1,0 +1,165 @@
+package dnsrecord
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/gosuda/portal-tunnel/v2/utils"
+)
+
+var (
+	errRecordNameIsRequired = errors.New("record name is required")
+	errBaseDomainIsRequired = errors.New("base domain is required")
+)
+
+// RecordName validates a fully qualified record name and returns it
+// normalized.
+func RecordName(raw string) (string, error) {
+	name := utils.NormalizeHostname(raw)
+	if name == "" {
+		return "", errRecordNameIsRequired
+	}
+	return name, nil
+}
+
+// BaseDomain validates a zone base domain and returns it normalized.
+func BaseDomain(raw string) (string, error) {
+	name := utils.NormalizeBaseDomain(raw)
+	if name == "" {
+		return "", errBaseDomainIsRequired
+	}
+	return name, nil
+}
+
+// AddressRecordInputs validates an address-record upsert and returns the
+// normalized record name, A or AAAA record type, and canonical IP address.
+func AddressRecordInputs(name, publicIP string) (string, string, string, error) {
+	name, err := RecordName(name)
+	if err != nil {
+		return "", "", "", err
+	}
+	recordType, publicIP, err := address(publicIP)
+	if err != nil {
+		return "", "", "", err
+	}
+	return name, recordType, publicIP, nil
+}
+
+// AddressRecordsInputs validates an apex and wildcard address-record upsert
+// and returns the normalized base domain, record type, and canonical IP address.
+func AddressRecordsInputs(baseDomain, publicIP string) (string, string, string, error) {
+	baseDomain, err := BaseDomain(baseDomain)
+	if err != nil {
+		return "", "", "", err
+	}
+	recordType, publicIP, err := address(publicIP)
+	if err != nil {
+		return "", "", "", err
+	}
+	return baseDomain, recordType, publicIP, nil
+}
+
+func address(raw string) (recordType, canonicalIP string, err error) {
+	canonicalIP = utils.SanitizeReportedIP(raw)
+	if canonicalIP == "" {
+		return "", "", fmt.Errorf("invalid ip address: %q", raw)
+	}
+	recordType = "A"
+	if strings.Contains(canonicalIP, ":") {
+		recordType = "AAAA"
+	}
+	return recordType, canonicalIP, nil
+}
+
+// TXTInputs validates a TXT upsert's record name and value, returning both
+// normalized.
+func TXTInputs(name, value string) (string, string, error) {
+	name, err := RecordName(name)
+	if err != nil {
+		return "", "", err
+	}
+	value, err = required(value, "txt record value")
+	if err != nil {
+		return "", "", err
+	}
+	return name, value, nil
+}
+
+// TXTPrefixInputs validates a TXT deletion's record name and match prefix,
+// returning both normalized.
+func TXTPrefixInputs(name, matchPrefix string) (string, string, error) {
+	name, err := RecordName(name)
+	if err != nil {
+		return "", "", err
+	}
+	matchPrefix, err = required(matchPrefix, "txt record match prefix")
+	if err != nil {
+		return "", "", err
+	}
+	return name, matchPrefix, nil
+}
+
+// ApexWildcard lists the apex and wildcard record names published for a base
+// domain.
+func ApexWildcard(baseDomain string) []string {
+	return []string{baseDomain, "*." + baseDomain}
+}
+
+// required trims raw and reports an empty input as "<label> is required".
+func required(raw, label string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fmt.Errorf("%s is required", label)
+	}
+	return value, nil
+}
+
+// RelativeName converts a fully qualified record name into the form expected
+// by DNS provider APIs while preserving provider-specific error messages.
+func RelativeName(provider, fqdn, zone string) (string, error) {
+	fqdn = utils.NormalizeHostname(fqdn)
+	zone = utils.NormalizeBaseDomain(zone)
+	if fqdn == "" {
+		return "", errRecordNameIsRequired
+	}
+	if zone == "" {
+		return "", fmt.Errorf("%s zone is required", provider)
+	}
+	if fqdn == zone {
+		return "@", nil
+	}
+	suffix := "." + zone
+	if !strings.HasSuffix(fqdn, suffix) {
+		return "", fmt.Errorf("hostname %q is outside %s zone %q", fqdn, provider, zone)
+	}
+	return strings.TrimSuffix(fqdn, suffix), nil
+}
+
+// NameMatches accepts the relative, apex, and fully qualified record-name
+// forms returned by DNS provider APIs for the same record.
+func NameMatches(recordName, expected, fqdn, zone string) bool {
+	recordName = utils.NormalizeHostname(recordName)
+	expected = strings.TrimSpace(strings.ToLower(expected))
+	fqdn = utils.NormalizeHostname(fqdn)
+	zone = utils.NormalizeBaseDomain(zone)
+
+	if recordName == expected {
+		return true
+	}
+	apexRecord := recordName == "" || recordName == zone || recordName == fqdn
+	if expected == "@" && apexRecord {
+		return true
+	}
+	return recordName == fqdn
+}
+
+// TXTContent normalizes the quoted TXT values returned by DNS provider APIs.
+func TXTContent(raw string) string {
+	unquoted, err := strconv.Unquote(strings.TrimSpace(raw))
+	if err == nil {
+		return unquoted
+	}
+	return strings.Trim(strings.TrimSpace(raw), "\"")
+}
