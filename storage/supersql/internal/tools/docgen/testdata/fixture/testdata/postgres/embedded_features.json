@@ -1,0 +1,268 @@
+{
+  "profile": "embedded_pg18",
+  "postgres_version_num": 180004,
+  "source": {
+    "archive": "https://example.invalid/postgresql-18.4.tar.bz2",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "catalog": "../postgres184/catalog",
+    "regression": "../postgres184",
+    "auxiliary_regression_revision": "1f02a1e488f7b0f4c962a19d6b7b8e172f97d9c2"
+  },
+  "features": [
+    {
+      "id": "server_transport",
+      "disposition": "unsupported",
+      "reason": "PostgreSQL wire transport is not embedded SQL.",
+      "sqlstate": "0A000",
+      "ast_match": ["transport negotiation (not SQL AST)"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "cluster_admin",
+      "disposition": "unsupported",
+      "reason": "Database instances are host-owned.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE DATABASE"],
+      "resolved_objects": [
+        {
+          "kind": "function",
+          "namespace": "pg_catalog",
+          "name": "pg_database_size",
+          "oid": 2321,
+          "argument_types": [26],
+          "argument_type_names": ["oid"],
+          "result_type": 20,
+          "result_type_name": "int8",
+          "strict": true,
+          "volatility": "s",
+          "function_kind": "f",
+          "returns_set": false,
+          "variadic_type": 0,
+          "mutable": false
+        }
+      ],
+      "regression_statements": []
+    },
+    {
+      "id": "authorization",
+      "disposition": "unsupported",
+      "reason": "The embedded principal is not a privilege subsystem.",
+      "sqlstate": "0A000",
+      "ast_match": ["GRANT", "REVOKE"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "external_code",
+      "disposition": "unsupported",
+      "reason": "External language handlers are not loaded.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE EXTENSION"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "foreign_data",
+      "disposition": "unsupported",
+      "reason": "Only local database objects participate in execution.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE FOREIGN TABLE"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "replication",
+      "disposition": "unsupported",
+      "reason": "There is no replication SQL interface.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE SUBSCRIPTION"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "prepared_transactions",
+      "disposition": "unsupported",
+      "reason": "Distributed prepared transactions are not implemented.",
+      "sqlstate": "0A000",
+      "ast_match": ["PREPARE TRANSACTION"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "weaker_isolation",
+      "disposition": "unsupported",
+      "reason": "Read-write transactions accept only SERIALIZABLE.",
+      "sqlstate": "0A000",
+      "ast_match": ["SET TRANSACTION ISOLATION LEVEL"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "notifications",
+      "disposition": "unsupported",
+      "reason": "Asynchronous notification channels are not provided.",
+      "sqlstate": "0A000",
+      "ast_match": ["LISTEN"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "server_io",
+      "disposition": "unsupported",
+      "reason": "SQL cannot access server files or programs.",
+      "sqlstate": "0A000",
+      "ast_match": ["COPY FROM file"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "xml",
+      "disposition": "unsupported",
+      "reason": "XML types are outside the fixed SQL profile.",
+      "sqlstate": "0A000",
+      "ast_match": ["XML type"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "locale_providers",
+      "disposition": "unsupported",
+      "reason": "Only UTF8 and deterministic collations are available.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE COLLATION"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "physical_storage",
+      "disposition": "unsupported",
+      "reason": "Physical storage identities are not NeoSepia objects.",
+      "sqlstate": "0A000",
+      "ast_match": ["CLUSTER"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "non_btree_indexes",
+      "disposition": "unsupported",
+      "reason": "Only ordered B-tree index semantics are available.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE INDEX USING hash"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "advanced_exclusion",
+      "disposition": "unsupported",
+      "reason": "Non-B-tree exclusion constraints are unavailable.",
+      "sqlstate": "0A000",
+      "ast_match": ["EXCLUDE"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "rewrite_hooks",
+      "disposition": "unsupported",
+      "reason": "User rewrite rules are unavailable.",
+      "sqlstate": "0A000",
+      "ast_match": ["CREATE RULE"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "physical_maintenance",
+      "disposition": "unsupported",
+      "reason": "Heap and cluster maintenance is not embedded maintenance.",
+      "sqlstate": "0A000",
+      "ast_match": ["VACUUM FULL"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "server_observability",
+      "disposition": "unsupported",
+      "reason": "Server processes and physical statistics are unavailable.",
+      "sqlstate": "0A000",
+      "ast_match": ["EXPLAIN (BUFFERS)"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "aggregate_or_replace",
+      "disposition": "unsupported",
+      "reason": "Replacing an existing aggregate is unavailable.",
+      "sqlstate": "0A000",
+      "ast_match": ["DefineStmt.kind = OBJECT_AGGREGATE with replace = true"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/create_aggregate.sql", "line": 217},
+        {"file": "testdata/postgres/sql/create_aggregate.sql", "line": 235}
+      ]
+    },
+    {
+      "id": "session_state",
+      "disposition": "unsupported",
+      "reason": "Session-local sequence state cannot be discarded.",
+      "sqlstate": "0A000",
+      "ast_match": ["DiscardStmt.target = DISCARD_SEQUENCES", "DiscardStmt.target = DISCARD_ALL sequence reset"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/guc.sql", "line": 204},
+        {"file": "testdata/postgres/sql/sequence.sql", "line": 127},
+        {"file": "testdata/postgres/sql/sequence.sql", "line": 263}
+      ]
+    },
+    {
+      "id": "write_descriptor_expansion",
+      "disposition": "unsupported",
+      "reason": "Writes needing unsupported descriptor expansion are unavailable.",
+      "sqlstate": "0A000",
+      "ast_match": ["resolved write target requiring unsupported expansion or constraints"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/insert.sql", "line": 205}
+      ]
+    },
+    {
+      "id": "datetime_fields",
+      "disposition": "unsupported",
+      "reason": "Only the supported temporal field units are available.",
+      "sqlstate": "0A000",
+      "ast_match": ["EXTRACT unsupported field unit"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/date.sql", "line": 286}
+      ]
+    },
+    {
+      "id": "encoding_conversion",
+      "disposition": "unsupported",
+      "reason": "Only the builtin encodings can be converted.",
+      "sqlstate": "0A000",
+      "ast_match": ["convert_from unsupported encoding"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/euc_kr.sql", "line": 10}
+      ]
+    },
+    {
+      "id": "required_sql",
+      "disposition": "required",
+      "reason": "All SQL outside the fixed exclusions is required.",
+      "sqlstate": "",
+      "ast_match": ["SELECT"],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "psql_commands",
+      "disposition": "client_command",
+      "reason": "psql backslash commands are test-client input.",
+      "sqlstate": "",
+      "ast_match": [],
+      "resolved_objects": [],
+      "regression_statements": []
+    }
+  ]
+}
