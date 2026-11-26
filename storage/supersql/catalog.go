@@ -277,7 +277,7 @@ func (database *Catalog) compose(ctx context.Context) error {
 	}
 	if database.indexJobs, err = schema.NewJobStore(ctx, schema.JobStoreOptions{
 		Target:  storage.ObjectRef{ObjectID: nativeIndexObjectID, Generation: 1, DescriptorVersion: 1, EncodingVersion: 1},
-		Encoder: database.keys, MetadataBytes: 1 << 20, RecordBytes: 1 << 16, KeyBytes: 4096, MaxJobs: 256, BatchRows: 64,
+		Encoder: database.keys, MetadataBytes: 1 << 20, RecordBytes: 1 << 20, KeyBytes: 4096, MaxJobs: 256, BatchRows: 64,
 	}); err != nil {
 		return err
 	}

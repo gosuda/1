@@ -137,16 +137,17 @@ func TestGrantRevokeTableViewSequenceSchemaFunction(t *testing.T) {
 		t.Fatalf("bob SELECT count = %d, want 4", out.Rows[0][0].IntVal)
 	}
 
-	// REVOKE GRANT OPTION FOR SELECT prevents alice from granting further while keeping her SELECT.
+	// REVOKE GRANT OPTION FOR SELECT fails with 2BP01 under default RESTRICT while bob holds alice's delegated grant,
+	// and succeeds with CASCADE (revoking bob's dependent grant while keeping alice's base SELECT).
 	mustExec(`RESET ROLE`)
-	mustExec(`REVOKE GRANT OPTION FOR SELECT ON items FROM alice`)
+	requireErrCode(`REVOKE GRANT OPTION FOR SELECT ON items FROM alice`, "2BP01")
+	mustExec(`REVOKE GRANT OPTION FOR SELECT ON items FROM alice CASCADE`)
 	mustExec(`SET ROLE alice`)
 	mustExec(`SELECT count(*) FROM items`)
 	requireErrCode(`GRANT SELECT ON items TO member_role`, "42501")
 
-	// REVOKE SELECT immediately denies access.
+	// bob's delegated SELECT was revoked by CASCADE.
 	mustExec(`RESET ROLE`)
-	mustExec(`REVOKE SELECT ON items FROM bob`)
 	mustExec(`SET ROLE bob`)
 	requireErrCode(`SELECT * FROM items`, "42501")
 

@@ -20,8 +20,10 @@ import (
 
 const (
 	defaultMaxConnections     = 128
+	defaultMaxPreAuthPerIP    = 32
 	defaultApplicationVersion = "18.4 (SuperSQL)"
 	defaultReadTimeout        = 30 * time.Second
+	defaultWriteTimeout       = 30 * time.Second
 	defaultIdleTimeout        = 5 * time.Minute
 	defaultMaxPreparedStmts   = 1024
 	defaultMaxPortals         = 256
@@ -80,6 +82,11 @@ type Config struct {
 	// Defaults to 128.
 	MaxConnections int
 
+	// MaxPreAuthPerIP caps concurrent unauthenticated (pre-auth) connections
+	// allowed from a single remote IP address. Defaults to 32 (capped at the
+	// global pre-auth limit) when zero or negative.
+	MaxPreAuthPerIP int
+
 	// MaxPreparedStatements caps the number of prepared statements cached per
 	// connection. Defaults to 1024 when zero or negative.
 	MaxPreparedStatements int
@@ -92,6 +99,10 @@ type Config struct {
 	// TLS handshakes. Defaults to 30s when zero; set a negative duration to
 	// disable read timeouts.
 	ReadTimeout time.Duration
+
+	// WriteTimeout bounds socket write and flush operations. Defaults to 30s
+	// when zero; set a negative duration to disable write timeouts.
+	WriteTimeout time.Duration
 
 	// IdleTimeout bounds how long an idle connection may wait for the next
 	// frontend message before being closed. Defaults to 5m when zero; set a
@@ -119,9 +130,11 @@ type Server struct {
 	cfg              Config
 	maxConns         int
 	maxPreAuth       int
+	maxPreAuthPerIP  int
 	maxPreparedStmts int
 	maxPortals       int
 	readTimeout      time.Duration
+	writeTimeout     time.Duration
 	idleTimeout      time.Duration
 	appVersion       string
 
@@ -135,6 +148,7 @@ type Server struct {
 	addr         net.Addr
 	conns        map[int32]*clientConn
 	preAuthConns map[*clientConn]struct{}
+	preAuthByIP  map[string]int
 
 	wg sync.WaitGroup
 }
@@ -169,6 +183,12 @@ func NewServer(connector *supersql.Connector, cfg Config) (*Server, error) {
 	} else if readTimeout < 0 {
 		readTimeout = 0
 	}
+	writeTimeout := cfg.WriteTimeout
+	if writeTimeout == 0 {
+		writeTimeout = defaultWriteTimeout
+	} else if writeTimeout < 0 {
+		writeTimeout = 0
+	}
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout == 0 {
 		idleTimeout = defaultIdleTimeout
@@ -180,18 +200,28 @@ func NewServer(connector *supersql.Connector, cfg Config) (*Server, error) {
 		appVersion = defaultApplicationVersion
 	}
 	maxPreAuth := max(maxConns*2, 64)
+	maxPreAuthPerIP := cfg.MaxPreAuthPerIP
+	if maxPreAuthPerIP <= 0 {
+		maxPreAuthPerIP = defaultMaxPreAuthPerIP
+	}
+	if maxPreAuthPerIP > maxPreAuth {
+		maxPreAuthPerIP = maxPreAuth
+	}
 	s := &Server{
 		connector:        connector,
 		cfg:              cfg,
 		maxConns:         maxConns,
 		maxPreAuth:       maxPreAuth,
+		maxPreAuthPerIP:  maxPreAuthPerIP,
 		maxPreparedStmts: maxPreparedStmts,
 		maxPortals:       maxPortals,
 		readTimeout:      readTimeout,
+		writeTimeout:     writeTimeout,
 		idleTimeout:      idleTimeout,
 		appVersion:       appVersion,
 		conns:            make(map[int32]*clientConn),
 		preAuthConns:     make(map[*clientConn]struct{}),
+		preAuthByIP:      make(map[string]int),
 	}
 	s.nextPID.Store(1000)
 	return s, nil
@@ -239,9 +269,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 
-	// Unblock Accept promptly when ctx is canceled.
+	// Unblock Accept and wake active/pre-auth connections promptly when ctx is canceled.
 	stopWatch := context.AfterFunc(serveCtx, func() {
 		_ = ln.Close()
+		s.drainConnections()
 	})
 	defer stopWatch()
 
@@ -249,6 +280,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		rawConn, err := ln.Accept()
 		if err != nil {
 			if serveCtx.Err() != nil || s.isClosed() || errors.Is(err, net.ErrClosed) {
+				if serveCtx.Err() != nil {
+					s.drainConnections()
+				}
 				s.wg.Wait()
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -263,16 +297,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			return err
 		}
 
-		if !s.acquirePreAuthSlot() {
+		if serveCtx.Err() != nil {
 			_ = rawConn.Close()
-			continue
-		}
-		cc := s.newClientConn(rawConn)
-		if !s.registerPreAuth(cc) {
-			s.releasePreAuthSlot()
-			_ = rawConn.Close()
+			s.drainConnections()
 			s.wg.Wait()
-			return nil
+			return ctx.Err()
+		}
+
+		cc, closed := s.acceptPreAuth(rawConn)
+		if cc == nil {
+			_ = rawConn.Close()
+			if closed {
+				s.wg.Wait()
+				return nil
+			}
+			continue
 		}
 		s.wg.Add(1)
 		go func() {
@@ -351,13 +390,7 @@ func (s *Server) Close() error {
 	}
 	s.closed = true
 	listeners := append([]net.Listener(nil), s.listeners...)
-	all := make([]*clientConn, 0, len(s.conns)+len(s.preAuthConns))
-	for _, cc := range s.conns {
-		all = append(all, cc)
-	}
-	for cc := range s.preAuthConns {
-		all = append(all, cc)
-	}
+	all := s.snapshotTrackedConnsLocked()
 	s.mu.Unlock()
 
 	var closeErr error
@@ -374,18 +407,55 @@ func (s *Server) Close() error {
 	return closeErr
 }
 
+func (s *Server) snapshotTrackedConnsLocked() []*clientConn {
+	all := make([]*clientConn, 0, len(s.conns)+len(s.preAuthConns))
+	for _, cc := range s.conns {
+		all = append(all, cc)
+	}
+	for cc := range s.preAuthConns {
+		all = append(all, cc)
+	}
+	return all
+}
+
+func (s *Server) drainConnections() {
+	s.mu.Lock()
+	all := s.snapshotTrackedConnsLocked()
+	s.mu.Unlock()
+	for _, cc := range all {
+		cc.cancelActiveQuery()
+		cc.forceClose()
+	}
+}
+
 func (s *Server) isClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
 }
 
-func (s *Server) newClientConn(rawConn net.Conn) *clientConn {
+func remoteIP(conn net.Conn) string {
+	if conn == nil || conn.RemoteAddr() == nil {
+		return ""
+	}
+	addr := conn.RemoteAddr().String()
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return host
+}
+
+func (s *Server) newClientConn(rawConn net.Conn, ip string) *clientConn {
 	pid := s.nextPID.Add(1)
 	secret := randomSecretKey()
 	return &clientConn{
 		server:      s,
 		rawConn:     rawConn,
+		remoteIP:    ip,
 		br:          bufio.NewReaderSize(rawConn, 16*1024),
 		bw:          bufio.NewWriterSize(rawConn, 16*1024),
 		pid:         pid,
@@ -414,41 +484,55 @@ func (s *Server) releaseSlot() {
 	s.activeConns.Add(-1)
 }
 
-func (s *Server) acquirePreAuthSlot() bool {
-	for {
-		cur := s.preAuthCount.Load()
-		if int(cur) >= s.maxPreAuth {
-			return false
-		}
-		if s.preAuthCount.CompareAndSwap(cur, cur+1) {
-			return true
-		}
-	}
-}
-
-func (s *Server) releasePreAuthSlot() {
-	s.preAuthCount.Add(-1)
-}
-
-func (s *Server) registerPreAuth(cc *clientConn) bool {
+func (s *Server) acceptPreAuth(rawConn net.Conn) (cc *clientConn, closed bool) {
+	ip := remoteIP(rawConn)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
-		return false
+		s.mu.Unlock()
+		return nil, true
 	}
+	if len(s.preAuthConns) >= s.maxPreAuth {
+		s.mu.Unlock()
+		return nil, false
+	}
+	if ip != "" && s.maxPreAuthPerIP > 0 && s.preAuthByIP[ip] >= s.maxPreAuthPerIP {
+		s.mu.Unlock()
+		return nil, false
+	}
+	cc = s.newClientConn(rawConn, ip)
 	s.preAuthConns[cc] = struct{}{}
-	return true
+	if ip != "" {
+		s.preAuthByIP[ip]++
+	}
+	s.preAuthCount.Add(1)
+	s.mu.Unlock()
+	return cc, false
+}
+
+func (s *Server) unregisterPreAuthLocked(cc *clientConn) {
+	if _, exists := s.preAuthConns[cc]; !exists {
+		return
+	}
+	delete(s.preAuthConns, cc)
+	s.preAuthCount.Add(-1)
+	if cc.remoteIP != "" {
+		if n := s.preAuthByIP[cc.remoteIP] - 1; n <= 0 {
+			delete(s.preAuthByIP, cc.remoteIP)
+		} else {
+			s.preAuthByIP[cc.remoteIP] = n
+		}
+	}
 }
 
 func (s *Server) unregisterPreAuth(cc *clientConn) {
 	s.mu.Lock()
-	delete(s.preAuthConns, cc)
+	s.unregisterPreAuthLocked(cc)
 	s.mu.Unlock()
 }
 
 func (s *Server) registerConn(cc *clientConn) {
 	s.mu.Lock()
-	delete(s.preAuthConns, cc)
+	s.unregisterPreAuthLocked(cc)
 	s.conns[cc.pid] = cc
 	s.mu.Unlock()
 }

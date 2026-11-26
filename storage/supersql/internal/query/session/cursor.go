@@ -90,6 +90,15 @@ func (cursor *namedCursor) close() error {
 
 type cursorSettingsRuntime struct{ owner *Transactions }
 
+var _ catalogrel.RoleProvider = cursorSettingsRuntime{}
+
+func (runtime cursorSettingsRuntime) CurrentRole() string {
+	if runtime.owner == nil || runtime.owner.settings == nil {
+		return ""
+	}
+	return runtime.owner.settings.CurrentRole()
+}
+
 func (runtime cursorSettingsRuntime) current(ctx context.Context) (settingRuntime, error) {
 	operation, ok := ctx.Value(sessionTransactionKey{}).(*sessionTransactionOperation)
 	if !ok || operation.owner != runtime.owner || !operation.active.Load() {
@@ -227,6 +236,9 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 			}
 			dependencies = append(dependencies, discovery...)
 		}
+		if boundHasCatalogScan(compiled.bound) {
+			dependencies = append(dependencies, catalogScanDependencies(options.Catalog, options.Environment.Catalog)...)
+		}
 		view, runErr := openPreparedTransactionReadView(statementContext, transactions.transaction, compiled, dependencies)
 		if runErr != nil {
 			return errors.Join(runErr, spool.Close(), spoolQuery.Close(), sourceQuery.Close())
@@ -258,6 +270,7 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 			if runErr != nil {
 				return errors.Join(runErr, view.Close(), spool.Close(), spoolQuery.Close(), sourceQuery.Close())
 			}
+			environment.Native.Database, _ = environment.Catalog.(model.DatabaseRuntime)
 		}
 		scope := &preparedMutationScope{transaction: transactions.transaction, ambient: true}
 		environment.Modify.Transaction = scope

@@ -65,7 +65,11 @@ func bindGrantStatement(ctx context.Context, statement *zpgparse.GrantStmt, snap
 			return nil, permissionDeniedError(target, 0)
 		}
 		revokeAllGrantors := roleIsSuperuser(roles, options.Bind.CurrentRole) || roleIsOwner(roles, options.Bind.CurrentRole, target.OwnerName())
-		nextACL := applyGrantToACL(target.ACL(), grantees, mask, grantor, statement.IsGrant, statement.GrantOption, revokeAllGrantors)
+		cascade := statement.Behavior == zpgparse.DropBehavior_DROP_CASCADE
+		nextACL, err := applyGrantToACLWithBehavior(target.ACL(), grantees, mask, grantor, statement.IsGrant, statement.GrantOption, revokeAllGrantors, cascade, roles, target.OwnerName())
+		if err != nil {
+			return nil, err
+		}
 		next, err := target.WithACL(nextACL)
 		if err != nil {
 			return nil, err
@@ -357,6 +361,161 @@ func applyGrantToACL(existing []model.PrivilegeGrant, grantees []string, mask mo
 		return nil
 	}
 	return filtered
+}
+
+func applyGrantToACLWithBehavior(
+	existing []model.PrivilegeGrant,
+	grantees []string,
+	mask model.PrivilegeMask,
+	grantor string,
+	isGrant, grantOption, revokeAllGrantors, cascade bool,
+	roles map[string]model.RoleMetadata,
+	ownerName string,
+) ([]model.PrivilegeGrant, error) {
+	if isGrant {
+		return applyGrantToACL(existing, grantees, mask, grantor, true, grantOption, revokeAllGrantors), nil
+	}
+
+	acl := make([]model.PrivilegeGrant, len(existing))
+	copy(acl, existing)
+	for _, grantee := range grantees {
+		for idx := range acl {
+			if acl[idx].Grantee != grantee {
+				continue
+			}
+			if !revokeAllGrantors && acl[idx].Grantor != grantor {
+				continue
+			}
+			if grantOption {
+				acl[idx].GrantOption &^= mask
+			} else {
+				acl[idx].Privileges &^= mask
+				acl[idx].GrantOption &^= mask
+			}
+		}
+	}
+
+	for rem := mask; rem != 0; {
+		bit := rem & -rem
+		rem &^= bit
+
+		roots := revokeRootGrantors(existing, bit, roles, ownerName)
+		groundedBefore := groundedGrantOptionRoles(existing, bit, roots, roles, ownerName)
+		groundedAfter := groundedGrantOptionRoles(acl, bit, roots, roles, ownerName)
+
+		for idx := range acl {
+			if (acl[idx].Privileges & bit) == 0 {
+				continue
+			}
+			g := normalizeRoleName(acl[idx].Grantor)
+			if !hasGroundedGrantOption(g, groundedBefore, roots, roles, ownerName) {
+				continue
+			}
+			if hasGroundedGrantOption(g, groundedAfter, roots, roles, ownerName) {
+				continue
+			}
+			if !cascade {
+				return nil, &model.Error{
+					Code:    "2BP01",
+					Message: "dependent privileges exist",
+					Hint:    "Use CASCADE to revoke them too.",
+				}
+			}
+			acl[idx].Privileges &^= bit
+			acl[idx].GrantOption &^= bit
+		}
+	}
+
+	filtered := make([]model.PrivilegeGrant, 0, len(acl))
+	for _, entry := range acl {
+		if entry.Privileges != 0 {
+			entry.GrantOption &= entry.Privileges
+			filtered = append(filtered, entry)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, nil
+	}
+	return filtered, nil
+}
+
+func isPrivilegeRootGrantor(roles map[string]model.RoleMetadata, role, ownerName string) bool {
+	r := normalizeRoleName(role)
+	return r == "" || roleIsSuperuser(roles, r) || roleIsOwner(roles, r, ownerName)
+}
+
+func aclGrantsOptionToRole(acl []model.PrivilegeGrant, roles map[string]model.RoleMetadata, role string, bit model.PrivilegeMask) bool {
+	r := normalizeRoleName(role)
+	for _, entry := range acl {
+		if (entry.GrantOption & bit) == 0 {
+			continue
+		}
+		grantee := normalizeRoleName(entry.Grantee)
+		if grantee == "public" || grantee == r || roleIsMemberOf(roles, r, grantee) {
+			return true
+		}
+	}
+	return false
+}
+
+func revokeRootGrantors(existing []model.PrivilegeGrant, bit model.PrivilegeMask, roles map[string]model.RoleMetadata, ownerName string) map[string]struct{} {
+	roots := make(map[string]struct{})
+	for _, entry := range existing {
+		if (entry.Privileges & bit) == 0 {
+			continue
+		}
+		g := normalizeRoleName(entry.Grantor)
+		if isPrivilegeRootGrantor(roles, g, ownerName) || !aclGrantsOptionToRole(existing, roles, g, bit) {
+			roots[g] = struct{}{}
+		}
+	}
+	return roots
+}
+
+func hasGroundedGrantOption(role string, grounded, roots map[string]struct{}, roles map[string]model.RoleMetadata, ownerName string) bool {
+	r := normalizeRoleName(role)
+	if isPrivilegeRootGrantor(roles, r, ownerName) {
+		return true
+	}
+	if _, ok := roots[r]; ok {
+		return true
+	}
+	if _, ok := grounded["public"]; ok {
+		return true
+	}
+	if _, ok := grounded[r]; ok {
+		return true
+	}
+	for g := range grounded {
+		if roleIsMemberOf(roles, r, g) {
+			return true
+		}
+	}
+	return false
+}
+
+func groundedGrantOptionRoles(acl []model.PrivilegeGrant, bit model.PrivilegeMask, roots map[string]struct{}, roles map[string]model.RoleMetadata, ownerName string) map[string]struct{} {
+	grounded := make(map[string]struct{})
+	for {
+		changed := false
+		for _, entry := range acl {
+			if (entry.GrantOption & bit) == 0 {
+				continue
+			}
+			grantee := normalizeRoleName(entry.Grantee)
+			if _, ok := grounded[grantee]; ok {
+				continue
+			}
+			if hasGroundedGrantOption(entry.Grantor, grounded, roots, roles, ownerName) {
+				grounded[grantee] = struct{}{}
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return grounded
 }
 
 func bindAlterOwner(ctx context.Context, statement *zpgparse.AlterOwnerStmt, snapshot CatalogSnapshot, options CreateDeclarationOptions) (*BoundObjectCommand, error) {

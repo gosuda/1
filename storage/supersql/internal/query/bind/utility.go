@@ -559,7 +559,7 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 		required |= model.PrivilegeSelect
 	} else {
 		for _, item := range n.TargetList {
-			if rt := item.GetResTarget(); rt != nil && astContainsColumnRef(rt.Val) {
+			if rt := item.GetResTarget(); rt != nil && (len(rt.Indirection) > 0 || astContainsColumnRef(rt.Val)) {
 				required |= model.PrivilegeSelect
 				break
 			}
@@ -586,7 +586,11 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 	} else {
 		b.rlsTargetID = target.descriptor.ID()
 	}
-	b.rlsTargetCommand = "UPDATE"
+	if required&model.PrivilegeSelect != 0 {
+		b.rlsTargetCommand = "UPDATE+SELECT"
+	} else {
+		b.rlsTargetCommand = "UPDATE"
+	}
 	b.dmlTargetID = target.descriptor.ID()
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
 	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
@@ -954,7 +958,11 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 	} else {
 		b.rlsTargetID = target.descriptor.ID()
 	}
-	b.rlsTargetCommand = "DELETE"
+	if required&model.PrivilegeSelect != 0 {
+		b.rlsTargetCommand = "DELETE+SELECT"
+	} else {
+		b.rlsTargetCommand = "DELETE"
+	}
 	b.dmlTargetID = target.descriptor.ID()
 	input, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
 	b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd

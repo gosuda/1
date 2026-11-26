@@ -22,7 +22,7 @@ const (
 	scramSaltLen           = 16
 	scramServerNonceBytes  = 18
 	scramMaxNonceLen       = 256
-	scramMaxIterations     = 1 << 24
+	scramMaxIterations     = 1 << 20
 )
 
 type scramVerifier struct {
@@ -63,18 +63,23 @@ func dummySCRAMVerifier() (scramVerifier, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return scramVerifier{}, fmt.Errorf("pgwire: generate dummy SCRAM salt: %w", err)
 	}
-	storedKey := make([]byte, sha256.Size)
-	if _, err := rand.Read(storedKey); err != nil {
-		return scramVerifier{}, fmt.Errorf("pgwire: generate dummy SCRAM stored key: %w", err)
+	var dummySecret [32]byte
+	if _, err := rand.Read(dummySecret[:]); err != nil {
+		return scramVerifier{}, fmt.Errorf("pgwire: generate dummy SCRAM secret: %w", err)
 	}
-	serverKey := make([]byte, sha256.Size)
-	if _, err := rand.Read(serverKey); err != nil {
-		return scramVerifier{}, fmt.Errorf("pgwire: generate dummy SCRAM server key: %w", err)
+	// Run the same PBKDF2 + HMAC derivation as deriveSCRAMVerifier so failed
+	// PasswordLookup responses match plaintext-password derivation timing.
+	saltedPassword, err := pbkdf2.Key(sha256.New, string(dummySecret[:]), salt, scramDefaultIterations, sha256.Size)
+	if err != nil {
+		return scramVerifier{}, fmt.Errorf("pgwire: derive dummy SCRAM salted password: %w", err)
 	}
+	clientKey := hmacSHA256(saltedPassword, []byte("Client Key"))
+	storedKeySum := sha256.Sum256(clientKey)
+	serverKey := hmacSHA256(saltedPassword, []byte("Server Key"))
 	return scramVerifier{
 		iterations: scramDefaultIterations,
 		salt:       salt,
-		storedKey:  storedKey,
+		storedKey:  storedKeySum[:],
 		serverKey:  serverKey,
 	}, nil
 }
@@ -213,8 +218,11 @@ func parseSCRAMClientFinal(msg string) (cbindB64, nonce, withoutProof string, pr
 
 func (c *clientConn) readAuthFrame() (byte, []byte, error) {
 	rc := c.currentConn()
-	if c.server.readTimeout > 0 && rc != nil {
-		_ = rc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
+	if dl := c.effectivePreAuthDeadline(); !dl.IsZero() && rc != nil {
+		if !time.Now().Before(dl) {
+			return 0, nil, context.DeadlineExceeded
+		}
+		_ = rc.SetReadDeadline(dl)
 		defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
 	}
 	msgType, body, err := readFrontendMessageWithLimit(c.br, maxPasswordMessageBytes)

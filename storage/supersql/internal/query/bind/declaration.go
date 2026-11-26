@@ -116,6 +116,9 @@ func BindCreateSchema(ctx context.Context, statement *zpgparse.CreateSchemaStmt,
 	if len(statement.SchemaElts) != 0 {
 		return nil, missing("CREATE SCHEMA embedded declarations", 0)
 	}
+	if err := b.requireSuperuser("create schema", 0); err != nil {
+		return nil, err
+	}
 	schemaName := statement.Schemaname
 	ownerOID := options.Owner
 	ownerName := normalizeOwnerName(options.Bind.CurrentRole)

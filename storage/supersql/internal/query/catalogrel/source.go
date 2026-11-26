@@ -3,6 +3,7 @@ package catalogrel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -36,11 +37,32 @@ func (s *Source) SequenceParameters(ctx context.Context, oid model.OID) (model.V
 	}}, nil
 }
 
-func (s *Source) SequenceData(ctx context.Context, oid model.OID) (model.Value, error) {
-	sequence, err := s.sequenceMetadata(ctx, oid)
-	if err != nil { return model.Value{}, err }
+func (s *Source) SequenceData(ctx context.Context, oid model.OID) (_ model.Value, err error) {
+	if s == nil || s.view == nil {
+		return model.Value{}, &model.Error{Code: "55000", Message: "catalog source is not bound to the statement read view"}
+	}
+	snapshot, err := s.options.Snapshot.OpenCatalogSnapshot(ctx, s.view)
+	if err != nil {
+		return model.Value{}, err
+	}
+	defer func() { err = errors.Join(err, snapshot.Close()) }()
+	descriptor, sequence, err := findSequenceDescriptor(ctx, snapshot, oid)
+	if err != nil {
+		return model.Value{}, err
+	}
+	var cachedRoles map[string]model.RoleMetadata
+	rolesLoaded := false
+	allowed, err := sequencePrivilegeAllowed(ctx, snapshot, s.options, &sequence, model.PrivilegeSelect, &cachedRoles, &rolesLoaded)
+	if err != nil {
+		return model.Value{}, err
+	}
+	if !allowed {
+		return model.Value{}, &model.Error{Code: "42501", Message: fmt.Sprintf("permission denied for sequence %s", descriptor.Name().Name)}
+	}
 	state, err := s.options.Sequences.Get(ctx, s.view, schema.SequenceIncarnation(sequence.Incarnation))
-	if err != nil { return model.Value{}, err }
+	if err != nil {
+		return model.Value{}, err
+	}
 	return model.Value{Type: model.TypeComposite, ArrayVal: []model.Value{model.Int64Val(state.Last), model.BoolVal(state.Called)}}, nil
 }
 
@@ -49,18 +71,23 @@ func (s *Source) sequenceMetadata(ctx context.Context, oid model.OID) (_ model.S
 	snapshot, err := s.options.Snapshot.OpenCatalogSnapshot(ctx, s.view)
 	if err != nil { return model.SequenceMetadata{}, err }
 	defer func() { err = errors.Join(err, snapshot.Close()) }()
+	_, sequence, err := findSequenceDescriptor(ctx, snapshot, oid)
+	return sequence, err
+}
+
+func findSequenceDescriptor(ctx context.Context, snapshot Snapshot, oid model.OID) (*model.Descriptor, model.SequenceMetadata, error) {
 	var descriptor *model.Descriptor
-	err = snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(namespace catalog.PublishedDescriptor) error {
+	err := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(namespace catalog.PublishedDescriptor) error {
 		return snapshot.ScanNamespace(ctx, namespace.Descriptor.ID(), model.ObjectSequence, func(published catalog.PublishedDescriptor) error {
 			if published.Descriptor.OID() == oid { descriptor = published.Descriptor }
 			return nil
 		})
 	})
-	if err != nil { return model.SequenceMetadata{}, err }
-	if descriptor == nil { return model.SequenceMetadata{}, &model.Error{Code: "42P01", Message: "sequence does not exist"} }
+	if err != nil { return nil, model.SequenceMetadata{}, err }
+	if descriptor == nil { return nil, model.SequenceMetadata{}, &model.Error{Code: "42P01", Message: "sequence does not exist"} }
 	sequence, ok := descriptor.Sequence()
-	if !ok { return model.SequenceMetadata{}, model.ErrInvalidDescriptor }
-	return sequence, nil
+	if !ok { return nil, model.SequenceMetadata{}, model.ErrInvalidDescriptor }
+	return descriptor, sequence, nil
 }
 
 func NewSource(options SourceOptions) (*Source, error) {
@@ -338,18 +365,20 @@ func (s *Source) OpenCatalog(ctx context.Context, request ScanRequest) (storage.
 	}
 	producerContext, cancel := context.WithCancel(ctx)
 	cursor := &catalogCursor{
-		context: producerContext,
-		cancel: cancel,
-		rows: make(chan rowResult),
-		done: make(chan struct{}),
-		builder: builder,
-		indexes: indexes,
+		context:   producerContext,
+		cancel:    cancel,
+		relation:  relation,
+		options:   s.options,
+		pull:      make(chan struct{}),
+		rows:      make(chan rowResult),
+		done:      make(chan struct{}),
+		builder:   builder,
+		indexes:   indexes,
 		batchRows: batchRows,
-		snapshot: snapshot,
+		snapshot:  snapshot,
 		projected: make([]model.Value, len(indexes)),
-		view: s.view,
+		view:      s.view,
 	}
-	go cursor.produce(relation, s.options)
 	return cursor, nil
 }
 
@@ -377,25 +406,34 @@ type rowResult struct {
 }
 
 type catalogCursor struct {
-	context context.Context
-	cancel context.CancelFunc
-	rows chan rowResult
-	done chan struct{}
-	builder *columnar.Builder
-	indexes []int
+	context   context.Context
+	cancel    context.CancelFunc
+	relation  Relation
+	options   SourceOptions
+	started   bool
+	pull      chan struct{}
+	rows      chan rowResult
+	done      chan struct{}
+	builder   *columnar.Builder
+	indexes   []int
 	projected []model.Value
 	batchRows int
-	snapshot Snapshot
-	view ReadView
-	pending []model.Value
-	terminal error
+	snapshot  Snapshot
+	view      ReadView
+	pending   []model.Value
+	terminal  error
 	closeOnce sync.Once
-	closeErr error
+	closeErr  error
 }
 
 func (c *catalogCursor) produce(relation Relation, options SourceOptions) {
 	defer close(c.done)
 	defer close(c.rows)
+	select {
+	case <-c.pull:
+	case <-c.context.Done():
+		return
+	}
 	// The scan row bound tracks catalog capacity, not the batch size: every
 	// emitted row traces back to a descriptor or descriptor item, so
 	// MaxDescriptors*MaxDescriptorItems bounds it. MaxRows stays the
@@ -407,6 +445,11 @@ func (c *catalogCursor) produce(relation Relation, options SourceOptions) {
 		}
 		select {
 		case c.rows <- rowResult{values: row}:
+		case <-c.context.Done():
+			return c.context.Err()
+		}
+		select {
+		case <-c.pull:
 			return nil
 		case <-c.context.Done():
 			return c.context.Err()
@@ -486,6 +529,17 @@ func (c *catalogCursor) nextRow(ctx context.Context) ([]model.Value, bool, error
 		c.pending = nil
 		return row, true, nil
 	}
+	if !c.started {
+		c.started = true
+		go c.produce(c.relation, c.options)
+	}
+	select {
+	case c.pull <- struct{}{}:
+	case <-c.done:
+	case <-ctx.Done():
+		c.cancel()
+		return nil, false, canceled(ctx.Err())
+	}
 	select {
 	case result, ok := <-c.rows:
 		if !ok {
@@ -509,7 +563,9 @@ func (c *catalogCursor) Close() error {
 func (c *catalogCursor) finish() error {
 	c.closeOnce.Do(func() {
 		c.cancel()
-		<-c.done
+		if c.started {
+			<-c.done
+		}
 		c.closeErr = errors.Join(c.builder.Close(), c.snapshot.Close())
 	})
 	return c.closeErr

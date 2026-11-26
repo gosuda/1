@@ -67,7 +67,11 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	} else {
 		b.rlsTargetID = target.descriptor.ID()
 	}
-	b.rlsTargetCommand = "MERGE"
+	if target.automatic() {
+		b.rlsTargetCommand = "MERGE_VIEW"
+	} else {
+		b.rlsTargetCommand = "MERGE"
+	}
 	b.rlsMergeHasUpdate, b.rlsMergeHasDelete = mergeHasUpdate, mergeHasDelete
 	b.dmlTargetID = target.descriptor.ID()
 	left, err := b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: n.Relation}}, s)
@@ -151,7 +155,7 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 		}
 	}
 	var terminal [4]bool
-	for _, node := range n.MergeWhenClauses {
+	for idx, node := range n.MergeWhenClauses {
 		clause := node.GetMergeWhenClause()
 		if clause == nil {
 			return relation{}, bindError("42601", "invalid MERGE WHEN clause", 0)
@@ -179,6 +183,7 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 			actionScope.columns = columns[:len(left.columns)]
 			actionScope.namespaces = namespaces[:len(left.namespaces)]
 		}
+		var userCond expression
 		if clause.Condition != nil {
 			condition, err := b.scalar(clause.Condition, &actionScope)
 			if err != nil {
@@ -188,6 +193,7 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 			if err != nil {
 				return relation{}, err
 			}
+			userCond = condition
 			action.Condition = condition.id
 			effects = effects.Union(condition.effects)
 		}
@@ -211,12 +217,57 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 			return relation{}, err
 		}
 		effects = effects.Union(actionEffects)
+		var guardAction *ir.MergeActionSpec
+		if action.Action == ir.Update || action.Action == ir.Delete {
+			cmd := "UPDATE"
+			if action.Action == ir.Delete {
+				cmd = "DELETE"
+			}
+			rlsPred, applied, err := b.bindMergeActionRLSUsing(s, target, left.columns, columns[:len(left.columns)], cmd, pos)
+			if err != nil {
+				return relation{}, err
+			}
+			if applied {
+				effects = effects.Union(rlsPred.effects)
+				if userCond.id == 0 {
+					action.Condition = rlsPred.id
+				} else {
+					combined, err := b.combineBool(&actionScope, ir.And, rlsPred, userCond)
+					if err != nil {
+						return relation{}, err
+					}
+					action.Condition = combined.id
+					effects = effects.Union(combined.effects)
+					if userCond.effects.Volatility != ir.Volatile && mergeHasLaterClauseForMatch(n.MergeWhenClauses[idx+1:], clause.MatchKind) {
+						guardCond, err := b.scalar(clause.Condition, &actionScope)
+						if err != nil {
+							return relation{}, err
+						}
+						guardCond, err = b.coerce(&actionScope, guardCond, b.primitive(16), ir.ImplicitCast)
+						if err != nil {
+							return relation{}, err
+						}
+						effects = effects.Union(guardCond.effects)
+						guardAction = &ir.MergeActionSpec{
+							MergeAction: ir.MergeAction{
+								Match:     action.Match,
+								Action:    ir.DoNothing,
+								Condition: guardCond.id,
+							},
+						}
+					}
+				}
+			}
+		}
 		for _, column := range updated {
 			if !slices.Contains(spec.UpdatedColumns, column) {
 				spec.UpdatedColumns = append(spec.UpdatedColumns, column)
 			}
 		}
 		spec.Actions = append(spec.Actions, action)
+		if guardAction != nil {
+			spec.Actions = append(spec.Actions, *guardAction)
+		}
 	}
 	d := target.executionDescriptor
 	if err := b.applyModifyRLS(s, target, ir.Merge, &spec, mergeHasInsert, mergeHasUpdate); err != nil {
@@ -477,4 +528,13 @@ func mergeMutationEvents(nodes []*zpgparse.Node) []string {
 		}
 	}
 	return events
+}
+
+func mergeHasLaterClauseForMatch(nodes []*zpgparse.Node, matchKind zpgparse.MergeMatchKind) bool {
+	for _, node := range nodes {
+		if clause := node.GetMergeWhenClause(); clause != nil && clause.MatchKind == matchKind {
+			return true
+		}
+	}
+	return false
 }

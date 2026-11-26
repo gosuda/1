@@ -161,7 +161,7 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 	if store == nil {
 		return result, settingError("55000", "catalog store is not configured for SET ROLE")
 	}
-	currentRole := transactions.settings.CurrentRole()
+	sessionUser := transactions.settings.SessionUser()
 	var authorizedTarget string
 	authorizeInView := func(readCtx context.Context) error {
 		view, err := transactions.transaction.ReadView(readCtx, catalogLayoutDependencies(store))
@@ -172,7 +172,7 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 		if err != nil {
 			return errors.Join(err, view.Close())
 		}
-		target, authErr := bind.CheckSetRoleAuthorization(readCtx, snapshot, currentRole, command.Target, 4096)
+		target, authErr := bind.CheckSetRoleAuthorization(readCtx, snapshot, sessionUser, command.Target, 4096)
 		closeErr := errors.Join(snapshot.Close(), view.Close())
 		if authErr != nil {
 			return errors.Join(authErr, closeErr)

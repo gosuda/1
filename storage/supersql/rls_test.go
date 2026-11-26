@@ -370,8 +370,10 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 	END;
 	$$`)
 
-	// Switch to worker_role: worker_role is a member of tenant_role, not ungranted_role or postgres.
-	mustExec(`SET ROLE worker_role`)
+	// Bind session_user to worker_role (non-superuser member of tenant_role, not ungranted_role or postgres).
+	if err := db.embeddedScope().settings.SetSessionUser(ctx, "worker_role", false); err != nil {
+		t.Fatalf("SetSessionUser(worker_role): %v", err)
+	}
 	requireErrCode(`SET ROLE postgres`, "42501")
 	requireErrCode(`SET ROLE ungranted_role`, "42501")
 	requireErrCode(`CREATE ROLE escalated SUPERUSER`, "42501")
@@ -928,8 +930,8 @@ func TestNativeRLSPenetrationMatrix(t *testing.T) {
 
 	// 9. Owner ALTER TABLE ... SET SCHEMA preserves policies in destination schema,
 	//    and non-owner schema CASCADE still cannot drop superuser-owned table.
-	mustExec(`CREATE SCHEMA tenant_owned_schema`)
 	mustExec(`RESET ROLE`)
+	mustExec(`CREATE SCHEMA tenant_owned_schema AUTHORIZATION pen_tenant`)
 	// Verify hidden row (id = 2) was untouched by EXPLAIN ANALYZE / writable CTE.
 	out = mustExec(`SELECT payload FROM secret WHERE id = 2`)
 	if len(out.Rows) != 1 || out.Rows[0][0].StrVal != "t2-secret-2" {

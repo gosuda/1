@@ -1,8 +1,6 @@
 package bind
 
 import (
-	"slices"
-
 	"google.golang.org/protobuf/proto"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
@@ -66,25 +64,35 @@ func (b *binder) applyScanRLS(scan relation, descriptor, namespace *model.Descri
 	}
 
 	// Determine which USING command sets apply to this scan.
+	// PostgreSQL RLS is default-deny: when an operation requires a policy class
+	// (such as SELECT for UPDATE/DELETE reading target columns, or UPDATE/DELETE
+	// for view-backed MERGE), evaluate it unconditionally so an absent permissive
+	// policy evaluates to FALSE rather than skipping enforcement.
 	commands := []string{"SELECT"}
 	if b.rlsTargetID == descriptor.ID() && b.rlsTargetCommand != "" {
 		switch b.rlsTargetCommand {
 		case "UPDATE":
 			commands = []string{"UPDATE"}
-			if tableHasCommandUsingPolicy(table.Policies, "SELECT") {
-				commands = append(commands, "SELECT")
-			}
+		case "UPDATE+SELECT":
+			commands = []string{"UPDATE", "SELECT"}
 		case "DELETE":
 			commands = []string{"DELETE"}
-			if tableHasCommandUsingPolicy(table.Policies, "SELECT") {
-				commands = append(commands, "SELECT")
-			}
+		case "DELETE+SELECT":
+			commands = []string{"DELETE", "SELECT"}
 		case "MERGE":
+			// Direct-table MERGE enforces SELECT USING at scan time and enforces
+			// UPDATE / DELETE USING per WHEN action in utility_merge.go so
+			// distinct UPDATE and DELETE policies do not mask each other.
 			commands = []string{"SELECT"}
-			if b.rlsMergeHasUpdate && tableHasCommandUsingPolicy(table.Policies, "UPDATE") {
+		case "MERGE_VIEW":
+			// Automatic-view MERGE may hide base-table policy columns from the
+			// view projection, so enforce active action USING policies on the
+			// underlying base-table scan (default-deny when absent).
+			commands = []string{"SELECT"}
+			if b.rlsMergeHasUpdate {
 				commands = append(commands, "UPDATE")
 			}
-			if b.rlsMergeHasDelete && tableHasCommandUsingPolicy(table.Policies, "DELETE") {
+			if b.rlsMergeHasDelete {
 				commands = append(commands, "DELETE")
 			}
 		}
@@ -140,6 +148,98 @@ func (b *binder) applyScanRLS(scan relation, descriptor, namespace *model.Descri
 	return scan, nil
 }
 
+// bindMergeActionRLSUsing binds the per-action USING policy predicate (cmd is
+// "UPDATE" or "DELETE") against a direct MERGE target's columns in the FULL
+// JOIN output. Returns ok=false when RLS does not apply to the target or when
+// the target is an automatic view (enforced on the base scan via MERGE_VIEW).
+func (b *binder) bindMergeActionRLSUsing(s *scope, target mutationTarget, leftCols, joinTargetCols []column, cmd string, position int) (expression, bool, error) {
+	if target.automatic() {
+		return expression{}, false, nil
+	}
+	d := target.executionDescriptor
+	table := target.executionTable
+	if d == nil {
+		d = target.descriptor
+		table = target.table
+	}
+	if d == nil || table == nil || !table.RowSecurity {
+		return expression{}, false, nil
+	}
+	effectiveRole := b.viewMutationEffectiveRole(target)
+	savedRole := b.options.CurrentRole
+	b.options.CurrentRole = effectiveRole
+	defer func() { b.options.CurrentRole = savedRole }()
+
+	roles, err := b.cachedRoles()
+	if err != nil {
+		return expression{}, false, err
+	}
+	if !rlsApplies(roles, b.options.CurrentRole, table) {
+		return expression{}, false, nil
+	}
+	if b.rlsStack == nil {
+		b.rlsStack = make(map[model.ObjectID]bool)
+	}
+	if b.rlsStack[d.ID()] {
+		return expression{}, false, bindError("42P17", `infinite recursion detected in policy for relation "`+d.Name().Name+`"`, position)
+	}
+	b.rlsStack[d.ID()] = true
+	defer delete(b.rlsStack, d.ID())
+
+	tableName := d.Name().Name
+	schemaName := ""
+	if target.namespace != nil {
+		schemaName = target.namespace.Name().Name
+	}
+	colNames := make(map[model.ColumnID]string, len(table.Columns))
+	for _, cd := range table.Columns {
+		colNames[cd.ID] = cd.Name
+	}
+	policyCols := make([]column, 0, len(leftCols))
+	for i, orig := range leftCols {
+		if orig.internal {
+			continue
+		}
+		c := joinTargetCols[i]
+		if info, ok := b.builder.Slot(orig.Slot); ok && info.Object == d.ID() && info.Column != 0 {
+			if name, found := colNames[info.Column]; found {
+				c.Name = name
+			}
+		}
+		c.qualifier = tableName
+		c.namespace = schemaName
+		c.hidden = false
+		policyCols = append(policyCols, c)
+	}
+	policyScope := &scope{
+		id:      s.id,
+		columns: policyCols,
+		namespaces: []relationNamespace{{
+			qualifier:     relationQualifier{namespace: schemaName, name: tableName},
+			descriptor:    d,
+			columns:       policyCols,
+			systemColumns: true,
+		}},
+		ctes: make(map[string]cteBinding),
+	}
+
+	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	savedMergeUpdate, savedMergeDelete := b.rlsMergeHasUpdate, b.rlsMergeHasDelete
+	savedDMLTargetID := b.dmlTargetID
+	b.rlsTargetID, b.rlsTargetCommand, b.rlsMergeHasUpdate, b.rlsMergeHasDelete, b.dmlTargetID = 0, "", false, false, 0
+	defer func() {
+		b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
+		b.rlsMergeHasUpdate, b.rlsMergeHasDelete = savedMergeUpdate, savedMergeDelete
+		b.dmlTargetID = savedDMLTargetID
+	}()
+
+	pred, err := b.bindRLSUsingPredicate(policyScope, roles, table.Policies, cmd, position)
+	if err != nil {
+		return expression{}, false, err
+	}
+	return pred, true, nil
+}
+
 // applyModifyRLS attaches per-branch RLS WITH CHECK predicates (and ON CONFLICT
 // DO UPDATE USING predicates) directly onto an ir.Modify RelSpec.
 func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyKind, spec *ir.RelSpec, mergeHasInsert, mergeHasUpdate bool) error {
@@ -176,6 +276,7 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 	b.rlsStack[d.ID()] = true
 	defer delete(b.rlsStack, d.ID())
 
+	hasReturning := len(spec.Bindings) > 0
 	needInsertCheck := kind == ir.Insert || (kind == ir.Merge && mergeHasInsert)
 	needUpdateCheck := kind == ir.Update || (kind == ir.Insert && spec.Conflict == ir.ConflictUpdate) || (kind == ir.Merge && mergeHasUpdate)
 	needConflictUsing := kind == ir.Insert && spec.Conflict == ir.ConflictUpdate
@@ -191,62 +292,89 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 		}
 	}
 
-	if needInsertCheck || needUpdateCheck || needConflictUsing {
-		columns := publicColumns(table)
-		layout := model.TypeLayout{
-			Type:     model.Type{ID: 2249, Modifier: -1, Storage: model.TypeComposite},
-			Children: make([]model.TypeLayout, len(columns)),
-		}
-		for i, c := range columns {
-			layout.Children[i] = c.Layout
-		}
-		rlsRow, err := b.slot(s, layout, false, d.ID(), 0)
+	savedTargetID, savedTargetCmd := b.rlsTargetID, b.rlsTargetCommand
+	savedMergeUpdate, savedMergeDelete := b.rlsMergeHasUpdate, b.rlsMergeHasDelete
+	savedDMLTargetID := b.dmlTargetID
+	b.rlsTargetID, b.rlsTargetCommand, b.rlsMergeHasUpdate, b.rlsMergeHasDelete, b.dmlTargetID = 0, "", false, false, 0
+	defer func() {
+		b.rlsTargetID, b.rlsTargetCommand = savedTargetID, savedTargetCmd
+		b.rlsMergeHasUpdate, b.rlsMergeHasDelete = savedMergeUpdate, savedMergeDelete
+		b.dmlTargetID = savedDMLTargetID
+	}()
+
+	columns := publicColumns(table)
+	layout := model.TypeLayout{
+		Type:     model.Type{ID: 2249, Modifier: -1, Storage: model.TypeComposite},
+		Children: make([]model.TypeLayout, len(columns)),
+	}
+	for i, c := range columns {
+		layout.Children[i] = c.Layout
+	}
+	rlsRow, err := b.slot(s, layout, false, d.ID(), 0)
+	if err != nil {
+		return err
+	}
+	spec.RLSRow = rlsRow
+	checkScope := b.rowImagePolicyScope(s.id, d, schemaName, columns, rlsRow, layout, false)
+
+	if needInsertCheck {
+		insertCheck, err := b.bindRLSWithCheckPredicate(checkScope, roles, table.Policies, "INSERT", 0)
 		if err != nil {
 			return err
 		}
-		spec.RLSRow = rlsRow
-		checkScope := b.rowImagePolicyScope(s.id, d, schemaName, columns, rlsRow, layout, false)
-
-		if needInsertCheck {
-			insertCheck, err := b.bindRLSWithCheckPredicate(checkScope, roles, table.Policies, "INSERT", 0)
+		if hasReturning {
+			selPred, err := b.bindRLSUsingPredicate(checkScope, roles, table.Policies, "SELECT", 0)
 			if err != nil {
 				return err
 			}
-			spec.RLSInsertCheck = insertCheck.id
-			spec.Effects = spec.Effects.Union(insertCheck.effects)
-		}
-		if needUpdateCheck {
-			updateCheck, err := b.bindRLSWithCheckPredicate(checkScope, roles, table.Policies, "UPDATE", 0)
+			insertCheck, err = b.combineBool(checkScope, ir.And, insertCheck, selPred)
 			if err != nil {
 				return err
 			}
-			spec.RLSUpdateCheck = updateCheck.id
-			spec.Effects = spec.Effects.Union(updateCheck.effects)
 		}
-		if needConflictUsing {
-			commands := []string{"UPDATE"}
-			if tableHasCommandUsingPolicy(table.Policies, "SELECT") {
-				commands = append(commands, "SELECT")
+		spec.RLSInsertCheck = insertCheck.id
+		spec.Effects = spec.Effects.Union(insertCheck.effects)
+	}
+	if needUpdateCheck {
+		updateCheck, err := b.bindRLSWithCheckPredicate(checkScope, roles, table.Policies, "UPDATE", 0)
+		if err != nil {
+			return err
+		}
+		if hasReturning || (kind == ir.Insert && spec.Conflict == ir.ConflictUpdate) || kind == ir.Merge {
+			selPred, err := b.bindRLSUsingPredicate(checkScope, roles, table.Policies, "SELECT", 0)
+			if err != nil {
+				return err
 			}
-			var conflictUsing expression
-			for _, cmd := range commands {
-				pred, err := b.bindRLSUsingPredicate(checkScope, roles, table.Policies, cmd, 0)
+			updateCheck, err = b.combineBool(checkScope, ir.And, updateCheck, selPred)
+			if err != nil {
+				return err
+			}
+		}
+		spec.RLSUpdateCheck = updateCheck.id
+		spec.Effects = spec.Effects.Union(updateCheck.effects)
+	}
+	if needConflictUsing {
+		// ON CONFLICT DO UPDATE always requires SELECT privilege for the arbiter
+		// index/constraint and enforces both UPDATE USING and SELECT USING
+		// unconditionally (default-deny FALSE when no permissive SELECT/ALL policy exists).
+		var conflictUsing expression
+		for _, cmd := range []string{"UPDATE", "SELECT"} {
+			pred, err := b.bindRLSUsingPredicate(checkScope, roles, table.Policies, cmd, 0)
+			if err != nil {
+				return err
+			}
+			if conflictUsing.id == 0 {
+				conflictUsing = pred
+			} else {
+				conflictUsing, err = b.combineBool(checkScope, ir.And, conflictUsing, pred)
 				if err != nil {
 					return err
 				}
-				if conflictUsing.id == 0 {
-					conflictUsing = pred
-				} else {
-					conflictUsing, err = b.combineBool(checkScope, ir.And, conflictUsing, pred)
-					if err != nil {
-						return err
-					}
-				}
 			}
-			if conflictUsing.id != 0 {
-				spec.RLSConflictCheck = conflictUsing.id
-				spec.Effects = spec.Effects.Union(conflictUsing.effects)
-			}
+		}
+		if conflictUsing.id != 0 {
+			spec.RLSConflictCheck = conflictUsing.id
+			spec.Effects = spec.Effects.Union(conflictUsing.effects)
 		}
 	}
 	return nil
@@ -283,12 +411,6 @@ func (b *binder) rowImagePolicyScope(scopeID ir.ScopeID, descriptor *model.Descr
 		namespaces: []relationNamespace{ns},
 		ctes:       make(map[string]cteBinding),
 	}
-}
-
-func tableHasCommandUsingPolicy(policies []model.PolicyDescriptor, cmd string) bool {
-	return slices.ContainsFunc(policies, func(p model.PolicyDescriptor) bool {
-		return p.Command == cmd
-	})
 }
 
 func (b *binder) bindRLSUsingPredicate(s *scope, roles map[string]model.RoleMetadata, policies []model.PolicyDescriptor, cmd string, position int) (expression, error) {

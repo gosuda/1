@@ -1728,11 +1728,30 @@ func BindDropIndexConcurrently(ctx context.Context, statement *zpgparse.DropStmt
 	if err != nil {
 		return nil, err
 	}
-	index, _, err := b.resolve(parts, []model.ObjectKind{model.ObjectIndex}, "42704", 0)
+	if len(parts) == 2 {
+		if ns, nsErr := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: parts[0]}); nsErr == nil {
+			b.dependency(ns.Descriptor, 0)
+			if err := b.checkSchemaUsage(ns.Descriptor, 0); err != nil {
+				return nil, err
+			}
+		} else if !isMissingObject(nsErr) {
+			return nil, nsErr
+		}
+	}
+	index, namespace, err := resolveNamespaceObject(ctx, snapshot, b.options.SearchPath, parts, []model.ObjectKind{model.ObjectIndex}, "42704", 0)
 	if err != nil {
-		if statement.MissingOk && isMissingObject(err) {
+		var sqlError *model.Error
+		if statement.MissingOk && (isMissingObject(err) || (errors.As(err, &sqlError) && sqlError.Code == "42704")) {
 			return &BoundSchemaDDL{noOp: true, warnings: []model.Error{{Code: "42704", Message: "index does not exist, skipping"}}}, nil
 		}
+		return nil, err
+	}
+	b.dependency(namespace, 0)
+	b.dependency(index, 0)
+	if err := b.checkSchemaUsage(namespace, 0); err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(index, 0); err != nil {
 		return nil, err
 	}
 	indexSpec, err := index.SpecWithin(ctx, options.Descriptors)
@@ -1750,6 +1769,9 @@ func BindDropIndexConcurrently(ctx context.Context, statement *zpgparse.DropStmt
 		return nil, err
 	}
 	table := tableEntry.Descriptor
+	if err := b.requireTableOwner(table, 0); err != nil {
+		return nil, err
+	}
 	if table == nil || table.State() != model.StatePublic || table.Version() > math.MaxUint64-3 || index.State() != model.StatePublic ||
 		!indexSpec.Index.Ready() || !indexSpec.Index.Live() {
 		return nil, bindError("55000", "index is not available for a concurrent drop", 0)

@@ -204,11 +204,20 @@ func BindAlterSequence(ctx context.Context, statement *zpgparse.AlterSeqStmt, sn
 	if statement.ForIdentity {
 		return nil, missing("identity-internal sequence alteration", 0)
 	}
+	pos := int(statement.Sequence.Location) + 1
 	parts := []string{statement.Sequence.Relname}
 	if statement.Sequence.Schemaname != "" {
 		parts = []string{statement.Sequence.Schemaname, statement.Sequence.Relname}
+		if ns, nsErr := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Sequence.Schemaname}); nsErr == nil {
+			b.dependency(ns.Descriptor, 0)
+			if err := b.checkSchemaUsage(ns.Descriptor, pos); err != nil {
+				return nil, err
+			}
+		} else if !isMissingObject(nsErr) {
+			return nil, nsErr
+		}
 	}
-	base, _, err := b.resolve(parts, []model.ObjectKind{model.ObjectTable, model.ObjectSequence, model.ObjectIndex, model.ObjectView, model.ObjectMaterializedView}, "42P01", 0)
+	base, namespace, err := resolveNamespaceObject(ctx, snapshot, b.options.SearchPath, parts, []model.ObjectKind{model.ObjectTable, model.ObjectSequence, model.ObjectIndex, model.ObjectView, model.ObjectMaterializedView}, "42P01", pos)
 	if err != nil {
 		var sqlError *model.Error
 		if statement.MissingOk && errors.As(err, &sqlError) && sqlError.Code == "42P01" {
@@ -216,8 +225,16 @@ func BindAlterSequence(ctx context.Context, statement *zpgparse.AlterSeqStmt, sn
 		}
 		return nil, err
 	}
+	b.dependency(namespace, 0)
+	b.dependency(base, 0)
+	if err := b.checkSchemaUsage(namespace, pos); err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, pos); err != nil {
+		return nil, err
+	}
 	if base.Kind() != model.ObjectSequence {
-		return nil, bindError("42809", "relation is not a sequence", 0)
+		return nil, bindError("42809", "relation is not a sequence", pos)
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
@@ -431,18 +448,40 @@ func (b *binder) sequenceOwner(d *BoundSequenceDefinition, option *zpgparse.DefE
 	if len(parts) == 1 && parts[0] == "none" {
 		s.OwnerTable, s.OwnerColumn = 0, 0
 	} else {
+		pos := int(option.Location) + 1
 		if len(parts) < 2 || len(parts) > 3 {
-			return bindError("42601", "OWNED BY requires table.column or schema.table.column", int(option.Location)+1)
+			return bindError("42601", "OWNED BY requires table.column or schema.table.column", pos)
 		}
-		table, _, err := b.resolve(parts[:len(parts)-1], []model.ObjectKind{model.ObjectTable, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView}, "42P01", int(option.Location)+1)
+		if len(parts) == 3 {
+			if ns, nsErr := b.catalog.Resolve(b.ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: parts[0]}); nsErr == nil {
+				b.dependency(ns.Descriptor, 0)
+				if err := b.checkSchemaUsage(ns.Descriptor, pos); err != nil {
+					return err
+				}
+			} else if !isMissingObject(nsErr) {
+				return nsErr
+			}
+		}
+		table, ownerSchema, err := resolveNamespaceObject(b.ctx, b.catalog, b.options.SearchPath, parts[:len(parts)-1], []model.ObjectKind{model.ObjectTable, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView}, "42P01", pos)
 		if err != nil {
 			return err
 		}
+		b.dependency(ownerSchema, 0)
+		b.dependency(table, 0)
+		if err := b.checkSchemaUsage(ownerSchema, pos); err != nil {
+			return err
+		}
+		if err := b.requireTableOwner(table, pos); err != nil {
+			return err
+		}
 		if table.Kind() != model.ObjectTable {
-			return bindError("42809", "sequence owner must be a table column", int(option.Location)+1)
+			return bindError("42809", "sequence owner must be a table column", pos)
+		}
+		if normalizeOwnerName(table.OwnerName()) != normalizeOwnerName(d.draft.Sequence.OwnerName) {
+			return bindError("55000", "sequence must have same owner as table it is linked to", pos)
 		}
 		if table.Name().Parent != d.draft.Name.Parent {
-			return bindError("55000", "sequence must be in same schema as table it is linked to", int(option.Location)+1)
+			return bindError("55000", "sequence must be in same schema as table it is linked to", pos)
 		}
 		spec, err := b.descriptorSpec(table)
 		if err != nil {
