@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: '11 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test, vet, lint
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        id: go
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Cache Go tool binaries
+        id: tools-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/go/bin/gojgp
+            ~/go/bin/checklocks
+          key: gotools-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-gojgp-v1.2.0-checklocks-20261024223036-c3e0783a533c
+      - name: Install gojgp
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: |
+          tmp=$(mktemp -d)
+          trap 'rm -rf -- "$tmp"' EXIT
+          cd "$tmp"
+          go mod init tools
+          go get github.com/gosuda/JustGoodPractices/cmd/gojgp@v1.2.0 golang.org/x/tools@v0.51.0
+          go install github.com/gosuda/JustGoodPractices/cmd/gojgp
+      - name: Install checklocks
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: go install gvisor.dev/gvisor/tools/checklocks/cmd/checklocks@v0.0.0-20261024223036-c3e0783a533c
+      - name: Run go vet
+        run: go vet ./...
+      - name: Run checklocks
+        run: go vet -vettool="$(go env GOPATH)/bin/checklocks" -inferred=false ./...
+      - name: Run gojgp
+        run: gojgp lint ./...
+      - name: Run all tests
+        run: go test -count=1 ./...
+  dst:
+    name: DST seed ${{ matrix.seed }}
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[1,16,42,67,1982,1992,2002,2012,2022,2026]' || '[42]') }}
+    env:
+      DST_SEED: ${{ matrix.seed }}
+      # go test surfaces captured stderr only on failure, so per-node debug
+      # logs are free on pass and present when a rare flake finally trips.
+      DST_LOG: '1'
+      # Serialize scheduling inside the synctest bubble: one P runs goroutines
+      # in runqueue order, async preemption stays off, and crypto packages
+      # honor the pinned crypto/rand.Reader, so same-tick wakeups replay in
+      # program order instead of racing across threads.
+      GOMAXPROCS: '1'
+      GODEBUG: 'asyncpreemptoff=1,cryptocustomrand=1'
+      # Keep GC marker goroutines out of the single P's run queue so
+      # executions replay identically (the dst overlay pins runtime
+      # randomness and neutralizes sysmon P retakes).
+      GOGC: 'off'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        id: go
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Generate durable-sync overlay
+        # Patches the current GOROOT's sync primitives so lock waits inside a
+        # synctest bubble park durably and the virtual clock can advance.
+        run: go run ./tools/dstoverlay -write "$RUNNER_TEMP/dst_overlay.json" -dir "$RUNNER_TEMP/dst_overlay_src"
+      - name: Run deterministic mesh and chaos tests
+        run: go test -count=1 -tags dst -overlay="$RUNNER_TEMP/dst_overlay.json" -run 'TestSim|TestDeterministic' .
+      - name: Run simulation-tagged unit tests
+        run: go test -count=1 -tags dst -overlay="$RUNNER_TEMP/dst_overlay.json" ./internal/simnet ./dataplane/internal/streaming/tunnel ./dataplane/internal/router ./controlplane/internal/router
+  cross-platform:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: ${{ matrix.os }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: depot-ubuntu-24.04
+            arch: amd64
+          - os: depot-macos-latest
+            arch: arm64
+          - os: depot-windows-2025
+            arch: amd64
+          - os: depot-windows-2025
+            arch: arm64
+    env:
+      GOARCH: ${{ matrix.arch }}
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        id: go
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build packages
+        run: go build ./...
+      - name: Run Windows state security regressions
+        if: runner.os == 'Windows' && matrix.arch == 'amd64'
+        run: go test -count=1 ./state/internal/filesystem_store ./state/internal/secure_store ./state/internal/configuration -run 'Test(Windows|CreatePrivate|AtomicRoundTrip|ReadBoundedRejectsSymlink|StateLock|StateRejectsUnsafe|StateCiphertext|LoadOrCreatePersists|LoadOrCreateOperating|LoadOperatingRejects|LoadRejectsSwapped)'
+      - name: Run Unix state security regressions
+        if: runner.os != 'Windows'
+        run: go test -count=1 ./state/internal/filesystem_store ./state/internal/secure_store ./state/internal/configuration

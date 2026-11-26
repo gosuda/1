@@ -1,0 +1,10 @@
+[package]
+name = "lexical"
+# Above upstream 7.0.5 so `swc_css_parser`'s `lexical = "7"` resolves here; see UPSTREAM.
+version = "7.0.6"
+edition = "2021"
+license = "Apache-2.0"
+description = "Safe stand-in for lexical 7: `parse` only, on the standard library's number parsers (see UPSTREAM)"
+
+[lib]
+path = "src/lib.rs"
