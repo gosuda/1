@@ -12,12 +12,18 @@ import (
 )
 
 func bindOnlineConstraint(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, table *model.Descriptor, command *zpgparse.AlterTableCmd) (*BoundSchemaDDL, error) {
-	if command == nil || command.Recurse || command.Behavior == zpgparse.DropBehavior_DROP_CASCADE {
-		return nil, bindError("0A000", "constraint recursion or CASCADE requires inherited constraint planning", 0)
+	if command == nil || command.Recurse {
+		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(WriteDescriptorExpansion)}
+	}
+	if command.Behavior == zpgparse.DropBehavior_DROP_CASCADE && command.Subtype != zpgparse.AlterTableType_AT_DropConstraint {
+		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(WriteDescriptorExpansion)}
 	}
 	spec, err := table.SpecWithin(ctx, options.Descriptors)
 	if err != nil || spec.Table == nil {
 		return nil, err
+	}
+	if command.Behavior == zpgparse.DropBehavior_DROP_CASCADE && (spec.Table.InheritanceChildren != 0 || spec.Table.PartitionStrategy != 0 || len(spec.Table.Parents) != 0) {
+		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(WriteDescriptorExpansion)}
 	}
 	switch command.Subtype {
 	case zpgparse.AlterTableType_AT_AddConstraint:

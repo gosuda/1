@@ -97,6 +97,10 @@ func (b *binder) insertValues(rows []*zpgparse.Node, s *scope, targets []model.C
 	ids := make([]ir.ScalarID, 0, len(rows)*width)
 	nullable := make([]bool, width)
 	bound := make([]expression, width)
+	var singleRow []expression
+	if len(rows) == 1 {
+		singleRow = make([]expression, width)
+	}
 	effects := ir.Effects{}
 	for _, row := range rows {
 		list := row.GetList()
@@ -112,6 +116,11 @@ func (b *binder) insertValues(rows []*zpgparse.Node, s *scope, targets []model.C
 			if targets[i].IdentitySequence != 0 && override == zpgparse.OverridingKind_OVERRIDING_USER_VALUE && node.GetSetToDefault() != nil {
 				// The assignment generates this value; the VALUES cell is unused.
 				value, err = b.addScalar(s, expression{typ: targets[i].Layout, nullable: true, value: model.NullVal(targets[i].Layout.Type.Storage)}, ir.Scalar{Kind: ir.Const}, nil)
+			} else if len(rows) == 1 {
+				allowed, restriction := b.allowTargetSRF, b.srfRestriction
+				b.allowTargetSRF, b.srfRestriction = true, ""
+				value, err = b.assignmentInput(node, s, targets[i])
+				b.allowTargetSRF, b.srfRestriction = allowed, restriction
 			} else {
 				value, err = b.assignmentInput(node, s, targets[i])
 			}
@@ -133,6 +142,9 @@ func (b *binder) insertValues(rows []*zpgparse.Node, s *scope, targets []model.C
 					return relation{}, err
 				}
 			}
+			if singleRow != nil {
+				singleRow[i] = value
+			}
 			bound[i] = expression{}
 			ids = append(ids, value.id)
 			nullable[i] = nullable[i] || value.nullable
@@ -146,6 +158,33 @@ func (b *binder) insertValues(rows []*zpgparse.Node, s *scope, targets []model.C
 					b.deferWriteError(bindError("428C9", "cannot insert a non-DEFAULT value into identity column", 0))
 				}
 			}
+		}
+	}
+	if singleRow != nil {
+		input, lowered, expanded, err := b.projectSetExpressions(relation{}, s, singleRow)
+		if err != nil {
+			return relation{}, err
+		}
+		if expanded {
+			columns := make([]column, width)
+			bindings := make([]ir.Binding, width)
+			projectEffects := input.effects
+			for i, e := range lowered {
+				slot, err := b.slot(s, targets[i].Layout, e.nullable, 0, 0)
+				if err != nil {
+					return relation{}, err
+				}
+				columns[i] = column{ResultColumn: ResultColumn{Name: fmt.Sprintf("column%d", i+1), Layout: targets[i].Layout, Nullable: e.nullable, Slot: slot}}
+				bindings[i] = ir.Binding{Slot: slot, Expr: e.id}
+				projectEffects = projectEffects.Union(e.effects)
+			}
+			id, err := b.builder.AddRel(b.ctx, ir.RelSpec{
+				Rel:      ir.Rel{Kind: ir.Project, Scope: s.id, Effects: projectEffects},
+				Inputs:   []ir.RelID{input.id},
+				Outputs:  outputSlots(columns),
+				Bindings: bindings,
+			})
+			return relation{id: id, columns: columns, effects: projectEffects}, err
 		}
 	}
 	columns := make([]column, width)

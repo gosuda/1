@@ -133,7 +133,7 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 			return nil, bindError("0A000", "access method \"gin\" does not support unique indexes", 0)
 		}
 		if len(statement.IndexParams) != 1 {
-			return nil, bindError("0A000", "GIN indexes on multiple columns are not supported", 0)
+			return nil, &model.Error{Code: "0A000", Message: "GIN indexes on multiple columns are not supported", FeatureID: string(NonBtreeIndexes)}
 		}
 		if len(statement.IndexIncludingParams) != 0 {
 			return nil, bindError("0A000", "access method \"gin\" does not support included columns", 0)
@@ -156,7 +156,7 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 		}
 		if isGIN {
 			if elem.Expr != nil || elem.Name == "" {
-				return nil, bindError("0A000", "GIN indexes on expressions are not supported", 0)
+				return nil, &model.Error{Code: "0A000", Message: "GIN indexes on expressions are not supported", FeatureID: string(NonBtreeIndexes)}
 			}
 			if elem.Ordering != zpgparse.SortByDir_SORTBY_DEFAULT || elem.NullsOrdering != zpgparse.SortByNulls_SORTBY_NULLS_DEFAULT {
 				return nil, bindError("0A000", "access method \"gin\" does not support ordering options", 0)

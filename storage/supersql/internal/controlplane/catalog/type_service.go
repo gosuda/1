@@ -208,6 +208,30 @@ func (s *Store) CompositeTypeDependents(ctx context.Context, snapshot *CatalogSn
 		if descriptor == nil {
 			return model.ErrInvalidDescriptor
 		}
+		if descriptor.Kind() == model.ObjectType {
+			if _, altering := byObject[descriptor.ID()]; altering {
+				return nil
+			}
+			spec, err := descriptor.SpecWithin(ctx, s.limits.Descriptor)
+			if err != nil {
+				return err
+			}
+			if spec.Type != nil && spec.Type.DeclaredKind() == model.TypeKindDomain {
+				for _, dep := range spec.Dependencies {
+					if _, affected := byObject[dep.Object]; affected {
+						return &model.Error{Code: "2BP01", Message: "cannot alter type because a domain uses it"}
+					}
+				}
+				affected, err := s.layoutReferencesCompositeChange(ctx, snapshot, spec.Type.BaseLayout, byOID, make(map[model.TypeID]bool), 0)
+				if err != nil {
+					return err
+				}
+				if affected {
+					return &model.Error{Code: "2BP01", Message: "cannot alter type because a domain uses it"}
+				}
+			}
+			return nil
+		}
 		if descriptor.Kind() != model.ObjectTable && descriptor.Kind() != model.ObjectMaterializedView {
 			return nil
 		}

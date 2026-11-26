@@ -795,7 +795,7 @@ func (execution *jsonPathExecution) castDatetime(value model.Value, source, targ
 	case source == 1114 && target == 1184: cast, timezone = 2028, true
 	case source == 1184 && target == 1082: cast, timezone = 1178, true
 	case source == 1184 && target == 1083: cast, timezone = 2019, true
-	case source == 1184 && target == 1266: cast, timezone = 1388, true
+	case source == 1184 && target == 1266: cast = 1388
 	case source == 1184 && target == 1114: cast, timezone = 2027, true
 	default: return model.Value{}, sqlError("22031", "incompatible jsonpath datetime types")
 	}

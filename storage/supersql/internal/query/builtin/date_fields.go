@@ -102,8 +102,10 @@ func compileDateFields(signature Signature) scalarKernel {
 // here: bind imports builtin. gates_test.go's manifest-driven exclusion table
 // fails if these ids drift from testdata/postgres/embedded_features.json.
 const (
-	featureDatetimeFields     = "datetime_fields"
-	featureEncodingConversion = "encoding_conversion"
+	featureDatetimeFields      = "datetime_fields"
+	featureEncodingConversion  = "encoding_conversion"
+	featureNonBtreeIndexes     = "non_btree_indexes"
+	featurePhysicalMaintenance = "physical_maintenance"
 )
 
 func temporalFieldError(text, typeName string, supported bool) error {
