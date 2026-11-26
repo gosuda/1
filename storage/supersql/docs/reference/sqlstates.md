@@ -102,7 +102,7 @@
 | 42P08 | 42 | syntax error or access rule violation | 2 | internal/query/bind/bind.go:263 | bindError call |
 | 42P09 | 42 | syntax error or access rule violation | 3 | internal/query/bind/relation_qualifier.go:23 | bindError call |
 | 42P10 | 42 | syntax error or access rule violation | 17 | internal/query/bind/aggregate_order.go:89 | bindError call |
-| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:160 | model.Error Code field |
+| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:161 | model.Error Code field |
 | 42P13 | 42 | syntax error or access rule violation | 45 | internal/query/bind/definition_declaration.go:1389 | bindError call, model.Error Code field, sqlError call |
 | 42P16 | 42 | syntax error or access rule violation | 29 | internal/query/bind/constraint_rename.go:121 | bindError call, model.Error Code field |
 | 42P17 | 42 | syntax error or access rule violation | 42 | internal/query/bind/definition_declaration.go:700 | bindError call, model.Error Code field |
@@ -117,7 +117,7 @@
 | 54000 | 54 | program limit exceeded | 446 | internal/controlplane/catalog/object_service.go:132 | bindError call, model.Error Code field, sqlError call |
 | 54001 | 54 | program limit exceeded | 13 | internal/query/bind/view_mutation.go:240 | bindError call, sqlError call |
 | 54023 | 54 | program limit exceeded | 3 | internal/query/bind/aggregate_order.go:12 | bindError call |
-| 55000 | 55 | object not in prerequisite state | 177 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |
+| 55000 | 55 | object not in prerequisite state | 179 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |
 | 55006 | 55 | object not in prerequisite state | 3 | internal/controlplane/schema/index_scheduler.go:27 | model.Error Code field |
 | 55P03 | 55 | object not in prerequisite state | 4 | internal/dataplane/txn/locks.go:27 | model.Error Code field |
 | 55P04 | 55 | object not in prerequisite state | 1 | internal/query/builtin/declared_type.go:742 | model.Error Code field |
