@@ -19,6 +19,10 @@ on:
         description: 'Chromium version to pin (default: latest stable)'
         required: false
         type: string
+      retry_existing:
+        description: 'Rebuild this revision; only current main may promote the result'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,31 +42,51 @@ jobs:
     timeout-minutes: 30
     outputs:
       branch: ${{ steps.pin.outputs.branch }}
+      source: ${{ steps.pin.outputs.source }}
+      source_is_main: ${{ steps.pin.outputs.source_is_main }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Pin the Chromium release
         id: pin
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          RETRY_EXISTING: ${{ inputs.retry_existing }}
         run: |
           set -euo pipefail
+          source=$(git rev-parse HEAD)
+          git fetch origin refs/heads/main:refs/remotes/origin/main
+          main=$(git rev-parse refs/remotes/origin/main)
+          printf 'source=%s\n' "$source" >> "$GITHUB_OUTPUT"
+          printf 'source_is_main=%s\n' "$([ "$source" = "$main" ] && printf true || printf false)" >> "$GITHUB_OUTPUT"
           version=$(python3 scripts/engine/engine.py pin --version "${INPUT_VERSION:-latest-stable}")
           branch="chromium/$version"
+          changed=true
           if git diff --quiet -- third_party/chromium; then
-            echo "Chromium $version is already pinned"
-            exit 0
+            changed=false
+            if [ "$RETRY_EXISTING" != true ] || [ "$source" = "$main" ]; then
+              printf 'Chromium %s is already pinned in the selected revision\n' "$version"
+              exit 0
+            fi
           fi
-          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then
-            echo "$branch already exists"
+          if [ "$source" != "$main" ]; then
+            # Builds from other revisions can never promote; keep them off the shared branch.
+            branch="$branch-try-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          elif [ "$RETRY_EXISTING" = true ]; then
+            # Keep the failed version branch as evidence; retries get distinct refs.
+            branch="$branch-retry-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          elif git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then
+            printf '%s already exists; dispatch with retry_existing=true to rebuild it\n' "$branch"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add third_party/chromium
-          git commit -m "third_party/chromium: update to Chromium $version"
+          if [ "$changed" = true ]; then
+            git add third_party/chromium
+            git commit -m "third_party/chromium: update to Chromium $version"
+          fi
           git push origin "$branch"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          printf 'branch=%s\n' "$branch" >> "$GITHUB_OUTPUT"
 
   engine:
     needs: [pin]
@@ -73,6 +97,7 @@ jobs:
 
   promote:
     needs: [pin, engine]
+    if: needs.pin.outputs.source_is_main == 'true'
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -97,12 +122,13 @@ jobs:
       - name: Push pins, tag, and publish GitHub release
         env:
           BRANCH: ${{ needs.pin.outputs.branch }}
+          PIN_SOURCE: ${{ needs.pin.outputs.source }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch origin main --tags
-          if ! git merge-base --is-ancestor origin/main HEAD; then
-            echo "main moved since the pin was made; rerun this workflow" >&2
+          if [ "$(git rev-parse origin/main)" != "$PIN_SOURCE" ]; then
+            printf '%s\n' 'main moved since the pin was made; dispatch this workflow again from main with retry_existing=true for the failed version' >&2
             exit 1
           fi
           chromium=$(sed -n 's/^version=//p' third_party/chromium/VERSION)

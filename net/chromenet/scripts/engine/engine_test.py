@@ -1,7 +1,51 @@
 #!/usr/bin/env python3
+import argparse
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import engine
+
+
+class ToolchainTest(unittest.TestCase):
+    def source(self, root: Path, *, mold: bool) -> Path:
+        src = root / 'src'
+        (src / 'tools/clang/scripts').mkdir(parents=True)
+        (src / 'tools/rust').mkdir(parents=True)
+        (src / 'tools/clang/scripts/update.py').write_text(
+            "CLANG_REVISION = 'clang-fixture'\nCLANG_SUB_REVISION = 1\n")
+        (src / 'tools/rust/update_rust.py').write_text(
+            "RUST_REVISION = 'rust-fixture'\nRUST_SUB_REVISION = 1\n")
+        deps = "'gn_version': 'gn-fixture',\n'ninja_version': 'ninja-fixture',\n"
+        if mold:
+            deps += ("'package': 'chromium/buildtools/third_party/mold/mold',\n"
+                     "'version': 'mold-fixture',\n")
+        (src / 'DEPS').write_text(deps)
+        return src
+
+    def test_optional_mold_on_both_hosts(self) -> None:
+        for has_mold in (False, True):
+            for host, target in ((engine.LINUX_HOST, 'linux-amd64'),
+                                 (engine.MAC_HOST, 'darwin-arm64')):
+                with self.subTest(mold=has_mold, host=host), tempfile.TemporaryDirectory() as work:
+                    src = self.source(Path(work), mold=has_mold)
+                    revs = engine.source_revisions(str(src))
+                    self.assertEqual(revs['mold'], 'mold-fixture' if has_mold else None)
+                    expected = has_mold and host == engine.LINUX_HOST
+                    archives = engine.toolchain_files(revs, [host], with_win=False)
+                    self.assertEqual(any(name.startswith('cipd/mold/') for name, _ in archives), expected)
+                    with patch.object(engine, 'host_of', return_value=host), \
+                            patch.object(engine, 'read_pins', return_value={}), \
+                            patch.object(engine, 'fetch_pinned'), \
+                            patch.object(engine.shutil, 'copyfile'), \
+                            patch.object(engine, 'run'), \
+                            patch.object(engine, 'unzip') as unzip:
+                        engine.cmd_toolchain(argparse.Namespace(work=work, targets=target))
+                    self.assertEqual(
+                        any('cipd/mold/' in call.args[0] for call in unzip.call_args_list),
+                        expected,
+                    )
 
 
 class ReleaseTagTest(unittest.TestCase):
