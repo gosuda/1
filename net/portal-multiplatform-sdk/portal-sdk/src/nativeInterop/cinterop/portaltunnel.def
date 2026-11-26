@@ -1,0 +1,3 @@
+headers = portaltunnel.h
+headerFilter = portaltunnel.h
+package = portaltunnel
