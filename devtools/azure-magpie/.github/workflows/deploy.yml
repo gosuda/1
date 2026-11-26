@@ -12,7 +12,7 @@ on:
         default: false
 
 concurrency:
-  group: azure-magpie-production
+  group: ${{ inputs.verify_only && format('azure-magpie-verify-{0}', github.run_id) || 'azure-magpie-production' }}
   cancel-in-progress: false
 
 jobs:
