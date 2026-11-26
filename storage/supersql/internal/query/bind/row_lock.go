@@ -281,6 +281,9 @@ func (b *binder) lockRows(input relation, s *scope, clauses []*zpgparse.Node, pu
 	locks := make([]ir.RowLockSpec, 0, len(selected))
 	effects := input.effects
 	for _, selected := range selected {
+		if err := b.checkObjectPrivilege(selected.namespace.descriptor, model.PrivilegeUpdate, 0); err != nil {
+			return input, err
+		}
 		table, ok := selected.namespace.descriptor.Table()
 		if !ok || len(table.PrimaryKey) == 0 {
 			return input, bindError("XX000", "row locking table has no physical primary key", 0)

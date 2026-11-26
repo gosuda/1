@@ -73,9 +73,9 @@ A database directory contains:
 
 | Magic | Location |
 | --- | --- |
-| `NSDB0001` | internal/dataplane/storage/neosepia/backend_directory.go:100 |
-| `NSBASE03` | internal/dataplane/storage/neosepia/base_manifest.go:506 |
-| `NSBASE02` | internal/dataplane/storage/neosepia/base_manifest.go:509 |
+| `NSDB0001` | internal/dataplane/storage/neosepia/backend_directory.go:111 |
+| `NSBASE03` | internal/dataplane/storage/neosepia/base_manifest.go:554 |
+| `NSBASE02` | internal/dataplane/storage/neosepia/base_manifest.go:557 |
 | `NSRUNS02` | internal/dataplane/storage/neosepia/run_manifest.go:22 |
 | `NSSST003` | internal/dataplane/storage/neosepia/sst_write.go:21 |
 | `NSSST002` | internal/dataplane/storage/neosepia/sst_write.go:22 |

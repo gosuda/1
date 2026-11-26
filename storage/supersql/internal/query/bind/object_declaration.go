@@ -596,6 +596,9 @@ func bindRefreshMaterializedView(ctx context.Context, statement *zpgparse.Refres
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, int(statement.Relation.Location)+1); err != nil {
+		return nil, err
+	}
 	if base.Version() == math.MaxUint64 || base.Physical().Generation == math.MaxUint64 {
 		return nil, model.ErrInvalidDescriptor
 	}
@@ -1192,6 +1195,9 @@ func bindSetObjectSchema(ctx context.Context, statement *zpgparse.AlterObjectSch
 		}
 		return nil, err
 	}
+	if err := b.checkSchemaCreate(destination.Descriptor, 0); err != nil {
+		return nil, err
+	}
 	if base.Kind() == model.ObjectTable || base.Kind() == model.ObjectView || base.Kind() == model.ObjectMaterializedView {
 		if err := implicitRelationTypeNamesAvailable(ctx, snapshot, destination.Descriptor.ID(), base.Name().Name); err != nil {
 			return nil, err
@@ -1280,6 +1286,9 @@ func bindCommentObject(ctx context.Context, statement *zpgparse.CommentStmt, sna
 	}
 	base, err := resolveOrdinaryObject(ctx, b, lookup, objectKinds(statement.Objtype), "42704")
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	next, err := nextObjectDescriptor(ctx, base, options, func(spec *model.DescriptorSpec) error {

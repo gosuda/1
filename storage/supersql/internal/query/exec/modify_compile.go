@@ -273,6 +273,7 @@ func (c *invocation) modify(id physical.NodeID, node physical.NodeSpec, children
 	}
 	options.RLSInsertCheck = nil
 	options.RLSUpdateCheck = nil
+	options.RLSConflictCheck = nil
 	if relation.RLSRow != 0 {
 		info, ok := graph.Slot(relation.RLSRow)
 		if !ok {
@@ -287,6 +288,12 @@ func (c *invocation) modify(id physical.NodeID, node physical.NodeSpec, children
 		}
 		if relation.RLSUpdateCheck != 0 {
 			options.RLSUpdateCheck, err = c.program(node.Logical.Graph, []ir.ScalarID{relation.RLSUpdateCheck}, rlsInputs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if relation.RLSConflictCheck != 0 {
+			options.RLSConflictCheck, err = c.program(node.Logical.Graph, []ir.ScalarID{relation.RLSConflictCheck}, rlsInputs)
 			if err != nil {
 				return nil, err
 			}

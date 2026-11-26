@@ -89,8 +89,17 @@ func (database *Catalog) Subscribe(channels ...string) *Subscription {
 		close(closedCh)
 		return &Subscription{ch: closedCh}
 	}
+	parent := database.workerCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	if parent.Err() != nil {
+		closedCh := make(chan Notification)
+		close(closedCh)
+		return &Subscription{ch: closedCh}
+	}
 	sub := database.hub.SubscribeGo(channels...)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	out := &Subscription{
 		sub:    sub,
 		ch:     make(chan Notification, 64),
@@ -100,7 +109,12 @@ func (database *Catalog) Subscribe(channels ...string) *Subscription {
 	go func() {
 		defer close(out.done)
 		defer close(out.ch)
+		defer sub.Close()
+		defer cancel()
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			n, err := sub.Wait(ctx)
 			if err != nil {
 				return

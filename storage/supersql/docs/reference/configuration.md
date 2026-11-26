@@ -90,7 +90,7 @@ The root package fixes its own envelope when it opens a database; the table list
 
 | Location | Fields |
 | --- | --- |
-| catalog.go:165 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
+| catalog.go:168 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
 | internal/controlplane/schema/column_policy.go:67 | MaxBytes=options.MetadataBytes MaxDepth=64 MaxItems=int(options.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:122 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:163 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
@@ -111,7 +111,7 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/controlplane/schema/relational_policy.go:68 | MaxBytes=maxBytes - fixed MaxDepth=64 MaxItems=max(set.limits.MaxColumns, len(set.indexes)) |
 | internal/query/bind/bind_limits.go:80 | MaxBytes=limits.MaxBytes MaxDepth=int(min(limits.MaxDepth, 64)) MaxItems=int(limits.MaxOperands) |
 | internal/query/catalogrel/rows.go:307 | MaxBytes=options.MaxDescriptorBytes MaxDepth=options.MaxDescriptorDepth MaxItems=options.MaxDescriptorItems |
-| internal/query/exec/modify/options.go:301 | MaxBytes=c.metadata / 2 MaxDepth=64 MaxItems=int(c.metadata / 64) |
+| internal/query/exec/modify/options.go:302 | MaxBytes=c.metadata / 2 MaxDepth=64 MaxItems=int(c.metadata / 64) |
 | internal/query/exec/modify_compile.go:53 | MaxBytes=c.portal.env.Limits.MetadataBytes MaxDepth=64 MaxItems=c.portal.env.Limits.Expressions.MaxRegisters |
 | internal/query/procedural/compile.go:439 | MaxBytes=c.options.Bind.Limits.MaxBytes MaxDepth=int(min(c.options.Bind.Limits.MaxDepth, 64)) MaxItems=int(c.options.Bind.Limits.MaxOperands) |
 | internal/query/procedural/trigger.go:267 | MaxBytes=maxBytes MaxDepth=64 MaxItems=runtime.limits.MaxStatements |

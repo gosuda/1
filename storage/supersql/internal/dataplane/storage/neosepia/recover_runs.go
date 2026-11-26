@@ -112,7 +112,7 @@ func recoverPublishedRuns(ctx context.Context, directory *databaseDirectory, sta
 	var base runBase
 	var fenceIndex coveredFenceIndex
 	if state.BaseGeneration != 0 {
-		base, err = loadRunBase(ctx, directory.runs, state.BaseGeneration, limits.Preparation.MetadataBytes, limits.IdentityBytes, limits.Preparation.MaxRuns)
+		base, err = loadRunBaseWithCipher(ctx, directory.runs, state.BaseGeneration, limits.Preparation.MetadataBytes, limits.IdentityBytes, limits.Preparation.MaxRuns, limits.Preparation.File.cipher)
 		if err != nil {
 			return recoveredRuns{}, err
 		}

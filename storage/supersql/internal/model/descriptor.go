@@ -443,6 +443,7 @@ type ViewMetadata struct {
 }
 type CompositeRelationMetadata struct {
 	Owner                OID
+	OwnerName            string `json:",omitempty"`
 	RowType              ObjectID
 	FieldIDHighWatermark ColumnID
 	Columns              []ColumnDescriptor
@@ -511,6 +512,7 @@ type RangeTypeMetadata struct {
 type TypeMetadata struct {
 	Kind                 TypeKind
 	Owner                OID
+	OwnerName            string `json:",omitempty"`
 	Layout               TypeLayout
 	Array                ObjectID
 	Relation             ObjectID
@@ -534,6 +536,7 @@ type TextSearchTemplateMetadata struct {
 
 type TextSearchDictionaryMetadata struct {
 	Owner             OID
+	OwnerName         string `json:",omitempty"`
 	Template          OID
 	Kind              TextSearchDictionaryKind
 	Language          string
@@ -559,9 +562,10 @@ type TextSearchMappingReference struct {
 	Dictionaries []OID
 }
 type TextSearchConfigurationMetadata struct {
-	Owner    OID
-	Parser   OID
-	Mappings []TextSearchMappingReference
+	Owner     OID
+	OwnerName string `json:",omitempty"`
+	Parser    OID
+	Mappings  []TextSearchMappingReference
 }
 type DescriptorSpec struct {
 	ID                      ObjectID
@@ -831,6 +835,33 @@ func (d *Descriptor) OwnerName() string {
 	case ObjectRoutine:
 		if d.spec.Routine != nil {
 			return d.spec.Routine.OwnerName
+		}
+		if d.spec.Aggregate != nil {
+			return d.spec.Aggregate.OwnerName
+		}
+	case ObjectType:
+		if d.spec.Type != nil {
+			return d.spec.Type.OwnerName
+		}
+	case ObjectCompositeRelation:
+		if d.spec.CompositeRelation != nil {
+			return d.spec.CompositeRelation.OwnerName
+		}
+	case ObjectCast:
+		if d.spec.Cast != nil {
+			return d.spec.Cast.OwnerName
+		}
+	case ObjectOperator:
+		if d.spec.Operator != nil {
+			return d.spec.Operator.OwnerName
+		}
+	case ObjectTextSearchDictionary:
+		if d.spec.TextSearchDictionary != nil {
+			return d.spec.TextSearchDictionary.OwnerName
+		}
+	case ObjectTextSearchConfiguration:
+		if d.spec.TextSearchConfiguration != nil {
+			return d.spec.TextSearchConfiguration.OwnerName
 		}
 	case ObjectCollation:
 		if d.spec.Collation != nil {
@@ -1251,6 +1282,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.CompositeRelation != nil && c.charge(uint64(unsafe.Sizeof(*in.CompositeRelation))) {
 		x := *in.CompositeRelation
+		x.OwnerName = c.text(x.OwnerName)
 		x.Columns = c.columns(x.Columns)
 		out.CompositeRelation = &x
 	}
@@ -1286,6 +1318,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Type != nil && c.charge(uint64(unsafe.Sizeof(*in.Type))) {
 		x := *in.Type
+		x.OwnerName = c.text(x.OwnerName)
 		x.Layout = c.layout(x.Layout, 1)
 		if x.BaseLayout.Type.ID != 0 {
 			x.BaseLayout = c.layout(x.BaseLayout, 1)
@@ -1312,6 +1345,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.TextSearchDictionary != nil && c.charge(uint64(unsafe.Sizeof(*in.TextSearchDictionary))) {
 		x := *in.TextSearchDictionary
+		x.OwnerName = c.text(x.OwnerName)
 		x.Language = c.text(x.Language)
 		x.InitOptions = c.text(x.InitOptions)
 		x.StopWordsLanguage = c.text(x.StopWordsLanguage)
@@ -1327,6 +1361,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.TextSearchConfiguration != nil && c.charge(uint64(unsafe.Sizeof(*in.TextSearchConfiguration))) {
 		x := *in.TextSearchConfiguration
+		x.OwnerName = c.text(x.OwnerName)
 		x.Mappings = descriptorSlice(c, x.Mappings)
 		for i := range x.Mappings {
 			x.Mappings[i].Dictionaries = descriptorSlice(c, x.Mappings[i].Dictionaries)
@@ -1335,12 +1370,14 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Cast != nil && c.charge(uint64(unsafe.Sizeof(*in.Cast))) {
 		x := *in.Cast
+		x.OwnerName = c.text(x.OwnerName)
 		x.Source = c.layout(x.Source, 1)
 		x.Target = c.layout(x.Target, 1)
 		out.Cast = &x
 	}
 	if in.Operator != nil && c.charge(uint64(unsafe.Sizeof(*in.Operator))) {
 		x := *in.Operator
+		x.OwnerName = c.text(x.OwnerName)
 		x.Name = c.text(x.Name)
 		x.Left = c.layout(x.Left, 1)
 		x.Right = c.layout(x.Right, 1)
@@ -1349,6 +1386,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 	}
 	if in.Aggregate != nil && c.charge(uint64(unsafe.Sizeof(*in.Aggregate))) {
 		x := *in.Aggregate
+		x.OwnerName = c.text(x.OwnerName)
 		x.Arguments = descriptorSlice(c, x.Arguments)
 		for i := range x.Arguments {
 			x.Arguments[i] = c.layout(x.Arguments[i], 1)

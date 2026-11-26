@@ -170,7 +170,8 @@ func (d *Descriptor) WithTableOwner(owner OID, ownerName string) (*Descriptor, e
 
 // WithOwner returns a validated successor descriptor with updated owner
 // identity at Version+1 for schema, table, view, materialized view, sequence,
-// routine, or collation objects.
+// routine/aggregate, type, composite relation, cast, operator, text search,
+// or collation objects.
 func (d *Descriptor) WithOwner(owner OID, ownerName string) (*Descriptor, error) {
 	if d == nil || d.spec.Version == ^uint64(0) {
 		return nil, ErrInvalidDescriptor
@@ -220,13 +221,68 @@ func (d *Descriptor) WithOwner(owner OID, ownerName string) (*Descriptor, error)
 		}
 		spec.Sequence.OwnerName = ownerName
 	case ObjectRoutine:
-		if spec.Routine == nil {
+		switch {
+		case spec.Routine != nil:
+			if owner != 0 {
+				spec.Routine.Owner = owner
+			}
+			spec.Routine.OwnerName = ownerName
+		case spec.Aggregate != nil:
+			if owner != 0 {
+				spec.Aggregate.Owner = owner
+			}
+			spec.Aggregate.OwnerName = ownerName
+		default:
+			return nil, ErrInvalidDescriptor
+		}
+	case ObjectType:
+		if spec.Type == nil {
 			return nil, ErrInvalidDescriptor
 		}
 		if owner != 0 {
-			spec.Routine.Owner = owner
+			spec.Type.Owner = owner
 		}
-		spec.Routine.OwnerName = ownerName
+		spec.Type.OwnerName = ownerName
+	case ObjectCompositeRelation:
+		if spec.CompositeRelation == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.CompositeRelation.Owner = owner
+		}
+		spec.CompositeRelation.OwnerName = ownerName
+	case ObjectCast:
+		if spec.Cast == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Cast.Owner = owner
+		}
+		spec.Cast.OwnerName = ownerName
+	case ObjectOperator:
+		if spec.Operator == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.Operator.Owner = owner
+		}
+		spec.Operator.OwnerName = ownerName
+	case ObjectTextSearchDictionary:
+		if spec.TextSearchDictionary == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.TextSearchDictionary.Owner = owner
+		}
+		spec.TextSearchDictionary.OwnerName = ownerName
+	case ObjectTextSearchConfiguration:
+		if spec.TextSearchConfiguration == nil {
+			return nil, ErrInvalidDescriptor
+		}
+		if owner != 0 {
+			spec.TextSearchConfiguration.Owner = owner
+		}
+		spec.TextSearchConfiguration.OwnerName = ownerName
 	case ObjectCollation:
 		if spec.Collation == nil {
 			return nil, ErrInvalidDescriptor

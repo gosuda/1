@@ -224,13 +224,19 @@ func (p *Portal) runMutations(driver *mutationDriver) {
 	}()
 	terminal := io.EOF
 	driver.err = p.mutations.transaction.Statement(p.ctx, func(active context.Context) error {
-		p.mutations.active = active
+		ambient := active == p.ctx
+		if !ambient {
+			p.mutations.active = active
+		}
 		defer func() { p.mutations.active = nil }()
 		started := false
 		for {
 			request := <-driver.requests
 			if request.out == nil && !request.writesOnly {
 				return p.releaseResources()
+			}
+			if ambient {
+				p.mutations.active = request.ctx
 			}
 			call, finish, err := p.mutations.call(request.ctx)
 			if err == nil && !started {
@@ -252,6 +258,9 @@ func (p *Portal) runMutations(driver *mutationDriver) {
 			}
 			if finish != nil {
 				finish()
+			}
+			if ambient {
+				p.mutations.active = nil
 			}
 			if p.mutation != nil {
 				p.affected = p.mutation.RowsAffected()

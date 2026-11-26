@@ -2133,19 +2133,21 @@ SQL session via Connector.Connect, keeping transactions, session settings,
 prepared statements, portals, and temporary objects isolated per client.
 
 Supported protocol capabilities include:
-  - Startup negotiation: SSLRequest (TLS upgrade when TLSConfig is set),
-    CancelRequest (in-flight statement cancellation by PID/secret key), and
-    StartupMessage v3.0.
-  - Authentication: trust (AuthenticationOk), cleartext password
-    (AuthenticationCleartextPassword), or custom AuthFunc.
+  - Startup negotiation: SSLRequest (TLS upgrade and enforcement when
+    TLSConfig or RequireTLS is set), CancelRequest (unencrypted in-flight
+    statement cancellation by PID/secret key), and StartupMessage v3.0.
+  - Authentication: SCRAM-SHA-256 (AuthenticationSASL via PasswordLookup or
+    Password), custom cleartext AuthFunc (AuthenticationCleartextPassword),
+    or trust (AuthenticationOk).
   - Simple Query Protocol ('Q') with multi-statement splitting and accurate
     transaction status reporting ('I', 'T', 'E').
   - Extended Query Protocol ('P' Parse, 'B' Bind, 'D' Describe Statement and
     Portal, 'E' Execute with maxRows / PortalSuspended, 'C' Close, 'H' Flush,
-    'S' Sync, 'X' Terminate) with text and binary parameter decoding and
-    result encoding.
-  - Asynchronous NotificationResponse ('A') delivery via Config.NotifyHandler
-    or Server.Notify for LISTEN/NOTIFY integration.
+    'S' Sync, 'X' Terminate) with text and binary parameter decoding,
+    result encoding, and per-connection prepared statement / portal caps.
+  - Asynchronous NotificationResponse ('A') delivery via Config.NotifyHandler,
+    Server.Notify, or non-blocking Server.BroadcastNotify with bounded write
+    deadlines for LISTEN/NOTIFY integration.
 
 
 ### Types
@@ -2162,29 +2164,55 @@ type Config struct {
 	// If passed to NewServer directly, that argument takes precedence.
 	Connector	*supersql.Connector
 
-	// Password enables cleartext password authentication when non-empty and
-	// AuthFunc is nil. When both Password and AuthFunc are empty/nil, trust
-	// authentication (AuthenticationOk) is used.
+	// Password enables SCRAM-SHA-256 authentication when non-empty and both
+	// PasswordLookup and AuthFunc are nil. It may be either a plaintext
+	// password or a PostgreSQL SCRAM-SHA-256 verifier string. When Password,
+	// PasswordLookup, and AuthFunc are all empty/nil, trust authentication
+	// (AuthenticationOk) is used.
 	Password	string
 
-	// AuthFunc optionally overrides password verification with custom logic.
-	// Returning a non-nil error rejects the client with SQLSTATE 28P01 (or the
-	// error's SQLSTATE if it carries one).
+	// PasswordLookup looks up the expected credential for (user, database)
+	// during SCRAM-SHA-256 authentication. It may return either a plaintext
+	// password or a PostgreSQL SCRAM-SHA-256 verifier string in the format
+	// "SCRAM-SHA-256$<iterations>:<b64salt>$<b64storedKey>:<b64serverKey>".
+	// When non-nil, PasswordLookup takes precedence over AuthFunc and Password.
+	PasswordLookup	func(ctx context.Context, user, database string) (string, error)
+
+	// AuthFunc optionally overrides password verification with custom cleartext
+	// password logic when PasswordLookup is nil. Returning a non-nil error
+	// rejects the client with SQLSTATE 28P01 (or the error's SQLSTATE if it
+	// carries one).
 	AuthFunc	func(ctx context.Context, user, database, password string) error
 
-	// TLSConfig enables SSLRequest ('S') upgrades via tls.Server when non-nil.
-	// When nil, SSLRequest is declined with 'N'.
+	// TLSConfig enables SSLRequest ('S') upgrades via tls.Server and requires
+	// TLS for StartupMessage connections when non-nil. When nil (and RequireTLS
+	// is false), SSLRequest is declined with 'N'.
 	TLSConfig	*tls.Config
 
-	// MaxConnections caps concurrent active client sessions. Defaults to 128.
+	// RequireTLS rejects clients that do not upgrade to TLS via SSLRequest.
+	// NewServer returns an error if RequireTLS is true and TLSConfig is nil.
+	RequireTLS	bool
+
+	// MaxConnections caps concurrent active authenticated client sessions.
+	// Defaults to 128.
 	MaxConnections	int
 
-	// ReadTimeout bounds individual wire frame reads and startup negotiation.
-	// Zero disables read timeouts.
+	// MaxPreparedStatements caps the number of prepared statements cached per
+	// connection. Defaults to 1024 when zero or negative.
+	MaxPreparedStatements	int
+
+	// MaxPortals caps the number of open portals per connection. Defaults to
+	// 256 when zero or negative.
+	MaxPortals	int
+
+	// ReadTimeout bounds individual wire frame reads, startup negotiation, and
+	// TLS handshakes. Defaults to 30s when zero; set a negative duration to
+	// disable read timeouts.
 	ReadTimeout	time.Duration
 
 	// IdleTimeout bounds how long an idle connection may wait for the next
-	// frontend message before being closed. Zero disables idle timeouts.
+	// frontend message before being closed. Defaults to 5m when zero; set a
+	// negative duration to disable idle timeouts.
 	IdleTimeout	time.Duration
 
 	// ApplicationVersion is reported in the server_version ParameterStatus.
@@ -2270,8 +2298,8 @@ bound a listener, or nil before serving starts.
 
 ##### `func (s *Server) BroadcastNotify(senderPID int32, channel, payload string)`
 
-BroadcastNotify delivers an asynchronous NotificationResponse ('A') frame to
-every currently connected client.
+BroadcastNotify enqueues an asynchronous NotificationResponse ('A') frame to
+every currently connected client without blocking on slow or stalled peers.
 
 
 ##### `func (s *Server) Close() error`

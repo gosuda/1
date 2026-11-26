@@ -1,7 +1,10 @@
 package supersql
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -131,7 +134,7 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	secret, fresh, err := readFenceSecret(options.Directory)
+	secret, fresh, err := readFenceSecret(options.Directory, options.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +159,7 @@ func Open(ctx context.Context, options OpenOptions) (*Catalog, error) {
 		return nil, openFormatError(options.Directory, err)
 	}
 	if fresh {
-		if err := writeFenceSecret(options.Directory, secret); err != nil {
+		if err := writeFenceSecret(options.Directory, secret, options.EncryptionKey); err != nil {
 			return nil, errors.Join(err, backend.Close())
 		}
 	}
@@ -370,7 +373,7 @@ func (database *Catalog) compose(ctx context.Context) error {
 			Manager: database.manager, Policies: database.policies, Jobs: database.indexJobs,
 			Lifecycle: database.lifecycle, Protections: database.protections, Transaction: options,
 			Scan:       schema.BackfillScanLimits{BatchRows: 64, MaxKeyBytes: 4096, WorkBytes: 8 << 20},
-			Backfill:   schema.BackfillLimits{MaxRows: 1 << 30, MaxKeyBytes: 4 << 20, WorkBytes: 128 << 20},
+			Backfill:   schema.BackfillLimits{MaxRows: 1 << 30, MaxKeyBytes: 4 << 20, WorkBytes: 512 << 20},
 			Validation: schema.IndexValidationLimits{BatchRows: 64, MaxRows: 1 << 30, MaxBytes: 32 << 20},
 			MaxRetries: 8, RetryDelay: 10 * time.Millisecond, MaxRetryDelay: time.Second,
 		},
@@ -535,32 +538,113 @@ func clockUnavailable(value clock.Clock) bool {
 	}
 }
 
-// readFenceSecretFile reads and validates the fence secret file in directory.
-// It returns the raw read error (including os.ErrNotExist), reports corrupt when
-// the file exists but fails its size or all-zero check, and returns the secret
-// otherwise.
+var fenceSecretEnvelopeHeader = [5]byte{'N', 'S', 'F', 'S', 1}
+
+const (
+	fenceSecretHeaderSize   = 5
+	fenceSecretNonceSize    = 12
+	fenceSecretTagSize      = 16
+	fenceSecretEnvelopeSize = fenceSecretHeaderSize + fenceSecretNonceSize + nativeFenceSecretSize + fenceSecretTagSize
+)
+
+func encodeFenceSecret(secret [nativeFenceSecretSize]byte, key []byte) ([]byte, error) {
+	if len(key) == 0 {
+		out := make([]byte, nativeFenceSecretSize)
+		copy(out, secret[:])
+		return out, nil
+	}
+	if len(key) != 32 {
+		return nil, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey, err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, fenceSecretNonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, secret[:], fenceSecretEnvelopeHeader[:])
+	out := make([]byte, 0, fenceSecretEnvelopeSize)
+	out = append(out, fenceSecretEnvelopeHeader[:]...)
+	out = append(out, nonce...)
+	out = append(out, ciphertext...)
+	return out, nil
+}
+
+func decodeFenceSecret(data []byte, key []byte) (secret [nativeFenceSecretSize]byte, corrupt bool, err error) {
+	if len(data) == fenceSecretEnvelopeSize && bytes.Equal(data[:fenceSecretHeaderSize], fenceSecretEnvelopeHeader[:]) {
+		if len(key) != 32 {
+			return secret, false, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return secret, false, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			return secret, false, err
+		}
+		nonce := data[fenceSecretHeaderSize : fenceSecretHeaderSize+fenceSecretNonceSize]
+		ciphertext := data[fenceSecretHeaderSize+fenceSecretNonceSize:]
+		plain, err := gcm.Open(nil, nonce, ciphertext, fenceSecretEnvelopeHeader[:])
+		if err != nil {
+			return secret, false, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+		}
+		if len(plain) != nativeFenceSecretSize {
+			return secret, true, nil
+		}
+		copy(secret[:], plain)
+		if secret == ([nativeFenceSecretSize]byte{}) {
+			return secret, true, nil
+		}
+		return secret, false, nil
+	}
+	if len(data) == nativeFenceSecretSize {
+		if len(key) > 0 {
+			return secret, false, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+		}
+		copy(secret[:], data)
+		if secret == ([nativeFenceSecretSize]byte{}) {
+			return secret, true, nil
+		}
+		return secret, false, nil
+	}
+	return secret, true, nil
+}
+
+// readFenceSecretFile reads and validates the unencrypted fence secret file in
+// directory. It returns the raw read error (including os.ErrNotExist), reports
+// corrupt when the file exists but fails its size or all-zero check, and
+// returns the secret otherwise.
 func readFenceSecretFile(directory string) ([nativeFenceSecretSize]byte, bool, error) {
+	return readFenceSecretFileWithKey(directory, nil)
+}
+
+// readFenceSecretFileWithKey reads and validates the fence secret file in
+// directory, decrypting the AES-256-GCM envelope when encryptionKey is set.
+func readFenceSecretFileWithKey(directory string, encryptionKey []byte) ([nativeFenceSecretSize]byte, bool, error) {
 	var secret [nativeFenceSecretSize]byte
 	data, err := os.ReadFile(filepath.Join(directory, nativeFenceSecretFile))
 	if err != nil {
 		return secret, false, err
 	}
-	if len(data) != nativeFenceSecretSize {
-		return secret, true, nil
-	}
-	copy(secret[:], data)
-	if secret == ([nativeFenceSecretSize]byte{}) {
-		return secret, true, nil
-	}
-	return secret, false, nil
+	return decodeFenceSecret(data, encryptionKey)
 }
 
 // readFenceSecret returns the persisted closed-read fence secret. A directory
 // without one is a database this composition has never bootstrapped, so a fresh
 // secret is generated and persisted after the backend has published its state.
-func readFenceSecret(directory string) ([nativeFenceSecretSize]byte, bool, error) {
-	secret, corrupt, err := readFenceSecretFile(directory)
+func readFenceSecret(directory string, encryptionKey []byte) ([nativeFenceSecretSize]byte, bool, error) {
+	secret, corrupt, err := readFenceSecretFileWithKey(directory, encryptionKey)
 	if errors.Is(err, os.ErrNotExist) {
+		if len(encryptionKey) > 0 && len(encryptionKey) != 32 {
+			return secret, false, errors.Join(ErrInvalidEncryptionKey, neosepia.ErrInvalidEncryptionKey)
+		}
 		if _, err := rand.Read(secret[:]); err != nil {
 			return secret, false, err
 		}
@@ -579,7 +663,11 @@ func readFenceSecret(directory string) ([nativeFenceSecretSize]byte, bool, error
 // staging file, fsync, close, rename into place, and sync the parent directory,
 // so a crash cannot leave a truncated fence.secret or lose it while
 // database.state survives.
-func writeFenceSecret(directory string, secret [nativeFenceSecretSize]byte) error {
+func writeFenceSecret(directory string, secret [nativeFenceSecretSize]byte, encryptionKey []byte) error {
+	encoded, err := encodeFenceSecret(secret, encryptionKey)
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(directory, nativeFenceSecretFile)
 	if _, err := os.Stat(path); err == nil {
 		return os.ErrExist
@@ -591,7 +679,7 @@ func writeFenceSecret(directory string, secret [nativeFenceSecretSize]byte) erro
 	if err != nil {
 		return err
 	}
-	if _, err := file.Write(secret[:]); err != nil {
+	if _, err := file.Write(encoded); err != nil {
 		return errors.Join(err, file.Close(), os.Remove(pendingPath))
 	}
 	if err := file.Sync(); err != nil {

@@ -7,9 +7,10 @@ package model
 // executable FunctionID; the corresponding descriptor, when user-defined, is
 // also present in DescriptorSpec.Dependencies so DROP closure reaches it.
 type CastMetadata struct {
-	Owner  OID
-	Source TypeLayout
-	Target TypeLayout
+	Owner     OID
+	OwnerName string `json:",omitempty"`
+	Source    TypeLayout
+	Target    TypeLayout
 	// Function is the conversion routine for Method 'f'; zero for 'b' and 'i'.
 	Function FunctionID
 	// Context is PostgreSQL castcontext: 'i' implicit, 'a' assignment, 'e' explicit.
@@ -24,7 +25,8 @@ type CastMetadata struct {
 // ID, or the logical OID of a user-defined operator, which also appears in
 // DescriptorSpec.Dependencies.
 type OperatorMetadata struct {
-	Owner OID
+	Owner     OID
+	OwnerName string `json:",omitempty"`
 	// Name duplicates DescriptorSpec.Name.Name for catalog introspection.
 	Name        string
 	Left, Right TypeLayout
@@ -71,6 +73,7 @@ const (
 // edge.
 type AggregateMetadata struct {
 	Owner           OID
+	OwnerName       string `json:",omitempty"`
 	Kind            AggregateKind
 	Arguments       []TypeLayout
 	// ArgumentNames parallels Arguments by ordinal and is empty when no

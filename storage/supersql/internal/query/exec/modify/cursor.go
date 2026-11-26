@@ -73,6 +73,7 @@ type cursor struct {
 	conflictInput            *columnar.Builder
 	rlsInsertCheck           *expr.State
 	rlsUpdateCheck           *expr.State
+	rlsConflictCheck         *expr.State
 	rlsCheckInput            *columnar.Builder
 	assignmentInput          *columnar.Builder
 	returnInput              *columnar.Builder
@@ -553,7 +554,7 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		}
 	}
 	if operation == storage.MutationUpdate && c.rlsUpdateCheck != nil {
-		if err := c.checkRLS(ctx, c.rlsUpdateCheck, source, current.Values); err != nil {
+		if err := c.checkRLS(ctx, c.rlsUpdateCheck, source, current.Values, false); err != nil {
 			return err
 		}
 	}
@@ -575,7 +576,7 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 	return c.finishPartitionMutation(ctx, frozen, operation, source, old, oldKey, &current)
 }
 
-func (c *cursor) checkRLS(ctx context.Context, state *expr.State, route *partitionChild, row []model.Value) error {
+func (c *cursor) checkRLS(ctx context.Context, state *expr.State, route *partitionChild, row []model.Value, usingExpr bool) error {
 	if state == nil {
 		return nil
 	}
@@ -610,9 +611,13 @@ func (c *cursor) checkRLS(ctx context.Context, state *expr.State, route *partiti
 	}
 	if value.IsNull || value.Type != model.TypeBoolean || value.IntVal == 0 {
 		tableName := c.descriptor.Name().Name
+		msg := fmt.Sprintf("new row violates row-level security policy for table %q", tableName)
+		if usingExpr {
+			msg = fmt.Sprintf("new row violates row-level security policy (USING expression) for table %q", tableName)
+		}
 		return &model.Error{
 			Code:    "42501",
-			Message: fmt.Sprintf("new row violates row-level security policy for table %q", tableName),
+			Message: msg,
 			Table:   tableName,
 		}
 	}
@@ -1231,6 +1236,9 @@ func (c *cursor) Close() error {
 	if c.rlsUpdateCheck != nil {
 		c.closeErr = errors.Join(c.closeErr, c.rlsUpdateCheck.Close())
 	}
+	if c.rlsConflictCheck != nil {
+		c.closeErr = errors.Join(c.closeErr, c.rlsConflictCheck.Close())
+	}
 	for _, builder := range []*columnar.Builder{c.assignmentInput, c.conflictInput, c.rlsCheckInput, c.returnInput, c.output} {
 		if builder != nil {
 			c.closeErr = errors.Join(c.closeErr, builder.Close())
@@ -1249,7 +1257,7 @@ func (c *cursor) Close() error {
 	c.visibleColumns, c.visibleLayouts, c.oldImage, c.newImage = nil, nil, nil, nil
 	c.keyColumns, c.assignmentColumns = nil, nil
 	c.assignmentInput, c.rlsCheckInput, c.returnInput, c.output = nil, nil, nil, nil
-	c.assignment, c.returning, c.rlsInsertCheck, c.rlsUpdateCheck, c.claim, c.descriptor = nil, nil, nil, nil, nil, nil
+	c.assignment, c.returning, c.rlsInsertCheck, c.rlsUpdateCheck, c.rlsConflictCheck, c.claim, c.descriptor = nil, nil, nil, nil, nil, nil, nil
 	c.options = Options{}
 	return c.closeErr
 }

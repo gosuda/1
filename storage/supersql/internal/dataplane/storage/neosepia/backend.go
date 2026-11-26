@@ -47,6 +47,7 @@ type Backend struct {
 	commitFault        commitFault
 	stateFault         stateFault
 	memtable           memtable
+	flushErr           error
 	groupMu            sync.Mutex
 	groupQueue         []*groupCommitReq
 	groupActive        bool
@@ -221,6 +222,9 @@ func openBackend(ctx context.Context, config Config, maxCommitTS model.Timestamp
 	if err := directory.root.Remove(databaseStatePending); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	if err := directory.root.Remove(encryptionMetaPending); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	if err := syncCommitDirectory(directory.root); err != nil {
 		return nil, err
 	}
@@ -299,9 +303,16 @@ func (backend *Backend) validateFenceLocked(ctx context.Context, fence storage.R
 // into coalesced NSSST004 PAX SST runs. Caller holds backend.commitMu and backend.mu.
 func (backend *Backend) flushMemtableLocked(ctx context.Context, maxPos uint64) error {
 	if backend.memtable.empty() {
+		backend.flushErr = nil
 		return nil
 	}
-	return backend.memtable.flushToRuns(ctx, backend.directory.runs, backend.runs, backend.limits, backend.cipher, maxPos)
+	err := backend.memtable.flushToRuns(ctx, backend.directory.runs, backend.runs, backend.limits, backend.cipher, maxPos)
+	if err != nil {
+		backend.flushErr = err
+		return err
+	}
+	backend.flushErr = nil
+	return nil
 }
 
 func (backend *Backend) closedTimestamp() model.Timestamp {
@@ -373,6 +384,7 @@ func (backend *Backend) Close() error {
 		runErr = backend.runs.Close()
 	}
 	backend.memtable.reset()
+	backend.flushErr = nil
 	backend.pending = nil
 	backend.transactions = ordered.Tree[recoveryTxnID, transactionRecord]{}
 	backend.prunedPosition = 0

@@ -491,7 +491,7 @@ func normalizeJoinPredicates(ctx context.Context, graph *ir.Graph, options Optio
 		} else if err := remapField(&spec.Predicate); err != nil {
 			return 0, err
 		}
-		for _, field := range [...]*ir.ScalarID{&spec.Offset, &spec.Count, &spec.ConflictPredicate, &spec.RLSInsertCheck, &spec.RLSUpdateCheck, &spec.Frame.Start.Offset, &spec.Frame.End.Offset, &spec.Recursion.CycleValue, &spec.Recursion.CycleDefault, &spec.Recursion.CycleContinue} {
+		for _, field := range [...]*ir.ScalarID{&spec.Offset, &spec.Count, &spec.ConflictPredicate, &spec.RLSInsertCheck, &spec.RLSUpdateCheck, &spec.RLSConflictCheck, &spec.Frame.Start.Offset, &spec.Frame.End.Offset, &spec.Recursion.CycleValue, &spec.Recursion.CycleDefault, &spec.Recursion.CycleContinue} {
 			if err := remapField(field); err != nil {
 				return 0, err
 			}
@@ -665,4 +665,5 @@ func (o *optimizer) relationScalars(n *ir.Rel, id ir.RelID, add func(ir.ScalarID
 	add(n.ConflictPredicate)
 	add(n.RLSInsertCheck)
 	add(n.RLSUpdateCheck)
+	add(n.RLSConflictCheck)
 }

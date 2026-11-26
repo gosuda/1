@@ -8,7 +8,7 @@
 | Code | Class | Class name | Occurrences | Sample location | Origin |
 | --- | --- | --- | --- | --- | --- |
 | 00000 | 00 | successful completion | 1 | internal/query/session/statistics_command.go:603 | model.Error Code field |
-| 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:777 | model.Error Code field |
+| 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:839 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
 | 0A000 | 0A | feature not supported | 181 | connector.go:1576 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:108 | bindError call |
@@ -36,7 +36,7 @@
 | 2201F | 22 | data exception | 7 | internal/query/builtin/float_math.go:32 | sqlError call |
 | 2201G | 22 | data exception | 8 | internal/query/builtin/width_bucket_range.go:100 | sqlError call |
 | 22021 | 22 | data exception | 28 | internal/query/builtin/array_output.go:126 | sqlError call |
-| 22023 | 22 | data exception | 517 | catalog.go:121 | bindError call, model.Error Code field, sqlError call |
+| 22023 | 22 | data exception | 517 | catalog.go:124 | bindError call, model.Error Code field, sqlError call |
 | 22025 | 22 | data exception | 5 | internal/query/builtin/like.go:135 | sqlError call |
 | 22026 | 22 | data exception | 3 | internal/query/builtin/bit_string.go:185 | sqlError call |
 | 2202E | 22 | data exception | 65 | internal/query/builtin/aggregate_collection_scalar.go:72 | model.Error Code field, sqlError call |
@@ -52,13 +52,13 @@
 | 2203A | 22 | data exception | 1 | internal/query/builtin/jsonpath_execute.go:287 | sqlError call |
 | 2203C | 22 | data exception | 3 | internal/query/builtin/jsonpath_execute.go:279 | sqlError call |
 | 2203F | 22 | data exception | 1 | internal/query/builtin/jsonpath_execute.go:729 | sqlError call |
-| 22P02 | 22 | data exception | 34 | internal/query/bind/type_declaration.go:1044 | bindError call, model.Error Code field, sqlError call |
+| 22P02 | 22 | data exception | 34 | internal/query/bind/type_declaration.go:1064 | bindError call, model.Error Code field, sqlError call |
 | 22P03 | 22 | data exception | 55 | internal/query/builtin/bit_string_value.go:24 | sqlError call |
 | 22P04 | 22 | data exception | 12 | internal/query/copy/source.go:189 | sqlError call |
 | 22P05 | 22 | data exception | 3 | internal/query/builtin/json_string.go:124 | sqlError call |
 | 23502 | 23 | integrity constraint violation | 13 | internal/controlplane/schema/index_encoding.go:269 | bindError call, model.Error Code field, sqlError call |
 | 23503 | 23 | integrity constraint violation | 4 | internal/controlplane/schema/relational_policy.go:384 | model.Error Code field |
-| 23505 | 23 | integrity constraint violation | 5 | internal/controlplane/schema/index_set.go:16 | model.Error Code field |
+| 23505 | 23 | integrity constraint violation | 6 | internal/controlplane/schema/index_set.go:16 | model.Error Code field |
 | 23514 | 23 | integrity constraint violation | 9 | internal/dataplane/txn/row_normalizer.go:586 | model.Error Code field |
 | 25001 | 25 | invalid transaction state | 7 | connector.go:321 | model.Error Code field |
 | 25006 | 25 | invalid transaction state | 2 | internal/dataplane/txn/manager_commit.go:13 | model.Error Code field |
@@ -73,8 +73,8 @@
 | 3F000 | 3F | invalid schema name | 24 | internal/query/bind/collation_ddl.go:39 | bindError call, sqlError call |
 | 40001 | 40 | transaction rollback | 6 | internal/controlplane/catalog/store.go:27 | model.Error Code field |
 | 40P01 | 40 | transaction rollback | 1 | internal/locks/wait_graph.go:13 | model.Error Code field |
-| 42501 | 42 | syntax error or access rule violation | 20 | internal/query/bind/declaration.go:136 | bindError call, model.Error Code field |
-| 42601 | 42 | syntax error or access rule violation | 623 | connector.go:270 | bindError call, model.Error Code field, sqlError call |
+| 42501 | 42 | syntax error or access rule violation | 21 | internal/query/bind/declaration.go:136 | bindError call, model.Error Code field |
+| 42601 | 42 | syntax error or access rule violation | 624 | connector.go:270 | bindError call, model.Error Code field, sqlError call |
 | 42602 | 42 | syntax error or access rule violation | 5 | internal/query/bind/regclass.go:23 | bindError call, model.Error Code field |
 | 42622 | 42 | syntax error or access rule violation | 4 | internal/query/bind/declaration.go:103 | bindError call |
 | 42701 | 42 | syntax error or access rule violation | 36 | internal/query/bind/copy.go:250 | bindError call, model.Error Code field |
@@ -83,7 +83,7 @@
 | 42704 | 42 | syntax error or access rule violation | 132 | internal/controlplane/catalog/store.go:26 | bindError call, model.Error Code field, sqlError call |
 | 42710 | 42 | syntax error or access rule violation | 64 | internal/controlplane/catalog/store.go:25 | bindError call, model.Error Code field, sqlError call |
 | 42712 | 42 | syntax error or access rule violation | 11 | internal/query/bind/conflict.go:41 | bindError call |
-| 42723 | 42 | syntax error or access rule violation | 5 | internal/query/bind/definition_declaration.go:1264 | bindError call |
+| 42723 | 42 | syntax error or access rule violation | 5 | internal/query/bind/definition_declaration.go:1337 | bindError call |
 | 42725 | 42 | syntax error or access rule violation | 13 | internal/query/bind/aggregate_invocation.go:54 | bindError call, model.Error Code field, sqlError call |
 | 42803 | 42 | syntax error or access rule violation | 8 | internal/query/bind/aggregate_invocation.go:77 | bindError call |
 | 42804 | 42 | syntax error or access rule violation | 411 | internal/controlplane/schema/index_encoding.go:306 | bindError call, model.Error Code field, sqlError call |
@@ -103,9 +103,9 @@
 | 42P09 | 42 | syntax error or access rule violation | 3 | internal/query/bind/relation_qualifier.go:23 | bindError call |
 | 42P10 | 42 | syntax error or access rule violation | 17 | internal/query/bind/aggregate_order.go:89 | bindError call |
 | 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:151 | model.Error Code field |
-| 42P13 | 42 | syntax error or access rule violation | 45 | internal/query/bind/definition_declaration.go:1316 | bindError call, model.Error Code field, sqlError call |
+| 42P13 | 42 | syntax error or access rule violation | 45 | internal/query/bind/definition_declaration.go:1389 | bindError call, model.Error Code field, sqlError call |
 | 42P16 | 42 | syntax error or access rule violation | 29 | internal/query/bind/constraint_rename.go:121 | bindError call, model.Error Code field |
-| 42P17 | 42 | syntax error or access rule violation | 41 | internal/query/bind/definition_declaration.go:680 | bindError call, model.Error Code field |
+| 42P17 | 42 | syntax error or access rule violation | 41 | internal/query/bind/definition_declaration.go:700 | bindError call, model.Error Code field |
 | 42P18 | 42 | syntax error or access rule violation | 4 | internal/query/bind/array.go:50 | bindError call, sqlError call |
 | 42P19 | 42 | syntax error or access rule violation | 3 | internal/query/bind/select_recursive.go:21 | bindError call |
 | 42P20 | 42 | syntax error or access rule violation | 8 | internal/query/bind/function.go:237 | bindError call |
@@ -122,7 +122,7 @@
 | 55P03 | 55 | object not in prerequisite state | 4 | internal/dataplane/txn/locks.go:27 | model.Error Code field |
 | 55P04 | 55 | object not in prerequisite state | 1 | internal/query/builtin/declared_type.go:742 | model.Error Code field |
 | 57014 | 57 | operator intervention | 6 | internal/controlplane/schema/index_runner.go:40 | model.Error Code field |
-| F0000 | F0 | configuration file error | 32 | internal/query/bind/text_search_declaration.go:603 | bindError call, sqlError call |
+| F0000 | F0 | configuration file error | 32 | internal/query/bind/text_search_declaration.go:615 | bindError call, sqlError call |
 | P0004 | P0 | PL/pgSQL error | 1 | internal/query/procedural/execute.go:536 | sqlError call |
 | XX000 | XX | internal error | 273 | internal/query/bind/bind.go:260 | bindError call, model.Error Code field, sqlError call |
 | XX001 | XX | internal error | 20 | internal/controlplane/schema/catalog_manifest.go:21 | bindError call, model.Error Code field |
@@ -143,7 +143,7 @@ None.
 | internal/dataplane/runtime/budget.go:23 | model.Error Code field | `code` |
 | internal/query/bind/bind.go:355 | model.Error Code field | `code` |
 | internal/query/bind/catalog_view.go:68 | model.Error Code field | `code` |
-| internal/query/bind/object_declaration.go:968 | bindError call | `code` |
+| internal/query/bind/object_declaration.go:971 | bindError call | `code` |
 | internal/query/bind/relation.go:27 | bindError call | `code` |
 | internal/query/bind/relation.go:64 | bindError call | `code` |
 | internal/query/builtin/registry.go:369 | model.Error Code field | `code` |
@@ -159,8 +159,8 @@ None.
 | internal/query/session/transaction_sql.go:41 | model.Error Code field | `code` |
 | internal/zpgparse/internal/neoparse/scan.rl:673 | model.Error Code field | `code` |
 | internal/query/bind/catalog_view.go:75 | model.Error Code field | `diagnostic.Code` |
-| internal/query/bind/definition_declaration.go:1870 | model.Error Code field | `diagnostic.Code` |
-| internal/query/bind/object_declaration.go:845 | model.Error Code field | `diagnostic.Code` |
+| internal/query/bind/definition_declaration.go:1943 | model.Error Code field | `diagnostic.Code` |
+| internal/query/bind/object_declaration.go:848 | model.Error Code field | `diagnostic.Code` |
 | internal/query/bind/routine_lifecycle.go:180 | model.Error Code field | `diagnostic.Code` |
 | internal/query/bind/text_search_lifecycle.go:90 | model.Error Code field | `diagnostic.Code` |
 | internal/controlplane/schema/relational_policy.go:809 | model.Error Code field | `e.code` |

@@ -35,6 +35,7 @@ type rowCandidateState struct {
 	originalKey     []byte
 	operation       storage.MutationOp
 	claim           columnar.Allocation
+	freshIdentity   bool
 	applied, closed bool
 }
 
@@ -190,8 +191,10 @@ func (transaction *Transaction) prepareRow(ctx context.Context, preparation Inse
 		return nil, errTransactionBudget
 	}
 	var originalKey []byte
+	freshIdentity := false
 	if previous == nil {
-		for _, rule := range normalizer.columns {
+		identityIndex := -1
+		for i, rule := range normalizer.columns {
 			if !rule.SystemIdentity {
 				continue
 			}
@@ -202,9 +205,24 @@ func (transaction *Transaction) prepareRow(ctx context.Context, preparation Inse
 			copy(normalizer.identity[:16], transaction.id[:])
 			binary.BigEndian.PutUint64(normalizer.identity[16:], transaction.rowIdentitySerial)
 			normalizer.hasIdentity = true
+			explicit := false
+			for _, colID := range input.ColumnIDs {
+				if colID == rule.Layout.ID {
+					explicit = true
+					break
+				}
+			}
+			if !explicit {
+				identityIndex = i
+			}
 			break
 		}
 		mutation, err = normalizer.completeOwned(operation, mutation, nil, overlayMemory{limit: normalizer.maxBytes, used: used})
+		if err == nil && identityIndex >= 0 && identityIndex < len(mutation.Values) &&
+			!mutation.Values[identityIndex].IsNull &&
+			bytes.Equal(mutation.Values[identityIndex].BytesVal, normalizer.identity[:]) {
+			freshIdentity = true
+		}
 	} else {
 		old, copyErr := copyTransactionMutation(operation, storage.Mutation{Values: previous.Values}, normalizer.maxBytes-used)
 		if copyErr != nil {
@@ -241,7 +259,7 @@ func (transaction *Transaction) prepareRow(ctx context.Context, preparation Inse
 			return nil, err
 		}
 	}
-	state = &rowCandidateState{transaction: transaction, mutation: mutation, originalKey: originalKey, operation: input.Op, claim: claim}
+	state = &rowCandidateState{transaction: transaction, mutation: mutation, originalKey: originalKey, operation: input.Op, claim: claim, freshIdentity: freshIdentity}
 	claim = nil
 	return state, nil
 }
@@ -311,9 +329,12 @@ func (transaction *Transaction) applyPreparedRow(ctx context.Context, state *row
 			return transactionError(err)
 		}
 	}
-	previous, err := transaction.previous(operation, target, originalKey)
-	if err != nil {
-		return err
+	var previous *model.Row
+	if !state.freshIdentity {
+		previous, err = transaction.previous(operation, target, originalKey)
+		if err != nil {
+			return err
+		}
 	}
 	if state.operation == storage.MutationInsert {
 		if previous != nil {

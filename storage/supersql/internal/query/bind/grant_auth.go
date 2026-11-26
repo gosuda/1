@@ -154,6 +154,20 @@ func (b *binder) checkObjectPrivilege(descriptor *model.Descriptor, required mod
 	return permissionDeniedError(descriptor, pos)
 }
 
+func (b *binder) checkObjectPrivilegeAny(descriptor *model.Descriptor, anyOf model.PrivilegeMask, pos int) error {
+	if descriptor == nil || anyOf == 0 || normalizeRoleName(b.options.CurrentRole) == "" {
+		return nil
+	}
+	roles, err := b.cachedRoles()
+	if err != nil {
+		return err
+	}
+	if hasObjectPrivilege(roles, b.options.CurrentRole, descriptor, anyOf, true) {
+		return nil
+	}
+	return permissionDeniedError(descriptor, pos)
+}
+
 func (b *binder) checkSchemaUsage(schema *model.Descriptor, pos int) error {
 	if schema == nil || normalizeRoleName(b.options.CurrentRole) == "" {
 		return nil

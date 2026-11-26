@@ -21,6 +21,12 @@ import (
 const (
 	defaultMaxConnections     = 128
 	defaultApplicationVersion = "18.4 (SuperSQL)"
+	defaultReadTimeout        = 30 * time.Second
+	defaultIdleTimeout        = 5 * time.Minute
+	defaultMaxPreparedStmts   = 1024
+	defaultMaxPortals         = 256
+	defaultNotifyWriteTimeout = 2 * time.Second
+	defaultNotifyQueueSize    = 64
 )
 
 // Notification represents an asynchronous PostgreSQL LISTEN/NOTIFY payload
@@ -41,29 +47,55 @@ type Config struct {
 	// If passed to NewServer directly, that argument takes precedence.
 	Connector *supersql.Connector
 
-	// Password enables cleartext password authentication when non-empty and
-	// AuthFunc is nil. When both Password and AuthFunc are empty/nil, trust
-	// authentication (AuthenticationOk) is used.
+	// Password enables SCRAM-SHA-256 authentication when non-empty and both
+	// PasswordLookup and AuthFunc are nil. It may be either a plaintext
+	// password or a PostgreSQL SCRAM-SHA-256 verifier string. When Password,
+	// PasswordLookup, and AuthFunc are all empty/nil, trust authentication
+	// (AuthenticationOk) is used.
 	Password string
 
-	// AuthFunc optionally overrides password verification with custom logic.
-	// Returning a non-nil error rejects the client with SQLSTATE 28P01 (or the
-	// error's SQLSTATE if it carries one).
+	// PasswordLookup looks up the expected credential for (user, database)
+	// during SCRAM-SHA-256 authentication. It may return either a plaintext
+	// password or a PostgreSQL SCRAM-SHA-256 verifier string in the format
+	// "SCRAM-SHA-256$<iterations>:<b64salt>$<b64storedKey>:<b64serverKey>".
+	// When non-nil, PasswordLookup takes precedence over AuthFunc and Password.
+	PasswordLookup func(ctx context.Context, user, database string) (string, error)
+
+	// AuthFunc optionally overrides password verification with custom cleartext
+	// password logic when PasswordLookup is nil. Returning a non-nil error
+	// rejects the client with SQLSTATE 28P01 (or the error's SQLSTATE if it
+	// carries one).
 	AuthFunc func(ctx context.Context, user, database, password string) error
 
-	// TLSConfig enables SSLRequest ('S') upgrades via tls.Server when non-nil.
-	// When nil, SSLRequest is declined with 'N'.
+	// TLSConfig enables SSLRequest ('S') upgrades via tls.Server and requires
+	// TLS for StartupMessage connections when non-nil. When nil (and RequireTLS
+	// is false), SSLRequest is declined with 'N'.
 	TLSConfig *tls.Config
 
-	// MaxConnections caps concurrent active client sessions. Defaults to 128.
+	// RequireTLS rejects clients that do not upgrade to TLS via SSLRequest.
+	// NewServer returns an error if RequireTLS is true and TLSConfig is nil.
+	RequireTLS bool
+
+	// MaxConnections caps concurrent active authenticated client sessions.
+	// Defaults to 128.
 	MaxConnections int
 
-	// ReadTimeout bounds individual wire frame reads and startup negotiation.
-	// Zero disables read timeouts.
+	// MaxPreparedStatements caps the number of prepared statements cached per
+	// connection. Defaults to 1024 when zero or negative.
+	MaxPreparedStatements int
+
+	// MaxPortals caps the number of open portals per connection. Defaults to
+	// 256 when zero or negative.
+	MaxPortals int
+
+	// ReadTimeout bounds individual wire frame reads, startup negotiation, and
+	// TLS handshakes. Defaults to 30s when zero; set a negative duration to
+	// disable read timeouts.
 	ReadTimeout time.Duration
 
 	// IdleTimeout bounds how long an idle connection may wait for the next
-	// frontend message before being closed. Zero disables idle timeouts.
+	// frontend message before being closed. Defaults to 5m when zero; set a
+	// negative duration to disable idle timeouts.
 	IdleTimeout time.Duration
 
 	// ApplicationVersion is reported in the server_version ParameterStatus.
@@ -83,11 +115,15 @@ type Config struct {
 // Server accepts PostgreSQL v3.0 wire protocol connections and routes each
 // client to its own isolated SuperSQL session.
 type Server struct {
-	connector  *supersql.Connector
-	cfg        Config
-	maxConns   int
-	maxPreAuth int
-	appVersion string
+	connector        *supersql.Connector
+	cfg              Config
+	maxConns         int
+	maxPreAuth       int
+	maxPreparedStmts int
+	maxPortals       int
+	readTimeout      time.Duration
+	idleTimeout      time.Duration
+	appVersion       string
 
 	nextPID      atomic.Int32
 	activeConns  atomic.Int32
@@ -112,9 +148,32 @@ func NewServer(connector *supersql.Connector, cfg Config) (*Server, error) {
 	if connector == nil {
 		return nil, errors.New("pgwire: connector is required")
 	}
+	if cfg.RequireTLS && cfg.TLSConfig == nil {
+		return nil, errors.New("pgwire: RequireTLS requires non-nil TLSConfig")
+	}
 	maxConns := cfg.MaxConnections
 	if maxConns <= 0 {
 		maxConns = defaultMaxConnections
+	}
+	maxPreparedStmts := cfg.MaxPreparedStatements
+	if maxPreparedStmts <= 0 {
+		maxPreparedStmts = defaultMaxPreparedStmts
+	}
+	maxPortals := cfg.MaxPortals
+	if maxPortals <= 0 {
+		maxPortals = defaultMaxPortals
+	}
+	readTimeout := cfg.ReadTimeout
+	if readTimeout == 0 {
+		readTimeout = defaultReadTimeout
+	} else if readTimeout < 0 {
+		readTimeout = 0
+	}
+	idleTimeout := cfg.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = defaultIdleTimeout
+	} else if idleTimeout < 0 {
+		idleTimeout = 0
 	}
 	appVersion := cfg.ApplicationVersion
 	if appVersion == "" {
@@ -122,13 +181,17 @@ func NewServer(connector *supersql.Connector, cfg Config) (*Server, error) {
 	}
 	maxPreAuth := max(maxConns*2, 64)
 	s := &Server{
-		connector:    connector,
-		cfg:          cfg,
-		maxConns:     maxConns,
-		maxPreAuth:   maxPreAuth,
-		appVersion:   appVersion,
-		conns:        make(map[int32]*clientConn),
-		preAuthConns: make(map[*clientConn]struct{}),
+		connector:        connector,
+		cfg:              cfg,
+		maxConns:         maxConns,
+		maxPreAuth:       maxPreAuth,
+		maxPreparedStmts: maxPreparedStmts,
+		maxPortals:       maxPortals,
+		readTimeout:      readTimeout,
+		idleTimeout:      idleTimeout,
+		appVersion:       appVersion,
+		conns:            make(map[int32]*clientConn),
+		preAuthConns:     make(map[*clientConn]struct{}),
 	}
 	s.nextPID.Store(1000)
 	return s, nil
@@ -256,8 +319,8 @@ func (s *Server) Notify(pid int32, channel, payload string) error {
 	})
 }
 
-// BroadcastNotify delivers an asynchronous NotificationResponse ('A') frame to
-// every currently connected client.
+// BroadcastNotify enqueues an asynchronous NotificationResponse ('A') frame to
+// every currently connected client without blocking on slow or stalled peers.
 func (s *Server) BroadcastNotify(senderPID int32, channel, payload string) {
 	s.mu.Lock()
 	targets := make([]*clientConn, 0, len(s.conns))
@@ -267,7 +330,13 @@ func (s *Server) BroadcastNotify(senderPID int32, channel, payload string) {
 	s.mu.Unlock()
 	n := Notification{PID: senderPID, Channel: channel, Payload: payload}
 	for _, cc := range targets {
-		_ = cc.sendNotification(n)
+		if cc.broadcastCh == nil {
+			continue
+		}
+		select {
+		case cc.broadcastCh <- n:
+		default:
+		}
 	}
 }
 
@@ -325,6 +394,7 @@ func (s *Server) newClientConn(rawConn net.Conn) *clientConn {
 		txStatus:    txStatusIdle,
 		stmts:       make(map[string]*preparedStmt),
 		portals:     make(map[string]*portal),
+		broadcastCh: make(chan Notification, defaultNotifyQueueSize),
 	}
 }
 

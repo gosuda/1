@@ -146,6 +146,11 @@ func (b *binder) descriptorRelation(descriptor, namespace *model.Descriptor, nod
 		return relation{}, err
 	}
 	if spec.View != nil && descriptor.Kind() == model.ObjectView {
+		if len(pushed) > 0 {
+			if err := b.checkObjectPrivilege(descriptor, model.PrivilegeUpdate, position); err != nil {
+				return relation{}, err
+			}
+		}
 		bound, err := b.view(descriptor, spec.View, node.Alias, scope, position, pushed)
 		if err != nil {
 			return relation{}, err

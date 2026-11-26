@@ -67,6 +67,9 @@ func commentOnType(ctx context.Context, b *binder, statement *zpgparse.CommentSt
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -99,6 +102,9 @@ func commentOnRoutine(ctx context.Context, b *binder, statement *zpgparse.Commen
 	}
 	base, err := resolveRoutineReference(ctx, b, snapshot, object, statement.Objtype)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
@@ -205,6 +211,9 @@ func commentOnDomainConstraint(ctx context.Context, b *binder, statement *zpgpar
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
 		return nil, err
@@ -243,6 +252,9 @@ func commentOnStatistics(ctx context.Context, b *binder, statement *zpgparse.Com
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireStatisticsOwner(found, 0); err != nil {
+		return nil, err
+	}
 	next, err := mutateStatisticsDescriptor(ctx, found, options, func(statistic *model.ExtendedStatisticDescriptor, _ *model.DescriptorSpec) {
 		statistic.Description = statement.Comment
 	})
@@ -268,6 +280,9 @@ func commentOnTextSearch(ctx context.Context, b *binder, statement *zpgparse.Com
 	}
 	base, _, err := b.resolve(parts, kinds, "42704", 0)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)

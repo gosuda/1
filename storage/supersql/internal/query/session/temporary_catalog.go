@@ -101,12 +101,25 @@ func (named *sessionNamedObjects) dropTemporary(descriptor *model.Descriptor) er
 	if descriptor == nil || named.temporary[descriptor.ID()] == nil {
 		return model.ErrInvalidDescriptor
 	}
-	before := named.temporary[descriptor.ID()]
-	named.temporaryChanges = append(named.temporaryChanges, temporaryCatalogChange{before: before})
-	delete(named.temporary, descriptor.ID())
+	id := descriptor.ID()
+	before := named.temporary[id]
+	beforeTarget, beforeHasTgt := named.temporaryTargets[id]
+	beforeRow, beforeHasRow := named.temporaryRows[id]
+	named.temporaryChanges = append(named.temporaryChanges, temporaryCatalogChange{
+		before:       before,
+		hasTarget:    true,
+		targetID:     id,
+		beforeTarget: beforeTarget,
+		beforeHasTgt: beforeHasTgt,
+		hasRow:       true,
+		rowID:        id,
+		beforeRow:    beforeRow,
+		beforeHasRow: beforeHasRow,
+	})
+	delete(named.temporary, id)
 	delete(named.temporaryNames, before.Name())
-	delete(named.temporaryTargets, descriptor.ID())
-	delete(named.temporaryRows, descriptor.ID())
+	delete(named.temporaryTargets, id)
+	delete(named.temporaryRows, id)
 	named.temporaryVersion++
 	return nil
 }
@@ -124,9 +137,24 @@ func (named *sessionNamedObjects) setTemporaryTargets(admitted *DeclarationResul
 		if target.Descriptor == nil {
 			continue
 		}
-		named.temporaryTargets[target.Descriptor.ID()] = target
+		id := target.Descriptor.ID()
+		beforeTarget, beforeHasTgt := named.temporaryTargets[id]
+		named.temporaryChanges = append(named.temporaryChanges, temporaryCatalogChange{
+			hasTarget:    true,
+			targetID:     id,
+			beforeTarget: beforeTarget,
+			beforeHasTgt: beforeHasTgt,
+		})
+		named.temporaryTargets[id] = target
 	}
 	for id, normalizer := range admitted.rows {
+		beforeRow, beforeHasRow := named.temporaryRows[id]
+		named.temporaryChanges = append(named.temporaryChanges, temporaryCatalogChange{
+			hasRow:       true,
+			rowID:        id,
+			beforeRow:    beforeRow,
+			beforeHasRow: beforeHasRow,
+		})
 		named.temporaryRows[id] = normalizer
 	}
 }
@@ -174,6 +202,7 @@ func (named *sessionNamedObjects) rollbackTemporary(mark int) {
 	if len(named.temporaryChanges) == mark {
 		return
 	}
+	named.ensureTemporaryMaps()
 	named.temporaryVersion++
 	for i := len(named.temporaryChanges) - 1; i >= mark; i-- {
 		change := named.temporaryChanges[i]
@@ -184,6 +213,20 @@ func (named *sessionNamedObjects) rollbackTemporary(mark int) {
 		if change.before != nil {
 			named.temporary[change.before.ID()] = change.before
 			named.temporaryNames[change.before.Name()] = change.before.ID()
+		}
+		if change.hasTarget {
+			if change.beforeHasTgt {
+				named.temporaryTargets[change.targetID] = change.beforeTarget
+			} else {
+				delete(named.temporaryTargets, change.targetID)
+			}
+		}
+		if change.hasRow {
+			if change.beforeHasRow {
+				named.temporaryRows[change.rowID] = change.beforeRow
+			} else {
+				delete(named.temporaryRows, change.rowID)
+			}
 		}
 	}
 	clear(named.temporaryChanges[mark:])
@@ -389,6 +432,9 @@ func (transactions *Transactions) applyTemporaryCommitActions(ctx context.Contex
 	if options == nil || len(transactions.named.temporary) == 0 {
 		return nil
 	}
+	if transactions.implicitReadOnly || transactions.settings.TransactionPolicy().ReadOnly || transactions.historical > 0 {
+		return nil
+	}
 	return transactions.routineAtomicStatement(ctx, func(statement context.Context) (statementErr error) {
 		mark := len(transactions.named.temporaryChanges)
 		defer func() {
@@ -535,8 +581,57 @@ func (transactions *Transactions) admitTemporaryDescriptors(ctx context.Context,
 		columns := options.Columns
 		columns.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		columns.Temporal = transactions.temporal
-		_, err := admitDeclaration(ctx, transactions.transaction, snapshot, descriptors, DeclarationOptions{Catalog: store, Encoder: transactions.options.KeyEncoder, Columns: columns, Indexes: options.Indexes, Limits: options.Limits, PolicyBytes: options.PolicyBytes})
-		return err
+		declarationOptions := DeclarationOptions{Catalog: store, Encoder: transactions.options.KeyEncoder, Columns: columns, Indexes: options.Indexes, Limits: options.Limits, PolicyBytes: options.PolicyBytes}
+		admitted, err := declarationTargets(ctx, transactions.transaction, snapshot, descriptors, declarationOptions, false)
+		if err != nil {
+			return err
+		}
+		columnCompiler, err := NewColumnExpressionCompiler(snapshot, declarationOptions.Columns)
+		if err != nil {
+			return err
+		}
+		if len(admitted.targets) != 0 {
+			admitted.rows = make(map[model.ObjectID]*txn.RowNormalizer)
+		}
+		for _, target := range admitted.targets {
+			table := target.Descriptor
+			if table == nil {
+				continue
+			}
+			retainedBytes, err := admitDeclarationPolicyBytes(ctx, table, declarationOptions)
+			if err != nil {
+				return err
+			}
+			policy, err := schema.NewTablePolicy(ctx, schema.TablePolicyOptions{
+				Descriptor:    table,
+				Encoder:       declarationOptions.Encoder,
+				Expressions:   columnCompiler,
+				MetadataBytes: declarationOptions.Limits.MetadataBytes,
+				RowBytes:      declarationOptions.Limits.EntryBytes,
+				MaxColumns:    declarationOptions.Limits.MaxColumns,
+			})
+			if err != nil {
+				return err
+			}
+			if policy.RetainedBytes() > retainedBytes {
+				return model.ErrValueBudget
+			}
+			admitted.rows[table.ID()] = policy
+			if indexSet, ok := target.Expansion.(*schema.IndexSet); ok && indexSet != nil {
+				for _, layout := range indexSet.Layouts() {
+					indexPolicy, err := indexSet.ResolveMutation(ctx, layout.Target)
+					if err != nil {
+						return err
+					}
+					if indexPolicy.RetainedBytes() > declarationOptions.PolicyBytes {
+						return model.ErrValueBudget
+					}
+					admitted.rows[layout.Target.ObjectID] = indexPolicy
+				}
+			}
+		}
+		transactions.named.setTemporaryTargets(admitted)
+		return nil
 	}()
 	return errors.Join(err, snapshot.Close(), view.Close())
 }

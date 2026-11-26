@@ -4,22 +4,134 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"os"
 	"slices"
+	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/clock"
+	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+const batchEncodeFixedOverhead = uint64(4 + 16 + 8 + 16 + 32 + 32 + 8 + 8)
+
+type valueBudgetChecker struct {
+	used  uint64
+	limit uint64
+}
+
+func (c *valueBudgetChecker) charge(count, size uint64) error {
+	if count > (c.limit-c.used)/size {
+		return model.ErrValueBudget
+	}
+	c.used += count * size
+	return nil
+}
+
+func (c *valueBudgetChecker) check(ctx context.Context, value model.Value, depth int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if depth > 64 {
+		return model.ErrValueDepth
+	}
+	for _, allocation := range [...]struct{ count, size uint64 }{
+		{uint64(len(value.StrVal)), 1},
+		{uint64(len(value.BytesVal)), 1},
+		{uint64(len(value.VectorVal)), 4},
+		{uint64(len(value.Dimensions)), uint64(unsafe.Sizeof(model.ArrayDimension{}))},
+		{uint64(len(value.ArrayVal)), uint64(unsafe.Sizeof(model.Value{}))},
+	} {
+		if err := c.charge(allocation.count, allocation.size); err != nil {
+			return err
+		}
+	}
+	for _, child := range value.ArrayVal {
+		if err := c.check(ctx, child, depth+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkValueCopyBudget(ctx context.Context, value model.Value, maxBytes uint64) error {
+	checker := valueBudgetChecker{limit: maxBytes}
+	return checker.check(ctx, value, 0)
+}
+
+func validateMemtableBatchBudget(ctx context.Context, batch storage.MutationBatch, limits Limits) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if batchEncodeFixedOverhead > limits.WALBytes {
+		return columnar.ErrBatchBudget
+	}
+	for _, layout := range batch.Layouts {
+		for _, col := range layout.Columns {
+			if col.HasMissingValue {
+				if err := checkValueCopyBudget(ctx, col.MissingValue, limits.RowBytes); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	cursor, err := batch.OpenMutations(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, cursor.Close()) }()
+
+	totalBytes := batchEncodeFixedOverhead
+	for {
+		mut, nextErr := cursor.Next(ctx)
+		if nextErr == io.EOF {
+			return nil
+		}
+		if nextErr != nil {
+			return nextErr
+		}
+		mutSize, sizeErr := storage.EncodedMutationSize(mut)
+		if sizeErr != nil {
+			return sizeErr
+		}
+		if mutSize > limits.MutationBytes {
+			return columnar.ErrBatchBudget
+		}
+		if mutSize > math.MaxUint64-8 {
+			return columnar.ErrBatchBudget
+		}
+		framedSize := mutSize + 8
+		if framedSize > limits.WALBytes-totalBytes {
+			return columnar.ErrBatchBudget
+		}
+		totalBytes += framedSize
+		if mut.Op == storage.MutationUpsert {
+			rowChecker := valueBudgetChecker{limit: limits.RowBytes}
+			for _, v := range mut.Values {
+				if err := rowChecker.check(ctx, v, 0); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
 func (backend *Backend) ApplyMutations(ctx context.Context, batch storage.MutationBatch) (storage.ApplyResult, error) {
-	if !memtableEnabled(backend.limits) {
+	backend.mu.Lock()
+	limits := backend.limits
+	backend.mu.Unlock()
+	if !memtableEnabled(limits) {
 		return backend.applyMutationDirect(ctx, batch)
 	}
 	// Pre-validate batch outside locks so concurrent callers hash in parallel.
 	validated, err := validateMutationBatch(ctx, batch)
 	if err != nil {
+		return storage.ApplyResult{}, err
+	}
+	if err := validateMemtableBatchBudget(ctx, batch, limits); err != nil {
 		return storage.ApplyResult{}, err
 	}
 	return backend.applyMutationGrouped(ctx, batch, validated)
@@ -199,9 +311,19 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 		backend.mu.Unlock()
 		return
 	}
+	if backend.flushErr != nil && backend.memtable.totalBytes >= memtableHardMaxBytes(backend.limits) {
+		if err := backend.flushMemtableLocked(context.Background(), 0); err != nil {
+			backend.mu.Unlock()
+			for i := range staged {
+				staged[i].setError(err)
+			}
+			return
+		}
+	}
 	commitsRoot := backend.directory.commits
 	walBytes := backend.limits.WALBytes
 	rowBytes := backend.limits.RowBytes
+	nodeBudget := memtableNodeBudget(backend.limits)
 	dbCipher := backend.cipher
 	archiver := backend.archiver
 	backend.mu.Unlock()
@@ -246,7 +368,7 @@ func (backend *Backend) processCommitGroup(group []*groupCommitReq) {
 	// Stage every durably WAL-committed batch into the in-memory memtable.
 	for i := range staged {
 		item := &staged[i]
-		if err := backend.memtable.stageBatch(context.Background(), item.decision, item.req.batch.Epoch, item.req.batch, rowBytes); err != nil {
+		if err := backend.memtable.stageBatchWithBudget(context.Background(), item.decision, item.req.batch.Epoch, item.req.batch, rowBytes, nodeBudget); err != nil {
 			// WAL segments staged[i:] are already durable on disk; record them
 			// as pending and mark metadata uncertain so no subsequent commit
 			// can reuse their LogPosition and ResolveCommit can recover them.
@@ -326,6 +448,12 @@ func (backend *Backend) commitOneMemtable(ctx context.Context, batch storage.Mut
 		backend.mu.Unlock()
 		return storage.ApplyResult{}, err
 	}
+	if backend.flushErr != nil && backend.memtable.totalBytes >= memtableHardMaxBytes(backend.limits) {
+		if err := backend.flushMemtableLocked(ctx, 0); err != nil {
+			backend.mu.Unlock()
+			return storage.ApplyResult{}, err
+		}
+	}
 	decision := runDecision{Position: position, TxID: batch.TxID, CommitTS: batch.CommitTS, Identity: validated.identity, MutationCount: batch.Count()}
 	commitsRoot := backend.directory.commits
 	walBytes := backend.limits.WALBytes
@@ -367,7 +495,7 @@ func (backend *Backend) publishMemtableCommit(ctx context.Context, result storag
 			return err
 		}
 	}
-	if err := backend.memtable.stageBatch(ctx, pending.decision, pending.epoch, batch, backend.limits.RowBytes); err != nil {
+	if err := backend.memtable.stageBatchWithBudget(ctx, pending.decision, pending.epoch, batch, backend.limits.RowBytes, memtableNodeBudget(backend.limits)); err != nil {
 		backend.metadataUncertain = true
 		return err
 	}

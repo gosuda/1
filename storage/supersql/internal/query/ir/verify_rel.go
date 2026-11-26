@@ -144,7 +144,7 @@ func (g *Graph) validateRel(ctx context.Context, n Rel, limits Limits) error {
 			return err
 		}
 	}
-	for _, id := range [...]ScalarID{n.Predicate, n.Offset, n.Count, n.ConflictPredicate, n.RLSInsertCheck, n.RLSUpdateCheck, n.Recursion.CycleValue, n.Recursion.CycleDefault, n.Recursion.CycleContinue, n.Frame.Start.Offset, n.Frame.End.Offset} {
+	for _, id := range [...]ScalarID{n.Predicate, n.Offset, n.Count, n.ConflictPredicate, n.RLSInsertCheck, n.RLSUpdateCheck, n.RLSConflictCheck, n.Recursion.CycleValue, n.Recursion.CycleDefault, n.Recursion.CycleContinue, n.Frame.Start.Offset, n.Frame.End.Offset} {
 		if id != 0 {
 			if err := g.expressionAvailable(ctx, n, id, 0, limits); err != nil {
 				return err
@@ -222,7 +222,7 @@ func (g *Graph) validateRel(ctx context.Context, n Rel, limits Limits) error {
 	if n.RowsFromOrdinality && n.Kind != RowsFrom {
 		return invalid("ROWS FROM ordinality on another relation")
 	}
-	modificationPayload := n.assignments.count != 0 || n.conflictAssignments.count != 0 || n.ExcludedRow != 0 || n.RLSRow != 0 || n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0 || n.OldRow != 0 || n.NewRow != 0 || n.SourceObject != 0 || n.OldTableOID != 0 || n.NewTableOID != 0 || n.MergeTableOID != 0 || n.targetKeys.count != 0 || n.updatedColumns.count != 0 || n.MergeSourcePresent != 0 || n.MergeTargetPresent != 0 || n.MergeResultRow != 0 || n.MergeActionSlot != 0
+	modificationPayload := n.assignments.count != 0 || n.conflictAssignments.count != 0 || n.ExcludedRow != 0 || n.RLSRow != 0 || n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0 || n.RLSConflictCheck != 0 || n.OldRow != 0 || n.NewRow != 0 || n.SourceObject != 0 || n.OldTableOID != 0 || n.NewTableOID != 0 || n.MergeTableOID != 0 || n.targetKeys.count != 0 || n.updatedColumns.count != 0 || n.MergeSourcePresent != 0 || n.MergeTargetPresent != 0 || n.MergeResultRow != 0 || n.MergeActionSlot != 0
 	if n.Kind != Modify && modificationPayload {
 		return invalid("modification payload on another relation")
 	}
@@ -565,7 +565,7 @@ func (n *Rel) hasForeignOperatorPayload() bool {
 	if n.Kind != Limit && limitPayload {
 		return true
 	}
-	modifyPayload := n.ModifyKind != 0 || n.ModifyTarget != 0 || n.Conflict != 0 || n.conflictArbiters.count != 0 || n.ConflictPredicate != 0 || n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0 || n.actions.count != 0 || n.targetKeys.count != 0 || n.updatedColumns.count != 0 || n.assignments.count != 0 || n.conflictAssignments.count != 0 || n.OldRow != 0 || n.NewRow != 0 || n.ExcludedRow != 0 || n.RLSRow != 0 || n.SourceObject != 0 || n.OldTableOID != 0 || n.NewTableOID != 0 || n.LogicalView != 0 || n.MergeSourcePresent != 0 || n.MergeTargetPresent != 0 || n.MergeResultRow != 0 || n.MergeActionSlot != 0 || n.MergeTableOID != 0 || n.viewMutationSteps.count != 0
+	modifyPayload := n.ModifyKind != 0 || n.ModifyTarget != 0 || n.Conflict != 0 || n.conflictArbiters.count != 0 || n.ConflictPredicate != 0 || n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0 || n.RLSConflictCheck != 0 || n.actions.count != 0 || n.targetKeys.count != 0 || n.updatedColumns.count != 0 || n.assignments.count != 0 || n.conflictAssignments.count != 0 || n.OldRow != 0 || n.NewRow != 0 || n.ExcludedRow != 0 || n.RLSRow != 0 || n.SourceObject != 0 || n.OldTableOID != 0 || n.NewTableOID != 0 || n.LogicalView != 0 || n.MergeSourcePresent != 0 || n.MergeTargetPresent != 0 || n.MergeResultRow != 0 || n.MergeActionSlot != 0 || n.MergeTableOID != 0 || n.viewMutationSteps.count != 0
 	return n.Kind != Modify && modifyPayload
 }
 

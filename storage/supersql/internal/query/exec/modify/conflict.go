@@ -302,6 +302,11 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 			return false, err
 		}
 	}
+	if c.rlsInsertCheck != nil {
+		if err := c.checkRLS(ctx, c.rlsInsertCheck, route, proposed.Values, false); err != nil {
+			return false, err
+		}
+	}
 	if o.Conflict != nil {
 		owner, err := c.conflictOwner(ctx, &proposed, route)
 		if err != nil {
@@ -320,11 +325,6 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 			}
 		}
 	}
-	if c.rlsInsertCheck != nil {
-		if err := c.checkRLS(ctx, c.rlsInsertCheck, route, proposed.Values); err != nil {
-			return false, err
-		}
-	}
 	if err := o.Transaction.ApplyPreparedInsert(ctx, candidate); err != nil {
 		return false, err
 	}
@@ -335,6 +335,11 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 }
 
 func (c *cursor) updateConflict(ctx context.Context, frozen []model.Value, source *partitionChild, old, proposed *model.Row) (bool, error) {
+	if c.rlsConflictCheck != nil {
+		if err := c.checkRLS(ctx, c.rlsConflictCheck, source, old.Values, true); err != nil {
+			return false, err
+		}
+	}
 	oldValues := c.visibleRow(old.Values, c.oldImage)
 	proposedValues := c.visibleRow(proposed.Values, c.newImage)
 	if len(c.viewMutationSteps) != 0 {

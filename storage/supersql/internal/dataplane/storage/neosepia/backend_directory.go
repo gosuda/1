@@ -78,6 +78,17 @@ func inspectDatabaseDirectory(ctx context.Context, path string) (err error) {
 				if !valid {
 					return ErrIncompatibleFormat
 				}
+			case encryptionMetaPending:
+				if !entry.Type().IsRegular() {
+					return ErrIncompatibleFormat
+				}
+				valid, err := encryptionMetaMagicPrefix(root, encryptionMetaPending)
+				if err != nil {
+					return err
+				}
+				if !valid {
+					return ErrIncompatibleFormat
+				}
 			default:
 				return ErrIncompatibleFormat
 			}
@@ -103,6 +114,23 @@ func stateMagicPrefix(root *os.Root, name string, partial bool) (_ bool, err err
 		return false, readErr
 	}
 	return string(magic[:]) == databaseStateMagic || string(magic[:]) == "NSDB0001", nil
+}
+
+func encryptionMetaMagicPrefix(root *os.Root, name string) (_ bool, err error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, file.Close()) }()
+	var magic [len(encryptionMagic)]byte
+	count, readErr := io.ReadFull(file, magic[:])
+	if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+		return bytes.Equal(magic[:count], []byte(encryptionMagic)[:count]), nil
+	}
+	if readErr != nil {
+		return false, readErr
+	}
+	return string(magic[:]) == encryptionMagic, nil
 }
 
 func emptyNativeDirectory(root *os.Root, name string) (_ bool, err error) {

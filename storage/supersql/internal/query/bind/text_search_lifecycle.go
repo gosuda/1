@@ -92,6 +92,9 @@ func bindDropTextSearch(ctx context.Context, statement *zpgparse.DropStmt, snaps
 			}
 			return nil, err
 		}
+		if err := b.requireTableOwner(descriptor, 0); err != nil {
+			return nil, err
+		}
 		if seen[descriptor.ID()] {
 			continue
 		}
@@ -117,6 +120,9 @@ func bindRenameTextSearch(ctx context.Context, statement *zpgparse.RenameStmt, s
 	}
 	base, err := resolveTextSearchLifecycleObject(ctx, b, statement.Object, statement.RenameType)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	if _, conflictErr := snapshot.Resolve(ctx, model.NamespaceName{Parent: base.Name().Parent, Kind: base.Kind(), Name: statement.Newname}); conflictErr == nil {
@@ -154,6 +160,9 @@ func bindSetTextSearchSchema(ctx context.Context, statement *zpgparse.AlterObjec
 		}
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	destination, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newschema})
 	if err != nil {
 		if isMissingObject(err) {
@@ -163,6 +172,9 @@ func bindSetTextSearchSchema(ctx context.Context, statement *zpgparse.AlterObjec
 	}
 	if destination.Descriptor.State() != model.StatePublic {
 		return nil, bindError("3F000", "schema does not exist", 0)
+	}
+	if err := b.checkSchemaCreate(destination.Descriptor, 0); err != nil {
+		return nil, err
 	}
 	if _, conflictErr := snapshot.Resolve(ctx, model.NamespaceName{Parent: destination.Descriptor.ID(), Kind: base.Kind(), Name: base.Name().Name}); conflictErr == nil {
 		return nil, bindError("42710", "text search object already exists in destination schema", 0)

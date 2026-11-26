@@ -191,7 +191,7 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 		}
 	}
 
-	if needInsertCheck || needUpdateCheck {
+	if needInsertCheck || needUpdateCheck || needConflictUsing {
 		columns := publicColumns(table)
 		layout := model.TypeLayout{
 			Type:     model.Type{ID: 2249, Modifier: -1, Storage: model.TypeComposite},
@@ -223,62 +223,28 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 			spec.RLSUpdateCheck = updateCheck.id
 			spec.Effects = spec.Effects.Union(updateCheck.effects)
 		}
-	}
-
-	if needConflictUsing && spec.OldRow != 0 {
-		oldInfo, ok := b.builder.Slot(spec.OldRow)
-		if !ok {
-			return model.ErrInvalidDescriptor
-		}
-		// Build a scope reading target table columns from spec.OldRow.
-		oldColumns := publicColumns(target.table)
-		oldLayout := model.TypeLayout{
-			Type:     model.Type{ID: 2249, Modifier: -1, Storage: model.TypeComposite},
-			Children: make([]model.TypeLayout, len(oldColumns)),
-		}
-		for i, c := range oldColumns {
-			oldLayout.Children[i] = c.Layout
-		}
-		oldScope := b.rowImagePolicyScope(s.id, d, schemaName, oldColumns, spec.OldRow, oldLayout, oldInfo.Nullable)
-		commands := []string{"UPDATE"}
-		if tableHasCommandUsingPolicy(table.Policies, "SELECT") {
-			commands = append(commands, "SELECT")
-		}
-		var conflictUsing expression
-		for _, cmd := range commands {
-			pred, err := b.bindRLSUsingPredicate(oldScope, roles, table.Policies, cmd, 0)
-			if err != nil {
-				return err
+		if needConflictUsing {
+			commands := []string{"UPDATE"}
+			if tableHasCommandUsingPolicy(table.Policies, "SELECT") {
+				commands = append(commands, "SELECT")
 			}
-			if conflictUsing.id == 0 {
-				conflictUsing = pred
-			} else {
-				conflictUsing, err = b.combineBool(oldScope, ir.And, conflictUsing, pred)
+			var conflictUsing expression
+			for _, cmd := range commands {
+				pred, err := b.bindRLSUsingPredicate(checkScope, roles, table.Policies, cmd, 0)
 				if err != nil {
 					return err
 				}
+				if conflictUsing.id == 0 {
+					conflictUsing = pred
+				} else {
+					conflictUsing, err = b.combineBool(checkScope, ir.And, conflictUsing, pred)
+					if err != nil {
+						return err
+					}
+				}
 			}
-		}
-		if conflictUsing.id != 0 {
-			if spec.ConflictPredicate != 0 {
-				existingScalar, ok := b.builder.Scalar(spec.ConflictPredicate)
-				if !ok {
-					return model.ErrInvalidDescriptor
-				}
-				existingExpr := expression{
-					id:       spec.ConflictPredicate,
-					typ:      b.primitive(16),
-					nullable: existingScalar.Nullable,
-					effects:  existingScalar.Effects,
-				}
-				merged, err := b.combineBool(oldScope, ir.And, conflictUsing, existingExpr)
-				if err != nil {
-					return err
-				}
-				spec.ConflictPredicate = merged.id
-				spec.Effects = spec.Effects.Union(merged.effects)
-			} else {
-				spec.ConflictPredicate = conflictUsing.id
+			if conflictUsing.id != 0 {
+				spec.RLSConflictCheck = conflictUsing.id
 				spec.Effects = spec.Effects.Union(conflictUsing.effects)
 			}
 		}

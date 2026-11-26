@@ -32,12 +32,29 @@ func (b *binder) bindTableLock(statement *zpgparse.LockStmt) (Command, []ResultC
 		if relation.Schemaname != "" {
 			parts = []string{relation.Schemaname, relation.Relname}
 		}
-		root, _, err := b.resolve(parts, []model.ObjectKind{model.ObjectTable, model.ObjectView, model.ObjectMaterializedView}, "42P01", position)
+		if len(parts) == 2 {
+			if ns, nsErr := b.catalog.Resolve(b.ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: parts[0]}); nsErr == nil {
+				if err := b.checkSchemaUsage(ns.Descriptor, position); err != nil {
+					return nil, nil, err
+				}
+			} else if !isMissingObject(nsErr) {
+				return nil, nil, nsErr
+			}
+		}
+		root, namespace, err := resolveNamespaceObject(b.ctx, b.catalog, b.options.SearchPath, parts, []model.ObjectKind{model.ObjectTable, model.ObjectView, model.ObjectMaterializedView}, "42P01", position)
 		if err != nil {
+			return nil, nil, err
+		}
+		b.dependency(namespace, 0)
+		b.dependency(root, 0)
+		if err := b.checkSchemaUsage(namespace, position); err != nil {
 			return nil, nil, err
 		}
 		if root.Kind() != model.ObjectTable {
 			return nil, nil, bindError("42809", "LOCK TABLE target is not a table", position)
+		}
+		if err := b.checkObjectPrivilegeAny(root, tableLockRequiredPrivileges(mode), position); err != nil {
+			return nil, nil, err
 		}
 		descriptors := []*model.Descriptor{root}
 		metadata, ok := root.Table()
@@ -71,4 +88,15 @@ func (b *binder) bindTableLock(statement *zpgparse.LockStmt) (Command, []ResultC
 		return compareObjectID(left.Target.ObjectID, right.Target.ObjectID)
 	})
 	return command, nil, nil
+}
+
+func tableLockRequiredPrivileges(mode txn.TableLockMode) model.PrivilegeMask {
+	switch mode {
+	case txn.AccessShareTableLock:
+		return model.PrivilegeSelect | model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+	case txn.RowExclusiveTableLock:
+		return model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+	default:
+		return model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+	}
 }

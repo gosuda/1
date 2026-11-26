@@ -26,6 +26,9 @@ const (
 
 	authTypeOk                int32 = 0
 	authTypeCleartextPassword int32 = 3
+	authTypeSASL              int32 = 10
+	authTypeSASLContinue      int32 = 11
+	authTypeSASLFinal         int32 = 12
 
 	txStatusIdle   byte = 'I'
 	txStatusInTx   byte = 'T'
@@ -300,6 +303,35 @@ func encodeAuthMessage(authType int32) []byte {
 	var body [4]byte
 	binary.BigEndian.PutUint32(body[:], uint32(authType))
 	return appendMessage(make([]byte, 0, 9), 'R', body[:])
+}
+
+func encodeAuthSASL(mechanisms ...string) []byte {
+	size := 4 + 1
+	for _, m := range mechanisms {
+		size += len(m) + 1
+	}
+	body := make([]byte, 4, size)
+	binary.BigEndian.PutUint32(body[0:4], uint32(authTypeSASL))
+	for _, m := range mechanisms {
+		body = append(body, m...)
+		body = append(body, 0)
+	}
+	body = append(body, 0)
+	return appendMessage(make([]byte, 0, 5+len(body)), 'R', body)
+}
+
+func encodeAuthSASLContinue(data string) []byte {
+	body := make([]byte, 4, 4+len(data))
+	binary.BigEndian.PutUint32(body[0:4], uint32(authTypeSASLContinue))
+	body = append(body, data...)
+	return appendMessage(make([]byte, 0, 5+len(body)), 'R', body)
+}
+
+func encodeAuthSASLFinal(data string) []byte {
+	body := make([]byte, 4, 4+len(data))
+	binary.BigEndian.PutUint32(body[0:4], uint32(authTypeSASLFinal))
+	body = append(body, data...)
+	return appendMessage(make([]byte, 0, 5+len(body)), 'R', body)
 }
 
 func encodeParameterStatus(name, value string) []byte {

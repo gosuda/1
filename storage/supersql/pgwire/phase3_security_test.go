@@ -484,8 +484,8 @@ func TestPhase3PasswordMessageLengthCap(t *testing.T) {
 
 	writeP3Startup(t, rawConn, map[string]string{"user": "postgres", "database": "postgres"})
 	typ, body := readP3Msg(t, r)
-	if typ != 'R' || binary.BigEndian.Uint32(body) != uint32(authTypeCleartextPassword) {
-		t.Fatalf("expected cleartext auth challenge, got %q %x", typ, body)
+	if typ != 'R' || binary.BigEndian.Uint32(body) != uint32(authTypeSASL) {
+		t.Fatalf("expected SASL auth challenge, got %q %x", typ, body)
 	}
 
 	// Send PasswordMessage claiming maxPasswordMessageBytes + 1 bytes (header only).

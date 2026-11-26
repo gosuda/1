@@ -131,6 +131,7 @@ type Options struct {
 	ViewMutationSteps     []ViewMutationStep
 	RLSInsertCheck        *expr.Program
 	RLSUpdateCheck        *expr.Program
+	RLSConflictCheck      *expr.Program
 	Returning             *expr.Program
 	ReturningInputLayouts []model.TypeLayout
 	// ReturningSourceColumns are strictly increasing indices into InputLayouts.
@@ -577,8 +578,8 @@ func (c *cursor) configure(ctx context.Context) error {
 			return err
 		}
 	}
-	if o.RLSInsertCheck != nil || o.RLSUpdateCheck != nil {
-		for _, program := range []*expr.Program{o.RLSInsertCheck, o.RLSUpdateCheck} {
+	if o.RLSInsertCheck != nil || o.RLSUpdateCheck != nil || o.RLSConflictCheck != nil {
+		for _, program := range []*expr.Program{o.RLSInsertCheck, o.RLSUpdateCheck, o.RLSConflictCheck} {
 			if program == nil {
 				continue
 			}
@@ -595,6 +596,12 @@ func (c *cursor) configure(ctx context.Context) error {
 		}
 		if o.RLSUpdateCheck != nil {
 			c.rlsUpdateCheck, err = expr.NewState(o.RLSUpdateCheck, c.stateOptions())
+			if err != nil {
+				return err
+			}
+		}
+		if o.RLSConflictCheck != nil {
+			c.rlsConflictCheck, err = expr.NewState(o.RLSConflictCheck, c.stateOptions())
 			if err != nil {
 				return err
 			}

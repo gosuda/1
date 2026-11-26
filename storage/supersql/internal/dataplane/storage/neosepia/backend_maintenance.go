@@ -459,7 +459,7 @@ func (backend *Backend) publishMaintenance(ctx context.Context, plan maintenance
 	if err := backend.maintenanceBoundary(ctx, maintenanceBeforeBase); err != nil {
 		return false, err
 	}
-	if err := writeRunBase(ctx, backend.directory.runs, base, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles); err != nil {
+	if err := writeRunBaseWithCipher(ctx, backend.directory.runs, base, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles, backend.cipher); err != nil {
 		return false, err
 	}
 	opened, err := backend.runs.openReplacementFiles(ctx, backend.directory.runs, descriptors, fragments, backend.preparationLimits().File, backend.limits.ResidentBytes)
@@ -580,7 +580,7 @@ func (backend *Backend) retireRecoveredWAL(ctx context.Context) error {
 	if backend.state.BaseGeneration == 0 {
 		return nil
 	}
-	base, err := loadRunBase(ctx, backend.directory.runs, backend.state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles)
+	base, err := loadRunBaseWithCipher(ctx, backend.directory.runs, backend.state.BaseGeneration, backend.limits.MetadataBytes, backend.limits.IdentityBytes, backend.limits.MaxFiles, backend.cipher)
 	if err != nil {
 		return err
 	}

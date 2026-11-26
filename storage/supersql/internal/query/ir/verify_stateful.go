@@ -526,10 +526,10 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 			return invalid("RLS row slot must be distinct")
 		}
 	}
-	if (n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0) && n.RLSRow == 0 {
+	if (n.RLSInsertCheck != 0 || n.RLSUpdateCheck != 0 || n.RLSConflictCheck != 0) && n.RLSRow == 0 {
 		return invalid("RLS check requires RLS row slot")
 	}
-	if n.RLSRow != 0 && n.RLSInsertCheck == 0 && n.RLSUpdateCheck == 0 {
+	if n.RLSRow != 0 && n.RLSInsertCheck == 0 && n.RLSUpdateCheck == 0 && n.RLSConflictCheck == 0 {
 		return invalid("RLS row slot without RLS check predicate")
 	}
 	if n.RLSInsertCheck != 0 && (n.ModifyKind != Insert && n.ModifyKind != Merge || !g.boolean(n.RLSInsertCheck)) {
@@ -537,6 +537,9 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 	}
 	if n.RLSUpdateCheck != 0 && (n.ModifyKind != Update && n.ModifyKind != Merge && n.Conflict != ConflictUpdate || !g.boolean(n.RLSUpdateCheck)) {
 		return invalid("invalid RLS update check predicate")
+	}
+	if n.RLSConflictCheck != 0 && (n.ModifyKind != Insert || n.Conflict != ConflictUpdate || !g.boolean(n.RLSConflictCheck)) {
+		return invalid("invalid RLS conflict check predicate")
 	}
 	for _, slot := range [...]model.SlotID{n.OldTableOID, n.NewTableOID, n.MergeTableOID} {
 		if slot == 0 {
@@ -625,7 +628,7 @@ func (g *Graph) validateModify(ctx context.Context, n Rel, limits Limits) error 
 	}
 	rlsCheck := n
 	rlsCheck.inputs, rlsCheck.OldRow, rlsCheck.NewRow, rlsCheck.ExcludedRow, rlsCheck.MergeResultRow, rlsCheck.MergeActionSlot, rlsCheck.OldTableOID, rlsCheck.NewTableOID, rlsCheck.MergeTableOID = extent{}, 0, 0, 0, 0, 0, 0, 0, 0
-	for _, checkID := range [...]ScalarID{n.RLSInsertCheck, n.RLSUpdateCheck} {
+	for _, checkID := range [...]ScalarID{n.RLSInsertCheck, n.RLSUpdateCheck, n.RLSConflictCheck} {
 		if checkID != 0 {
 			if err := g.expressionAvailable(ctx, rlsCheck, checkID, 0, limits); err != nil {
 				return err

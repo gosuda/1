@@ -316,7 +316,7 @@ func indexRunnerPermanentCode(err error) string {
 			return sqlError.Code
 		}
 		code := sqlError.Code
-		if len(code) == 5 && (code[:2] == "22" || code[:2] == "23") {
+		if len(code) == 5 && (code[:2] == "22" || code[:2] == "23" || code[:2] == "53" || code[:2] == "54") {
 			var nested *model.Error
 			if errors.As(sqlError.Cause, &nested) {
 				return indexRunnerPermanentCode(sqlError.Cause)
