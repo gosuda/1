@@ -326,6 +326,11 @@ func (n *normalizer) relation(id ir.RelID, depth uint32) relResult {
 		n.rels[id] = result
 		return result
 	}
+	if result, converted := n.predicateCrossJoin(id, source, spec, depth); converted {
+		n.relActive[id] = false
+		n.rels[id] = result
+		return result
+	}
 	spec.Expressions = n.scalarList(source.ExpressionCount(), func(i uint32) ir.ScalarID { value, _ := n.g.Expression(id, i); return value }, depth)
 	spec.Partition = n.scalarList(source.PartitionCount(), func(i uint32) ir.ScalarID { value, _ := n.g.Partition(id, i); return value }, depth)
 	spec.Bindings = n.bindings(source.BindingCount(), func(i uint32) ir.Binding { value, _ := n.g.Binding(id, i); return value }, depth)

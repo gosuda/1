@@ -12,6 +12,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/rowstore"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
@@ -87,28 +88,28 @@ type entry struct {
 	matched  bool
 }
 type cursor struct {
-	options                                                                 Options
-	left, right                                                             storage.BatchCursor
-	ctx                                                                     context.Context
-	cancel                                                                  context.CancelFunc
-	stopQuery                                                               func() bool
-	claim, hashClaim                                                        columnar.Allocation
-	metadata, hashBytes                                                     uint64
-	partitions                                                              []partition
-	partitioned                                                             *partitionedState
-	part                                                                    int
-	leftSchema, rightSchema                                                 []model.TypeLayout
-	keyLayout                                                               []storage.KeyColumn
-	keyValues, row, output, predicateRow                                    []model.Value
-	builder, predicateBuilder                                               *columnar.Builder
-	predicate                                                               *expr.State
-	leftReader, rightReader                                                 *rowstore.Reader
-	replacement                                                             *rowstore.Spool
-	entries                                                                 []entry
-	buckets                                                                 []int
-	leftRow                                                                 []model.Value
-	candidate                                                               int
-	unmatched                                                               int
+	options                                                                           Options
+	left, right                                                                       storage.BatchCursor
+	ctx                                                                               context.Context
+	cancel                                                                            context.CancelFunc
+	stopQuery                                                                         func() bool
+	claim, hashClaim                                                                  columnar.Allocation
+	metadata, hashBytes                                                               uint64
+	partitions                                                                        []partition
+	partitioned                                                                       *partitionedState
+	part                                                                              int
+	leftSchema, rightSchema                                                           []model.TypeLayout
+	keyLayout                                                                         []storage.KeyColumn
+	keyValues, row, output, predicateRow                                              []model.Value
+	builder, predicateBuilder                                                         *columnar.Builder
+	predicate                                                                         *expr.State
+	leftReader, rightReader                                                           *rowstore.Reader
+	replacement                                                                       *rowstore.Spool
+	entries                                                                           []entry
+	buckets                                                                           []int
+	leftRow                                                                           []model.Value
+	candidate                                                                         int
+	unmatched                                                                         int
 	mark                                                                              model.Value
 	partOpen, hashMode, leftMatched, scanning, draining, initialized, pending, closed bool
 	repartitions, replayFallbacks                                                     int
@@ -278,7 +279,7 @@ func (c *cursor) configureSchema(ctx context.Context, base uint64) error {
 	c.keyLayout = make([]storage.KeyColumn, len(o.Keys))
 	c.keyValues = make([]model.Value, len(o.Keys))
 	for i, k := range o.Keys {
-		if k.Left < 0 || k.Left >= len(o.LeftLayouts) || k.Right < 0 || k.Right >= len(o.RightLayouts) || !model.TypeLayoutsEqual(o.LeftLayouts[k.Left], o.RightLayouts[k.Right]) {
+		if k.Left < 0 || k.Left >= len(o.LeftLayouts) || k.Right < 0 || k.Right >= len(o.RightLayouts) || !builtin.BinaryCoercibleKeyLayouts(o.LeftLayouts[k.Left], o.RightLayouts[k.Right]) {
 			return runtime.ErrInvalidConfig
 		}
 		c.keyLayout[i] = storage.KeyColumn{ColumnID: model.ColumnID(i + 1), Type: o.LeftLayouts[k.Left].Type, Children: o.LeftLayouts[k.Left].Children, NullsFirst: true}

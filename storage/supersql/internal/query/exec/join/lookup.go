@@ -11,6 +11,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
 )
 
@@ -94,7 +95,7 @@ func checkLookup(ctx context.Context, o Options) (lookupWorkspace, error) {
 	}
 	var numeric uint64
 	for _, key := range o.Keys {
-		if key.Left < 0 || key.Left >= len(o.LeftLayouts) || key.Right < 0 || key.Right >= len(o.RightLayouts) || !model.TypeLayoutsEqual(o.LeftLayouts[key.Left], o.RightLayouts[key.Right]) {
+		if key.Left < 0 || key.Left >= len(o.LeftLayouts) || key.Right < 0 || key.Right >= len(o.RightLayouts) || !builtin.BinaryCoercibleKeyLayouts(o.LeftLayouts[key.Left], o.RightLayouts[key.Right]) {
 			return work, runtime.ErrInvalidConfig
 		}
 		layout := o.LeftLayouts[key.Left]

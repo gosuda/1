@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
 )
 
@@ -29,7 +30,7 @@ func (p *Plan) key(k Key, schema []Slot) error {
 	if err != nil {
 		return err
 	}
-	if typ != k.Type || typ.Collation != k.Collation || !containsSlot(schema, k.Slot) {
+	if !builtin.BinaryCoercibleTypes(typ, k.Type) || typ.Collation != k.Collation || !containsSlot(schema, k.Slot) {
 		return invalid("key is absent or has incompatible SQL type/collation")
 	}
 	return nil
