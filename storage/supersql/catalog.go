@@ -475,12 +475,12 @@ func (database *Catalog) closeAll() error {
 		// The blocking receive is what guarantees no Advance or Collect is in
 		// flight when protections, the manager and the backend close.
 		runErr := <-database.maintenanceErr
-		if !errors.Is(runErr, context.Canceled) {
+		if runErr != nil && runErr != context.Canceled {
 			err = errors.Join(err, runErr)
 		}
 		// A fatal exit already delivered its error; only an earlier transient
 		// failure the loop recorded and continued past is still outstanding.
-		if last := database.maintenanceLast.Load(); last != nil && !errors.Is(runErr, *last) {
+		if last := database.maintenanceLast.Load(); last != nil && !errors.Is(err, *last) {
 			err = errors.Join(err, *last)
 		}
 	}

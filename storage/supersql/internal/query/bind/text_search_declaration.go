@@ -699,7 +699,7 @@ func bindTextSearchConfigurationDefinition(ctx context.Context, b *binder, snaps
 	switch strings.ToLower(option.Defname) {
 	case "parser":
 		if !strings.EqualFold(value, "default") && !strings.EqualFold(value, "pg_catalog.default") {
-			return metadata, nil, bindError("0A000", "only the native default text search parser is supported", int(option.Location)+1)
+			return metadata, nil, &model.Error{Code: "0A000", Message: "only the native default text search parser is supported", FeatureID: string(ExternalCode), Position: int(option.Location) + 1}
 		}
 		metadata.Parser = defaultTextSearchParserOID
 	case "copy":

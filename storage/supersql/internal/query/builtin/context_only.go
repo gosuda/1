@@ -16,8 +16,18 @@ func compileContextOnly(signature Signature) scalarKernel {
 		return kernel
 	}
 	requirement := contextOnlyRequirement(signature)
+	featureID := contextOnlyFeatureID(signature)
 	return func(context.Context, []model.Value, CallBudget) (model.Value, error) {
-		return model.Value{}, sqlError("0A000", fmt.Sprintf("%s requires %s", signature.Name, requirement))
+		return model.Value{}, &model.Error{Code: "0A000", Message: fmt.Sprintf("%s requires %s", signature.Name, requirement), FeatureID: featureID}
+	}
+}
+
+func contextOnlyFeatureID(signature Signature) string {
+	switch signature.ID {
+	case 6362, 6363, 6397, 6398:
+		return featurePhysicalMaintenance
+	default:
+		return ""
 	}
 }
 

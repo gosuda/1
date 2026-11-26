@@ -10,7 +10,7 @@
 | 00000 | 00 | successful completion | 1 | internal/query/session/statistics_command.go:603 | model.Error Code field |
 | 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:777 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
-| 0A000 | 0A | feature not supported | 179 | connector.go:1563 | bindError call, model.Error Code field, sqlError call, unsupported call |
+| 0A000 | 0A | feature not supported | 181 | connector.go:1563 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:108 | bindError call |
 | 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1195 | sqlError call |
 | 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:473 | sqlError call |
@@ -65,7 +65,7 @@
 | 25P01 | 25 | invalid transaction state | 4 | internal/query/session/deferred_trigger.go:222 | model.Error Code field |
 | 25P02 | 25 | invalid transaction state | 4 | internal/dataplane/txn/transaction.go:88 | model.Error Code field |
 | 26000 | 26 | invalid SQL statement name | 2 | internal/query/session/named_commands.go:270 | model.Error Code field |
-| 2BP01 | 2B | dependent privilege descriptors still exist | 20 | internal/controlplane/catalog/object_service.go:153 | bindError call, model.Error Code field |
+| 2BP01 | 2B | dependent privilege descriptors still exist | 22 | internal/controlplane/catalog/object_service.go:153 | bindError call, model.Error Code field |
 | 2D000 | 2D | invalid transaction termination | 1 | internal/query/procedural/compile.go:614 | sqlError call |
 | 2F005 | 2F | SQL routine exception | 1 | internal/query/procedural/execute.go:280 | sqlError call |
 | 34000 | 34 | invalid cursor name | 6 | internal/query/procedural/execute.go:1050 | model.Error Code field, sqlError call |

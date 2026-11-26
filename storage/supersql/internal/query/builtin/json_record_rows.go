@@ -74,9 +74,11 @@ func (plan *jsonRecordPlan) Open(ctx context.Context, arguments []model.Value, o
 		if plan.binary {
 			limit := options.MaxMemoryBytes - inputBytes
 			if iterator.inputClaim != nil {
-				if err := iterator.inputClaim.Resize(options.MaxMemoryBytes); err != nil {
+				granted, err := iterator.inputClaim.GrowUpTo(limit)
+				if err != nil {
 					return fail(err)
 				}
+				limit = granted
 			}
 			canonical, err := canonicalJSONB(ctx, iterator.text, int64(min(limit, math.MaxInt64)), false)
 			if err != nil {
@@ -180,10 +182,16 @@ func (iterator *jsonRecordRows) next(ctx context.Context) ([]model.Value, bool, 
 	}
 	memory := iterator.options.MaxMemoryBytes - iterator.inputBytes
 	if iterator.options.Allocator != nil {
-		claim, err := iterator.options.Allocator.Reserve(memory)
+		claim, err := iterator.options.Allocator.Reserve(0)
 		if err != nil {
 			return nil, false, err
 		}
+		granted, err := claim.GrowUpTo(memory)
+		if err != nil {
+			claim.Release()
+			return nil, false, err
+		}
+		memory = granted
 		iterator.rowClaim = claim
 	}
 	columns := len(plan.root.children)

@@ -665,14 +665,14 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-128 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+134 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
 | connector.go:1563 | `model.Error{Code: "0A000"}` |
 | connector.go:335 | `model.Error{Code: "0A000"}` |
 | execution.go:271 | `model.Error{Code: "0A000"}` |
-| internal/controlplane/catalog/type_service.go:1051 | `model.Error{Code: "0A000"}` |
+| internal/controlplane/catalog/type_service.go:1075 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |
 | internal/dataplane/txn/transaction_historical.go:12 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/aggregate_invocation.go:205 | `ordered-set aggregates cannot be used as window functions` |
@@ -700,9 +700,9 @@ No resolved catalog objects.
 | internal/query/bind/function_window.go:413 | `` |
 | internal/query/bind/function_window.go:417 | `` |
 | internal/query/bind/index.go:133 | `access method "gin" does not support unique indexes` |
-| internal/query/bind/index.go:136 | `GIN indexes on multiple columns are not supported` |
+| internal/query/bind/index.go:136 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/index.go:139 | `access method "gin" does not support included columns` |
-| internal/query/bind/index.go:159 | `GIN indexes on expressions are not supported` |
+| internal/query/bind/index.go:159 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/index.go:162 | `access method "gin" does not support ordering options` |
 | internal/query/bind/index.go:165 | `access method "gin" does not support explicit collations` |
 | internal/query/bind/index.go:72 | `cross-database reference is not supported` |
@@ -713,7 +713,7 @@ No resolved catalog objects.
 | internal/query/bind/index_expression.go:414 | `index expression semantic resolution changed` |
 | internal/query/bind/index_expression.go:631 | `domain CHECK type identity changed` |
 | internal/query/bind/index_expression.go:636 | `row expression relation identity changed` |
-| internal/query/bind/index_expression.go:675 | `index expression column type dependency changed` |
+| internal/query/bind/index_expression.go:681 | `index expression column type dependency changed` |
 | internal/query/bind/index_expression_encoding.go:82 | `index expression uses a different timezone data revision` |
 | internal/query/bind/indirection.go:14 | `row expansion via * is not supported here` |
 | internal/query/bind/native_rows.go:247 | `could not determine row type for set-returning function` |
@@ -741,13 +741,15 @@ No resolved catalog objects.
 | internal/query/bind/routine_default_reference.go:122 | `routine default dependency is not public` |
 | internal/query/bind/routine_default_reference.go:130 | `routine default relation identity changed` |
 | internal/query/bind/routine_default_reference.go:133 | `routine default sequence identity changed` |
-| internal/query/bind/routine_default_reference.go:137 | `routine default dependency version changed` |
+| internal/query/bind/routine_default_reference.go:149 | `routine default dependency version changed` |
 | internal/query/bind/row_lock.go:215 | `row locking cannot be applied to the nullable side of an outer join` |
 | internal/query/bind/row_order.go:22 | `cannot compare rows of zero length` |
 | internal/query/bind/row_order.go:54 | `row comparison operators must belong to compatible btree families` |
-| internal/query/bind/schema_constraint_ddl.go:16 | `constraint recursion or CASCADE requires inherited constraint planning` |
-| internal/query/bind/schema_constraint_ddl.go:486 | `constraint type is not deferrable` |
-| internal/query/bind/schema_constraint_ddl.go:494 | `constraint enforceability cannot be altered` |
+| internal/query/bind/schema_constraint_ddl.go:16 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/schema_constraint_ddl.go:19 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/schema_constraint_ddl.go:26 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/schema_constraint_ddl.go:492 | `constraint type is not deferrable` |
+| internal/query/bind/schema_constraint_ddl.go:500 | `constraint enforceability cannot be altered` |
 | internal/query/bind/schema_ddl.go:1765 | `cannot drop a partitioned index concurrently` |
 | internal/query/bind/select.go:252 | `row locking is not allowed with aggregate or window queries` |
 | internal/query/bind/select.go:361 | `row locking is not allowed with set-returning targets` |
@@ -767,7 +769,7 @@ No resolved catalog objects.
 | internal/query/bind/text_search_declaration.go:487 | `external text search stop-word files are unavailable` |
 | internal/query/bind/text_search_declaration.go:502 | `external text search stop-word files are unavailable` |
 | internal/query/bind/text_search_declaration.go:542 | `unsupported native text search dictionary template` |
-| internal/query/bind/text_search_declaration.go:702 | `only the native default text search parser is supported` |
+| internal/query/bind/text_search_declaration.go:702 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/text_search_declaration.go:822 | `unsupported ALTER TEXT SEARCH CONFIGURATION action` |
 | internal/query/bind/trigger.go:444 | `trigger WHEN condition cannot contain a subquery` |
 | internal/query/bind/type_declaration.go:1325 | `serial is not valid for a composite attribute` |
@@ -782,11 +784,15 @@ No resolved catalog objects.
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
 | internal/query/bind/utility_merge.go:330 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
-| internal/query/builtin/date_fields.go:130 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/context_only.go:21 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/date_fields.go:132 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:296 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:311 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:321 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/interval_fields.go:106 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:153 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:159 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:162 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/modify/options.go:172 | `model.Error{Code: "0A000"}` |

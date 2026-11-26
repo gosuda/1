@@ -150,16 +150,16 @@ func (e *KeyEncoder) ValidateOperatorClass(ctx context.Context, layout model.Typ
 		return err
 	}
 	if !keyOperatorClassFamilyEquivalent(class) {
-		return sqlError("0A000", fmt.Sprintf("operator class %q has no equivalent SQL key ordering and equality", class.Name))
+		return &model.Error{Code: "0A000", Message: fmt.Sprintf("operator class %q has no equivalent SQL key ordering and equality", class.Name), FeatureID: featureNonBtreeIndexes}
 	}
 	if err := e.validateKeyLayout(ctx, layout, 0); err != nil {
 		return fmt.Errorf("operator class %q: %w", class.Name, err)
 	}
 	if !e.keyOrderingEquivalent(typ, class.InputType) {
-		return sqlError("0A000", fmt.Sprintf("operator class %q requires different SQL key ordering or equality for data type %d", class.Name, typ.ID))
+		return &model.Error{Code: "0A000", Message: fmt.Sprintf("operator class %q requires different SQL key ordering or equality for data type %d", class.Name, typ.ID), FeatureID: featureNonBtreeIndexes}
 	}
 	if class.KeyType != 0 && class.KeyType != class.InputType {
-		return sqlError("0A000", fmt.Sprintf("operator class %q requires a different SQL key representation", class.Name))
+		return &model.Error{Code: "0A000", Message: fmt.Sprintf("operator class %q requires a different SQL key representation", class.Name), FeatureID: featureNonBtreeIndexes}
 	}
 	return ctx.Err()
 }

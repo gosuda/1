@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -74,7 +75,8 @@ func newJSONRecordPlan(ctx context.Context, id model.FunctionID, arguments []mod
 		}
 		layout = arguments[0]
 	}
-	if layout.Type.Storage != model.TypeComposite || len(layout.FieldNames) != len(layout.Children) {
+	anonymousRecord := layout.Type.ID == 2249 && len(layout.FieldNames) == 0 && len(layout.Children) > 0
+	if layout.Type.Storage != model.TypeComposite || (len(layout.FieldNames) != len(layout.Children) && !anonymousRecord) {
 		return nil, sqlError("0A000", "could not determine row type for result of "+signature.Name)
 	}
 	if layout.Type.ID == 2249 && len(layout.Children) == 0 && layout.Type.Modifier < 0 {
@@ -117,15 +119,26 @@ func (field *jsonRecordField) resolve(ctx context.Context, layout model.TypeLayo
 		return err
 	}
 	field.typ = layout.Type
-	if layout.Type.Storage == model.TypeComposite && len(layout.FieldNames) != len(layout.Children) {
+	anonymousRecord := layout.Type.ID == 2249 && len(layout.FieldNames) == 0 && len(layout.Children) > 0
+	if layout.Type.Storage == model.TypeComposite && len(layout.FieldNames) != len(layout.Children) && !anonymousRecord {
 		return sqlError("42804", "JSON record conversion requires declared field names")
 	}
 	bytes := uint64(len(layout.Children)) * uint64(unsafe.Sizeof(jsonRecordField{}))
-	for _, name := range layout.FieldNames {
-		if uint64(len(name)) > *remaining || bytes > *remaining-uint64(len(name)) {
-			return jsonRecordMemoryError()
+	if anonymousRecord {
+		for i := range layout.Children {
+			nameLen := uint64(1 + len(strconv.Itoa(i+1)))
+			if nameLen > *remaining || bytes > *remaining-nameLen {
+				return jsonRecordMemoryError()
+			}
+			bytes += nameLen
 		}
-		bytes += uint64(len(name))
+	} else {
+		for _, name := range layout.FieldNames {
+			if uint64(len(name)) > *remaining || bytes > *remaining-uint64(len(name)) {
+				return jsonRecordMemoryError()
+			}
+			bytes += uint64(len(name))
+		}
 	}
 	if bytes > *remaining {
 		return jsonRecordMemoryError()
@@ -133,7 +146,9 @@ func (field *jsonRecordField) resolve(ctx context.Context, layout model.TypeLayo
 	*remaining -= bytes
 	field.children = make([]jsonRecordField, len(layout.Children))
 	for i, child := range layout.Children {
-		if i < len(layout.FieldNames) {
+		if anonymousRecord {
+			field.children[i].name = "f" + strconv.Itoa(i+1)
+		} else if i < len(layout.FieldNames) {
 			field.children[i].name = strings.Clone(layout.FieldNames[i])
 		}
 		if err := field.children[i].resolve(ctx, child, options, remaining); err != nil {
@@ -168,11 +183,16 @@ func (plan *jsonRecordPlan) OwnedBytes() uint64 { return plan.metadata }
 
 func (plan *jsonRecordPlan) call(ctx context.Context, arguments []model.Value, budget CallBudget) (model.Value, error) {
 	if budget.Allocator != nil {
-		claim, err := budget.Allocator.Reserve(budget.MemoryBytes)
+		claim, err := budget.Allocator.Reserve(0)
 		if err != nil {
 			return model.Value{}, err
 		}
 		defer claim.Release()
+		granted, err := claim.GrowUpTo(budget.MemoryBytes)
+		if err != nil {
+			return model.Value{}, err
+		}
+		budget.MemoryBytes = granted
 		budget.Allocator = nil
 	}
 	input := arguments[plan.jsonArgument]

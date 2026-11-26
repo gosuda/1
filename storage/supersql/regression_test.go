@@ -578,14 +578,19 @@ func expectedErrorSet(t *testing.T, corpus, name string, statements []regStateme
 	}
 	// Matching runs in collapsed space so an echo whose line wrapping differs
 	// from the .sql source still locates; positions stay consistent because
-	// every index is taken against the same collapsed text.
-	out := collapseWhitespace(string(data))
+	// every index is taken against the same collapsed text. Trailing same-line
+	// SQL comments after ';' (e.g. "; -- should fail") are stripped from each
+	// line first so they do not sit between ';' and the following ERROR: line.
+	out := collapseWhitespace(stripTrailingLineComments(string(data)))
 	pos := 0
 	for i, statement := range statements {
 		if statement.kind != regSQL {
 			continue
 		}
-		needle := collapseWhitespace(statement.text)
+		needle := collapseWhitespace(stripLeadingComments(statement.text))
+		if needle == "" {
+			continue
+		}
 		idx := strings.Index(out[pos:], needle)
 		if idx < 0 {
 			continue
@@ -596,6 +601,76 @@ func expectedErrorSet(t *testing.T, corpus, name string, statements []regStateme
 		pos = idx + len(needle)
 	}
 	return expected
+}
+
+// stripTrailingLineComments removes same-line "-- ..." comments that follow a
+// semicolon outside single-quoted literals, preserving the semicolon and line
+// breaks so expectedErrorSet sees "ERROR:" immediately after the echoed query.
+func stripTrailingLineComments(text string) string {
+	lines := strings.Split(text, "\n")
+	for idx, line := range lines {
+		semi := strings.IndexByte(line, ';')
+		if semi < 0 || !strings.Contains(line[semi:], "--") {
+			continue
+		}
+		inQuote := false
+		for i := 0; i < len(line); i++ {
+			switch line[i] {
+			case '\'':
+				if inQuote && i+1 < len(line) && line[i+1] == '\'' {
+					i++
+					continue
+				}
+				inQuote = !inQuote
+			case ';':
+				if inQuote {
+					continue
+				}
+				j := i + 1
+				for j < len(line) && (line[j] == ' ' || line[j] == '\t' || line[j] == '\r') {
+					j++
+				}
+				if j+1 < len(line) && line[j] == '-' && line[j+1] == '-' {
+					lines[idx] = line[:i+1]
+					i = len(line)
+				}
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// stripLeadingComments drops leading whitespace and SQL comments from a
+// statement so a preceding comment does not prevent matching the echoed SQL.
+func stripLeadingComments(s string) string {
+	for {
+		s = strings.TrimLeft(s, " \t\r\n")
+		if strings.HasPrefix(s, "--") {
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = s[i+1:]
+				continue
+			}
+			return ""
+		}
+		if strings.HasPrefix(s, "/*") {
+			depth := 1
+			i := 2
+			for i < len(s) && depth > 0 {
+				if strings.HasPrefix(s[i:], "/*") {
+					depth++
+					i += 2
+				} else if strings.HasPrefix(s[i:], "*/") {
+					depth--
+					i += 2
+				} else {
+					i++
+				}
+			}
+			s = s[i:]
+			continue
+		}
+		return s
+	}
 }
 
 func collapseWhitespace(s string) string {
@@ -829,6 +904,18 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 						data.WriteString(row)
 					}
 					stmt.data = data.String()
+				} else {
+					j := i
+					for j < len(source) && (source[j] == ' ' || source[j] == '\t' || source[j] == '\r') {
+						j++
+					}
+					if j+1 < len(source) && source[j] == '-' && source[j+1] == '-' {
+						if end := strings.IndexByte(source[j:], '\n'); end >= 0 {
+							i = j + end
+						} else {
+							i = len(source)
+						}
+					}
 				}
 				statements = append(statements, stmt)
 			}

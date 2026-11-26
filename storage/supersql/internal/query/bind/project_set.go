@@ -81,6 +81,13 @@ func (b *binder) projectSetExpressions(input relation, s *scope, values []expres
 	if len(lowering.sources) == 0 {
 		return input, values, false, nil
 	}
+	if input.id == 0 {
+		id, err := b.builder.AddRel(b.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Values, Scope: s.id, Rows: 1}})
+		if err != nil {
+			return input, nil, false, err
+		}
+		input.id = id
+	}
 	var err error
 	for level := range lowering.sources {
 		input, err = lowering.stage(input, lowering.sources[level])

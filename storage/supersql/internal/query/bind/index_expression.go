@@ -671,7 +671,13 @@ func (b *binder) rowParameterDependencies(encoding indexExpressionEncoding, pend
 		if descriptor.Kind() != model.ObjectType || !types[id] {
 			continue
 		}
-		if descriptor.Version() != dependency.Version || descriptor.State() != model.StatePublic {
+		versionMismatch := descriptor.Version() != dependency.Version
+		if versionMismatch && descriptor.Version() > dependency.Version {
+			if declared, ok := descriptor.DeclaredType(); ok && declared.DeclaredKind() == model.TypeKindDomain {
+				versionMismatch = false
+			}
+		}
+		if versionMismatch || descriptor.State() != model.StatePublic {
 			return bindError("0A000", "index expression column type dependency changed", 0)
 		}
 		b.dependency(descriptor, 0)
