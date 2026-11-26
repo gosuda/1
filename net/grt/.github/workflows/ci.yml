@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    name: Lint, Format & Cross-OS Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Verify Formatting (gofmt)
+        run: |
+          diffs=$(gofmt -l .)
+          if [ -n "$diffs" ]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "$diffs"
+            exit 1
+          fi
+
+      - name: Verify Formal Codegen Up-To-Date
+        run: |
+          go run ./cmd/grtgen
+          git diff --exit-code
+
+      - name: Static Analysis (go vet)
+        run: go vet ./...
+
+      - name: Vulnerability Check (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Cross-OS Compile Check
+        run: |
+          for goos in linux darwin windows freebsd openbsd; do
+            GOOS=$goos GOARCH=amd64 go build ./...
+          done
+
+  unit-test:
+    name: Unit & Fuzz Smoke Tests (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Unit Tests (with Race Detector)
+        run: go test -v -race -timeout 5m ./internal/formal/... ./internal/wire/... ./internal/crypto/... ./internal/engine/... .
+
+      - name: Run Wire Parser Fuzz Smoke Tests
+        run: |
+          go test -fuzz=^FuzzParseFrames$ -fuzztime=5s ./internal/wire
+          go test -fuzz=^FuzzParseFragment$ -fuzztime=5s ./internal/wire
+
+  dst-matrix:
+    name: DST Seed ${{ matrix.seed }} (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        seed: [1, 42, 67, 1982, 1992, 2002, 2012, 2022, 2026]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Deterministic Simulation Tests (Seed ${{ matrix.seed }})
+        env:
+          DST_SEED: ${{ matrix.seed }}
+        run: go test -v -race -timeout 5m ./internal/sim/...
+
+  benchmark:
+    name: Benchmarks (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Benchmarks
+        run: go test -v -bench=. -benchmem -benchtime=1x -run=^# ./...
