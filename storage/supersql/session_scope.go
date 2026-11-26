@@ -79,6 +79,12 @@ func (database *Catalog) sessionConfig(settings *session.Settings, sequences *se
 // newSession builds one isolated session for a driver connection. Close
 // releases every session-scoped object.
 func (database *Catalog) newSession(ctx context.Context) (_ *sessionScope, err error) {
+	if database == nil {
+		return nil, ErrDatabaseClosed
+	}
+	if err := database.checkOpen(); err != nil {
+		return nil, err
+	}
 	settings, err := session.NewSettings(ctx, database.settingsOptions())
 	if err != nil {
 		return nil, err

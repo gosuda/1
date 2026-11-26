@@ -29,6 +29,32 @@ import (
 
 var errPreparedInvocation = &model.Error{Code: "22023", Message: "invalid prepared session invocation"}
 var errPreparedDependency = &model.Error{Code: "0A000", Message: "prepared query catalog dependency changed; prepare again"}
+var errImplicitReadOnlyUpgrade = errors.New("implicit read-only statement requires read-write transaction")
+
+func isOnlyImplicitReadOnlyUpgrade(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == errImplicitReadOnlyUpgrade {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := joined.Unwrap()
+		if len(errs) == 0 {
+			return false
+		}
+		for _, item := range errs {
+			if !isOnlyImplicitReadOnlyUpgrade(item) {
+				return false
+			}
+		}
+		return true
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		return isOnlyImplicitReadOnlyUpgrade(unwrapped)
+	}
+	return false
+}
 
 // PreparedExecution borrows Catalog and Dependencies. For RunPrepared, nil
 // Dependencies derives descriptors and declared physical scan spans from the plan,
@@ -240,41 +266,8 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 	operation = txn.WithLockTimeout(operation, resources.LockTimeout)
 	operation = builtin.WithNotifyRuntime(operation, transactions.notifyRuntime())
 	automatic := !transactions.active
-	if automatic {
-		if err = transactions.begin(operation, TransactionStart{Historical: execution.timestamp(), ImplicitReadOnly: execution.readOnlyHint}); err != nil {
-			return result, err
-		}
-	}
-	options.Environment.Temporal = transactions.temporal
-	if err = transactions.ordinary(); err != nil {
-		if automatic && transactions.active {
-			err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
-		}
-		return result, err
-	}
-	options.Environment.Advisory = transactions.advisoryRuntime()
-	if !automatic && execution.timestamp() != 0 {
-		if err := transactions.selectPreparedHistory(operation, execution.timestamp()); err != nil {
-			return result, err
-		}
-	}
-	if transactions.settings.TransactionPolicy().ReadOnly && options.Environment.Sequences != nil {
-		options.Environment.Sequences = readOnlySequences{SequenceRuntime: options.Environment.Sequences}
-	}
-	advisoryMark, err := transactions.advisoryStatementMark()
-	if err != nil {
-		if automatic && transactions.active {
-			err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
-		}
-		return result, transactions.fail(err)
-	}
+	implicitReadOnly := automatic && execution.readOnlyHint && execution.timestamp() == 0 && !transactions.settings.TransactionPolicy().ReadOnly
 	completed := false
-	beforeSettings := transactions.settings.snapshotState()
-	deferredMark := len(transactions.deferredTriggers)
-	deferredConstraintMark := len(transactions.deferredConstraints)
-	deferredConstraintBytes := transactions.deferredConstraintBytes
-	notifyMark := len(transactions.pendingNotifications)
-	invocationGeneration := transactions.generation
 	defer func() {
 		if !completed {
 			transactions.markFailed(errSessionStatementPanic)
@@ -283,58 +276,108 @@ func (transactions *Transactions) runPlanExecution(operation context.Context, ex
 			}
 		}
 	}()
-	if _, reentry := transactions.routineReentry(operation); reentry {
-		*transferred = true
-		result.RowsAffected, err = runPreparedStatement(operation, transactions, transactions.transaction, execution, options, consume, false)
-	} else if automatic && (inline || execution.nonAtomic) {
-		*transferred = true
-		result.RowsAffected, err = runPreparedStatement(operation, transactions, transactions.transaction, execution, options, consume, true)
-	} else {
-		err = transactions.transaction.Statement(operation, func(statement context.Context) (runErr error) {
-			*transferred = true
-			result.RowsAffected, runErr = runPreparedStatement(statement, transactions, transactions.transaction, execution, options, consume, false)
-			return runErr
-		})
-	}
-	if inline {
-		result.Tag = "DO"
-	}
-	err = errors.Join(err, transactions.markDataAccess())
-	if err != nil && transactions.generation == invocationGeneration {
-		err = errors.Join(err, transactions.rollbackAdvisoryStatement(advisoryMark))
-	}
-	if err != nil && transactions.generation == invocationGeneration && deferredMark <= len(transactions.deferredTriggers) {
-		clear(transactions.deferredTriggers[deferredMark:])
-		transactions.deferredTriggers = transactions.deferredTriggers[:deferredMark]
-	}
-	if err != nil && transactions.generation == invocationGeneration && deferredConstraintMark <= len(transactions.deferredConstraints) {
-		clear(transactions.deferredConstraints[deferredConstraintMark:])
-		transactions.deferredConstraints = transactions.deferredConstraints[:deferredConstraintMark]
-		transactions.deferredConstraintBytes = deferredConstraintBytes
-	}
-	if err != nil && transactions.generation == invocationGeneration && notifyMark <= len(transactions.pendingNotifications) {
-		clear(transactions.pendingNotifications[notifyMark:])
-		transactions.pendingNotifications = transactions.pendingNotifications[:notifyMark]
-	}
-	completed = true
-	if err != nil {
-		if transactions.generation == invocationGeneration {
-			transactions.settings.restoreStatementSettings(beforeSettings)
-		}
-		result.RowsAffected = 0
-		transactions.markFailed(err)
+	for {
 		if automatic {
-			err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			if err = transactions.begin(operation, TransactionStart{Historical: execution.timestamp(), ImplicitReadOnly: implicitReadOnly}); err != nil {
+				completed = true
+				return result, err
+			}
+		}
+		options.Environment.Temporal = transactions.temporal
+		if err = transactions.ordinary(); err != nil {
+			completed = true
+			if automatic && transactions.active {
+				err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			}
+			return result, err
+		}
+		options.Environment.Advisory = transactions.advisoryRuntime()
+		if !automatic && execution.timestamp() != 0 {
+			if err := transactions.selectPreparedHistory(operation, execution.timestamp()); err != nil {
+				completed = true
+				return result, err
+			}
+		}
+		if transactions.settings.TransactionPolicy().ReadOnly && options.Environment.Sequences != nil {
+			options.Environment.Sequences = readOnlySequences{SequenceRuntime: options.Environment.Sequences}
+		}
+		advisoryMark, err := transactions.advisoryStatementMark()
+		if err != nil {
+			completed = true
+			if automatic && transactions.active {
+				err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			}
+			return result, transactions.fail(err)
+		}
+		beforeSettings := transactions.settings.snapshotState()
+		deferredMark := len(transactions.deferredTriggers)
+		deferredConstraintMark := len(transactions.deferredConstraints)
+		deferredConstraintBytes := transactions.deferredConstraintBytes
+		notifyMark := len(transactions.pendingNotifications)
+		invocationGeneration := transactions.generation
+		if _, reentry := transactions.routineReentry(operation); reentry {
+			*transferred = true
+			result.RowsAffected, err = runPreparedStatement(operation, transactions, transactions.transaction, execution, options, consume, false)
+		} else if automatic && (inline || execution.nonAtomic) {
+			*transferred = true
+			result.RowsAffected, err = runPreparedStatement(operation, transactions, transactions.transaction, execution, options, consume, true)
+		} else {
+			err = transactions.transaction.Statement(operation, func(statement context.Context) (runErr error) {
+				*transferred = true
+				result.RowsAffected, runErr = runPreparedStatement(statement, transactions, transactions.transaction, execution, options, consume, false)
+				return runErr
+			})
+		}
+		if inline {
+			result.Tag = "DO"
+		}
+		err = errors.Join(err, transactions.markDataAccess())
+		if err != nil && transactions.generation == invocationGeneration {
+			err = errors.Join(err, transactions.rollbackAdvisoryStatement(advisoryMark))
+		}
+		if err != nil && transactions.generation == invocationGeneration && deferredMark <= len(transactions.deferredTriggers) {
+			clear(transactions.deferredTriggers[deferredMark:])
+			transactions.deferredTriggers = transactions.deferredTriggers[:deferredMark]
+		}
+		if err != nil && transactions.generation == invocationGeneration && deferredConstraintMark <= len(transactions.deferredConstraints) {
+			clear(transactions.deferredConstraints[deferredConstraintMark:])
+			transactions.deferredConstraints = transactions.deferredConstraints[:deferredConstraintMark]
+			transactions.deferredConstraintBytes = deferredConstraintBytes
+		}
+		if err != nil && transactions.generation == invocationGeneration && notifyMark <= len(transactions.pendingNotifications) {
+			clear(transactions.pendingNotifications[notifyMark:])
+			transactions.pendingNotifications = transactions.pendingNotifications[:notifyMark]
+		}
+		if err != nil {
+			if transactions.generation == invocationGeneration {
+				transactions.settings.restoreStatementSettings(beforeSettings)
+			}
+			result.RowsAffected = 0
+			if implicitReadOnly && isOnlyImplicitReadOnlyUpgrade(err) && operation.Err() == nil {
+				if rollbackErr := transactions.endRollback(context.WithoutCancel(operation)); rollbackErr != nil {
+					completed = true
+					return result, rollbackErr
+				}
+				implicitReadOnly = false
+				*transferred = false
+				continue
+			}
+			completed = true
+			transactions.markFailed(err)
+			if automatic {
+				err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			}
+			return result, err
+		}
+		completed = true
+		if automatic {
+			result.Commit, err = transactions.commit(operation, false)
+			if err != nil && transactions.active && transactions.transaction.State() != txn.Indeterminate {
+				err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
+			}
 		}
 		return result, err
 	}
-	if automatic {
-		result.Commit, err = transactions.commit(operation, false)
-		if err != nil && transactions.active && transactions.transaction.State() != txn.Indeterminate {
-			err = errors.Join(err, transactions.endRollback(context.WithoutCancel(operation)))
-		}
-	}
-	return result, err
 }
 
 func (transactions *Transactions) selectPreparedHistory(ctx context.Context, timestamp model.Timestamp) error {
@@ -530,6 +573,9 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 		trialTemporary := owner.named.overlayVersion()
 		var trialPrepared *Prepared
 		bound, bindErr := execution.bind(ctx, bindingView, environment.Builtin)
+		if bindErr == nil && owner.implicitReadOnly && !owner.settings.TransactionPolicy().ReadOnly && owner.historical == 0 && !isBoundReadOnlySelect(bound) {
+			bindErr = errImplicitReadOnlyUpgrade
+		}
 		if bindErr == nil && deriveDependencies {
 			var scans []txn.ReadDependency
 			scans, trialPrepared, bindErr = owner.statementScanDependenciesWithTrial(ctx, bindingView, bound, options, options.planningOptions, environment.Builtin)
@@ -543,6 +589,11 @@ func runPreparedStatement(ctx context.Context, owner *Transactions, transaction 
 		}
 		bindErr = errors.Join(bindErr, bindingView.Close())
 		if bindErr != nil {
+			if isOnlyImplicitReadOnlyUpgrade(bindErr) {
+				// Preserve environment.Query for the immediate ReadWrite retry;
+				// environment.Reader has not been opened yet.
+				transferred = true
+			}
 			return 0, bindErr
 		}
 		if bound == nil {

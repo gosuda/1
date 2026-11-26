@@ -3,17 +3,17 @@ package txn
 import (
 	"context"
 	"errors"
+	"slices"
 	"unsafe"
 )
 
 type transactionCheckpoint struct {
-	log             mutationLogPosition
-	overlay         overlayCheckpoint
-	locks           lockPosition
-	mode            TransactionMode
-	targets, marks  int
-	metadata, views uint64
-	ordinal         uint64
+	log            mutationLogPosition
+	overlay        overlayCheckpoint
+	locks          lockPosition
+	mode           TransactionMode
+	targets, marks int
+	views, ordinal uint64
 }
 
 type transactionMark struct {
@@ -52,10 +52,20 @@ func (transaction *Transaction) isLifecycleAbortError(err error) bool {
 // Savepoint is an opaque retained-branch mark. Copying it preserves identity.
 type Savepoint struct{ mark *transactionMark }
 
+func shrinkMetadataSlice[T any](s []T) []T {
+	if cap(s) <= 64 || len(s) > cap(s)/4 {
+		return s
+	}
+	if len(s) == 0 {
+		return nil
+	}
+	return slices.Clone(s)
+}
+
 func (transaction *Transaction) checkpoint() (transactionCheckpoint, error) {
 	position := transactionCheckpoint{
 		mode: transaction.mode, targets: len(transaction.targets), marks: len(transaction.marks),
-		metadata: transaction.metadataUsed, views: transaction.viewSerial, ordinal: transaction.ordinal,
+		views: transaction.viewSerial, ordinal: transaction.ordinal,
 	}
 	if transaction.owner == nil {
 		return position, nil
@@ -95,7 +105,7 @@ func (transaction *Transaction) restore(ctx context.Context, position transactio
 		transaction.metadataUsed -= target.bytes
 	}
 	clear(transaction.targets[position.targets:])
-	transaction.targets = transaction.targets[:position.targets]
+	transaction.targets = shrinkMetadataSlice(transaction.targets[:position.targets])
 	for _, mark := range transaction.marks[position.marks:] {
 		mark.valid = false
 		mark.checkpoint = transactionCheckpoint{}
@@ -103,10 +113,7 @@ func (transaction *Transaction) restore(ctx context.Context, position transactio
 		mark.charge = 0
 	}
 	clear(transaction.marks[position.marks:])
-	transaction.marks = transaction.marks[:position.marks]
-	if len(transaction.marks) == 0 && cap(transaction.marks) > 64 {
-		transaction.marks = nil
-	}
+	transaction.marks = shrinkMetadataSlice(transaction.marks[:position.marks])
 	if transaction.owner != nil {
 		if err := transaction.manager.locks.rollback(transaction.owner, position.locks); err != nil {
 			if transaction.isLifecycleAbortError(err) {
@@ -207,9 +214,6 @@ func (transaction *Transaction) ReleaseSavepoint(ctx context.Context, savepoint 
 		released.charge = 0
 	}
 	clear(transaction.marks[index:])
-	transaction.marks = transaction.marks[:index]
-	if len(transaction.marks) == 0 && cap(transaction.marks) > 64 {
-		transaction.marks = nil
-	}
+	transaction.marks = shrinkMetadataSlice(transaction.marks[:index])
 	return nil
 }

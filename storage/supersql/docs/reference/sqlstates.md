@@ -10,7 +10,7 @@
 | 00000 | 00 | successful completion | 1 | internal/query/session/statistics_command.go:603 | model.Error Code field |
 | 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:839 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
-| 0A000 | 0A | feature not supported | 181 | connector.go:1587 | bindError call, model.Error Code field, sqlError call, unsupported call |
+| 0A000 | 0A | feature not supported | 181 | connector.go:1610 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:112 | bindError call |
 | 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1207 | sqlError call |
 | 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:481 | sqlError call |
@@ -60,7 +60,7 @@
 | 23503 | 23 | integrity constraint violation | 4 | internal/controlplane/schema/relational_policy.go:384 | model.Error Code field |
 | 23505 | 23 | integrity constraint violation | 6 | internal/controlplane/schema/index_set.go:16 | model.Error Code field |
 | 23514 | 23 | integrity constraint violation | 9 | internal/dataplane/txn/row_normalizer.go:586 | model.Error Code field |
-| 25001 | 25 | invalid transaction state | 7 | connector.go:321 | model.Error Code field |
+| 25001 | 25 | invalid transaction state | 7 | connector.go:336 | model.Error Code field |
 | 25006 | 25 | invalid transaction state | 2 | internal/dataplane/txn/manager_commit.go:13 | model.Error Code field |
 | 25P01 | 25 | invalid transaction state | 4 | internal/query/session/deferred_trigger.go:222 | model.Error Code field |
 | 25P02 | 25 | invalid transaction state | 4 | internal/dataplane/txn/transaction.go:88 | model.Error Code field |
@@ -74,7 +74,7 @@
 | 40001 | 40 | transaction rollback | 6 | internal/controlplane/catalog/store.go:27 | model.Error Code field |
 | 40P01 | 40 | transaction rollback | 1 | internal/locks/wait_graph.go:13 | model.Error Code field |
 | 42501 | 42 | syntax error or access rule violation | 22 | internal/query/bind/declaration.go:139 | bindError call, model.Error Code field |
-| 42601 | 42 | syntax error or access rule violation | 624 | connector.go:270 | bindError call, model.Error Code field, sqlError call |
+| 42601 | 42 | syntax error or access rule violation | 624 | connector.go:285 | bindError call, model.Error Code field, sqlError call |
 | 42602 | 42 | syntax error or access rule violation | 5 | internal/query/bind/regclass.go:23 | bindError call, model.Error Code field |
 | 42622 | 42 | syntax error or access rule violation | 4 | internal/query/bind/declaration.go:103 | bindError call |
 | 42701 | 42 | syntax error or access rule violation | 36 | internal/query/bind/copy.go:250 | bindError call, model.Error Code field |
@@ -114,7 +114,7 @@
 | 44000 | 44 | with check option violation | 1 | internal/query/exec/modify/view.go:129 | model.Error Code field |
 | 53200 | 53 | insufficient resources | 24 | internal/controlplane/schema/jobs.go:59 | model.Error Code field |
 | 53300 | 53 | insufficient resources | 3 | internal/dataplane/txn/locks.go:24 | model.Error Code field |
-| 54000 | 54 | program limit exceeded | 446 | internal/controlplane/catalog/object_service.go:132 | bindError call, model.Error Code field, sqlError call |
+| 54000 | 54 | program limit exceeded | 449 | internal/controlplane/catalog/object_service.go:132 | bindError call, model.Error Code field, sqlError call |
 | 54001 | 54 | program limit exceeded | 13 | internal/query/bind/view_mutation.go:240 | bindError call, sqlError call |
 | 54023 | 54 | program limit exceeded | 3 | internal/query/bind/aggregate_order.go:12 | bindError call |
 | 55000 | 55 | object not in prerequisite state | 177 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |

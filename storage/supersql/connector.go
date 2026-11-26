@@ -191,6 +191,9 @@ func (connector *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if connector == nil || connector.closed.Load() || connector.database == nil {
 		return nil, ErrDatabaseClosed
 	}
+	if err := connector.database.checkOpen(); err != nil {
+		return nil, err
+	}
 	scope, err := connector.database.newSession(ctx)
 	if err != nil {
 		return nil, wrapError(err)
@@ -206,7 +209,7 @@ func NewConnectorWithCatalog(database *Catalog) *Connector {
 
 // Catalog returns the underlying Catalog owned by this connector.
 func (connector *Connector) Catalog() *Catalog {
-	if connector == nil || connector.closed.Load() {
+	if connector == nil || connector.closed.Load() || connector.database == nil || connector.database.checkOpen() != nil {
 		return nil
 	}
 	return connector.database
@@ -219,6 +222,9 @@ func (connector *Connector) Driver() driver.Driver { return Driver{} }
 // first so no live connection outlives the database.
 func (connector *Connector) Close() error {
 	if connector == nil || !connector.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if connector.database == nil {
 		return nil
 	}
 	return connector.database.Close()
@@ -249,12 +255,21 @@ func (c *connection) check() error {
 	if c == nil || c.closed.Load() {
 		return driver.ErrBadConn
 	}
+	if c.database == nil {
+		return ErrDatabaseClosed
+	}
+	if err := c.database.checkOpen(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // execSQL parses with this session's lexical settings and runs each statement
 // through the session pipeline, returning the last statement's outcome.
 func (c *connection) execSQL(ctx context.Context, text string, args []driver.NamedValue) (outcome, error) {
+	if err := c.check(); err != nil {
+		return outcome{}, err
+	}
 	parsed, err := c.scope.txns.Parse(ctx, text, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 	if err != nil {
 		return outcome{}, wrapError(err)
@@ -637,7 +652,7 @@ func (c *connection) Ping(ctx context.Context) error {
 // currval/lastval state, held cursors, SQL prepared statements, temporary
 // objects, and session advisory locks so state never leaks across callers.
 func (c *connection) ResetSession(ctx context.Context) error {
-	if c.closed.Load() {
+	if c == nil || c.closed.Load() || c.database == nil || c.database.checkOpen() != nil {
 		return driver.ErrBadConn
 	}
 	if !c.scope.txns.Active() {
@@ -664,7 +679,9 @@ func (c *connection) ResetSession(ctx context.Context) error {
 	return nil
 }
 
-func (c *connection) IsValid() bool { return c != nil && !c.closed.Load() }
+func (c *connection) IsValid() bool {
+	return c != nil && !c.closed.Load() && c.database != nil && c.database.checkOpen() == nil
+}
 
 // transaction is one driver.Tx over the connection's session.
 type transaction struct {
@@ -681,7 +698,8 @@ func (tx *transaction) Commit() error {
 	}
 	_, err := tx.conn.execSQL(tx.ctx, "COMMIT", nil)
 	if err != nil && tx.conn != nil && tx.conn.scope != nil && tx.conn.scope.txns != nil &&
-		!errors.Is(err, storage.ErrCommitIndeterminate) && tx.conn.scope.txns.Active() && !tx.conn.scope.txns.Indeterminate() {
+		!errors.Is(err, storage.ErrCommitIndeterminate) && !errors.Is(err, ErrDatabaseClosed) && !errors.Is(err, driver.ErrBadConn) &&
+		tx.conn.scope.txns.Active() && !tx.conn.scope.txns.Indeterminate() {
 		rollbackCtx := context.Background()
 		if tx.ctx != nil {
 			rollbackCtx = context.WithoutCancel(tx.ctx)
@@ -731,6 +749,8 @@ type statement struct {
 	mu                sync.Mutex
 	cached            *cachedStatementPlan
 	parameterizedScan bool
+	planCacheHits     atomic.Uint64
+	planCacheMisses   atomic.Uint64
 }
 
 var (
@@ -887,7 +907,7 @@ func isStalePreparedError(err error) bool {
 // cache so runtime parameters specialize index spans on every invocation.
 func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.ParameterValue) (*session.Prepared, bool) {
 	c := s.conn
-	if c == nil || c.database == nil || c.scope == nil || c.database.readOnly {
+	if c == nil || c.database == nil || c.scope == nil || c.database.readOnly || c.database.checkOpen() != nil {
 		return nil, false
 	}
 	active, tempDescriptors, tempVersion, searchPath := c.scope.txns.TemporaryCatalogSnapshot(ctx)
@@ -922,7 +942,7 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 	ddlSeq := c.scope.ddlSeq.Load()
 	currentRole := c.scope.settings.CurrentRole()
 	sessionUser := c.scope.settings.SessionUser()
-	builtins := c.scope.builtins()
+	baseBuiltins := c.scope.builtins()
 	declaredLayouts := declaredParameterLayouts(parameters)
 
 	if cached != nil &&
@@ -932,8 +952,9 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 		cached.currentRole == currentRole &&
 		cached.sessionUser == sessionUser &&
 		slices.Equal(cached.searchPath, searchPath) &&
-		builtins.SameSemantics(cached.builtins) &&
+		baseBuiltins.SameSemantics(cached.builtins) &&
 		equalTypeLayouts(cached.paramLayouts, declaredLayouts) {
+		s.planCacheHits.Add(1)
 		return cached.prepared, true
 	}
 
@@ -947,23 +968,24 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 		return nil, false
 	}
 
-	types, err := c.scope.txns.DeclaredTypeRuntime(ctx, snapshot, *c.database.typeRuntimeOptions(builtins))
+	types, err := c.scope.txns.DeclaredTypeRuntime(ctx, snapshot, *c.database.typeRuntimeOptions(baseBuiltins))
 	if err != nil {
 		return nil, false
 	}
-	builtins.Types = types
+	planBuiltins := baseBuiltins
+	planBuiltins.Types = types
 
-	prepareOpts, err := c.scope.prepareOptions(ctx, snapshot, view, builtins)
+	prepareOpts, err := c.scope.prepareOptions(ctx, snapshot, view, planBuiltins)
 	if err != nil {
 		return nil, false
 	}
-	prepareOpts.Normalize.Builtin = builtins
-	prepareOpts.Bind.Builtin = builtins
+	prepareOpts.Normalize.Builtin = planBuiltins
+	prepareOpts.Bind.Builtin = planBuiltins
 	prepareOpts.Bind.SearchPath = searchPath
 	if effectiveWork := c.scope.settings.Resources().EffectiveWorkMemoryBytes; effectiveWork > 0 && prepareOpts.Optimize.WorkingMemory > 0 {
 		prepareOpts.Optimize.WorkingMemory = uint64(effectiveWork)
 	}
-	prepareOpts.Optimize.StatisticsKeyEncoder = c.database.keys.WithResolveOptions(builtins)
+	prepareOpts.Optimize.StatisticsKeyEncoder = c.database.keys.WithResolveOptions(planBuiltins)
 
 	rawStmt := s.parsed.ParseResult.Stmts[0]
 	prepared, err := session.Prepare(ctx, rawStmt, snapshot, prepareOpts, declaredLayouts)
@@ -987,12 +1009,13 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 		currentRole:  currentRole,
 		sessionUser:  sessionUser,
 		searchPath:   slices.Clone(searchPath),
-		builtins:     builtins,
+		builtins:     baseBuiltins,
 		paramLayouts: slices.Clone(declaredLayouts),
 	}
 	s.mu.Lock()
 	s.cached = entry
 	s.mu.Unlock()
+	s.planCacheMisses.Add(1)
 	return prepared, true
 }
 
