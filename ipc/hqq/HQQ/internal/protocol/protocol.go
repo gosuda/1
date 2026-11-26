@@ -1,0 +1,225 @@
+// Package protocol defines the fixed 64-byte little-endian packet ABI and
+// opcodes used by HQQ Standard and Advanced shared-memory links.
+package protocol
+
+import "encoding/binary"
+
+// HQQ Protocol Version Constants.
+//
+// The Standard Protocol is versioned separately from optional AdvancedLink
+// features. Packets are encoded as fixed-width little-endian words so the
+// shared-memory ABI does not depend on uintptr width, Go struct padding, or the
+// local machine's native byte order.
+const (
+	HQQProtocolMajorVersion = 1
+	HQQProtocolMinorVersion = 1
+)
+
+const (
+	// PacketWordCount is the number of 64-bit words in every packet:
+	// word 0 stores the opcode and words 1-7 store operands.
+	PacketWordCount = 8
+
+	// PacketOperandCount is the number of operand words available after the
+	// opcode word.
+	PacketOperandCount = PacketWordCount - 1
+
+	// PacketSize is the fixed wire/shared-memory size of every HQQ packet.
+	PacketSize = PacketWordCount * 8
+)
+
+//go:generate go tool golang.org/x/tools/cmd/stringer -type=OpCode
+
+// OpCode represents the operation code for HQQ protocol packets.
+//
+// OpCode is encoded in the low byte of little-endian packet word 0. The
+// remaining bytes of word 0 are reserved and must be zero when creating new
+// packets.
+type OpCode uint8
+
+const (
+	// OpError (0x00): Error reporting packet.
+	//
+	// Operands:
+	//   Operand0: ContextID (connection ID, copy ID, or request ID)
+	//   Operand1: ErrorCode
+	OpError OpCode = 0x00
+
+	// OpConnCreate (0x01): Connection creation request.
+	//
+	// Operands:
+	//   Operand0: ConnectionID
+	OpConnCreate OpCode = 0x01
+
+	// OpConnAccept (0x02): Connection acceptance.
+	//
+	// Operands:
+	//   Operand0: ConnectionID
+	OpConnAccept OpCode = 0x02
+
+	// OpConnClose (0x03): Connection closure.
+	//
+	// Operands:
+	//   Operand0: ConnectionID
+	OpConnClose OpCode = 0x03
+
+	// OpConnCopy (0x04): Advanced Protocol chunk transfer.
+	//
+	// Operands:
+	//   Operand0: ConnectionID, or zero for link-level request-response
+	//   Operand1: MessageID
+	//   Operand2: TotalSize
+	//   Operand3: ChunkOffset
+	//   Operand4: ChunkSize
+	//   Operand5: Advanced frame flags
+	//   Operand6: MethodID, status code, or zero depending on flags
+	OpConnCopy OpCode = 0x04
+
+	// OpProtoNegotiate (0x05): Protocol negotiation request.
+	//
+	// Operands:
+	//   Operand0: Protocol version encoded as (major << 8) | minor
+	//   Operand1: Requested feature flags
+	//   Operand2: reserved, sent as zero and ignored on receipt
+	OpProtoNegotiate OpCode = 0x05
+
+	// OpProtoAck (0x06): Protocol negotiation acknowledgment.
+	//
+	// Operands:
+	//   Operand0: Accepted protocol version encoded as (major << 8) | minor
+	//   Operand1: Negotiated feature flags
+	//   Operand2: reserved, sent as zero and ignored on receipt
+	OpProtoAck OpCode = 0x06
+
+	// OpCancel (0x07): Advanced Protocol request cancellation, valid only
+	// when FeatureCancel was negotiated (protocol 1.1).
+	//
+	// The sender of a request tells the receiver that it no longer waits for
+	// the response. It is advisory and carries no reply.
+	//
+	// Operands:
+	//   Operand0: ConnectionID of the request (zero for link-level requests)
+	//   Operand1: MessageID of the request
+	//   Operand2..6: reserved, zero
+	OpCancel OpCode = 0x07
+
+	// OpStandardLinkTombstone (0xFE): Empty Standard Protocol slot marker.
+	//
+	// Tombstones are published when a reserved producer slot must be abandoned
+	// after the ring write cursor has advanced. They keep the ring progressing
+	// without exposing a payload to readers.
+	//
+	// Operands:
+	//   Operand0: CopyID or reservation ID
+	//   Operand1: BufferIndex, diagnostic mirror of the claimed data-ring slot
+	//   Operand2: ErrorCode or reason code
+	OpStandardLinkTombstone OpCode = 0xFE
+
+	// OpStandardLinkCopy (0xFF): Standard Protocol data packet.
+	//
+	// Operands:
+	//   Operand0: CopyID, monotonically increasing per endpoint
+	//   Operand1: BufferIndex into the direction-local payload buffer pool
+	//   Operand2: DataSize in bytes, 1 <= DataSize <= BufferSize
+	//
+	// Buffer ownership is derived from the data ring slot. Operand1 mirrors
+	// that slot index for diagnostics and compatibility, but the receiver uses
+	// the claimed slot to locate the payload buffer and releases ownership when
+	// the dequeue callback returns.
+	OpStandardLinkCopy OpCode = 0xFF
+)
+
+// Packet is the fixed-size Standard Protocol packet.
+//
+// Layout:
+//
+//	word 0: opcode in the low byte; remaining bits reserved
+//	word 1: operand 0
+//	word 2: operand 1
+//	word 3: operand 2
+//	word 4: operand 3
+//	word 5: operand 4
+//	word 6: operand 5
+//	word 7: operand 6
+//
+// Every word is encoded with binary.LittleEndian.
+type Packet [PacketSize]byte
+
+// NewPacket returns a packet with op and up to seven operands encoded in
+// little-endian form.
+func NewPacket(op OpCode, operands ...uint64) Packet {
+	var p Packet
+	p.SetOp(op)
+	for i, operand := range operands {
+		if i >= PacketOperandCount {
+			break
+		}
+		p.SetOperand(i, operand)
+	}
+	return p
+}
+
+// NewStandardLinkCopyPacket returns the hot-path StandardLink data packet.
+//
+// It avoids the variadic operand loop in NewPacket for the most frequently
+// emitted packet type.
+func NewStandardLinkCopyPacket(copyID, bufferIndex, size uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpStandardLinkCopy))
+	binary.LittleEndian.PutUint64(p[8:16], copyID)
+	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
+	binary.LittleEndian.PutUint64(p[24:32], size)
+	return p
+}
+
+// NewStandardLinkTombstonePacket returns a StandardLink tombstone packet.
+func NewStandardLinkTombstonePacket(copyID, bufferIndex, reason uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpStandardLinkTombstone))
+	binary.LittleEndian.PutUint64(p[8:16], copyID)
+	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
+	binary.LittleEndian.PutUint64(p[24:32], reason)
+	return p
+}
+
+// NewConnCopyPacket returns an Advanced Protocol chunk packet.
+func NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, chunkSize, flags, aux uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpConnCopy))
+	binary.LittleEndian.PutUint64(p[8:16], connectionID)
+	binary.LittleEndian.PutUint64(p[16:24], messageID)
+	binary.LittleEndian.PutUint64(p[24:32], totalSize)
+	binary.LittleEndian.PutUint64(p[32:40], chunkOffset)
+	binary.LittleEndian.PutUint64(p[40:48], chunkSize)
+	binary.LittleEndian.PutUint64(p[48:56], flags)
+	binary.LittleEndian.PutUint64(p[56:64], aux)
+	return p
+}
+
+// Op returns the packet opcode.
+func (p *Packet) Op() OpCode {
+	return OpCode(binary.LittleEndian.Uint64(p[0:8]) & 0xFF)
+}
+
+// SetOp stores the packet opcode and clears reserved bits in word 0.
+func (p *Packet) SetOp(op OpCode) {
+	binary.LittleEndian.PutUint64(p[0:8], uint64(op))
+}
+
+// Operand returns operand i. It returns zero for out-of-range operand indexes.
+func (p *Packet) Operand(i int) uint64 {
+	if i < 0 || i >= PacketOperandCount {
+		return 0
+	}
+	offset := (i + 1) * 8
+	return binary.LittleEndian.Uint64(p[offset : offset+8])
+}
+
+// SetOperand stores operand i. Out-of-range operand indexes are ignored.
+func (p *Packet) SetOperand(i int, value uint64) {
+	if i < 0 || i >= PacketOperandCount {
+		return
+	}
+	offset := (i + 1) * 8
+	binary.LittleEndian.PutUint64(p[offset:offset+8], value)
+}
