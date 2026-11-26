@@ -17,6 +17,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
+	"github.com/gosuda/supersql-alpha/internal/query/ir"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
@@ -414,7 +415,7 @@ func isReadOnlyFunctionCall(call *zpgparse.FuncCall) bool {
 		"lower", "upper", "length", "char_length", "character_length", "octet_length",
 		"substr", "substring", "trim", "btrim", "ltrim", "rtrim", "replace", "concat", "concat_ws",
 		"abs", "round", "trunc", "floor", "ceil", "ceiling", "mod", "power", "sqrt", "sign",
-		"now", "current_timestamp", "statement_timestamp", "transaction_timestamp", "clock_timestamp",
+		"now", "current_timestamp", "statement_timestamp", "transaction_timestamp",
 		"current_date", "current_time", "localtime", "localtimestamp", "extract", "date_part", "date_trunc",
 		"current_setting", "current_user", "session_user", "current_role", "user",
 		"current_schema", "current_schemas", "current_database", "pg_backend_pid",
@@ -425,6 +426,148 @@ func isReadOnlyFunctionCall(call *zpgparse.FuncCall) bool {
 	default:
 		return false
 	}
+}
+
+// isBoundReadOnlySelect verifies after binding/catalog resolution that a
+// speculatively ImplicitReadOnly autocommit SELECT cannot write, lock rows, or
+// invoke any volatile or non-builtin routine, operator, cast, or declared type
+// (including through expanded views, shadowed built-in names, virtual generated
+// columns, domain CHECK constraints, or RLS policies).
+func isBoundReadOnlySelect(bound *bind.BoundStatement) bool {
+	if bound == nil || bound.Graph() == nil || bound.Command() != nil || bound.Copy() != nil || bound.ProcedureCall() {
+		return false
+	}
+	if bound.Effects().Volatility > ir.Stable {
+		return false
+	}
+	for _, parameter := range bound.Parameters() {
+		if !typeLayoutIsBuiltin(parameter) {
+			return false
+		}
+	}
+	graph := bound.Graph()
+	for id := ir.RelID(1); id <= ir.RelID(graph.RelCount()); id++ {
+		relation, ok := graph.Rel(id)
+		if !ok {
+			return false
+		}
+		if relation.Kind == ir.Modify || relation.Kind == ir.LockRows || relation.Effects.Volatility > ir.Stable {
+			return false
+		}
+		if relation.RowFunction != 0 {
+			if _, ok := builtin.LookupSignature(relation.RowFunction); !ok {
+				return false
+			}
+		}
+		for i := uint32(0); i < relation.AggregateCount(); i++ {
+			agg, ok := graph.Aggregate(id, i)
+			if !ok || agg.Effects.Volatility > ir.Stable {
+				return false
+			}
+			if agg.Function != 0 {
+				if _, ok := builtin.LookupSignature(agg.Function); !ok {
+					return false
+				}
+			}
+			for j := uint32(0); j < agg.OrderCount(); j++ {
+				ord, ok := graph.AggregateOrder(id, i, j)
+				if !ok {
+					return false
+				}
+				if ord.Operator != 0 {
+					if _, ok := builtin.LookupOperator(ord.Operator); !ok {
+						return false
+					}
+				}
+			}
+		}
+		for i := uint32(0); i < relation.WindowCount(); i++ {
+			win, ok := graph.Window(id, i)
+			if !ok || win.Effects.Volatility > ir.Stable {
+				return false
+			}
+			if win.Function != 0 {
+				if _, ok := builtin.LookupSignature(win.Function); !ok {
+					return false
+				}
+			}
+		}
+		for i := uint32(0); i < relation.OrderCount(); i++ {
+			ord, ok := graph.Order(id, i)
+			if !ok {
+				return false
+			}
+			if ord.Operator != 0 {
+				if _, ok := builtin.LookupOperator(ord.Operator); !ok {
+					return false
+				}
+			}
+		}
+	}
+	for id := ir.ScalarID(1); id <= ir.ScalarID(graph.ScalarCount()); id++ {
+		scalar, ok := graph.Scalar(id)
+		if !ok || scalar.Effects.Volatility > ir.Stable {
+			return false
+		}
+		if scalar.Function != 0 {
+			if _, ok := builtin.LookupSignature(scalar.Function); !ok {
+				return false
+			}
+		}
+		if scalar.Operator != 0 {
+			if _, ok := builtin.LookupOperator(scalar.Operator); !ok {
+				return false
+			}
+		}
+	}
+	for id := ir.SignatureID(1); id <= ir.SignatureID(graph.SignatureCount()); id++ {
+		sig, ok := graph.Signature(id)
+		if !ok || sig.Effects.Volatility > ir.Stable {
+			return false
+		}
+		if sig.Function != 0 {
+			if _, ok := builtin.LookupSignature(sig.Function); !ok {
+				return false
+			}
+		}
+		if sig.Operator != 0 {
+			if _, ok := builtin.LookupOperator(sig.Operator); !ok {
+				return false
+			}
+		}
+	}
+	for id := ir.CTEID(1); id <= ir.CTEID(graph.CTECount()); id++ {
+		cte, ok := graph.CTE(id)
+		if !ok || cte.Effects.Volatility > ir.Stable {
+			return false
+		}
+	}
+	for id := ir.LayoutID(1); id <= ir.LayoutID(graph.LayoutCount()); id++ {
+		typ, ok := graph.Type(id)
+		if !ok {
+			return false
+		}
+		if typ.ID != 0 {
+			if _, ok := builtin.LookupType(typ.ID); !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func typeLayoutIsBuiltin(layout model.TypeLayout) bool {
+	if layout.Type.ID != 0 {
+		if _, ok := builtin.LookupType(layout.Type.ID); !ok {
+			return false
+		}
+	}
+	for _, child := range layout.Children {
+		if !typeLayoutIsBuiltin(child) {
+			return false
+		}
+	}
+	return true
 }
 func normalizeSelectInto(statement *zpgparse.RawStmt) *zpgparse.RawStmt {
 	if statement == nil || statement.Stmt == nil {

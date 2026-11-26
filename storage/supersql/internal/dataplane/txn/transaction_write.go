@@ -107,8 +107,8 @@ func (transaction *Transaction) cacheTarget(ctx context.Context, target storage.
 		}
 		layout.Columns[i] = column
 	}
-	cached := transactionTarget{normalizer: normalizer, layout: layout, bytes: memory.used - 2*uint64(unsafe.Sizeof(transactionTarget{}))}
-	transaction.metadataUsed += memory.used
+	cached := transactionTarget{normalizer: normalizer, layout: layout, bytes: memory.used}
+	transaction.metadataUsed += cached.bytes
 	transaction.targets = append(transaction.targets, cached)
 	return cached, nil
 }

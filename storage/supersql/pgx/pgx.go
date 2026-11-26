@@ -809,6 +809,9 @@ func OpenPoolWithConfig(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 // Calling Close on the returned Pool closes its sql.DB pool; the caller retains
 // ownership of closing the Connector unless OpenPool constructed it.
 func NewPoolFromConnector(connector *supersql.Connector) *Pool {
+	if connector == nil {
+		return &Pool{}
+	}
 	db := sql.OpenDB(connector)
 	return &Pool{
 		connector: connector,
@@ -818,6 +821,9 @@ func NewPoolFromConnector(connector *supersql.Connector) *Pool {
 
 // NewPoolFromCatalog creates a Pool over an already-opened supersql.Catalog.
 func NewPoolFromCatalog(catalog *supersql.Catalog) *Pool {
+	if catalog == nil {
+		return &Pool{}
+	}
 	connector := supersql.NewConnectorWithCatalog(catalog)
 	return NewPoolFromConnector(connector)
 }
@@ -828,14 +834,21 @@ func (p *Pool) Close() {
 	if p == nil || !p.closed.CompareAndSwap(false, true) {
 		return
 	}
-	_ = p.db.Close()
+	if p.db != nil {
+		_ = p.db.Close()
+	}
 	if p.ownsConnector && p.connector != nil {
 		_ = p.connector.Close()
 	}
 }
 
 // StdDB returns the underlying *sql.DB handle.
-func (p *Pool) StdDB() *sql.DB { return p.db }
+func (p *Pool) StdDB() *sql.DB {
+	if p == nil {
+		return nil
+	}
+	return p.db
+}
 
 // Catalog returns the underlying *supersql.Catalog.
 func (p *Pool) Catalog() *supersql.Catalog {
@@ -847,22 +860,30 @@ func (p *Pool) Catalog() *supersql.Catalog {
 
 // Stat returns pool connection statistics.
 func (p *Pool) Stat() PoolStat {
+	if p == nil || p.db == nil {
+		return PoolStat{}
+	}
 	return PoolStat{stats: p.db.Stats()}
 }
 
 // Ping verifies the pool can acquire a session and communicate with the engine.
 func (p *Pool) Ping(ctx context.Context) error {
+	if p == nil || p.db == nil {
+		return supersql.ErrDatabaseClosed
+	}
 	return wrapPgError(p.db.PingContext(ctx))
 }
 
 // Acquire checks out an isolated session connection from the pool.
 func (p *Pool) Acquire(ctx context.Context) (*PoolConn, error) {
+	if p == nil || p.db == nil {
+		return nil, supersql.ErrDatabaseClosed
+	}
 	for attempt := 0; attempt < 4; attempt++ {
 		sqlConn, err := p.db.Conn(ctx)
 		if err != nil {
 			return nil, wrapPgError(err)
 		}
-		c := &Conn{sqlConn: sqlConn, pool: p}
 		var hc *hookConn
 		if p.afterConnect != nil || p.beforeAcquire != nil || p.afterRelease != nil {
 			_ = sqlConn.Raw(func(driverConn any) error {
@@ -870,6 +891,17 @@ func (p *Pool) Acquire(ctx context.Context) (*PoolConn, error) {
 				return nil
 			})
 		}
+		if err := sqlConn.PingContext(ctx); err != nil {
+			if hc != nil {
+				hc.discarded.Store(true)
+			}
+			_ = sqlConn.Close()
+			if errors.Is(err, driver.ErrBadConn) && ctx.Err() == nil {
+				continue
+			}
+			return nil, wrapPgError(err)
+		}
+		c := &Conn{sqlConn: sqlConn, pool: p}
 		isNew := hc != nil && hc.isNew.CompareAndSwap(true, false)
 		if isNew && p.afterConnect != nil {
 			if err := p.afterConnect(ctx, c); err != nil {
@@ -1551,10 +1583,16 @@ func (tx *pgxTx) CopyFrom(ctx context.Context, tableName Identifier, columnNames
 	var total int64
 	err := tx.BeginFunc(ctx, func(subTx Tx) error {
 		n, err := copyFromExecer(ctx, subTx, tableName, columnNames, rowSrc)
+		if err != nil {
+			return err
+		}
 		total = n
-		return err
+		return nil
 	})
-	return total, wrapPgError(err)
+	if err != nil {
+		return 0, wrapPgError(err)
+	}
+	return total, nil
 }
 
 // BeginFunc begins a transaction on db and executes fn.
@@ -2781,6 +2819,9 @@ func copyFromExecer(ctx context.Context, execer queryExecer, tableName Identifie
 	if len(columnNames) == 0 {
 		return 0, errors.New("pgx: CopyFrom requires at least one column")
 	}
+	if rowSrc == nil {
+		return 0, errors.New("pgx: CopyFrom requires a non-nil rowSrc")
+	}
 	cols := make([]string, len(columnNames))
 	for i, c := range columnNames {
 		cols[i] = Identifier{c}.Sanitize()
@@ -2828,24 +2869,24 @@ func copyFromExecer(ctx context.Context, execer queryExecer, tableName Identifie
 	for rowSrc.Next() {
 		vals, err := rowSrc.Values()
 		if err != nil {
-			return total, err
+			return 0, err
 		}
 		if len(vals) != numCols {
-			return total, fmt.Errorf("pgx: CopyFrom expected %d values, got %d", numCols, len(vals))
+			return 0, fmt.Errorf("pgx: CopyFrom expected %d values, got %d", numCols, len(vals))
 		}
 		batchArgs = append(batchArgs, vals...)
 		rowsInBatch++
 		if rowsInBatch >= maxRowsPerBatch {
 			if err := flush(); err != nil {
-				return total, err
+				return 0, err
 			}
 		}
 	}
 	if err := rowSrc.Err(); err != nil {
-		return total, err
+		return 0, err
 	}
 	if err := flush(); err != nil {
-		return total, err
+		return 0, err
 	}
 	return total, nil
 }

@@ -28,7 +28,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build
-        run: go build ./...
+        run: CGO_ENABLED=0 go build ./...
       - name: "Vet (accepted baseline: generated ragel scanner unreachable code)"
         run: |
           set -eu
@@ -61,7 +61,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Test with -race
-        run: go test -race -count=1 ./internal/dataplane/... ./internal/controlplane/... ./clock/... .
+        run: go test -race -count=1 ./internal/dataplane/... ./internal/controlplane/... ./clock/... ./pgwire/... ./pgx/... ./internal/query/session/... .
 
   govulncheck:
     name: govulncheck

@@ -17,7 +17,7 @@ var ErrNoClosedFrontier = errors.New("no closed frontier has been published")
 // across statements while two views report equal identities, because equal
 // identities imply identical catalog content.
 type CatalogReadIdentity struct {
-	// Live reports a snapshot taken above the published frontier. Every
+	// Live reports a snapshot taken at or above the published frontier. Every
 	// published commit is visible to it, so Version identifies its content.
 	Live bool
 	// Fixed is the exact timestamp of a snapshot taken at or below the
@@ -75,16 +75,51 @@ func (manager *Manager) CurrentReadView(ctx context.Context) (ReadView, error) {
 // ClosedReadView owns a snapshot at the already published closed frontier. It
 // never certifies a new instant, so it never advances the durable read fence;
 // pollers that rescan durable state use it instead of CurrentReadView.
+//
+// state.ClosedTS and catalogVersion are captured together under manager.mu,
+// where publishResolved advances both atomically on commit. Every published
+// commit at or before state.ClosedTS is therefore reflected in catalogVersion,
+// and any later or in-flight commit receives a strictly larger timestamp from
+// the sequencer. Reporting Live: true with Version: catalogVersion preserves
+// catalog-derived caches (such as prepared statement plans) across non-catalog
+// DML commits while invalidating immediately on any DDL commit.
 func (manager *Manager) ClosedReadView(ctx context.Context) (ReadView, error) {
 	manager.mu.Lock()
+	if manager.closed {
+		manager.mu.Unlock()
+		return nil, storage.ErrClosed
+	}
 	closed := manager.frontier.ClosedTS
 	manager.mu.Unlock()
 	if closed == 0 {
 		return nil, ErrNoClosedFrontier
 	}
-	opened, err := manager.historicalSnapshot(ctx, closed)
+	operation, finish, err := manager.operation(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &managerReadView{SnapshotReader: opened.reader, timestamp: opened.timestamp, identity: opened.identity}, nil
+	defer finish()
+	manager.mu.Lock()
+	state := manager.frontier
+	catalogVersion := manager.catalogVersion
+	manager.mu.Unlock()
+	if state.ClosedTS == 0 {
+		return nil, ErrNoClosedFrontier
+	}
+	if state.ClosedTS < state.HistoryFloor {
+		return nil, storage.ErrSnapshotTooOld
+	}
+	fence, err := manager.authority.Issue(operation, state.ClosedTS, state.LogPosition, state.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := manager.backend.OpenSnapshot(operation, storage.SnapshotSpec{Timestamp: state.ClosedTS, Fence: fence})
+	if err != nil {
+		return nil, err
+	}
+	return &managerReadView{
+		SnapshotReader: reader,
+		timestamp:      state.ClosedTS,
+		identity:       CatalogReadIdentity{Live: true, Version: catalogVersion},
+	}, nil
 }

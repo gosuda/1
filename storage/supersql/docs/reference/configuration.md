@@ -140,7 +140,7 @@ The root package's `Catalog.irLimits` supplies the default envelope for statemen
 | internal/query/exec/aggregate_project.go:69 | MaxBytes=p.env.Limits.MetadataBytes MaxDepth=512 MaxNodes=handles MaxOperands=handles MaxSlots=handles SourceBytes=math.MaxUint32 |
 | internal/query/exec/residual.go:111 | MaxBytes=limits.MaxBytes MaxDepth=uint32(limits.MaxDepth) MaxNodes=uint32(limits.MaxInstructions) MaxOperands=uint32(limits.MaxInstructions) MaxSlots=uint32(limits.MaxInstructions) SourceBytes=1 |
 | internal/query/session/setting_command.go:20 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
-| session_scope.go:121 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
+| session_scope.go:127 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
 
 ## `supersql.CopyOptions`
 
