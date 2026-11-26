@@ -193,10 +193,14 @@ func (m *memtable) empty() bool {
 }
 
 func (m *memtable) shouldFlush(limits Limits) bool {
+	return m.shouldFlushThreshold(memtableMaxBytes(limits))
+}
+
+func (m *memtable) shouldFlushThreshold(maxBytes uint64) bool {
 	if m.empty() {
 		return false
 	}
-	return m.totalBytes >= memtableMaxBytes(limits) || m.totalMuts >= defaultMemtableMaxMutations
+	return m.totalBytes >= maxBytes || m.totalMuts >= defaultMemtableMaxMutations
 }
 
 func (m *memtable) pendingRunCount() uint64 {
@@ -311,6 +315,10 @@ func (m *memtable) stageBatchWithBudget(ctx context.Context, decision runDecisio
 	if nodeBudget == 0 {
 		nodeBudget = defaultMemtableNodeBudget
 	}
+	var totalNodeBytes uint64
+	for _, existing := range m.targets {
+		totalNodeBytes = saturatingAddU64(totalNodeBytes, existing.entries.NodeBytes())
+	}
 	addedTargets := make(map[objectGeneration]*memTargetState)
 	var addedBytes uint64
 	var addedMuts uint64
@@ -365,11 +373,20 @@ func (m *memtable) stageBatchWithBudget(ctx context.Context, decision runDecisio
 		}
 		entry.bytes = entryBytes
 		vk := memVersionKey{key: entry.key, commitTS: entry.commitTS, ordinal: entry.ordinal}
-		nextTree, _, err := state.entries.Set(vk, entry, nodeBudget)
+		prevNodeBytes := state.entries.NodeBytes()
+		if totalNodeBytes >= nodeBudget {
+			return ordered.ErrBudget
+		}
+		nextTree, _, err := state.entries.Set(vk, entry, nodeBudget-totalNodeBytes)
 		if err != nil {
 			return err
 		}
 		state.entries = nextTree
+		if nextNodeBytes := nextTree.NodeBytes(); nextNodeBytes >= prevNodeBytes {
+			totalNodeBytes = saturatingAddU64(totalNodeBytes, nextNodeBytes-prevNodeBytes)
+		} else {
+			totalNodeBytes -= prevNodeBytes - nextNodeBytes
+		}
 		if entry.op == storage.MutationDeleteRange {
 			state.ranges = append(state.ranges, entry)
 		}
@@ -813,7 +830,13 @@ func encodeMemEntriesBlock(ctx context.Context, layout storage.ObjectLayout, ent
 // flushToRuns writes commits [firstPos .. maxPos] from the memtable into
 // coalesced NSSST004 PAX SST files and a run manifest (NSRUNS01 if single
 // commit, NSRUNS02 if multiple), admits them into runs, and trims the memtable.
-func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runSet, limits Limits, c *storageCipher, maxPos uint64) (err error) {
+func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runSet, limits Limits, c *storageCipher, maxPos uint64) error {
+	prepLimits := limits.preparation()
+	prepLimits.File.cipher = c
+	return m.flushToRunsWithLimits(ctx, runsRoot, set, prepLimits, limits.PublicationBytes, memtableNodeBudget(limits), maxPos)
+}
+
+func (m *memtable) flushToRunsWithLimits(ctx context.Context, runsRoot *os.Root, set *runSet, prepLimits runPreparationLimits, publicationBytes, nodeBudget, maxPos uint64) (err error) {
 	if m.empty() {
 		return nil
 	}
@@ -828,8 +851,6 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 	maxCommitTS := flushedCommits[len(flushedCommits)-1].decision.CommitTS
 	isPartial := flushCount < len(m.commits)
 
-	prepLimits := limits.preparation()
-	prepLimits.File.cipher = c
 	prepared := &preparedRuns{root: runsRoot, metadataBytes: uint64(unsafe.Sizeof(preparedRuns{}))}
 	defer func() {
 		if err != nil {
@@ -958,7 +979,7 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 		if err := syncCommitDirectory(runsRoot); err != nil {
 			return err
 		}
-		admission, err = set.admitDecision(ctx, runsRoot, decisions[0], prepared.files, prepLimits.File, limits.PublicationBytes)
+		admission, err = set.admitDecision(ctx, runsRoot, decisions[0], prepared.files, prepLimits.File, publicationBytes)
 		if err != nil {
 			return err
 		}
@@ -973,7 +994,7 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 		if err := syncCommitDirectory(runsRoot); err != nil {
 			return err
 		}
-		admission, err = set.admitCoalescedDecision(ctx, runsRoot, coalesced, commitTSs, prepared.files, prepLimits.File, limits.PublicationBytes)
+		admission, err = set.admitCoalescedDecision(ctx, runsRoot, coalesced, commitTSs, prepared.files, prepLimits.File, publicationBytes)
 		if err != nil {
 			return err
 		}
@@ -990,7 +1011,10 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 	// Trim flushed prefix [firstPos .. maxPos] and retain suffix [maxPos+1 .. lastPos].
 	remainingCommits := slices.Clone(m.commits[flushCount:])
 	nextTargets := make(map[objectGeneration]*memTargetState)
-	nodeBudget := memtableNodeBudget(limits)
+	if nodeBudget == 0 {
+		nodeBudget = defaultMemtableNodeBudget
+	}
+	var keptNodeBytes uint64
 	var nextBytes, nextMuts uint64
 	for tk, state := range m.targets {
 		var kept *memTargetState
@@ -1009,11 +1033,20 @@ func (m *memtable) flushToRuns(ctx context.Context, runsRoot *os.Root, set *runS
 			if layout, ok := state.layouts[e.target.DescriptorVersion]; ok {
 				kept.layouts[e.target.DescriptorVersion] = layout
 			}
-			t, _, err := kept.entries.Set(k, e, nodeBudget)
+			prevNodeBytes := kept.entries.NodeBytes()
+			if keptNodeBytes >= nodeBudget {
+				return ordered.ErrBudget
+			}
+			t, _, err := kept.entries.Set(k, e, nodeBudget-keptNodeBytes)
 			if err != nil {
 				return err
 			}
 			kept.entries = t
+			if nextNodeBytes := t.NodeBytes(); nextNodeBytes >= prevNodeBytes {
+				keptNodeBytes = saturatingAddU64(keptNodeBytes, nextNodeBytes-prevNodeBytes)
+			} else {
+				keptNodeBytes -= prevNodeBytes - nextNodeBytes
+			}
 			if e.op == storage.MutationDeleteRange {
 				kept.ranges = append(kept.ranges, e)
 			}

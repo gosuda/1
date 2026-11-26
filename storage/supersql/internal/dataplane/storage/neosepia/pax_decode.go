@@ -510,8 +510,8 @@ func (b *paxBlock) Column(ctx context.Context, id model.ColumnID) (columnar.Vect
 		return columnar.Vector{}, err
 	}
 	b.cache = append(b.cache, cachedPAXColumn{id: id, vector: v})
-	if b.shared != nil && descriptor.encoding != encodingLOB && descriptor.storage != model.TypeArray && descriptor.storage != model.TypeComposite {
-		b.shared.putColumn(id, v)
+	if b.shared != nil && b.shared.cache != nil && descriptor.encoding != encodingLOB && descriptor.storage != model.TypeArray && descriptor.storage != model.TypeComposite {
+		b.shared.cache.putColumn(b.shared.key, b.shared, id, v)
 	}
 	b.memory.observe(storage.ScanObservation{DecodedBytes: storage.ObservationCount{Value: descriptor.length, Known: true}})
 	return v, nil

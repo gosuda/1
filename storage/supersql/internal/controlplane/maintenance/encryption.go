@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -26,18 +27,24 @@ var ErrInvalidEncryptionKey = errors.New("invalid or missing backup encryption k
 const (
 	encryptionMagic           = "NSE1"
 	encryptionKeySize         = 32
+	encryptionSaltSize        = 32
 	encryptionNonceSize       = 12
 	encryptionTagSize         = 16
-	encryptionHeaderSize      = 4 + 4 + encryptionNonceSize
+	encryptionHeaderSizeV1    = 4 + 4 + encryptionNonceSize
+	encryptionHeaderSizeV2    = 4 + 4 + encryptionSaltSize
+	encryptionHeaderSize      = encryptionHeaderSizeV2
+	encryptionHeaderV2Bit     = uint32(1 << 31)
 	encryptionChunkHeaderSize = 4
 	encryptionChunkOverhead   = encryptionChunkHeaderSize + encryptionTagSize
 	encryptionDefaultChunk    = 64 << 10
 	encryptionMaxChunk        = 4 << 20
 	encryptionFinalBit        = uint32(1 << 31)
 	encryptionKeyDomain       = "supersql-enc-key-v1"
+	encryptionDEKInfo         = "supersql-nse2-dek-v1"
 )
 
 type backupCipher struct {
+	masterKey   [encryptionKeySize]byte
 	aead        cipher.AEAD
 	fingerprint [sha256.Size]byte
 }
@@ -72,7 +79,29 @@ func newBackupCipher(key []byte) (*backupCipher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
 	}
-	return &backupCipher{aead: aead, fingerprint: fp}, nil
+	var masterKey [encryptionKeySize]byte
+	copy(masterKey[:], key)
+	return &backupCipher{masterKey: masterKey, aead: aead, fingerprint: fp}, nil
+}
+
+func (c *backupCipher) deriveFileAEAD(salt [encryptionSaltSize]byte) (cipher.AEAD, error) {
+	if c == nil {
+		return nil, ErrInvalidEncryptionKey
+	}
+	dek, err := hkdf.Key(sha256.New, c.masterKey[:], salt[:], encryptionDEKInfo, encryptionKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	defer clear(dek)
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	return aead, nil
 }
 
 func (c *backupCipher) fingerprintHex() string {
@@ -103,6 +132,12 @@ func deriveChunkNonce(base [encryptionNonceSize]byte, chunkIndex uint64) [encryp
 	return nonce
 }
 
+func deriveChunkNonceV2(chunkIndex uint64) [encryptionNonceSize]byte {
+	var nonce [encryptionNonceSize]byte
+	binary.BigEndian.PutUint64(nonce[4:12], chunkIndex)
+	return nonce
+}
+
 func buildChunkAAD(chunkIndex uint64, plainLen uint32, isFinal bool) [17]byte {
 	var aad [17]byte
 	copy(aad[0:4], encryptionMagic)
@@ -114,7 +149,26 @@ func buildChunkAAD(chunkIndex uint64, plainLen uint32, isFinal bool) [17]byte {
 	return aad
 }
 
-// EncryptBytes encrypts plaintext into the chunked NSE1 AES-256-GCM format.
+func buildHeaderV2(chunkSize uint32, salt [encryptionSaltSize]byte) [encryptionHeaderSizeV2]byte {
+	var hdr [encryptionHeaderSizeV2]byte
+	copy(hdr[0:4], encryptionMagic)
+	binary.BigEndian.PutUint32(hdr[4:8], encryptionHeaderV2Bit|chunkSize)
+	copy(hdr[8:encryptionHeaderSizeV2], salt[:])
+	return hdr
+}
+
+func buildChunkAADV2(header [encryptionHeaderSizeV2]byte, chunkIndex uint64, plainLen uint32, isFinal bool) [encryptionHeaderSizeV2 + 13]byte {
+	var aad [encryptionHeaderSizeV2 + 13]byte
+	copy(aad[0:encryptionHeaderSizeV2], header[:])
+	binary.BigEndian.PutUint64(aad[encryptionHeaderSizeV2:encryptionHeaderSizeV2+8], chunkIndex)
+	binary.BigEndian.PutUint32(aad[encryptionHeaderSizeV2+8:encryptionHeaderSizeV2+12], plainLen)
+	if isFinal {
+		aad[encryptionHeaderSizeV2+12] = 1
+	}
+	return aad
+}
+
+// EncryptBytes encrypts plaintext into the chunked NSE1 v2 AES-256-GCM format.
 func EncryptBytes(key, plaintext []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	_, _, _, err := EncryptStream(context.Background(), &buf, bytes.NewReader(plaintext), key)
@@ -124,7 +178,7 @@ func EncryptBytes(key, plaintext []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// DecryptBytes decrypts and authenticates an NSE1 AES-256-GCM payload.
+// DecryptBytes decrypts and authenticates an NSE1 (v1 or v2) AES-256-GCM payload.
 func DecryptBytes(key, ciphertext []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	_, _, err := DecryptStream(context.Background(), &buf, bytes.NewReader(ciphertext), key)
@@ -134,7 +188,8 @@ func DecryptBytes(key, ciphertext []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// EncryptStream encrypts src to dst in chunked NSE1 AES-256-GCM framing using
+// EncryptStream encrypts src to dst in chunked NSE1 v2 AES-256-GCM framing
+// with a per-file HKDF-SHA256 DEK and deterministic chunk counter nonces using
 // bounded O(64 KiB) memory, returning the plaintext byte count, plaintext
 // SHA-256 digest, and written ciphertext byte count.
 func EncryptStream(ctx context.Context, dst io.Writer, src io.Reader, key []byte) (plainSize uint64, plainSHA [sha256.Size]byte, encSize uint64, err error) {
@@ -148,9 +203,9 @@ func EncryptStream(ctx context.Context, dst io.Writer, src io.Reader, key []byte
 	return encryptStreamWithCipher(ctx, dst, src, c, nil)
 }
 
-// DecryptStream decrypts an NSE1 AES-256-GCM stream from src into dst using
-// bounded O(64 KiB) memory, verifying every chunk tag, final-chunk bit, and
-// trailing EOF.
+// DecryptStream decrypts an NSE1 (v1 or v2) AES-256-GCM stream from src into
+// dst using bounded O(64 KiB) memory, verifying every chunk tag, final-chunk
+// bit, and trailing EOF.
 func DecryptStream(ctx context.Context, dst io.Writer, src io.Reader, key []byte) (plainSize uint64, plainSHA [sha256.Size]byte, err error) {
 	c, err := newBackupCipher(key)
 	if err != nil {
@@ -166,14 +221,15 @@ func encryptStreamWithCipher(ctx context.Context, dst io.Writer, src io.Reader, 
 	if c == nil {
 		return 0, plainSHA, 0, ErrInvalidEncryptionKey
 	}
-	var baseNonce [encryptionNonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, baseNonce[:]); err != nil {
+	var salt [encryptionSaltSize]byte
+	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
 		return 0, plainSHA, 0, err
 	}
-	var hdr [encryptionHeaderSize]byte
-	copy(hdr[0:4], encryptionMagic)
-	binary.BigEndian.PutUint32(hdr[4:8], encryptionDefaultChunk)
-	copy(hdr[8:20], baseNonce[:])
+	fileAEAD, err := c.deriveFileAEAD(salt)
+	if err != nil {
+		return 0, plainSHA, 0, err
+	}
+	hdr := buildHeaderV2(encryptionDefaultChunk, salt)
 	n, err := dst.Write(hdr[:])
 	if n != len(hdr) {
 		err = errors.Join(err, io.ErrShortWrite)
@@ -220,9 +276,9 @@ func encryptStreamWithCipher(ctx context.Context, dst io.Writer, src io.Reader, 
 		}
 		sealed = sealed[:encryptionChunkHeaderSize]
 		binary.BigEndian.PutUint32(sealed[:encryptionChunkHeaderSize], flags)
-		nonce := deriveChunkNonce(baseNonce, chunkIdx)
-		aad := buildChunkAAD(chunkIdx, plainLen, isFinal)
-		sealed = c.aead.Seal(sealed, nonce[:], plain, aad[:])
+		nonce := deriveChunkNonceV2(chunkIdx)
+		aad := buildChunkAADV2(hdr, chunkIdx, plainLen, isFinal)
+		sealed = fileAEAD.Seal(sealed, nonce[:], plain, aad[:])
 		wn, werr := dst.Write(sealed)
 		if wn != len(sealed) {
 			werr = errors.Join(werr, io.ErrShortWrite)
@@ -277,19 +333,40 @@ func decryptStreamWithCipher(ctx context.Context, dst io.Writer, src io.Reader, 
 	if c == nil {
 		return 0, plainSHA, ErrInvalidEncryptionKey
 	}
-	var hdr [encryptionHeaderSize]byte
-	if _, err := io.ReadFull(src, hdr[:]); err != nil {
+	var prefix [8]byte
+	if _, err := io.ReadFull(src, prefix[:]); err != nil {
 		return 0, plainSHA, errors.Join(ErrCorrupt, err)
 	}
-	if string(hdr[0:4]) != encryptionMagic {
+	if string(prefix[0:4]) != encryptionMagic {
 		return 0, plainSHA, ErrCorrupt
 	}
-	chunkSize := uint64(binary.BigEndian.Uint32(hdr[4:8]))
+	hdrFlags := binary.BigEndian.Uint32(prefix[4:8])
+	isV2 := (hdrFlags & encryptionHeaderV2Bit) != 0
+	chunkSize := uint64(hdrFlags &^ encryptionHeaderV2Bit)
 	if chunkSize == 0 || chunkSize > encryptionMaxChunk {
 		return 0, plainSHA, ErrCorrupt
 	}
+
+	var fileAEAD cipher.AEAD
 	var baseNonce [encryptionNonceSize]byte
-	copy(baseNonce[:], hdr[8:20])
+	var hdrV2 [encryptionHeaderSizeV2]byte
+	if isV2 {
+		var salt [encryptionSaltSize]byte
+		if _, err := io.ReadFull(src, salt[:]); err != nil {
+			return 0, plainSHA, errors.Join(ErrCorrupt, err)
+		}
+		copy(hdrV2[0:8], prefix[:])
+		copy(hdrV2[8:encryptionHeaderSizeV2], salt[:])
+		fileAEAD, err = c.deriveFileAEAD(salt)
+		if err != nil {
+			return 0, plainSHA, err
+		}
+	} else {
+		if _, err := io.ReadFull(src, baseNonce[:]); err != nil {
+			return 0, plainSHA, errors.Join(ErrCorrupt, err)
+		}
+		fileAEAD = c.aead
+	}
 
 	digest := sha256.New()
 	var encBuf []byte
@@ -321,10 +398,16 @@ func decryptStreamWithCipher(ctx context.Context, dst io.Writer, src io.Reader, 
 		if _, err := io.ReadFull(src, encBuf); err != nil {
 			return 0, plainSHA, errors.Join(ErrCorrupt, err)
 		}
-		nonce := deriveChunkNonce(baseNonce, chunkIdx)
-		aad := buildChunkAAD(chunkIdx, uint32(plainLen), isFinal)
 		var decErr error
-		plainBuf, decErr = c.aead.Open(plainBuf[:0], nonce[:], encBuf, aad[:])
+		if isV2 {
+			nonce := deriveChunkNonceV2(chunkIdx)
+			aad := buildChunkAADV2(hdrV2, chunkIdx, uint32(plainLen), isFinal)
+			plainBuf, decErr = fileAEAD.Open(plainBuf[:0], nonce[:], encBuf, aad[:])
+		} else {
+			nonce := deriveChunkNonce(baseNonce, chunkIdx)
+			aad := buildChunkAAD(chunkIdx, uint32(plainLen), isFinal)
+			plainBuf, decErr = fileAEAD.Open(plainBuf[:0], nonce[:], encBuf, aad[:])
+		}
 		if decErr != nil {
 			return 0, plainSHA, errors.Join(ErrCorrupt, ErrInvalidEncryptionKey, decErr)
 		}

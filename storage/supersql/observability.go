@@ -3,6 +3,7 @@ package supersql
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/exec"
 	"github.com/gosuda/supersql-alpha/internal/query/physical"
@@ -333,10 +335,26 @@ func (database *Catalog) runAutoAnalyzeIfEnabled(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err != nil && transientMaintenance(err) {
+	if err != nil && !autoAnalyzeBenignContention(err) && transientMaintenance(err) {
 		return err
 	}
 	return nil
+}
+
+// autoAnalyzeBenignContention reports SQL-level concurrency contention errors
+// (serialization failure / wound-wait, deadlock, lock timeout, transaction
+// capacity) that are expected when background auto-ANALYZE overlaps with active
+// DDL or DML. Ignoring them keeps retention and GC running on the same tick and
+// avoids surfacing benign contention through Close.
+func autoAnalyzeBenignContention(err error) bool {
+	if errors.Is(err, txn.ErrManagerCapacity) {
+		return true
+	}
+	switch SQLState(err) {
+	case "40001", "40P01", "55P03", "53300":
+		return true
+	}
+	return false
 }
 
 // runAutoAnalyze executes ANALYZE on due tables using a dedicated short-lived

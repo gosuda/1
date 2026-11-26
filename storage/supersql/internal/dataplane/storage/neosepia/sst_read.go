@@ -761,8 +761,12 @@ func (s *sstFile) readBlock(ctx context.Context, index int, maxBytes uint64, mem
 			vis:         block.vis,
 			sizeBytes:   uint64(len(block.data)) + uint64(unsafe.Sizeof(cachedPAXBlock{})),
 		}
-		core.cache.put(cacheKey, cached)
-		block.shared = cached
+		if stored := core.cache.put(cacheKey, cached); stored != nil {
+			block.data = stored.data
+			block.descriptors = stored.descriptors
+			block.vis = stored.vis
+			block.shared = stored
+		}
 	}
 	return block, nil
 }

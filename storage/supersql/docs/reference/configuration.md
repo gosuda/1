@@ -174,13 +174,13 @@ Constants declared alongside the type:
 
 | Constant | Value | Location |
 | --- | --- | --- |
-| DefaultMaintenanceInterval | 30 * time.Second | maintenance.go:51 |
-| MinMaintenanceInterval | 100 * time.Millisecond | maintenance.go:53 |
-| DefaultWALThreshold | 64 | maintenance.go:56 |
-| DefaultRunThreshold | 64 | maintenance.go:59 |
-| DefaultMaxRetiredTargets | 1024 | maintenance.go:61 |
-| DefaultAutoAnalyzeMinRows | 50 | maintenance.go:64 |
-| DefaultAutoAnalyzeScaleFactor | 0.2 | maintenance.go:67 |
+| DefaultMaintenanceInterval | 30 * time.Second | maintenance.go:52 |
+| MinMaintenanceInterval | 100 * time.Millisecond | maintenance.go:54 |
+| DefaultWALThreshold | 64 | maintenance.go:57 |
+| DefaultRunThreshold | 64 | maintenance.go:60 |
+| DefaultMaxRetiredTargets | 1024 | maintenance.go:62 |
+| DefaultAutoAnalyzeMinRows | 50 | maintenance.go:65 |
+| DefaultAutoAnalyzeScaleFactor | 0.2 | maintenance.go:68 |
 
 ## Internal limit structs
 
@@ -204,7 +204,7 @@ Constants declared alongside the type:
 | blockLimits | internal/dataplane/storage/neosepia/pax_format.go | 3 |
 | pointReadLimits | internal/dataplane/storage/neosepia/point_read.go | 2 |
 | runPreparationLimits | internal/dataplane/storage/neosepia/prepare_runs.go | 5 |
-| runRecoveryLimits | internal/dataplane/storage/neosepia/recover_runs.go | 5 |
+| runRecoveryLimits | internal/dataplane/storage/neosepia/recover_runs.go | 6 |
 | recoveryLimits | internal/dataplane/storage/neosepia/recovery.go | 4 |
 | runSetLimits | internal/dataplane/storage/neosepia/run_set.go | 3 |
 | pinnedPointLimits | internal/dataplane/storage/neosepia/run_set_point.go | 4 |

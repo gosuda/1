@@ -12,6 +12,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
@@ -174,10 +175,15 @@ func transientMaintenance(err error) bool {
 		errors.Is(err, storage.ErrCommitIndeterminate),
 		errors.Is(err, columnar.ErrBatchBudget),
 		errors.Is(err, schema.ErrJobLimit),
+		errors.Is(err, txn.ErrManagerCapacity),
 		errors.Is(err, clock.ErrClockUnavailable),
 		errors.Is(err, clock.ErrClockEpochChanged),
 		errors.Is(err, clock.ErrClockRange),
 		errors.Is(err, context.DeadlineExceeded):
+		return true
+	}
+	switch SQLState(err) {
+	case "40001", "40P01", "55P03", "53300":
 		return true
 	}
 	var pathErr *fs.PathError
