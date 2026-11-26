@@ -254,3 +254,14 @@ func ErrorCodeOf(err error) (ErrorCode, bool)
 
 - [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md): Shared-memory ring geometry, credit flow control, exposed IDL surface, security policy, and `cgo` comparison benchmarks.
 - **License**: Wrapper code is licensed under the [MIT License](LICENSE); Zstandard (`1.5.7`) is used under the [BSD-3-Clause License](third_party/zstd/LICENSE).
+
+## CI coverage
+
+Pull requests run one Linux Clang 18 build, release-script tests, Go vet,
+and race tests on `depot-ubuntu-24.04`. The C11 toolchain is installed
+explicitly. The six release binaries still build in `build-and-test.yml`.
+That workflow runs weekly, on manual dispatch, and before releases or
+upstream promotion. Runtime tests cover Linux amd64/arm64, macOS arm64,
+and Windows amd64 on Depot runners. Windows arm64 and macOS amd64 remain
+cross-built artifacts; this CI does not claim native runtime validation
+for those targets. Upstream Zstandard checks run daily.
