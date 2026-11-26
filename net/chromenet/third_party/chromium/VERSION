@@ -1,0 +1,6 @@
+# Chromium release whose //net stack chrome_net_server is built from.
+# Read by scripts/engine/engine.py; rewritten by `engine.py pin`.
+# Official source archive, verified against SHA256 in this directory.
+version=157.0.8103.78
+archive=chromium-157.0.8103.78-lite.tar.xz
+url=https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.78-lite.tar.xz
