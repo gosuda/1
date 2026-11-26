@@ -1,0 +1,4 @@
+# The mirror's release.yml and chromium.yml commit hashes.go as a bot together with the binaries it
+# pins. The grant is per file and lets that bot land its own push inbound; everything else here
+# inherits the parent owners.
+per-file hashes.go=@github-actions[bot]
