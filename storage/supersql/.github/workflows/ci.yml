@@ -1,0 +1,223 @@
+# Continuous integration for the SuperSQL repository.
+#
+# Actions are pinned to full commit SHAs because a tag can be moved; the
+# trailing comment records the release tag each SHA was resolved from.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-vet:
+    name: build + vet
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: "Vet (accepted baseline: generated ragel scanner unreachable code)"
+        run: |
+          set -eu
+          go mod download
+          findings="$(go vet ./... 2>&1 | grep -v '^#' | grep -v '^go: downloading ' | grep -v 'scan\.rl:[0-9]*: unreachable code$' || true)"
+          if [ -n "$findings" ]; then
+            printf '%s\n' "$findings"
+            exit 1
+          fi
+      - name: Test
+        run: go test -short -count=1 ./...
+      - name: licensecheck
+        run: go run ./internal/tools/licensecheck
+      - name: docgen check
+        run: go run ./internal/tools/docgen -check
+      - name: go generate + diff
+        run: |
+          set -eu
+          go generate ./internal/query/bind ./internal/query/builtin
+          git diff --exit-code
+
+  race:
+    name: race detector
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test with -race
+        run: go test -race -count=1 ./internal/dataplane/... ./internal/controlplane/... ./clock/... .
+
+  govulncheck:
+    name: govulncheck
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: Scan
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  test-full:
+    name: test (full)
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -count=1 ./...
+
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run all four bounded fuzz targets
+        run: |
+          go test -run '^$' -fuzz '^FuzzEncodedBatchFraming$' -fuzztime 30s ./internal/dataplane/storage
+          go test -run '^$' -fuzz '^FuzzDecodeMutation$' -fuzztime 30s ./internal/dataplane/storage
+          go test -run '^$' -fuzz '^FuzzReverseMVCCVisibility$' -fuzztime 30s ./internal/dataplane/storage/neosepia
+          go test -run '^$' -fuzz '^FuzzPAXColumnDecoding$' -fuzztime 30s ./internal/dataplane/storage/neosepia
+
+  pg184-differential:
+    name: postgres 18.4 differential
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SUPERSQL_PG184_DSN: postgres://postgres:pw@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Differential gate
+        run: go test -count=1 -timeout 0 -run '^TestPG184Differential$' -v .
+
+  pg184-regression:
+    # The 18.4 reference corpus (231 schedule files, ~47,000 statements) cannot
+    # finish in one process inside the 180-minute job budget: one Catalog is
+    # reused for the whole run, so per-statement cost grows along the schedule
+    # (~275 minutes projected). Each shard runs a disjoint file subset
+    # (SUPERSQL_REGRESS_FILES keeps schedule order) in its own process with a
+    # fresh Catalog, so no state accumulates across shards. Shard balance is
+    # greedy longest-processing-time over measured per-file durations from the
+    # CI log of job 139472923362 (150 files, 177 minutes); the 81 files past
+    # the kill point reuse the measured mean (70.8s) as an upper-bound
+    # estimate. Every schedule file appears in exactly one shard.
+    name: postgres 18.4 regression (shard ${{ matrix.shard }} of 8)
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 180
+    needs: [pg184-differential]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            files: "test_setup,float4,float8,pg_lsn,numerology,line,polygon,interval,copy,create_index_spgist,constraints,union,matview,replica_identity,tablesample,collate.icu.utf8,rules,select_parallel,foreign_key,foreign_data,jsonb,plancache,conversion,with,partition_info,compression_pglz"
+          - shard: 2
+            files: "int8,oid,bit,regproc,date,time,misc_sanity,insert_conflict,inherit,create_am,hash_func,select_into,select_distinct_on,transactions,brin_bloom,alter_generic,dbsize,merge,tidrangescan,collate.windows.win1252,portals_p2,tsdicts,json,sqljson_jsontable,prepare,largeobject,partition_aggregate,compression"
+          - shard: 3
+            files: "boolean,char,name,strings,point,box,copyencoding,create_aggregate,updatable_views,infinite_recurse,select_having,prepared_xacts,brin,misc,async,misc_functions,tid,tidscan,collate.utf8,psql_pipeline,maintain_every,guc,functional_deps,jsonpath_encoding,copy2,sequence,partition_prune,memoize,event_trigger_login"
+          - shard: 4
+            files: "numeric,comments,xid,copyselect,copydml,create_operator,create_procedure,create_index,create_cast,triggers,roleattributes,sanity_check,delete,namespace,gin,spgist,privileges,join_hash,brin_multi,generated_virtual,stats_ext,subscription,combocid,indirect_toast,sqljson,domain,rowtypes,hash_part,predicate,tablespace"
+          - shard: 5
+            files: "int2,enum,money,md5,lseg,timetz,geometry,opr_sanity,create_table,vacuum,errors,select_implicit,case,update,init_privs,groupingsets,drop_operator,identity,create_role,psql,write_parallel,cluster,window,json_encoding,limit,truncate,xml,tuplesort,oidjoins"
+          - shard: 6
+            files: "text,uuid,path,timestamp,inet,macaddr,database,stats_import,index_including,index_including_gist,aggregates,random,portals,arrays,security_label,rowsecurity,object_address,password,sysviews,psql_crosstab,vacuum_parallel,dependency,xmlmap,jsonpath,plpgsql,alter_table,partition_join,explain,event_trigger"
+          - shard: 7
+            files: "varchar,circle,timestamptz,multirangetypes,type_sanity,expressions,mvcc,encoding,euc_kr,create_function_c,create_misc,create_schema,create_function_sql,select,typed_table,drop_if_exists,select_distinct,join,hash_index,collate,create_table_like,tsrf,collate.linux.utf8,select_views,tsearch,equivclass,sqljson_queryfuncs,rangefuncs,returning,indexing,numa"
+          - shard: 8
+            files: "int4,txid,rangetypes,macaddr8,horology,tstypes,regex,unicode,insert,create_type,create_view,subselect,btree_index,gist,lock,generated_stored,alter_operator,incremental_sort,without_overlaps,amutils,publication,bitmapops,advisory_lock,jsonb_jsonpath,temp,polymorphism,reloptions,stats,fast_default"
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SUPERSQL_PG184_DSN: postgres://postgres:pw@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Regression corpus (shard ${{ matrix.shard }} of 8)
+        # The workflow has no schedule trigger, so the corpus is always the
+        # pinned 18.4 reference; the test default is the same value.
+        env:
+          SUPERSQL_REGRESS_CORPORA: postgres184
+          SUPERSQL_REGRESS_FILES: ${{ matrix.files }}
+        run: NEOSEPIA_POSTGRES_REGRESS=1 go test -count=1 -timeout 0 -run '^TestPostgres18OfficialRegression$' -v .
+
+  pg184-verdict:
+    # Single blocking verdict under the original check name. Fails closed:
+    # any non-success in the differential gate or any regression shard keeps
+    # the gate red. Runs even when a needed job is skipped or cancelled.
+    name: postgres 18.4 differential + regression
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 10
+    needs: [pg184-differential, pg184-regression]
+    if: always()
+    steps:
+      - name: Aggregate pg184 gate verdict
+        run: |
+          differential="${{ needs['pg184-differential'].result }}"
+          regression="${{ needs['pg184-regression'].result }}"
+          echo "differential=$differential regression=$regression"
+          if [ "$differential" != "success" ] || [ "$regression" != "success" ]; then
+            echo "pg184 gate red: differential=$differential regression=$regression"
+            exit 1
+          fi
+          echo "pg184 gate green: differential passed and all 8 regression shards passed"
+

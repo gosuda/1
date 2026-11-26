@@ -1,0 +1,117 @@
+# Unit tests. Every C test is a single file test_<name>.c; a test is registered
+# when its file exists. Tests that need the library internals (hqq_internal.h,
+# hqq_ring.h) link the static `hqq_internal` target; tests of the public API
+# link `hqq::hqq`.
+#
+#   hqq_add_test(<name> [INTERNAL] [POSIX_ONLY] [TIMEOUT <s>] [LABELS <l>...] [SOURCES <extra.c>...])
+
+add_library(hqq_testutil STATIC hqq_testutil.c)
+target_link_libraries(hqq_testutil PUBLIC hqq_internal)
+target_include_directories(hqq_testutil PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+hqq_apply_compile_options(hqq_testutil)
+
+function(hqq_add_test name)
+  cmake_parse_arguments(T "INTERNAL;POSIX_ONLY" "TIMEOUT" "LABELS;SOURCES" ${ARGN})
+  if(T_POSIX_ONLY AND WIN32)
+    return()
+  endif()
+  set(src ${CMAKE_CURRENT_SOURCE_DIR}/test_${name}.c)
+  if(NOT EXISTS ${src})
+    return()
+  endif()
+  add_executable(test_${name} ${src} ${T_SOURCES})
+  if(T_INTERNAL)
+    target_link_libraries(test_${name} PRIVATE hqq_testutil hqq_internal)
+  else()
+    target_link_libraries(test_${name} PRIVATE hqq_testutil hqq::hqq)
+  endif()
+  target_include_directories(test_${name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+  hqq_apply_compile_options(test_${name})
+  add_test(NAME ${name} COMMAND test_${name})
+  if(NOT T_TIMEOUT)
+    set(T_TIMEOUT 120)
+  endif()
+  set_tests_properties(${name} PROPERTIES TIMEOUT ${T_TIMEOUT})
+  if(T_LABELS)
+    set_tests_properties(${name} PROPERTIES LABELS "${T_LABELS}")
+  endif()
+endfunction()
+
+hqq_add_test(smoke)
+hqq_add_test(constants INTERNAL)
+hqq_add_test(ring INTERNAL)
+hqq_add_test(superblock INTERNAL)
+hqq_add_test(link INTERNAL)
+hqq_add_test(adv)
+hqq_add_test(adv_uninit)
+hqq_add_test(adv_listen INTERNAL)
+hqq_add_test(adv_close_queued INTERNAL)
+hqq_add_test(adv_serve INTERNAL)
+hqq_add_test(listener INTERNAL)
+hqq_add_test(simple)
+hqq_add_test(named INTERNAL POSIX_ONLY)
+hqq_add_test(fork POSIX_ONLY LABELS posix)
+hqq_add_test(lifeline POSIX_ONLY LABELS posix)
+hqq_add_test(stress LABELS stress TIMEOUT 180)
+hqq_add_test(platform_mutex INTERNAL)
+
+# The hqq-bindgen C runtime (BINDGEN.md 11.2). rpc_ml.c is a stand-in for the microlib library and
+# rpc_ml_server.c, rpc_ml_hooks.c a verbatim copy of its generated server (9.6).
+set(HQQ_RPC_FIXTURE rpc_ml.c rpc_ml_server.c rpc_ml_hooks.c)
+hqq_add_test(rpc INTERNAL SOURCES ${HQQ_RPC_FIXTURE})
+hqq_add_test(rpc_calls INTERNAL)
+hqq_add_test(rpc_handles INTERNAL)
+hqq_add_test(rpc_fuzz INTERNAL SOURCES ${HQQ_RPC_FIXTURE} TIMEOUT 300)
+hqq_add_test(rpc_live INTERNAL POSIX_ONLY LABELS posix SOURCES ${HQQ_RPC_FIXTURE} TIMEOUT 300)
+
+# hqqrpc_main as a process: the microlib fixture server and the test that starts it.
+if(NOT WIN32)
+  add_executable(rpc_microlib_server rpc_microlib_server.c ${HQQ_RPC_FIXTURE})
+  target_link_libraries(rpc_microlib_server PRIVATE hqq::hqq)
+  target_include_directories(rpc_microlib_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  hqq_apply_compile_options(rpc_microlib_server)
+  add_executable(test_rpc_main test_rpc_main.c ${HQQ_RPC_FIXTURE})
+  target_link_libraries(test_rpc_main PRIVATE hqq_testutil hqq_internal)
+  target_include_directories(test_rpc_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  hqq_apply_compile_options(test_rpc_main)
+  add_dependencies(test_rpc_main rpc_microlib_server)
+  add_test(NAME rpc_main COMMAND test_rpc_main $<TARGET_FILE:rpc_microlib_server>)
+  set_tests_properties(rpc_main PROPERTIES TIMEOUT 300 LABELS posix)
+endif()
+
+# libFuzzer targets of the C runtime (BINDGEN.md 10.2), built with -DHQQ_BUILD_FUZZERS=ON and clang.
+# Their standalone replay drivers (fuzz_rpc_*_smoke) always build: without arguments they run a
+# bounded pseudo-random smoke test (what ctest runs), with file arguments they replay the files.
+option(HQQ_BUILD_FUZZERS "Build the libFuzzer targets of the hqq-bindgen C runtime (clang)" OFF)
+foreach(fz fuzz_rpc_frame fuzz_rpc_writer)
+  add_executable(${fz}_smoke ${fz}.c ${HQQ_RPC_FIXTURE})
+  target_compile_definitions(${fz}_smoke PRIVATE HQQ_FUZZ_STANDALONE=1)
+  target_link_libraries(${fz}_smoke PRIVATE hqq_testutil hqq_internal)
+  target_include_directories(${fz}_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  hqq_apply_compile_options(${fz}_smoke)
+  add_test(NAME ${fz}_smoke COMMAND ${fz}_smoke)
+  set_tests_properties(${fz}_smoke PROPERTIES TIMEOUT 300)
+  if(HQQ_BUILD_FUZZERS)
+    add_executable(${fz} ${fz}.c ${HQQ_RPC_FIXTURE})
+    target_link_libraries(${fz} PRIVATE hqq_testutil hqq_internal)
+    target_include_directories(${fz} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    hqq_apply_compile_options(${fz})
+    target_compile_options(${fz} PRIVATE -fsanitize=fuzzer-no-link,address)
+    target_link_options(${fz} PRIVATE -fsanitize=fuzzer,address)
+  endif()
+endforeach()
+
+if(HQQ_BUILD_CXX_CHECK)
+  add_executable(test_cxx17 test_cxx17.cpp)
+  target_link_libraries(test_cxx17 PRIVATE hqq::hqq)
+  hqq_apply_compile_options(test_cxx17)
+  add_test(NAME cxx17 COMMAND test_cxx17)
+endif()
+
+# The generated constants header must match spec/constants.json.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  add_test(NAME constants_fresh
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_constants.py --check)
+endif()
