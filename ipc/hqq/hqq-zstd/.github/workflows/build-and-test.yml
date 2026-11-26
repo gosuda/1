@@ -21,6 +21,7 @@ concurrency:
 
 env:
   GOCACHEPROG: ""
+  GOENV: "off"
   GO_VERSION: '1.27.4'
   ZIG_VERSION: '0.17.1'
   ZIG_SHA256: '3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a'
@@ -221,6 +222,13 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
+
+      - name: Verify release Go cache isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_program=$(go env GOCACHEPROG)
+          test -z "$cache_program"
 
       - name: Install the Linux test compiler
         if: runner.os == 'Linux'
