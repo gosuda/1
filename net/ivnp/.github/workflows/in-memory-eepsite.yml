@@ -1,0 +1,31 @@
+name: In-memory daemon eepsite access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: in-memory-eepsite-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  in-memory-eepsite:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fetch i2p-projekt.i2p through the in-memory daemon proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          IVNP_LIVE_MEMORY_EEPSITE=1 \
+            go test -tags integration -v -timeout=20m \
+              -run '^TestInMemoryDaemonFetchesPublicEepsite$' ./tests/integration
