@@ -1,0 +1,94 @@
+{
+  "name": "portal-tunnel",
+  "publisher": "gosuda",
+  "displayName": "Portal Tunnel",
+  "description": "Expose local services to the internet via Portal relay tunnels",
+  "version": "0.0.3",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gosuda/portal-tunnel.git",
+    "directory": "extensions/vscode"
+  },
+  "homepage": "https://github.com/gosuda/portal-tunnel/tree/main/extensions/vscode#readme",
+  "bugs": {
+    "url": "https://github.com/gosuda/portal-tunnel/issues"
+  },
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "portal.startTunnel",
+        "title": "Start Tunnel",
+        "category": "Portal"
+      },
+      {
+        "command": "portal.startTunnelAdvanced",
+        "title": "Start Tunnel (Advanced)",
+        "category": "Portal"
+      },
+      {
+        "command": "portal.stopTunnel",
+        "title": "Stop Tunnel",
+        "category": "Portal"
+      }
+    ],
+    "configuration": {
+      "title": "Portal",
+      "properties": {
+        "portal.relayUrls": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Relay server URLs (https only, e.g. https://my-relay.example.com). Leave empty to use the public registry at https://raw.githubusercontent.com/gosuda/portal-tunnel/main/registry.json.",
+          "restricted": true
+        },
+        "portal.defaultHost": {
+          "type": "string",
+          "default": "localhost:3000",
+          "description": "Default local host:port suggested when starting a tunnel.",
+          "restricted": true
+        },
+        "portal.defaultName": {
+          "type": "string",
+          "default": "",
+          "description": "Default tunnel service name suggestion. Leave empty to omit --name.",
+          "restricted": true
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run package",
+    "compile": "pnpm run check-types && pnpm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "pnpm run check-types && pnpm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "pnpm run compile-tests && node --test out/test/extension.test.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.109.0",
+    "@types/node": "22.x",
+    "@vscode/vsce": "4.0.0",
+    "typescript-eslint": "^8.54.0",
+    "eslint": "^9.39.2",
+    "esbuild": "^0.27.2",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3"
+  }
+}
