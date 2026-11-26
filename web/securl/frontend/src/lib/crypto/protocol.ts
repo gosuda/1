@@ -1,0 +1,449 @@
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
+import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { sha3_256 } from '@noble/hashes/sha3.js';
+import { normalizeServiceDomain } from '../security/domain';
+import { MAX_URL_BYTES } from '../security/url';
+import {
+  CaptchaLayerSchema,
+  EnvelopeMetadataSchema,
+  EnvelopeSchema,
+  FeatureFlag,
+  PasswordLayerSchema,
+  PasswordProfile,
+  PayloadKind,
+  PayloadSchema,
+  type Envelope,
+  type EnvelopeMetadata,
+  type Payload
+} from '../gen/securl/v1/envelope_pb.js';
+
+const textEncoder = new TextEncoder();
+const EMPTY_INFO = new Uint8Array();
+const ROOT_KEY_SALT_PREFIX = textEncoder.encode('v2-root-key\0');
+const STORAGE_KEY_SALT_PREFIX = textEncoder.encode('v2-storage-key\0');
+const ENCRYPTION_KEY_SALT = textEncoder.encode('v2-encryption-key');
+const KNOWN_FEATURE_FLAGS =
+  FeatureFlag.CAPTCHA | FeatureFlag.PASSWORD | FeatureFlag.BURN_AFTER_READ;
+export const PROTOCOL_VERSION = 2;
+
+export const KEY_LENGTH = 32;
+export const STORAGE_KEY_LENGTH = 16;
+export const PAYLOAD_NONCE_LENGTH = 24;
+export const PASSWORD_SALT_LENGTH = 16;
+const URL_PADDING_ALIGNMENT = 32;
+const MAX_URL_PADDING_LENGTH = 128;
+/** Serialized Markdown payloads are padded to a multiple of this many bytes. */
+export const MARKDOWN_PADDING_BUCKET = 1024;
+const NULL_BYTE = '\0';
+
+/** Plaintext carried by an envelope; mirrors the `Payload.content` oneof. */
+export type EnvelopeContent =
+  | { kind: 'url'; url: string }
+  | { kind: 'markdown'; deflated: Uint8Array };
+
+export class IncorrectPasswordError extends Error {
+  constructor() {
+    super('Incorrect password.');
+    this.name = 'IncorrectPasswordError';
+  }
+}
+export interface LinkKeys {
+  storageKey: Uint8Array;
+  encryptionKeyMaterial: Uint8Array;
+}
+
+
+export interface PasswordEncryptionLayer {
+  key: Uint8Array;
+  salt: Uint8Array;
+}
+
+export interface EncryptEnvelopeOptions {
+  ttlSeconds: number;
+  password?: PasswordEncryptionLayer;
+  captchaKey?: Uint8Array;
+  burnAfterRead?: boolean;
+  randomBytes?: (length: number) => Uint8Array;
+}
+
+export interface DecryptEnvelopeOptions {
+  passwordKey?: Uint8Array;
+  captchaKey?: Uint8Array;
+}
+
+function requireIdBytes(idBytes: Uint8Array): void {
+  if (idBytes.length !== 8) {
+    throw new Error('ID must be exactly 8 bytes.');
+  }
+}
+
+function requireKey(key: Uint8Array, name: string): void {
+  if (key.length !== KEY_LENGTH) {
+    throw new Error(`${name} must be exactly 32 bytes.`);
+  }
+}
+
+function takeRandomBytes(length: number, source?: (length: number) => Uint8Array): Uint8Array {
+  const bytes = source ? source(length) : crypto.getRandomValues(new Uint8Array(length));
+  if (bytes.length !== length) {
+    throw new Error(`Random source returned ${bytes.length} bytes; expected ${length}.`);
+  }
+  return bytes.slice();
+}
+
+function padDestinationUrl(
+  destinationUrl: string,
+  source?: (length: number) => Uint8Array
+): string {
+  const destinationBytes = textEncoder.encode(destinationUrl);
+  const destinationLength = destinationBytes.length;
+  destinationBytes.fill(0);
+  if (destinationLength > MAX_URL_BYTES) {
+    throw new Error(`Destination URL must not exceed ${MAX_URL_BYTES} UTF-8 bytes.`);
+  }
+
+  const alignmentPadding =
+    (URL_PADDING_ALIGNMENT - (destinationLength % URL_PADDING_ALIGNMENT)) %
+    URL_PADDING_ALIGNMENT;
+  const availablePadding = Math.min(
+    MAX_URL_PADDING_LENGTH,
+    MAX_URL_BYTES - destinationLength
+  );
+  const candidateCount =
+    Math.floor((availablePadding - alignmentPadding) / URL_PADDING_ALIGNMENT) + 1;
+  if (candidateCount === 1) {
+    return alignmentPadding === 0
+      ? destinationUrl
+      : destinationUrl + NULL_BYTE.repeat(alignmentPadding);
+  }
+
+  const randomChoice = takeRandomBytes(1, source);
+  try {
+    // Choose among only the padding lengths that align the padded URL byte length.
+    const paddingLength =
+      alignmentPadding +
+      Math.floor((randomChoice[0] * candidateCount) / 256) * URL_PADDING_ALIGNMENT;
+    return paddingLength === 0
+      ? destinationUrl
+      : destinationUrl + NULL_BYTE.repeat(paddingLength);
+  } finally {
+    randomChoice.fill(0);
+  }
+}
+
+function varintLength(value: number): number {
+  let length = 1;
+  while (value >= 0x80) {
+    value = Math.floor(value / 0x80);
+    length += 1;
+  }
+  return length;
+}
+
+/**
+ * Returns the `Payload.padding` length that makes the serialized Markdown payload an exact
+ * multiple of MARKDOWN_PADDING_BUCKET. The padding field costs one tag byte, its varint
+ * length, and the zero bytes, so some bucket boundaries are unreachable and roll to the next.
+ */
+export function markdownPaddingLength(unpaddedPayloadLength: number): number {
+  let target = Math.ceil(unpaddedPayloadLength / MARKDOWN_PADDING_BUCKET) * MARKDOWN_PADDING_BUCKET;
+  for (;;) {
+    const gap = target - unpaddedPayloadLength;
+    if (gap === 0) return 0;
+    for (let lengthBytes = 1; lengthBytes <= 3; lengthBytes += 1) {
+      const padding = gap - 1 - lengthBytes;
+      if (padding > 0 && varintLength(padding) === lengthBytes) return padding;
+    }
+    target += MARKDOWN_PADDING_BUCKET;
+  }
+}
+
+function serializePayload(content: EnvelopeContent, source?: (length: number) => Uint8Array): Uint8Array {
+  if (content.kind === 'url') {
+    return toBinary(
+      PayloadSchema,
+      create(PayloadSchema, {
+        content: { case: 'url', value: padDestinationUrl(content.url, source) }
+      }),
+      { writeUnknownFields: false }
+    );
+  }
+  if (content.deflated.length === 0) throw new Error('Markdown payload must not be empty.');
+  const payload = create(PayloadSchema, {
+    content: { case: 'markdownDeflate', value: content.deflated }
+  });
+  const unpadded = toBinary(PayloadSchema, payload, { writeUnknownFields: false });
+  const paddingLength = markdownPaddingLength(unpadded.length);
+  if (paddingLength === 0) return unpadded;
+  unpadded.fill(0);
+  payload.padding = new Uint8Array(paddingLength);
+  return toBinary(PayloadSchema, payload, { writeUnknownFields: false });
+}
+
+function parsePayload(payloadBytes: Uint8Array, kind: PayloadKind): EnvelopeContent {
+  const payload: Payload = fromBinary(PayloadSchema, payloadBytes);
+  if (kind === PayloadKind.URL && payload.content.case === 'url') {
+    const paddedUrl = payload.content.value;
+    const paddingStart = paddedUrl.indexOf(NULL_BYTE);
+    return { kind: 'url', url: paddingStart === -1 ? paddedUrl : paddedUrl.slice(0, paddingStart) };
+  }
+  if (kind === PayloadKind.MARKDOWN && payload.content.case === 'markdownDeflate') {
+    return { kind: 'markdown', deflated: payload.content.value };
+  }
+  throw new Error('Envelope payload does not match its declared kind.');
+}
+
+export function deriveRootKeySalt(serviceDomain: string): Uint8Array {
+  const domainBytes = textEncoder.encode(normalizeServiceDomain(serviceDomain));
+  const input = new Uint8Array(ROOT_KEY_SALT_PREFIX.length + domainBytes.length);
+  input.set(ROOT_KEY_SALT_PREFIX);
+  input.set(domainBytes, ROOT_KEY_SALT_PREFIX.length);
+  const digest = sha3_256(input);
+  input.fill(0);
+  const salt = digest.slice(0, PASSWORD_SALT_LENGTH);
+  digest.fill(0);
+  return salt;
+}
+
+export function deriveLinkKeys(rootKey: Uint8Array, serviceDomain: string): LinkKeys {
+  requireKey(rootKey, 'Root key');
+  const domainBytes = textEncoder.encode(normalizeServiceDomain(serviceDomain));
+  const storageSalt = new Uint8Array(STORAGE_KEY_SALT_PREFIX.length + domainBytes.length);
+  storageSalt.set(STORAGE_KEY_SALT_PREFIX);
+  storageSalt.set(domainBytes, STORAGE_KEY_SALT_PREFIX.length);
+  const storageKey = hkdf(sha3_256, rootKey, storageSalt, EMPTY_INFO, STORAGE_KEY_LENGTH);
+  storageSalt.fill(0);
+  const encryptionKeyMaterial = hkdf(
+    sha3_256,
+    rootKey,
+    ENCRYPTION_KEY_SALT,
+    EMPTY_INFO,
+    KEY_LENGTH
+  );
+  return { storageKey, encryptionKeyMaterial };
+}
+
+export function deriveFinalKey(
+  encryptionKeyMaterial: Uint8Array,
+  idBytes: Uint8Array,
+  payloadNonce: Uint8Array
+): Uint8Array {
+  requireKey(encryptionKeyMaterial, 'Encryption key material');
+  requireIdBytes(idBytes);
+  if (payloadNonce.length !== PAYLOAD_NONCE_LENGTH) {
+    throw new Error('Payload nonce must be exactly 24 bytes.');
+  }
+
+  const salt = new Uint8Array(idBytes.length + payloadNonce.length);
+  salt.set(idBytes);
+  salt.set(payloadNonce, idBytes.length);
+  return hkdf(sha3_256, encryptionKeyMaterial, salt, EMPTY_INFO, KEY_LENGTH);
+}
+
+export function encodeStorageKey(storageKey: Uint8Array): string {
+  if (storageKey.length !== STORAGE_KEY_LENGTH) {
+    throw new Error('Storage key must be exactly 16 bytes.');
+  }
+  let binary = '';
+  for (const byte of storageKey) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+export function validateEnvelopeMetadata(metadata: EnvelopeMetadata): void {
+  if (metadata.protocolVersion !== PROTOCOL_VERSION) {
+    throw new Error('Unsupported protocol version.');
+  }
+  if ((metadata.featureFlags & ~KNOWN_FEATURE_FLAGS) !== 0) {
+    throw new Error('Envelope contains unknown feature flags.');
+  }
+  if (metadata.payloadKind !== PayloadKind.URL && metadata.payloadKind !== PayloadKind.MARKDOWN) {
+    throw new Error('Envelope contains an unknown payload kind.');
+  }
+  if (!Number.isInteger(metadata.ttlSeconds) || metadata.ttlSeconds < 0) {
+    throw new Error('Envelope TTL must be a non-negative integer. Zero means no expiration.');
+  }
+  if (metadata.payloadNonce.length !== PAYLOAD_NONCE_LENGTH) {
+    throw new Error('Payload nonce must be exactly 24 bytes.');
+  }
+
+  const passwordEnabled = (metadata.featureFlags & FeatureFlag.PASSWORD) !== 0;
+  if (passwordEnabled !== (metadata.password !== undefined)) {
+    throw new Error('Password metadata does not match feature flags.');
+  }
+  if (
+    metadata.password &&
+    (metadata.password.salt.length !== PASSWORD_SALT_LENGTH ||
+      metadata.password.nonce.length !== PAYLOAD_NONCE_LENGTH ||
+      metadata.password.profile !== PasswordProfile.ARGON2D_V1)
+  ) {
+    throw new Error('Invalid password layer metadata.');
+  }
+
+  const captchaEnabled = (metadata.featureFlags & FeatureFlag.CAPTCHA) !== 0;
+  if (captchaEnabled !== (metadata.captcha !== undefined)) {
+    throw new Error('CAPTCHA metadata does not match feature flags.');
+  }
+  if (metadata.captcha && metadata.captcha.nonce.length !== PAYLOAD_NONCE_LENGTH) {
+    throw new Error('Invalid CAPTCHA layer metadata.');
+  }
+}
+
+export function serializeMetadata(metadata: EnvelopeMetadata): Uint8Array {
+  validateEnvelopeMetadata(metadata);
+  return toBinary(EnvelopeMetadataSchema, metadata, { writeUnknownFields: false });
+}
+
+export function sealLayer(
+  key: Uint8Array,
+  nonce: Uint8Array,
+  plaintext: Uint8Array,
+  aad: Uint8Array
+): Uint8Array {
+  requireKey(key, 'Encryption key');
+  if (nonce.length !== PAYLOAD_NONCE_LENGTH) {
+    throw new Error('Encryption nonce must be exactly 24 bytes.');
+  }
+  return xchacha20poly1305(key, nonce, aad).encrypt(plaintext);
+}
+
+export function openLayer(
+  key: Uint8Array,
+  nonce: Uint8Array,
+  ciphertext: Uint8Array,
+  aad: Uint8Array
+): Uint8Array {
+  requireKey(key, 'Decryption key');
+  if (nonce.length !== PAYLOAD_NONCE_LENGTH) {
+    throw new Error('Decryption nonce must be exactly 24 bytes.');
+  }
+  return xchacha20poly1305(key, nonce, aad).decrypt(ciphertext);
+}
+
+export function encryptEnvelope(
+  content: EnvelopeContent,
+  idBytes: Uint8Array,
+  encryptionKeyMaterial: Uint8Array,
+  options: EncryptEnvelopeOptions
+): Envelope {
+  requireIdBytes(idBytes);
+  requireKey(encryptionKeyMaterial, 'Encryption key material');
+  if (!Number.isInteger(options.ttlSeconds) || options.ttlSeconds < 0) {
+    throw new Error('TTL must be a non-negative integer. Zero means no expiration.');
+  }
+  if (options.password) {
+    requireKey(options.password.key, 'Password key');
+    if (options.password.salt.length !== PASSWORD_SALT_LENGTH) {
+      throw new Error('Password salt must be exactly 16 bytes.');
+    }
+  }
+  if (options.captchaKey) {
+    requireKey(options.captchaKey, 'CAPTCHA key');
+  }
+
+  let featureFlags = 0;
+  if (options.captchaKey) featureFlags |= FeatureFlag.CAPTCHA;
+  if (options.password) featureFlags |= FeatureFlag.PASSWORD;
+  if (options.burnAfterRead) featureFlags |= FeatureFlag.BURN_AFTER_READ;
+
+  const payloadNonce = takeRandomBytes(PAYLOAD_NONCE_LENGTH, options.randomBytes);
+  const passwordNonce = options.password
+    ? takeRandomBytes(PAYLOAD_NONCE_LENGTH, options.randomBytes)
+    : undefined;
+  const captchaNonce = options.captchaKey
+    ? takeRandomBytes(PAYLOAD_NONCE_LENGTH, options.randomBytes)
+    : undefined;
+  const metadata = create(EnvelopeMetadataSchema, {
+    protocolVersion: PROTOCOL_VERSION,
+    featureFlags,
+    ttlSeconds: options.ttlSeconds,
+    payloadNonce,
+    payloadKind: content.kind === 'markdown' ? PayloadKind.MARKDOWN : PayloadKind.URL,
+    password: options.password
+      ? create(PasswordLayerSchema, {
+          salt: options.password.salt.slice(),
+          nonce: passwordNonce,
+          profile: PasswordProfile.ARGON2D_V1
+        })
+      : undefined,
+    captcha: options.captchaKey
+      ? create(CaptchaLayerSchema, { nonce: captchaNonce })
+      : undefined
+  });
+  const aad = serializeMetadata(metadata);
+  const payloadBytes = serializePayload(content, options.randomBytes);
+  const finalKey = deriveFinalKey(encryptionKeyMaterial, idBytes, payloadNonce);
+
+  let ciphertext = sealLayer(finalKey, payloadNonce, payloadBytes, aad);
+  payloadBytes.fill(0);
+  finalKey.fill(0);
+  if (options.password && passwordNonce) {
+    const next = sealLayer(options.password.key, passwordNonce, ciphertext, aad);
+    ciphertext.fill(0);
+    ciphertext = next;
+  }
+  if (options.captchaKey && captchaNonce) {
+    const next = sealLayer(options.captchaKey, captchaNonce, ciphertext, aad);
+    ciphertext.fill(0);
+    ciphertext = next;
+  }
+
+  return create(EnvelopeSchema, { metadata, ciphertext });
+}
+
+export function decryptEnvelope(
+  envelope: Envelope,
+  idBytes: Uint8Array,
+  encryptionKeyMaterial: Uint8Array,
+  options: DecryptEnvelopeOptions = {}
+): EnvelopeContent {
+  requireIdBytes(idBytes);
+  requireKey(encryptionKeyMaterial, 'Encryption key material');
+  if (!envelope.metadata || envelope.ciphertext.length === 0) {
+    throw new Error('Envelope is missing required data.');
+  }
+  const metadata = envelope.metadata;
+  const aad = serializeMetadata(metadata);
+  const passwordEnabled = (metadata.featureFlags & FeatureFlag.PASSWORD) !== 0;
+  const captchaEnabled = (metadata.featureFlags & FeatureFlag.CAPTCHA) !== 0;
+  if (passwordEnabled && !options.passwordKey) {
+    throw new Error('Password key is required.');
+  }
+  if (captchaEnabled && !options.captchaKey) {
+    throw new Error('CAPTCHA key is required.');
+  }
+  if (options.passwordKey) requireKey(options.passwordKey, 'Password key');
+  if (options.captchaKey) requireKey(options.captchaKey, 'CAPTCHA key');
+
+  let plaintext: Uint8Array<ArrayBufferLike> = envelope.ciphertext.slice();
+  const finalKey = deriveFinalKey(encryptionKeyMaterial, idBytes, metadata.payloadNonce);
+  try {
+    if (captchaEnabled && metadata.captcha && options.captchaKey) {
+      const next = openLayer(options.captchaKey, metadata.captcha.nonce, plaintext, aad);
+      plaintext.fill(0);
+      plaintext = next;
+    }
+    if (passwordEnabled && metadata.password && options.passwordKey) {
+      try {
+        const next = openLayer(options.passwordKey, metadata.password.nonce, plaintext, aad);
+        plaintext.fill(0);
+        plaintext = next;
+      } catch {
+        throw new IncorrectPasswordError();
+      }
+    }
+    const payloadBytes = openLayer(finalKey, metadata.payloadNonce, plaintext, aad);
+    plaintext.fill(0);
+    plaintext = payloadBytes;
+    const content = parsePayload(payloadBytes, metadata.payloadKind);
+    // Decoded bytes alias payloadBytes, which is zero-filled below.
+    return content.kind === 'markdown'
+      ? { kind: 'markdown', deflated: content.deflated.slice() }
+      : content;
+  } finally {
+    plaintext.fill(0);
+    finalKey.fill(0);
+  }
+}

@@ -1,0 +1,5 @@
+# The mirror's chromium.yml rewrites the Chromium pins as a bot when a new Stable release builds and
+# passes the tests on all six platforms. The grant covers only these two files: WINSDK and patches/
+# still need the parent owners.
+per-file VERSION=@github-actions[bot]
+per-file SHA256=@github-actions[bot]

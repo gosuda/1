@@ -1,0 +1,38 @@
+//go:build dst || synctest
+
+package ivnp
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// Dst tests require the durable-semaphore overlay (tools/dstoverlay): stock
+// sync lock waits are not idle in a synctest bubble, so without -overlay the
+// virtual clock freezes. This reference fails compilation without the overlay.
+var _ = sync.DurableMutexOverlay
+
+// TestMain serializes goroutine scheduling for deterministic simulation: one
+// P runs runnable goroutines in runqueue order rather than racing them across
+// threads, and crypto packages honor a pinned crypto/rand.Reader. Both
+// GODEBUG settings can only be applied at process start; run dst tests as:
+//
+//	GODEBUG=asyncpreemptoff=1,cryptocustomrand=1 GOGC=off go test -tags dst -overlay=...
+//
+// GOGC=off keeps GC marker goroutines out of the single P's run queue; it is
+// required for byte-identical replay and recommended for every dst run.
+func TestMain(m *testing.M) {
+	godebug := os.Getenv("GODEBUG")
+	for _, setting := range []string{"asyncpreemptoff=1", "cryptocustomrand=1"} {
+		if !strings.Contains(godebug, setting) {
+			fmt.Fprintf(os.Stderr, "dst tests require GODEBUG=asyncpreemptoff=1,cryptocustomrand=1 (missing %s)\n", setting)
+			os.Exit(1)
+		}
+	}
+	runtime.GOMAXPROCS(1)
+	os.Exit(m.Run())
+}

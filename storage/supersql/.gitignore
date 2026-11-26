@@ -1,0 +1,16 @@
+# Binaries & build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+# PostgreSQL regression expected outputs are tracked fixtures, not build artifacts
+!testdata/**/expected/*.out
+
+# Data directories generated during runs
+data_dir/
+*.db/
+*.wal
+*.log
