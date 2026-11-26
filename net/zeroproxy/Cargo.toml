@@ -1,0 +1,137 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zp-shared",
+    "crates/zp-rewriter",
+    "crates/zp-css",
+    "crates/zp-htmltx",
+    "crates/zp-engine",
+    "crates/zp-transport-codec",
+    "crates/zp-bundle",
+    "crates/zp-kernel-bundle",
+    "crates/zp-page-bundle",
+    "crates/zp-page-rt",
+]
+# zp-shared stays separate for the Go parity boundary, and zp-page-rt stays
+# separate to avoid wasm-bindgen + raw-extern-"C" dead-strip interference
+# (see the wasm-page-rt entries in .ai/trap-notebook). The JS rewriter lives in
+# zp-rewriter (OXC 0.133) and the CSS rewriter in zp-css (SWC).
+exclude = ["third_party-rustls-fork", "third_party-h2-fork", "third_party-rustls-rustcrypto", "third_party-lexical"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/gosuda/zeroproxy"
+
+[workspace.dependencies]
+zp-shared = { path = "crates/zp-shared" }
+zp-rewriter = { path = "crates/zp-rewriter" }
+zp-css = { path = "crates/zp-css" }
+zp-htmltx = { path = "crates/zp-htmltx" }
+zp-engine = { path = "crates/zp-engine" }
+zp-transport-codec = { path = "crates/zp-transport-codec" }
+
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Client-side transport stack (Step 14: server-TLS regression repair).
+# These run inside the SW WASM bundle so target HTTPS handshakes happen
+# on the client; the relay server is reduced to a byte-pipe.
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
+pin-project-lite = "0.2"
+bytes = "1"
+httparse = "1"
+
+# TLS: rustls without a built-in crypto provider so we can plug
+# rustls-rustcrypto (pure-Rust, WASM-friendly). `ring` and `aws-lc-rs`
+# either fail to compile on wasm32-unknown-unknown or pull in C/asm code
+# the WASM linker rejects, so they're not options.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "brotli", "zlib"] }
+# `web` feature gives UnixTime::now() via web-time on wasm32-unknown-unknown.
+# Without it rustls's default TimeProvider fails to compile against pki-types.
+rustls-pki-types = { version = "1", features = ["web"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+# getrandom backs the rustcrypto provider's RNGs. wasm_js feature wires
+# `crypto.getRandomValues` as the entropy source on wasm32-unknown-unknown.
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+
+# Yamux client: 1 WebSocket = N concurrent streams. Pure-Rust, futures-based.
+# wasm32 compatibility depends on whether the crate's Connection<T> bounds
+# require Send + Sync, verified by cargo check below.
+yamux = "0.13"
+# HTTP/2 client. ALPN-negotiates `h2` so a single TLS connection carries
+# every concurrent fetch to the same origin (vs HTTP/1.1 which needs one
+# TLS handshake per parallel request). Speaks tokio's AsyncRead/Write so we
+# bridge via `tokio-util::compat` from our futures-io stream.
+h2 = "0.4"
+# `tokio` core only: we want the io traits + macros + sync primitives, not
+# tokio::net (no sockets on wasm32) or the multi-threaded runtime. Default
+# features pull in `net` which fails on wasm32-unknown-unknown.
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "sync"] }
+# Bridges `futures::io::AsyncRead/Write` and `tokio::io::AsyncRead/Write` so
+# h2 can drive the same yamux/TLS stream the rest of our stack uses.
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+# `http` is h2's public-API request/response type; we build `http::Request`
+# from the SW's `(method, url, headers)` tuple and parse `http::Response`
+# back to `Vec<u8>` for the JS side. Same minor version h2 0.4 uses.
+http = "1"
+# Body envelope for h2 send_request bodies. The h2 client takes raw bytes
+# via `SendStream<Bytes>`; we just need `Bytes::from(Vec<u8>)`. Workspace
+# already has `bytes` so this is a no-op import.
+# Full `futures` crate for `Stream`/`Sink`/`SinkExt::send` used by yamux's
+# native API surface. `futures-util` alone doesn't give us yamux's
+# preferred re-exports; pull `futures` (the meta-crate) for compatibility.
+# `async-await` feature enables the `select!` / `select_biased!` macros our
+# yamux driver task uses to fairly interleave inbound polling and outbound
+# open commands.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+# JA3 Phase 2: rustls 0.23.40 fork in third_party-rustls-fork/. Patches:
+#   client/hs.rs::emit_client_hello_for_retry: always set
+#     `renegotiation_info` empty + `certificate_compression_algorithms`
+#     (Brotli) when ja3 feature is wired; populates `contiguous_extensions`
+#     with the Chrome 134 extension order so `used_extensions_in_encoding_order`
+#     emits them in browser layout.
+#   Other compile units untouched. Upstream tag pinned in UPSTREAM file
+#   so rebases against future rustls releases stay traceable.
+#
+# JA3 Phase 5.3: h2 0.4.14 fork in third_party-h2-fork/. Single
+# 4-line patch in `src/frame/headers.rs Iter::next` swaps the
+# `:authority` and `:scheme` pseudo-headers so the emitted HEADERS
+# frame matches Chrome 134's `m,a,s,p` order (upstream h2 emits
+# `m,s,a,p`). Akamai-style H2 fingerprint's last field reflects this
+# order; NAVER WAF appears to use it as part of its bot signal.
+#
+# rustls-rustcrypto 0.0.2-alpha in third_party-rustls-rustcrypto/. Its only use of `rustls-webpki` was the `alg_id` constants of the signature
+# verification algorithms, which `rustls-pki-types` carries as well. The fork takes them from there, so the old `rustls-webpki` 0.102 (the
+# certificate verifier is the 0.103 one of the rustls fork) is no longer built or in Cargo.lock. No other change; see its UPSTREAM file.
+#
+# lexical 6.1.2 in third_party-lexical/ is a stand-in, not a fork: `swc_css_parser` (every release) requires `lexical ^6.1`, whose releases and `lexical-core` 0.8 carry soundness
+# advisories (GHSA-c2hm-mjxv-89r4, GHSA-2326-pfpj-vx3h) fixed only in lexical 7 and lexical-core 1. The parser uses `lexical::parse` and nothing else, so the stand-in is that one
+# function on the standard library's parsers, and the five lexical crates are no longer built or in Cargo.lock. See its UPSTREAM file.
+#
+# Directory name avoids `vendor/` so Go's vendor mode doesn't claim the
+# tree (Go's `vendor/modules.txt` is generated by `go mod vendor` and
+# we don't use vendored Go modules).
+[patch.crates-io]
+rustls = { path = "third_party-rustls-fork" }
+h2 = { path = "third_party-h2-fork" }
+rustls-rustcrypto = { path = "third_party-rustls-rustcrypto" }
+lexical = { path = "third_party-lexical" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
