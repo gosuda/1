@@ -84,8 +84,8 @@ CI runs only on this repository:
 
 | Workflow | Does |
 |:---|:---|
-| [`engine.yml`](.github/workflows/engine.yml) | Builds all six engines and runs the Go tests against them on each platform. |
-| [`chromium.yml`](.github/workflows/chromium.yml) | Every six hours, pins a new Chromium Stable release (`engine.py pin --version latest-stable`) on a `chromium/<version>` branch and runs `engine.yml` on it. Once all six engines build and pass the tests, it attests them, pushes the pins, binaries, `hashes.go` and license texts to `main`, tags the next release (`engine.py release-tag`) and publishes a GitHub release. |
+| [`engine.yml`](.github/workflows/engine.yml) | Builds all six engines weekly, on manual dispatch, and for release/tracker callers. Runtime tests cover the four platforms with Depot runners. |
+| [`chromium.yml`](.github/workflows/chromium.yml) | Daily, pins a new Chromium Stable release (`engine.py pin --version latest-stable`) on a `chromium/<version>` branch and runs `engine.yml` on it. Once all six engines build and the four runtime test targets pass, it attests them, pushes the pins, binaries, `hashes.go` and license texts to `main`, tags the next release (`engine.py release-tag`) and publishes a GitHub release. |
 | [`release.yml`](.github/workflows/release.yml) | On a tag or manual dispatch, builds the engines, attests their provenance, commits them with `internal/embedded/hashes.go` and publishes a release. |
 
 Both bot commits reach gosuda/0 on their own: the monorepo's `OWNERS` grant `github-actions[bot]` exactly the files they write (`third_party/chromium/{VERSION,SHA256}`, `third_party/chromium/notices/*.txt`, `internal/embedded/hashes.go`, `internal/embedded/bin/chrome_net_server_*`). A change to anything else, such as `WINSDK` or `patches/`, still needs an owner.
@@ -99,3 +99,14 @@ gh attestation verify internal/embedded/bin/chrome_net_server_linux_amd64 --repo
 ## Licensing
 
 The Go code, the engine glue in `engine/` and the build scripts are under the [MIT License](LICENSE). `chrome_net_server` contains Chromium and its dependencies under their own licenses; [`third_party/chromium/notices`](third_party/chromium/notices) holds the license texts of each platform's binary, generated from its build graph by Chromium's `tools/licenses/licenses.py`.
+
+### CI runtime coverage
+
+Routine PR and main-push checks run Go vet and tests on Depot Linux
+amd64 against the pinned engine. Weekly and manual Go checks also run
+on Linux arm64, macOS arm64, and Windows amd64. Full Chromium engine
+rebuilds run weekly, manually, and before release or tracker promotion.
+All six engine artifacts remain in the build and attestation pipeline.
+Windows arm64 and macOS amd64 remain cross-built; these workflows do
+not claim native runtime validation for those two targets. Every job
+uses Depot, and every macOS job uses `depot-macos-latest`.
