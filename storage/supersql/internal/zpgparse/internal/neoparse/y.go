@@ -1271,6 +1271,7 @@ var yyStatenames = [...]string{}
 const yyEofCode = 1
 const yyErrCode = 2
 const yyInitialStackSize = 16
+const yyMaxStackSize = 4096
 
 //line gram.y:17789
 
@@ -23818,7 +23819,12 @@ yystack:
 
 	yyp++
 	if yyp >= len(yyS) {
-		nyys := make([]yySymType, len(yyS)*2)
+		if yyp >= yyMaxStackSize {
+			yylex.Error("parser stack overflow")
+			goto ret1
+		}
+		newcap := min(len(yyS)*2, yyMaxStackSize)
+		nyys := make([]yySymType, newcap)
 		copy(nyys, yyS)
 		yyS = nyys
 	}

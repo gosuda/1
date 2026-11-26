@@ -19,8 +19,10 @@ const (
 	cancelRequestCode int32 = 80877102
 	gssEncRequestCode int32 = 80877104
 
-	maxStartupPacketBytes = 64 * 1024
-	maxMessageBytes       = 64 * 1024 * 1024
+	maxStartupPacketBytes   = 64 * 1024
+	maxPasswordMessageBytes = 64 * 1024
+	maxMessageBytes         = 64 * 1024 * 1024
+	frameReadChunkBytes     = 4 * 1024
 
 	authTypeOk                int32 = 0
 	authTypeCleartextPassword int32 = 3
@@ -147,17 +149,52 @@ type startupPacket struct {
 	Secret int32
 }
 
+func readMessageBody(r io.Reader, bodyLen int) ([]byte, error) {
+	if bodyLen == 0 {
+		return nil, nil
+	}
+	if bodyLen < 0 {
+		return nil, fmt.Errorf("invalid message body length: %d", bodyLen)
+	}
+	buf := make([]byte, 0, min(bodyLen, frameReadChunkBytes))
+	remaining := bodyLen
+	for remaining > 0 {
+		if len(buf) == cap(buf) {
+			nextCap := min(bodyLen, max(cap(buf)*2, frameReadChunkBytes))
+			grown := make([]byte, len(buf), nextCap)
+			copy(grown, buf)
+			buf = grown
+		}
+		end := min(cap(buf), len(buf)+remaining)
+		n, err := r.Read(buf[len(buf):end])
+		if n > 0 {
+			buf = buf[:len(buf)+n]
+			remaining -= n
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if remaining == 0 {
+					return buf, nil
+				}
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
 func readStartupPacket(r io.Reader) (startupPacket, error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return startupPacket{}, err
 	}
-	pktLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-	if pktLen < 8 || pktLen > maxStartupPacketBytes {
-		return startupPacket{}, fmt.Errorf("invalid startup packet length: %d", pktLen)
+	rawLen := binary.BigEndian.Uint32(lenBuf[:])
+	if rawLen < 8 || rawLen > maxStartupPacketBytes {
+		return startupPacket{}, fmt.Errorf("invalid startup packet length: %d", rawLen)
 	}
-	payload := make([]byte, pktLen-4)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	payload, err := readMessageBody(r, int(rawLen)-4)
+	if err != nil {
 		return startupPacket{}, err
 	}
 	code := int32(binary.BigEndian.Uint32(payload[0:4]))
@@ -208,6 +245,10 @@ func parseStartupParams(body []byte) (map[string]string, error) {
 }
 
 func readFrontendMessage(r *bufio.Reader) (byte, []byte, error) {
+	return readFrontendMessageWithLimit(r, maxMessageBytes)
+}
+
+func readFrontendMessageWithLimit(r *bufio.Reader, maxBytes int) (byte, []byte, error) {
 	msgType, err := r.ReadByte()
 	if err != nil {
 		return 0, nil, err
@@ -216,15 +257,21 @@ func readFrontendMessage(r *bufio.Reader) (byte, []byte, error) {
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return 0, nil, err
 	}
-	msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-	if msgLen < 4 || msgLen > maxMessageBytes {
-		return 0, nil, fmt.Errorf("invalid frontend message length: %d", msgLen)
+	rawLen := binary.BigEndian.Uint32(lenBuf[:])
+	limit := maxBytes
+	if msgType == 'p' && limit > maxPasswordMessageBytes {
+		limit = maxPasswordMessageBytes
 	}
-	body := make([]byte, msgLen-4)
-	if len(body) > 0 {
-		if _, err := io.ReadFull(r, body); err != nil {
-			return 0, nil, err
+	if rawLen < 4 || rawLen > uint32(limit) {
+		return 0, nil, &wireError{
+			Severity: "FATAL",
+			Code:     "08P01",
+			Message:  fmt.Sprintf("invalid frontend message length: %d", rawLen),
 		}
+	}
+	body, err := readMessageBody(r, int(rawLen)-4)
+	if err != nil {
+		return 0, nil, err
 	}
 	return msgType, body, nil
 }

@@ -152,14 +152,10 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 	if d == nil || table == nil || !table.RowSecurity {
 		return nil
 	}
-	// If modifying through a view without security_invoker, evaluate RLS under
-	// the view owner's role; otherwise evaluate under the caller's role.
-	effectiveRole := b.options.CurrentRole
-	if target.view && target.descriptor != nil {
-		if vmeta, ok := target.descriptor.View(); ok && !vmeta.SecurityInvoker {
-			effectiveRole = vmeta.OwnerName
-		}
-	}
+	// Walk all view layers from outer to inner to determine the effective role
+	// against the underlying table: each definer view switches to its owner,
+	// while security_invoker views preserve the current effective role.
+	effectiveRole := b.viewMutationEffectiveRole(target)
 	savedRole := b.options.CurrentRole
 	b.options.CurrentRole = effectiveRole
 	defer func() { b.options.CurrentRole = savedRole }()

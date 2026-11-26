@@ -346,7 +346,7 @@ func emitRoles(ctx context.Context, snapshot Snapshot, relation Relation, option
 			fv("rolinherit", boolValue(true)),
 			fv("rolcreaterole", boolValue(role.Superuser)),
 			fv("rolcreatedb", boolValue(role.Superuser)),
-			fv("rolcanlogin", boolValue(true)),
+			fv("rolcanlogin", boolValue(role.CanLogin)),
 			fv("rolreplication", boolValue(false)),
 			fv("rolconnlimit", intValue(-1)),
 			fv("rolbypassrls", boolValue(role.BypassRLS)),
@@ -355,10 +355,12 @@ func emitRoles(ctx context.Context, snapshot Snapshot, relation Relation, option
 }
 
 func emitUsers(ctx context.Context, snapshot Snapshot, relation Relation, options SourceOptions, emit rowEmitter) error {
-	if err := emitCatalogRow(relation, emit,
-		fv("usename", stringValue(options.Database.RoleName)), fv("usesysid", oidValue(options.Database.RoleOID)), fv("usecreatedb", boolValue(options.Database.RoleCreateDB)),
-		fv("usesuper", boolValue(options.Database.RoleSuperuser)), fv("userepl", boolValue(options.Database.RoleReplication)), fv("usebypassrls", boolValue(options.Database.RoleBypassRLS))); err != nil {
-		return err
+	if options.Database.RoleCanLogin {
+		if err := emitCatalogRow(relation, emit,
+			fv("usename", stringValue(options.Database.RoleName)), fv("usesysid", oidValue(options.Database.RoleOID)), fv("usecreatedb", boolValue(options.Database.RoleCreateDB)),
+			fv("usesuper", boolValue(options.Database.RoleSuperuser)), fv("userepl", boolValue(options.Database.RoleReplication)), fv("usebypassrls", boolValue(options.Database.RoleBypassRLS))); err != nil {
+			return err
+		}
 	}
 	if snapshot == nil {
 		return nil
@@ -380,6 +382,9 @@ func emitUsers(ctx context.Context, snapshot Snapshot, relation Relation, option
 		role, ok := descriptor.Role()
 		if !ok {
 			return &model.Error{Code: "XX000", Message: "role descriptor metadata is unavailable", Detail: name}
+		}
+		if !role.CanLogin {
+			return nil
 		}
 		return emitCatalogRow(relation, emit,
 			fv("usename", stringValue(name)),

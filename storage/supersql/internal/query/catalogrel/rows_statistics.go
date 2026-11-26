@@ -34,9 +34,18 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 	}
 	var cachedRoles map[string]model.RoleMetadata
 	rolesLoaded := false
+	if relation.ID == IDPgStatistic {
+		superuser, err := isCatalogSuperuser(ctx, snapshot, options, activeRole, &cachedRoles, &rolesLoaded)
+		if err != nil {
+			return err
+		}
+		if !superuser {
+			return nil
+		}
+	}
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
-		if object.spec.Table != nil && object.spec.Table.RowSecurity {
-			visible, err := statsVisibleUnderRLS(ctx, snapshot, options, object.spec.Table, activeRole, &cachedRoles, &rolesLoaded)
+		if relation.ID == IDPgStats {
+			visible, err := statsVisibleForRole(ctx, snapshot, options, object.spec.Table, activeRole, &cachedRoles, &rolesLoaded)
 			if err != nil {
 				return err
 			}
@@ -62,12 +71,53 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 	})
 }
 
-func statsVisibleUnderRLS(ctx context.Context, snapshot Snapshot, options SourceOptions, table *model.TableMetadata, activeRole string, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
-	if table == nil || !table.RowSecurity {
+func isCatalogSuperuser(ctx context.Context, snapshot Snapshot, options SourceOptions, activeRole string, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
+	role := strings.ToLower(strings.TrimSpace(activeRole))
+	if role == "" || role == "none" {
 		return true, nil
 	}
+	if !*rolesLoaded {
+		roles, err := loadCatalogRoles(ctx, snapshot, options)
+		if err != nil {
+			return false, err
+		}
+		*cachedRoles = roles
+		*rolesLoaded = true
+	}
+	if meta, ok := (*cachedRoles)[role]; ok {
+		return meta.Superuser, nil
+	}
+	return isDefaultSuperuserRole(role, options.Database.RoleName), nil
+}
+
+func hasTableSelectPrivilege(roles map[string]model.RoleMetadata, role string, table *model.TableMetadata) bool {
+	if table == nil {
+		return false
+	}
+	if table.OwnerName != "" {
+		owner := strings.ToLower(strings.TrimSpace(table.OwnerName))
+		if role == owner || roleIsMemberOf(roles, role, owner) {
+			return true
+		}
+	}
+	for _, grant := range table.ACL {
+		if (grant.Privileges & model.PrivilegeSelect) == 0 {
+			continue
+		}
+		grantee := strings.ToLower(strings.TrimSpace(grant.Grantee))
+		if grantee == "public" || role == grantee || roleIsMemberOf(roles, role, grantee) {
+			return true
+		}
+	}
+	return false
+}
+
+func statsVisibleForRole(ctx context.Context, snapshot Snapshot, options SourceOptions, table *model.TableMetadata, activeRole string, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
+	if table == nil {
+		return false, nil
+	}
 	role := strings.ToLower(strings.TrimSpace(activeRole))
-	if isDefaultSuperuserRole(role, options.Database.RoleName) {
+	if role == "" || role == "none" {
 		return true, nil
 	}
 	if !*rolesLoaded {
@@ -81,9 +131,15 @@ func statsVisibleUnderRLS(ctx context.Context, snapshot Snapshot, options Source
 	roles := *cachedRoles
 	meta, ok := roles[role]
 	if !ok {
+		return isDefaultSuperuserRole(role, options.Database.RoleName), nil
+	}
+	if meta.Superuser {
+		return true, nil
+	}
+	if !hasTableSelectPrivilege(roles, role, table) {
 		return false, nil
 	}
-	if meta.Superuser || meta.BypassRLS {
+	if !table.RowSecurity || meta.BypassRLS {
 		return true, nil
 	}
 	if !table.ForceRowSecurity && table.OwnerName != "" {
@@ -213,16 +269,14 @@ func emitExtendedStatisticData(ctx context.Context, snapshot Snapshot, view Read
 	}
 	var cachedRoles map[string]model.RoleMetadata
 	rolesLoaded := false
+	superuser, err := isCatalogSuperuser(ctx, snapshot, options, activeRole, &cachedRoles, &rolesLoaded)
+	if err != nil {
+		return err
+	}
+	if !superuser {
+		return nil
+	}
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectTable}, func(object objectDescriptor) error {
-		if object.spec.Table != nil && object.spec.Table.RowSecurity {
-			visible, err := statsVisibleUnderRLS(ctx, snapshot, options, object.spec.Table, activeRole, &cachedRoles, &rolesLoaded)
-			if err != nil {
-				return err
-			}
-			if !visible {
-				return nil
-			}
-		}
 		ref := storage.ObjectRef{ObjectID: object.spec.ID, Generation: object.spec.Physical.Generation, DescriptorVersion: object.spec.Version, EncodingVersion: object.spec.Physical.EncodingVersion}
 		table, ok, err := reader.Lookup(ctx, ref)
 		if err != nil || !ok {

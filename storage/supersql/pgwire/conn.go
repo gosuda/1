@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -232,6 +233,27 @@ func (c *clientConn) closeResources() {
 	c.forceClose()
 }
 
+func (c *clientConn) safeSendFatalPanic() {
+	defer func() {
+		_ = recover()
+	}()
+	if rc := c.currentConn(); rc != nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	}
+	_ = c.writeAndFlush(encodeErrorResponse(wireError{
+		Severity: "FATAL",
+		Code:     "XX000",
+		Message:  "internal server error",
+	}))
+}
+
+func (c *clientConn) recoverPanic(r any) {
+	if c.server != nil {
+		c.server.logf("pgwire: recovered panic on connection pid=%d: %v\n%s", c.pid, r, debug.Stack())
+	}
+	c.safeSendFatalPanic()
+}
+
 func (c *clientConn) serve(ctx context.Context) {
 	preAuthReleased := false
 	releasePreAuth := func() {
@@ -244,6 +266,11 @@ func (c *clientConn) serve(ctx context.Context) {
 	defer func() {
 		releasePreAuth()
 		c.closeResources()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			c.recoverPanic(r)
+		}
 	}()
 
 	// 1. Startup negotiation (SSLRequest / GSSENCRequest / CancelRequest / StartupMessage).
@@ -298,14 +325,14 @@ func (c *clientConn) serve(ctx context.Context) {
 	}
 	c.driverConn = dc
 
-	// Apply safe startup session parameters (best effort).
-	c.applyStartupParams(ctx, params)
-
-	// Bind SQL role if the authenticated username matches a role in pg_roles.
+	// Fail-closed role authentication and session role binding before executing any startup SQL.
 	if err := c.bindAuthenticatedRole(ctx); err != nil {
 		_ = c.writeAndFlush(encodeErrorResponse(toWireError(err, "FATAL")))
 		return
 	}
+
+	// Apply safe startup session parameters (best effort).
+	c.applyStartupParams(ctx, params)
 
 	// 5. Promote from pre-auth tracking to active connection registry.
 	c.server.registerConn(c)
@@ -328,6 +355,11 @@ func (c *clientConn) serve(ctx context.Context) {
 		watchDone := make(chan struct{})
 		go func() {
 			defer close(watchDone)
+			defer func() {
+				if r := recover(); r != nil {
+					c.server.logf("pgwire: recovered panic in notification watcher pid=%d: %v\n%s", c.pid, r, debug.Stack())
+				}
+			}()
 			for {
 				n, err := nc.WaitForNotification(watchCtx)
 				if err != nil {
@@ -429,8 +461,12 @@ func (c *clientConn) authenticate(ctx context.Context) error {
 		_ = rc.SetReadDeadline(time.Now().Add(c.server.cfg.ReadTimeout))
 		defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
 	}
-	msgType, body, err := readFrontendMessage(c.br)
+	msgType, body, err := readFrontendMessageWithLimit(c.br, maxPasswordMessageBytes)
 	if err != nil {
+		var we *wireError
+		if errors.As(err, &we) {
+			_ = c.writeAndFlush(encodeErrorResponse(*we))
+		}
 		return err
 	}
 	if msgType != 'p' {
@@ -496,65 +532,117 @@ func (c *clientConn) applyStartupParams(ctx context.Context, params map[string]s
 	}
 }
 
-// bindAuthenticatedRole binds the SQL session to the authenticated username
-// whenever a matching role exists in pg_catalog.pg_roles. Non-superuser bound
-// roles are pinned on clientConn.boundRole so RESET ROLE / RESET ALL / SET ROLE
-// NONE cannot escalate back to the default embedded superuser. When no matching
-// SQL role exists (e.g. default embedded/trust sessions), the connection keeps
-// SuperSQL's default superuser session.
+// bindAuthenticatedRole verifies and binds the SQL session to the authenticated
+// username. Built-in embedded superuser aliases ("", "postgres", "supersql",
+// "embedded") retain superuser privileges. Every other username is verified
+// fail-closed against pg_catalog.pg_roles (must exist and have rolcanlogin = true)
+// and pinned on the session so RESET ROLE / RESET ALL / SET ROLE NONE cannot
+// escalate back to the default embedded superuser.
 func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
-	c.isSuperuser = true
+	c.isSuperuser = false
 	c.boundRole = ""
-	if c.user == "" || strings.EqualFold(c.user, "postgres") || strings.EqualFold(c.user, "supersql") {
+	user := strings.ToLower(strings.TrimSpace(c.user))
+	if user == "" || user == "postgres" || user == "supersql" || user == "embedded" {
+		c.isSuperuser = true
 		return nil
 	}
 	queryer, ok := c.driverConn.(driver.QueryerContext)
 	if !ok {
-		return nil
-	}
-	execer, ok := c.driverConn.(driver.ExecerContext)
-	if !ok {
-		return nil
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("cannot authenticate role %q", c.user),
+		}
 	}
 	rows, err := queryer.QueryContext(ctx,
-		`SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = $1`,
-		[]driver.NamedValue{{Ordinal: 1, Value: c.user}},
+		`SELECT rolsuper, rolcanlogin FROM pg_catalog.pg_roles WHERE lower(rolname) = $1`,
+		[]driver.NamedValue{{Ordinal: 1, Value: user}},
 	)
 	if err != nil {
-		return nil
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("failed to authenticate role %q", c.user),
+		}
 	}
 	var found bool
 	var rolsuper bool
-	dest := make([]driver.Value, 1)
+	var rolcanlogin bool
+	dest := make([]driver.Value, 2)
 	if nextErr := rows.Next(dest); nextErr == nil {
 		found = true
 		if b, ok := dest[0].(bool); ok {
 			rolsuper = b
 		}
+		if b, ok := dest[1].(bool); ok {
+			rolcanlogin = b
+		}
+	} else if !errors.Is(nextErr, io.EOF) {
+		_ = rows.Close()
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("failed to authenticate role %q", c.user),
+		}
 	}
-	_ = rows.Close()
+	if closeErr := rows.Close(); closeErr != nil {
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("failed to authenticate role %q", c.user),
+		}
+	}
 	if !found {
-		return nil
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("role %q does not exist", c.user),
+		}
+	}
+	if !rolcanlogin {
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("role %q is not permitted to log in", c.user),
+		}
+	}
+	if user == "default" {
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("role %q is not permitted to log in", c.user),
+		}
 	}
 	type sessionUserSetter interface {
 		SetSessionUser(context.Context, string) error
 	}
 	if setter, ok := c.driverConn.(sessionUserSetter); ok {
-		if err := setter.SetSessionUser(ctx, c.user); err != nil {
+		if err := setter.SetSessionUser(ctx, user); err != nil {
 			return &wireError{
 				Severity: "FATAL",
 				Code:     "28000",
-				Message:  fmt.Sprintf("failed to set session user %q: %v", c.user, err),
+				Message:  fmt.Sprintf("failed to set session user %q: %v", user, err),
 			}
 		}
-	} else if _, err := execer.ExecContext(ctx, fmt.Sprintf("SET ROLE %s", quoteIdent(c.user)), nil); err != nil {
-		return &wireError{
-			Severity: "FATAL",
-			Code:     "28000",
-			Message:  fmt.Sprintf("failed to set session role %q: %v", c.user, err),
+	} else {
+		execer, ok := c.driverConn.(driver.ExecerContext)
+		if !ok {
+			return &wireError{
+				Severity: "FATAL",
+				Code:     "28000",
+				Message:  fmt.Sprintf("cannot bind session role %q", user),
+			}
+		}
+		if _, err := execer.ExecContext(ctx, fmt.Sprintf("SET ROLE %s", quoteIdent(user)), nil); err != nil {
+			return &wireError{
+				Severity: "FATAL",
+				Code:     "28000",
+				Message:  fmt.Sprintf("failed to set session role %q: %v", user, err),
+			}
 		}
 	}
-	c.boundRole = c.user
+	c.user = user
+	c.boundRole = user
 	c.isSuperuser = rolsuper
 	return nil
 }
@@ -591,6 +679,11 @@ func (c *clientConn) sendStartupParameters() error {
 }
 
 func (c *clientConn) commandLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.recoverPanic(r)
+		}
+	}()
 	for {
 		if ctx.Err() != nil {
 			return
@@ -623,20 +716,22 @@ func (c *clientConn) commandLoop(ctx context.Context) {
 		if _, err := io.ReadFull(c.br, lenBuf[:]); err != nil {
 			return
 		}
-		msgLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-		if msgLen < 4 || msgLen > maxMessageBytes {
+		rawLen := binary.BigEndian.Uint32(lenBuf[:])
+		limit := uint32(maxMessageBytes)
+		if msgType == 'p' {
+			limit = maxPasswordMessageBytes
+		}
+		if rawLen < 4 || rawLen > limit {
 			_ = c.writeAndFlush(encodeErrorResponse(wireError{
 				Severity: "FATAL",
 				Code:     "08P01",
-				Message:  fmt.Sprintf("invalid frontend message length: %d", msgLen),
+				Message:  fmt.Sprintf("invalid frontend message length: %d", rawLen),
 			}))
 			return
 		}
-		body := make([]byte, msgLen-4)
-		if len(body) > 0 {
-			if _, err := io.ReadFull(c.br, body); err != nil {
-				return
-			}
+		body, err := readMessageBody(c.br, int(rawLen)-4)
+		if err != nil {
+			return
 		}
 		// Clear socket deadline while executing SQL so long-running queries are
 		// governed by cancellation/statement timeouts rather than IdleTimeout.
@@ -938,6 +1033,9 @@ func (c *clientConn) handleParse(ctx context.Context, body []byte) error {
 		return &wireError{Severity: "ERROR", Code: "08P01", Message: "malformed Parse message: missing parameter count"}
 	}
 	numParamTypes := int(binary.BigEndian.Uint16(body[pos : pos+2]))
+	if numParamTypes > maxWireParams {
+		return tooManyParametersError(numParamTypes)
+	}
 	pos += 2
 	if pos+4*numParamTypes > len(body) {
 		return &wireError{Severity: "ERROR", Code: "08P01", Message: "malformed Parse message: truncated parameter OIDs"}
@@ -963,6 +1061,18 @@ func (c *clientConn) handleParse(ctx context.Context, body []byte) error {
 		return err
 	}
 
+	txInfo := classifyTxStmt(raw)
+	analysis, err := analyzeParams(raw)
+	if err != nil {
+		c.updateTxStatusOnError(txInfo, err)
+		return err
+	}
+	if analysis.maxParam > maxWireParams {
+		err := tooManyParametersError(analysis.maxParam)
+		c.updateTxStatusOnError(txInfo, err)
+		return err
+	}
+
 	ps := &preparedStmt{
 		name:            stmtName,
 		sql:             queryStr,
@@ -970,9 +1080,9 @@ func (c *clientConn) handleParse(ctx context.Context, body []byte) error {
 		isEmpty:         raw == nil,
 		returnsRows:     stmtReturnsRows(raw),
 		verb:            stmtCommandVerb(raw),
-		txInfo:          classifyTxStmt(raw),
+		txInfo:          txInfo,
 		clientParamOIDs: clientOIDs,
-		analysis:        analyzeParams(raw),
+		analysis:        analysis,
 	}
 
 	// If in a failed transaction block, only transaction recovery commands may
@@ -1049,6 +1159,9 @@ func (c *clientConn) handleBind(ctx context.Context, body []byte) error {
 		return &wireError{Severity: "ERROR", Code: "08P01", Message: "malformed Bind message: missing param value count"}
 	}
 	numParams := int(binary.BigEndian.Uint16(body[pos : pos+2]))
+	if numParams > maxWireParams {
+		return tooManyParametersError(numParams)
+	}
 	pos += 2
 	rawParams := make([][]byte, numParams)
 	hasBinaryParam := false
@@ -1097,7 +1210,12 @@ func (c *clientConn) handleBind(ctx context.Context, body []byte) error {
 	paramOIDs := ps.paramOIDs
 	if len(paramOIDs) < numParams {
 		if hasBinaryParam || !ps.described {
-			paramOIDs = c.resolveParamOIDs(ctx, ps)
+			var err error
+			paramOIDs, err = c.resolveParamOIDs(ctx, ps)
+			if err != nil {
+				c.updateTxStatusOnError(ps.txInfo, err)
+				return err
+			}
 		}
 	}
 
@@ -1392,10 +1510,13 @@ func (c *clientConn) handleClose(body []byte) error {
 
 // --- Statement Describe & Parameter OID Resolution ---
 
-func (c *clientConn) resolveParamOIDs(ctx context.Context, ps *preparedStmt) []uint32 {
+func (c *clientConn) resolveParamOIDs(ctx context.Context, ps *preparedStmt) ([]uint32, error) {
 	count := max(len(ps.clientParamOIDs), ps.analysis.maxParam)
 	if count == 0 {
-		return nil
+		return nil, nil
+	}
+	if count < 0 || count > maxWireParams {
+		return nil, tooManyParametersError(count)
 	}
 	oids := make([]uint32, count)
 	for i := range count {
@@ -1436,7 +1557,7 @@ func (c *clientConn) resolveParamOIDs(ctx context.Context, ps *preparedStmt) []u
 			}
 		}
 	}
-	return oids
+	return oids, nil
 }
 
 func (c *clientConn) probeTableColumns(ctx context.Context, qualifiedTable string) []columnDesc {
@@ -1463,7 +1584,11 @@ func (c *clientConn) describeStatement(ctx context.Context, ps *preparedStmt, bo
 		}
 	}
 
-	ps.paramOIDs = c.resolveParamOIDs(ctx, ps)
+	paramOIDs, err := c.resolveParamOIDs(ctx, ps)
+	if err != nil {
+		return err
+	}
+	ps.paramOIDs = paramOIDs
 
 	if !ps.returnsRows {
 		ps.columns = nil
@@ -1491,7 +1616,14 @@ func (c *clientConn) describeStatement(ctx context.Context, ps *preparedStmt, bo
 	// usually references 0 parameters even though the INSERT has $1..$N).
 	probeParamCount := len(ps.paramOIDs)
 	if probeRaw, parseErr := parseSingleStatement(probeSQL); parseErr == nil {
-		probeParamCount = analyzeParams(probeRaw).maxParam
+		probeAnalysis, err := analyzeParams(probeRaw)
+		if err != nil {
+			return err
+		}
+		probeParamCount = probeAnalysis.maxParam
+	}
+	if probeParamCount > maxWireParams {
+		return tooManyParametersError(probeParamCount)
 	}
 	var probeOIDs []uint32
 	if probeParamCount > 0 {

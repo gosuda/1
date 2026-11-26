@@ -209,6 +209,7 @@ type ExtendedStatisticDescriptor struct {
 	Name        string
 	Description string
 	Owner       OID
+	OwnerName   string `json:",omitempty"`
 	Namespace   ObjectID
 	Target      int32
 	TargetSet   bool
@@ -298,6 +299,7 @@ type CollationMetadata struct {
 type RoleMetadata struct {
 	Superuser bool
 	BypassRLS bool
+	CanLogin  bool     `json:",omitempty"`
 	MemberOf  []string `json:",omitempty"` // normalized lower-case role names
 }
 
@@ -1176,6 +1178,7 @@ func (c *descriptorCopier) copy(in DescriptorSpec) (DescriptorSpec, error) {
 		for i := range x.ExtendedStatistics {
 			statistic := &x.ExtendedStatistics[i]
 			statistic.Name = c.text(statistic.Name)
+			statistic.OwnerName = c.text(statistic.OwnerName)
 			statistic.Keys = descriptorSlice(c, statistic.Keys)
 			statistic.Kinds = descriptorSlice(c, statistic.Kinds)
 			expressions := descriptorSlice(c, statistic.Expressions)

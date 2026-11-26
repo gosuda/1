@@ -234,25 +234,58 @@ type paramAnalysis struct {
 	colHints     map[int]paramColHint
 }
 
-func analyzeParams(raw *zpgparse.RawStmt) paramAnalysis {
+const (
+	maxWireParams     = 65535
+	maxProtoWalkDepth = 1024
+	maxProtoWalkNodes = 100_000
+)
+
+var (
+	errProtoWalkDepth = &wireError{
+		Severity: "ERROR",
+		Code:     "54001",
+		Message:  fmt.Sprintf("statement nesting depth exceeds maximum %d", maxProtoWalkDepth),
+	}
+	errProtoWalkNodes = &wireError{
+		Severity: "ERROR",
+		Code:     "54001",
+		Message:  fmt.Sprintf("statement AST node count exceeds maximum %d", maxProtoWalkNodes),
+	}
+)
+
+func tooManyParametersError(paramNum int) error {
+	return &wireError{
+		Severity: "ERROR",
+		Code:     "54000",
+		Message:  fmt.Sprintf("too many parameters: $%d exceeds maximum %d", paramNum, maxWireParams),
+	}
+}
+
+func analyzeParams(raw *zpgparse.RawStmt) (paramAnalysis, error) {
 	out := paramAnalysis{
 		explicitOIDs: make(map[int]uint32),
 		colHints:     make(map[int]paramColHint),
 	}
 	if raw == nil || raw.Stmt == nil {
-		return out
+		return out, nil
 	}
 
-	// 1. Walk the entire AST to discover all ParamRef numbers and direct TypeCasts.
-	walkProtoMessage(raw.Stmt.ProtoReflect(), func(msg protoreflect.Message) {
+	// 1. Walk the entire AST iteratively to discover all ParamRef numbers and direct TypeCasts.
+	var paramErr error
+	if err := walkProtoMessage(raw.Stmt.ProtoReflect(), func(msg protoreflect.Message) bool {
 		switch node := msg.Interface().(type) {
 		case *zpgparse.ParamRef:
-			if n := int(node.Number); n > out.maxParam {
+			n := int(node.Number)
+			if n <= 0 || n > maxWireParams {
+				paramErr = tooManyParametersError(n)
+				return false
+			}
+			if n > out.maxParam {
 				out.maxParam = n
 			}
 		case *zpgparse.TypeCast:
 			if node.Arg != nil {
-				if pr := node.Arg.GetParamRef(); pr != nil && pr.Number > 0 {
+				if pr := node.Arg.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 					if oid := extractTypeNameOID(node.TypeName); oid != 0 {
 						if _, exists := out.explicitOIDs[int(pr.Number)]; !exists {
 							out.explicitOIDs[int(pr.Number)] = oid
@@ -262,58 +295,143 @@ func analyzeParams(raw *zpgparse.RawStmt) paramAnalysis {
 			}
 		case *zpgparse.SelectStmt:
 			if node.LimitCount != nil {
-				if pr := node.LimitCount.GetParamRef(); pr != nil && pr.Number > 0 {
+				if pr := node.LimitCount.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 					if _, exists := out.explicitOIDs[int(pr.Number)]; !exists {
 						out.explicitOIDs[int(pr.Number)] = oidInt8
 					}
 				}
 			}
 			if node.LimitOffset != nil {
-				if pr := node.LimitOffset.GetParamRef(); pr != nil && pr.Number > 0 {
+				if pr := node.LimitOffset.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 					if _, exists := out.explicitOIDs[int(pr.Number)]; !exists {
 						out.explicitOIDs[int(pr.Number)] = oidInt8
 					}
 				}
 			}
 		}
-	})
+		return true
+	}); err != nil {
+		return paramAnalysis{}, err
+	}
+	if paramErr != nil {
+		return paramAnalysis{}, paramErr
+	}
 
 	if out.maxParam == 0 {
-		return out
+		return out, nil
 	}
 
 	// 2. Collect table-column hints for DML/SELECT statements so Describe('S')
 	// can resolve exact column OIDs for parameters without explicit casts.
-	collectTableHints(raw.Stmt, &out)
-	return out
+	if err := collectTableHints(raw.Stmt, &out); err != nil {
+		return paramAnalysis{}, err
+	}
+	return out, nil
 }
 
-func walkProtoMessage(msg protoreflect.Message, visit func(protoreflect.Message)) {
-	if !msg.IsValid() {
-		return
+type protoWalkFrame struct {
+	msg   protoreflect.Message
+	depth int
+}
+
+// walkProtoMessage performs a bounded iterative depth-first traversal of root.
+// Returning false from visit stops traversal early without error. Exceeding
+// maxProtoWalkDepth or maxProtoWalkNodes returns a statement_too_complex error.
+func walkProtoMessage(root protoreflect.Message, visit func(protoreflect.Message) bool) error {
+	if !root.IsValid() {
+		return nil
 	}
-	visit(msg)
-	msg.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		switch {
-		case fd.IsList():
-			if fd.Kind() == protoreflect.MessageKind {
-				list := v.List()
-				for i := 0; i < list.Len(); i++ {
-					walkProtoMessage(list.Get(i).Message(), visit)
+	stack := make([]protoWalkFrame, 1, 64)
+	stack[0] = protoWalkFrame{msg: root, depth: 0}
+	visited := 0
+
+	for len(stack) > 0 {
+		frame := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if !frame.msg.IsValid() {
+			continue
+		}
+		if frame.depth > maxProtoWalkDepth {
+			return errProtoWalkDepth
+		}
+		visited++
+		if visited > maxProtoWalkNodes {
+			return errProtoWalkNodes
+		}
+		if !visit(frame.msg) {
+			return nil
+		}
+
+		nextDepth := frame.depth + 1
+		var depthExceeded bool
+		var nodesExceeded bool
+		var children []protoreflect.Message
+		frame.msg.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+			switch {
+			case fd.IsList():
+				if fd.Kind() == protoreflect.MessageKind {
+					list := v.List()
+					if list.Len() > 0 && nextDepth > maxProtoWalkDepth {
+						depthExceeded = true
+						return false
+					}
+					for i := 0; i < list.Len(); i++ {
+						if child := list.Get(i).Message(); child.IsValid() {
+							children = append(children, child)
+							if visited+len(stack)+len(children) > maxProtoWalkNodes {
+								nodesExceeded = true
+								return false
+							}
+						}
+					}
+				}
+			case fd.IsMap():
+				if fd.MapValue().Kind() == protoreflect.MessageKind {
+					v.Map().Range(func(_ protoreflect.MapKey, mv protoreflect.Value) bool {
+						if nextDepth > maxProtoWalkDepth {
+							depthExceeded = true
+							return false
+						}
+						if child := mv.Message(); child.IsValid() {
+							children = append(children, child)
+							if visited+len(stack)+len(children) > maxProtoWalkNodes {
+								nodesExceeded = true
+								return false
+							}
+						}
+						return true
+					})
+					if depthExceeded || nodesExceeded {
+						return false
+					}
+				}
+			case fd.Kind() == protoreflect.MessageKind:
+				if child := v.Message(); child.IsValid() {
+					if nextDepth > maxProtoWalkDepth {
+						depthExceeded = true
+						return false
+					}
+					children = append(children, child)
+					if visited+len(stack)+len(children) > maxProtoWalkNodes {
+						nodesExceeded = true
+						return false
+					}
 				}
 			}
-		case fd.IsMap():
-			if fd.MapValue().Kind() == protoreflect.MessageKind {
-				v.Map().Range(func(_ protoreflect.MapKey, mv protoreflect.Value) bool {
-					walkProtoMessage(mv.Message(), visit)
-					return true
-				})
-			}
-		case fd.Kind() == protoreflect.MessageKind:
-			walkProtoMessage(v.Message(), visit)
+			return true
+		})
+		if depthExceeded {
+			return errProtoWalkDepth
 		}
-		return true
-	})
+		if nodesExceeded {
+			return errProtoWalkNodes
+		}
+		for i := len(children) - 1; i >= 0; i-- {
+			stack = append(stack, protoWalkFrame{msg: children[i], depth: nextDepth})
+		}
+	}
+	return nil
 }
 
 func extractTypeNameOID(tn *zpgparse.TypeName) uint32 {
@@ -348,14 +466,14 @@ func rangeVarRef(rv *zpgparse.RangeVar) (tableRef, bool) {
 	}, true
 }
 
-func collectTableHints(node *zpgparse.Node, out *paramAnalysis) {
+func collectTableHints(node *zpgparse.Node, out *paramAnalysis) error {
 	if node == nil {
-		return
+		return nil
 	}
 	if ins := node.GetInsertStmt(); ins != nil {
 		ref, ok := rangeVarRef(ins.Relation)
 		if !ok {
-			return
+			return nil
 		}
 		colNames := make([]string, 0, len(ins.Cols))
 		for _, c := range ins.Cols {
@@ -371,7 +489,7 @@ func collectTableHints(node *zpgparse.Node, out *paramAnalysis) {
 						continue
 					}
 					for idx, item := range lst.Items {
-						if pr := item.GetParamRef(); pr != nil && pr.Number > 0 {
+						if pr := item.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 							pnum := int(pr.Number)
 							if _, has := out.explicitOIDs[pnum]; has {
 								continue
@@ -386,23 +504,25 @@ func collectTableHints(node *zpgparse.Node, out *paramAnalysis) {
 				}
 			}
 		}
-		return
+		return nil
 	}
 	if upd := node.GetUpdateStmt(); upd != nil {
 		ref, ok := rangeVarRef(upd.Relation)
 		if !ok {
-			return
+			return nil
 		}
 		tables := map[string]tableRef{strings.ToLower(ref.alias): ref}
 		for _, f := range upd.FromClause {
-			collectFromTables(f, tables)
+			if err := collectFromTables(f, tables); err != nil {
+				return err
+			}
 		}
 		for _, tgt := range upd.TargetList {
 			rt := tgt.GetResTarget()
 			if rt == nil || rt.Val == nil {
 				continue
 			}
-			if pr := rt.Val.GetParamRef(); pr != nil && pr.Number > 0 {
+			if pr := rt.Val.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 				pnum := int(pr.Number)
 				if _, has := out.explicitOIDs[pnum]; !has {
 					out.colHints[pnum] = paramColHint{table: ref, colName: rt.Name}
@@ -410,29 +530,33 @@ func collectTableHints(node *zpgparse.Node, out *paramAnalysis) {
 			}
 		}
 		if upd.WhereClause != nil {
-			collectExprColHints(upd.WhereClause, tables, ref, out)
+			return collectExprColHints(upd.WhereClause, tables, ref, out)
 		}
-		return
+		return nil
 	}
 	if del := node.GetDeleteStmt(); del != nil {
 		ref, ok := rangeVarRef(del.Relation)
 		if !ok {
-			return
+			return nil
 		}
 		tables := map[string]tableRef{strings.ToLower(ref.alias): ref}
 		for _, u := range del.UsingClause {
-			collectFromTables(u, tables)
+			if err := collectFromTables(u, tables); err != nil {
+				return err
+			}
 		}
 		if del.WhereClause != nil {
-			collectExprColHints(del.WhereClause, tables, ref, out)
+			return collectExprColHints(del.WhereClause, tables, ref, out)
 		}
-		return
+		return nil
 	}
 	if sel := node.GetSelectStmt(); sel != nil {
 		tables := make(map[string]tableRef)
 		var single tableRef
 		for _, f := range sel.FromClause {
-			collectFromTables(f, tables)
+			if err := collectFromTables(f, tables); err != nil {
+				return err
+			}
 		}
 		if len(tables) == 1 {
 			for _, ref := range tables {
@@ -440,51 +564,81 @@ func collectTableHints(node *zpgparse.Node, out *paramAnalysis) {
 			}
 		}
 		if sel.WhereClause != nil && len(tables) > 0 {
-			collectExprColHints(sel.WhereClause, tables, single, out)
+			return collectExprColHints(sel.WhereClause, tables, single, out)
 		}
 	}
+	return nil
 }
 
-func collectFromTables(n *zpgparse.Node, tables map[string]tableRef) {
-	if n == nil {
-		return
+func collectFromTables(root *zpgparse.Node, tables map[string]tableRef) error {
+	if root == nil {
+		return nil
 	}
-	if rv := n.GetRangeVar(); rv != nil {
-		if ref, ok := rangeVarRef(rv); ok {
-			tables[strings.ToLower(ref.alias)] = ref
-			tables[strings.ToLower(ref.table)] = ref
+	type joinFrame struct {
+		node  *zpgparse.Node
+		depth int
+	}
+	stack := []joinFrame{{node: root, depth: 0}}
+	visited := 0
+	for len(stack) > 0 {
+		frame := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if frame.node == nil {
+			continue
 		}
-		return
+		if frame.depth > maxProtoWalkDepth {
+			return errProtoWalkDepth
+		}
+		visited++
+		if visited > maxProtoWalkNodes {
+			return errProtoWalkNodes
+		}
+		if rv := frame.node.GetRangeVar(); rv != nil {
+			if ref, ok := rangeVarRef(rv); ok {
+				tables[strings.ToLower(ref.alias)] = ref
+				tables[strings.ToLower(ref.table)] = ref
+			}
+			continue
+		}
+		if je := frame.node.GetJoinExpr(); je != nil {
+			if je.Rarg != nil {
+				stack = append(stack, joinFrame{node: je.Rarg, depth: frame.depth + 1})
+			}
+			if je.Larg != nil {
+				stack = append(stack, joinFrame{node: je.Larg, depth: frame.depth + 1})
+			}
+		}
 	}
-	if je := n.GetJoinExpr(); je != nil {
-		collectFromTables(je.Larg, tables)
-		collectFromTables(je.Rarg, tables)
-	}
+	return nil
 }
 
-func collectExprColHints(exprNode *zpgparse.Node, tables map[string]tableRef, defaultTable tableRef, out *paramAnalysis) {
+func collectExprColHints(exprNode *zpgparse.Node, tables map[string]tableRef, defaultTable tableRef, out *paramAnalysis) error {
 	if exprNode == nil {
-		return
+		return nil
 	}
-	walkProtoMessage(exprNode.ProtoReflect(), func(msg protoreflect.Message) {
+	return walkProtoMessage(exprNode.ProtoReflect(), func(msg protoreflect.Message) bool {
 		ae, ok := msg.Interface().(*zpgparse.A_Expr)
 		if !ok || ae.Lexpr == nil || ae.Rexpr == nil {
-			return
+			return true
 		}
 		// Check col <op> $N or $N <op> col.
 		if cr := ae.Lexpr.GetColumnRef(); cr != nil {
-			if pr := ae.Rexpr.GetParamRef(); pr != nil && pr.Number > 0 {
+			if pr := ae.Rexpr.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 				recordColRefHint(int(pr.Number), cr, tables, defaultTable, out)
 			}
 		} else if cr := ae.Rexpr.GetColumnRef(); cr != nil {
-			if pr := ae.Lexpr.GetParamRef(); pr != nil && pr.Number > 0 {
+			if pr := ae.Lexpr.GetParamRef(); pr != nil && pr.Number > 0 && int(pr.Number) <= maxWireParams {
 				recordColRefHint(int(pr.Number), cr, tables, defaultTable, out)
 			}
 		}
+		return true
 	})
 }
 
 func recordColRefHint(pnum int, cr *zpgparse.ColumnRef, tables map[string]tableRef, defaultTable tableRef, out *paramAnalysis) {
+	if pnum <= 0 || pnum > maxWireParams {
+		return
+	}
 	if _, has := out.explicitOIDs[pnum]; has {
 		return
 	}

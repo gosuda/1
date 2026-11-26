@@ -182,6 +182,9 @@ func bindDropRoutines(ctx context.Context, statement *zpgparse.DropStmt, snapsho
 			}
 			return nil, resolveErr
 		}
+		if err := b.requireTableOwner(descriptor, 0); err != nil {
+			return nil, err
+		}
 		if _, duplicate := seen[descriptor.ID()]; duplicate {
 			continue
 		}
@@ -203,6 +206,9 @@ func bindRenameRoutine(ctx context.Context, statement *zpgparse.RenameStmt, snap
 	}
 	base, err := resolveRoutineReference(ctx, b, snapshot, statement.Object.GetObjectWithArgs(), statement.RenameType)
 	if err != nil {
+		return nil, err
+	}
+	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
 	if err := declarationName(statement.Newname); err != nil {
@@ -235,6 +241,9 @@ func bindSetRoutineSchema(ctx context.Context, statement *zpgparse.AlterObjectSc
 	if err != nil {
 		return nil, err
 	}
+	if err := b.requireTableOwner(base, 0); err != nil {
+		return nil, err
+	}
 	target, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newschema})
 	if err != nil {
 		if isMissingObject(err) {
@@ -243,6 +252,9 @@ func bindSetRoutineSchema(ctx context.Context, statement *zpgparse.AlterObjectSc
 		return nil, err
 	}
 	b.dependency(target.Descriptor, 0)
+	if err := b.checkSchemaCreate(target.Descriptor, 0); err != nil {
+		return nil, err
+	}
 	spec, err := base.SpecWithin(ctx, options.Descriptors)
 	if err != nil {
 		return nil, err

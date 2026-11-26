@@ -112,7 +112,7 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 		rlsExtStatOID   model.OID = 930002
 		forceExtStatOID model.OID = 930003
 	)
-	makeTable := func(id model.ObjectID, oid model.OID, rowTypeID model.ObjectID, name, ownerName string, rls, force bool, policies []model.PolicyDescriptor, extOID model.OID) *model.Descriptor {
+	makeTable := func(id model.ObjectID, oid model.OID, rowTypeID model.ObjectID, name, ownerName string, rls, force bool, policies []model.PolicyDescriptor, acl []model.PrivilegeGrant, extOID model.OID) *model.Descriptor {
 		return mustDesc(model.DescriptorSpec{
 			ID: id, OID: oid, Version: 1, State: model.StatePublic,
 			Name:     model.NamespaceName{Parent: publicSchemaID, Kind: model.ObjectTable, Name: name},
@@ -126,6 +126,7 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 				RowSecurity:      rls,
 				ForceRowSecurity: force,
 				Policies:         policies,
+				ACL:              acl,
 				ExtendedStatistics: []model.ExtendedStatisticDescriptor{{
 					OID: extOID, Name: name + "_ext", Namespace: publicSchemaID, Owner: 10,
 					Keys: []model.ColumnID{1, 2}, Kinds: []byte{'d', 'm'},
@@ -160,9 +161,16 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 		makeRowType(plainRowTypeID, plainRowTypeOID, plainTableID, "plain_tbl"),
 		makeRowType(rlsRowTypeID, rlsRowTypeOID, rlsTableID, "rls_tbl"),
 		makeRowType(forceRowTypeID, forceRowTypeOID, forceTableID, "force_tbl"),
-		makeTable(plainTableID, plainTableOID, plainRowTypeID, "plain_tbl", "", false, false, nil, plainExtStatOID),
-		makeTable(rlsTableID, rlsTableOID, rlsRowTypeID, "rls_tbl", "alice", true, false, policies, rlsExtStatOID),
-		makeTable(forceTableID, forceTableOID, forceRowTypeID, "force_tbl", "alice", true, true, nil, forceExtStatOID),
+		makeTable(plainTableID, plainTableOID, plainRowTypeID, "plain_tbl", "", false, false, nil, []model.PrivilegeGrant{
+			{Grantee: "alice", Privileges: model.PrivilegeSelect},
+		}, plainExtStatOID),
+		makeTable(rlsTableID, rlsTableOID, rlsRowTypeID, "rls_tbl", "alice", true, false, policies, []model.PrivilegeGrant{
+			{Grantee: "auditor", Privileges: model.PrivilegeSelect},
+			{Grantee: "bob", Privileges: model.PrivilegeSelect},
+		}, rlsExtStatOID),
+		makeTable(forceTableID, forceTableOID, forceRowTypeID, "force_tbl", "alice", true, true, nil, []model.PrivilegeGrant{
+			{Grantee: "auditor", Privileges: model.PrivilegeSelect},
+		}, forceExtStatOID),
 		mustDesc(model.DescriptorSpec{
 			ID: roleAliceID, OID: roleAliceOID, Version: 1, State: model.StatePublic,
 			Name: model.NamespaceName{Parent: 0, Kind: model.ObjectRole, Name: "alice"},
@@ -311,7 +319,7 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 		t.Fatalf("policy[1] mismatch: %+v", p1)
 	}
 
-	// 4. pg_stats masks RLS-enabled tables from unprivileged non-owner/non-bypassrls roles.
+	// 4. pg_stats enforces SELECT privilege + RLS rules for all tables.
 	pgStats, ok := bootstrap.Lookup("pg_catalog", "pg_stats")
 	if !ok {
 		t.Fatal("pg_stats missing")
@@ -332,7 +340,32 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 		return names
 	}
 
-	// 5. pg_statistic_ext_data masks RLS-enabled tables identically to pg_stats.
+	// 5. pg_statistic and pg_statistic_ext_data are superuser-only.
+	pgStatistic, ok := bootstrap.Lookup("pg_catalog", "pg_statistic")
+	if !ok {
+		t.Fatal("pg_statistic missing")
+	}
+	staRelOIDIdx := colIndex(pgStatistic, "starelid")
+	relOIDToTable := map[int64]string{
+		int64(plainTableOID): "plain_tbl",
+		int64(rlsTableOID):   "rls_tbl",
+		int64(forceTableOID): "force_tbl",
+	}
+	visibleStatisticTablesFor := func(role string) []string {
+		t.Helper()
+		opts := baseOptions
+		opts.Settings = testRoleSettings{role: role}
+		var names []string
+		if err := generateRows(t.Context(), snapshot, view, pgStatistic, opts, func(row []model.Value) error {
+			names = append(names, relOIDToTable[row[staRelOIDIdx].IntVal])
+			return nil
+		}); err != nil {
+			t.Fatalf("pg_statistic(role=%q): %v", role, err)
+		}
+		slices.Sort(names)
+		return names
+	}
+
 	pgStatExtData, ok := bootstrap.Lookup("pg_catalog", "pg_statistic_ext_data")
 	if !ok {
 		t.Fatal("pg_statistic_ext_data missing")
@@ -358,25 +391,31 @@ func TestCatalogRelPgClassPgRolesPgPoliciesAndPgStatsRLSMasking(t *testing.T) {
 		return names
 	}
 
+	allTables := []string{"force_tbl", "plain_tbl", "rls_tbl"}
 	for _, tc := range []struct {
-		role string
-		want []string
+		role         string
+		wantStats    []string
+		wantRawStats []string
 	}{
-		{"", []string{"force_tbl", "plain_tbl", "rls_tbl"}},        // default superuser sees all
-		{"admin", []string{"force_tbl", "plain_tbl", "rls_tbl"}},   // explicit superuser sees all
-		{"auditor", []string{"force_tbl", "plain_tbl", "rls_tbl"}}, // BYPASSRLS sees all
-		{"alice", []string{"plain_tbl", "rls_tbl"}},                // owner sees non-forced RLS, hidden on forced RLS
-		{"alice_member", []string{"plain_tbl", "rls_tbl"}},         // member of owner sees non-forced RLS, hidden on forced RLS
-		{"bob", []string{"plain_tbl"}},                             // unprivileged non-owner sees only non-RLS table
-		{"unknown_role", []string{"plain_tbl"}},                    // fail-closed for unknown role
+		{"", allTables, allTables},                         // default superuser sees all
+		{"admin", allTables, allTables},                    // explicit superuser sees all
+		{"auditor", []string{"force_tbl", "rls_tbl"}, nil}, // BYPASSRLS + SELECT sees RLS/forced tables, denied on plain_tbl (no SELECT) and raw stats
+		{"alice", []string{"plain_tbl", "rls_tbl"}, nil},   // SELECT on plain_tbl + owner on non-forced RLS, hidden on forced RLS and raw stats
+		{"alice_member", []string{"plain_tbl", "rls_tbl"}, nil},
+		{"bob", nil, nil},          // no SELECT on plain_tbl, RLS active on rls_tbl despite SELECT
+		{"unknown_role", nil, nil}, // fail-closed for unknown role
 	} {
 		got := visibleTablesFor(tc.role)
-		if !slices.Equal(got, tc.want) {
-			t.Errorf("pg_stats visible tables for role %q = %v, want %v", tc.role, got, tc.want)
+		if !slices.Equal(got, tc.wantStats) {
+			t.Errorf("pg_stats visible tables for role %q = %v, want %v", tc.role, got, tc.wantStats)
+		}
+		gotSta := visibleStatisticTablesFor(tc.role)
+		if !slices.Equal(gotSta, tc.wantRawStats) {
+			t.Errorf("pg_statistic visible tables for role %q = %v, want %v", tc.role, gotSta, tc.wantRawStats)
 		}
 		gotExt := visibleExtTablesFor(tc.role)
-		if !slices.Equal(gotExt, tc.want) {
-			t.Errorf("pg_statistic_ext_data visible tables for role %q = %v, want %v", tc.role, gotExt, tc.want)
+		if !slices.Equal(gotExt, tc.wantRawStats) {
+			t.Errorf("pg_statistic_ext_data visible tables for role %q = %v, want %v", tc.role, gotExt, tc.wantRawStats)
 		}
 	}
 }

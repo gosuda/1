@@ -69,7 +69,7 @@ func (n *normalizer) predicateJoin(source ir.Rel, spec ir.RelSpec, left relResul
 	if n.err != nil {
 		return relResult{}, true
 	}
-	filtered, err := n.b.AddRel(n.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Filter, Scope: source.Scope, Effects: effects, Predicate: predicate.id}, Inputs: []ir.RelID{join}, Outputs: outputs})
+	filtered, err := n.b.AddRel(n.ctx, ir.RelSpec{Rel: ir.Rel{Kind: ir.Filter, Scope: source.Scope, Effects: effects, SecurityBarrier: source.SecurityBarrier, Predicate: predicate.id}, Inputs: []ir.RelID{join}, Outputs: outputs})
 	if err != nil {
 		n.err = err
 		return relResult{}, true
@@ -86,7 +86,7 @@ func (n *normalizer) predicateJoin(source ir.Rel, spec ir.RelSpec, left relResul
 	if n.err != nil {
 		return relResult{}, true
 	}
-	project := ir.Rel{Kind: ir.Project, Scope: source.Scope, Effects: effects, Span: source.Span}
+	project := ir.Rel{Kind: ir.Project, Scope: source.Scope, Effects: effects, SecurityBarrier: source.SecurityBarrier, Span: source.Span}
 	root, err := n.b.AddRel(n.ctx, ir.RelSpec{Rel: project, Inputs: []ir.RelID{filtered}, Outputs: spec.Outputs, Bindings: bindings})
 	n.err = err
 	return relResult{id: root, n: project, input: filtered, outputs: spec.Outputs}, true

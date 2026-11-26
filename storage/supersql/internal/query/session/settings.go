@@ -144,7 +144,13 @@ func NewSettings(ctx context.Context, opts SettingsOptions) (*Settings, error) {
 	return s, nil
 }
 
-func (*Settings) Principal() model.Principal { return model.Principal{} }
+func (s *Settings) Principal() model.Principal {
+	role := s.CurrentRole()
+	if role == "" {
+		return model.Principal{}
+	}
+	return model.NewPrincipal(role, 0)
+}
 
 func (s *Settings) InTransaction() bool {
 	s.mu.RLock()

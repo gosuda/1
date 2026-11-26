@@ -73,7 +73,7 @@
 | 3F000 | 3F | invalid schema name | 24 | internal/query/bind/collation_ddl.go:39 | bindError call, sqlError call |
 | 40001 | 40 | transaction rollback | 6 | internal/controlplane/catalog/store.go:27 | model.Error Code field |
 | 40P01 | 40 | transaction rollback | 1 | internal/locks/wait_graph.go:13 | model.Error Code field |
-| 42501 | 42 | syntax error or access rule violation | 24 | internal/query/bind/declaration.go:136 | bindError call, model.Error Code field |
+| 42501 | 42 | syntax error or access rule violation | 20 | internal/query/bind/declaration.go:136 | bindError call, model.Error Code field |
 | 42601 | 42 | syntax error or access rule violation | 623 | connector.go:270 | bindError call, model.Error Code field, sqlError call |
 | 42602 | 42 | syntax error or access rule violation | 5 | internal/query/bind/regclass.go:23 | bindError call, model.Error Code field |
 | 42622 | 42 | syntax error or access rule violation | 4 | internal/query/bind/declaration.go:103 | bindError call |
@@ -88,7 +88,7 @@
 | 42803 | 42 | syntax error or access rule violation | 8 | internal/query/bind/aggregate_invocation.go:77 | bindError call |
 | 42804 | 42 | syntax error or access rule violation | 411 | internal/controlplane/schema/index_encoding.go:306 | bindError call, model.Error Code field, sqlError call |
 | 42809 | 42 | syntax error or access rule violation | 89 | internal/query/bind/aggregate_order.go:189 | bindError call, model.Error Code field, sqlError call |
-| 42830 | 42 | syntax error or access rule violation | 5 | internal/query/bind/declaration_constraint.go:228 | bindError call |
+| 42830 | 42 | syntax error or access rule violation | 5 | internal/query/bind/declaration_constraint.go:238 | bindError call |
 | 42846 | 42 | syntax error or access rule violation | 5 | internal/query/bind/record_coerce.go:11 | bindError call |
 | 42883 | 42 | syntax error or access rule violation | 96 | internal/query/bind/aggregate_invocation.go:83 | bindError call, model.Error Code field, sqlError call |
 | 428C9 | 42 | syntax error or access rule violation | 11 | internal/dataplane/txn/row_normalizer.go:415 | bindError call, model.Error Code field |
@@ -154,7 +154,7 @@ None.
 | internal/query/procedural/types.go:148 | model.Error Code field | `code` |
 | internal/query/session/parse.go:39 | model.Error Code field | `code` |
 | internal/query/session/sequence.go:74 | model.Error Code field | `code` |
-| internal/query/session/settings.go:972 | model.Error Code field | `code` |
+| internal/query/session/settings.go:978 | model.Error Code field | `code` |
 | internal/query/session/system_time.go:370 | model.Error Code field | `code` |
 | internal/query/session/transaction_sql.go:41 | model.Error Code field | `code` |
 | internal/zpgparse/internal/neoparse/scan.rl:673 | model.Error Code field | `code` |

@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -163,6 +164,18 @@ func (ts *testServer) connString(extra string) string {
 		return base + "&" + extra
 	}
 	return base
+}
+
+func (ts *testServer) execAdmin(t *testing.T, query string) {
+	t.Helper()
+	dc, err := ts.connector.Connect(t.Context())
+	if err != nil {
+		t.Fatalf("connector.Connect: %v", err)
+	}
+	defer func() { _ = dc.Close() }()
+	if _, err := dc.(driver.ExecerContext).ExecContext(t.Context(), query, nil); err != nil {
+		t.Fatalf("execAdmin(%q): %v", query, err)
+	}
 }
 
 func generateSelfSignedTLS(t *testing.T) *tls.Config {
@@ -584,6 +597,7 @@ func TestAuthenticationModes(t *testing.T) {
 
 	t.Run("CleartextPassword", func(t *testing.T) {
 		ts := startTestServer(t, pgwire.Config{Password: "s3cr3t!"})
+		ts.execAdmin(t, `CREATE USER alice`)
 
 		// Wrong password -> 28P01.
 		_, err := pgx.Connect(ctx, fmt.Sprintf("postgres://alice:wrong@%s/mydb?sslmode=disable", ts.addr))
@@ -613,6 +627,7 @@ func TestAuthenticationModes(t *testing.T) {
 				return errors.New("denied")
 			},
 		})
+		ts.execAdmin(t, `CREATE USER admin`)
 
 		_, err := pgx.Connect(ctx, fmt.Sprintf("postgres://admin:bad@%s/prod?sslmode=disable", ts.addr))
 		var pgErr *pgconn.PgError
@@ -845,6 +860,8 @@ func TestRawProtocolMultiStatementPortalSuspendedAndNotify(t *testing.T) {
 	if err != nil || sslReply != 'N' {
 		t.Fatalf("SSLRequest reply = (%q, %v), want 'N'", sslReply, err)
 	}
+
+	ts.execAdmin(t, `CREATE USER tester SUPERUSER`)
 
 	// 2. StartupMessage -> AuthOk + ParameterStatus + BackendKeyData + ReadyForQuery('I').
 	writeStartup(t, rawConn, map[string]string{"user": "tester", "database": "testdb"})
@@ -1321,7 +1338,7 @@ func TestAuthenticatedNonSuperuserRoleBinding(t *testing.T) {
 	if _, err := admin.Exec(ctx, `INSERT INTO secret_tbl VALUES (1, 'top-secret')`); err != nil {
 		t.Fatalf("INSERT: %v", err)
 	}
-	if _, err := admin.Exec(ctx, `CREATE ROLE lowpriv`); err != nil {
+	if _, err := admin.Exec(ctx, `CREATE ROLE lowpriv LOGIN`); err != nil {
 		t.Fatalf("CREATE ROLE: %v", err)
 	}
 

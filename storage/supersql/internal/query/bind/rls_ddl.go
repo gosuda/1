@@ -62,7 +62,9 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 	} else if !isMissingObject(err) {
 		return nil, err
 	}
-	meta := model.RoleMetadata{}
+	meta := model.RoleMetadata{
+		CanLogin: statement.StmtType == zpgparse.RoleStmtType_ROLESTMT_USER,
+	}
 	var memberTargets []string
 	var addMembers []string
 	for _, optNode := range statement.Options {
@@ -80,6 +82,10 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 			meta.BypassRLS = val
 		case "nobypassrls":
 			meta.BypassRLS = false
+		case "canlogin", "login":
+			meta.CanLogin = val
+		case "nologin":
+			meta.CanLogin = false
 		case "addroleto":
 			if list := def.Arg.GetList(); list != nil {
 				for _, item := range list.Items {
@@ -212,6 +218,10 @@ func bindAlterRole(ctx context.Context, statement *zpgparse.AlterRoleStmt, snaps
 			meta.BypassRLS = val
 		case "nobypassrls":
 			meta.BypassRLS = false
+		case "canlogin", "login":
+			meta.CanLogin = val
+		case "nologin":
+			meta.CanLogin = false
 		}
 	}
 	next, err := base.WithRole(meta)
