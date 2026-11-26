@@ -221,14 +221,25 @@ func (database *Catalog) allocateSchemaIdentity(ctx context.Context, scope *sess
 		return allocateErr
 	})
 	if err != nil {
-		return allocation, errors.Join(err, scope.txns.Rollback(ctx, false))
+		return allocation, errors.Join(err, scope.txns.Rollback(context.WithoutCancel(ctx), false))
 	}
 	commit, err := scope.txns.Commit(ctx, false)
 	if err != nil {
+		if scope.txns.Active() && !errors.Is(err, storage.ErrCommitIndeterminate) && !scope.txns.Indeterminate() {
+			if rbErr := scope.txns.Rollback(context.WithoutCancel(ctx), false); rbErr != nil && !errors.Is(rbErr, storage.ErrCommitIndeterminate) {
+				err = errors.Join(err, rbErr)
+			}
+		}
 		return allocation, err
 	}
 	if !commit.Committed {
-		return allocation, &model.Error{Code: "55000", Message: "schema identity reservation did not commit"}
+		err := error(&model.Error{Code: "55000", Message: "schema identity reservation did not commit"})
+		if scope.txns.Active() && !scope.txns.Indeterminate() {
+			if rbErr := scope.txns.Rollback(context.WithoutCancel(ctx), false); rbErr != nil && !errors.Is(rbErr, storage.ErrCommitIndeterminate) {
+				err = errors.Join(err, rbErr)
+			}
+		}
+		return allocation, err
 	}
 	return allocation, nil
 }
