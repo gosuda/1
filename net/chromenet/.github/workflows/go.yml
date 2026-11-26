@@ -1,0 +1,32 @@
+name: Go
+
+# Runs the Go tests against the engine binaries embedded in internal/embedded.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Go vet and tests
+        shell: bash
+        run: |
+          GOWORK=off go vet ./...
+          GOWORK=off go test -count=1 -timeout 15m ./...
