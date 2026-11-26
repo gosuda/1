@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	"github.com/gosuda/supersql-alpha"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
 )
 
 var (
@@ -78,6 +79,14 @@ func (e *PgError) SQLState() string {
 		return ""
 	}
 	return e.Code
+}
+
+func sqlState(err error) string {
+	var pgErr *PgError
+	if errors.As(err, &pgErr) && pgErr.Code != "" {
+		return pgErr.Code
+	}
+	return supersql.SQLState(err)
 }
 
 func wrapPgError(err error) error {
@@ -1224,8 +1233,25 @@ func (txOptions TxOptions) beginSQL() (string, error) {
 	return strings.Join(parts, " "), nil
 }
 
+func (c *Conn) checkNoActiveTx(ctx context.Context, allowHistoricalReadOnly bool) error {
+	probeTx, err := c.sqlConn.BeginTx(ctx, nil)
+	if err != nil {
+		if allowHistoricalReadOnly && sqlState(err) == "0A000" {
+			return nil
+		}
+		return wrapPgError(err)
+	}
+	if rbErr := probeTx.Rollback(); rbErr != nil {
+		return wrapPgError(rbErr)
+	}
+	return nil
+}
+
 func (c *Conn) beginTxInternal(ctx context.Context, txOptions TxOptions, release func()) (Tx, error) {
 	if txOptions.BeginQuery != "" {
+		if err := c.checkNoActiveTx(ctx, true); err != nil {
+			return nil, err
+		}
 		if _, err := c.sqlConn.ExecContext(ctx, txOptions.BeginQuery); err != nil {
 			return nil, wrapPgError(err)
 		}
@@ -1234,6 +1260,9 @@ func (c *Conn) beginTxInternal(ctx context.Context, txOptions TxOptions, release
 	if txOptions.DeferrableMode != "" {
 		beginSQL, err := txOptions.beginSQL()
 		if err != nil {
+			return nil, err
+		}
+		if err := c.checkNoActiveTx(ctx, false); err != nil {
 			return nil, err
 		}
 		if _, err := c.sqlConn.ExecContext(ctx, beginSQL); err != nil {
@@ -1263,7 +1292,7 @@ func (c *Conn) sendBatchWithRelease(ctx context.Context, b *Batch, release func(
 	if err != nil {
 		// If the connection is already inside a manual BEGIN block (SQLSTATE 25001),
 		// run the batch inside the active transaction without starting a new one.
-		if supersql.SQLState(err) == "25001" {
+		if sqlState(err) == "25001" {
 			return &batchResults{
 				ctx:     ctx,
 				execer:  c,
@@ -1289,12 +1318,64 @@ func (c *Conn) sendBatchWithRelease(ctx context.Context, b *Batch, release func(
 
 // CopyFrom performs an atomic bulk insert of rows into tableName.
 func (c *Conn) CopyFrom(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (int64, error) {
-	var total int64
-	err := c.BeginFunc(ctx, func(tx Tx) error {
-		n, err := copyFromExecer(ctx, tx, tableName, columnNames, rowSrc)
-		total = n
-		return err
-	})
+	tx, err := c.beginTxInternal(ctx, TxOptions{}, nil)
+	if err != nil {
+		if sqlState(err) == "25001" {
+			return c.copyFromInSavepoint(ctx, tableName, columnNames, rowSrc)
+		}
+		return 0, wrapPgError(err)
+	}
+	return c.copyFromWithTx(ctx, tx, tableName, columnNames, rowSrc)
+}
+
+func (c *Conn) copyFromWithTx(ctx context.Context, tx Tx, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (total int64, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p)
+		}
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			total = 0
+		} else if commitErr := tx.Commit(ctx); commitErr != nil {
+			err = wrapPgError(commitErr)
+			total = 0
+		}
+	}()
+	total, err = copyFromExecer(ctx, tx, tableName, columnNames, rowSrc)
+	return total, wrapPgError(err)
+}
+
+func (c *Conn) copyFromInSavepoint(ctx context.Context, tableName Identifier, columnNames []string, rowSrc CopyFromSource) (total int64, err error) {
+	spID := c.savepoint.Add(1)
+	spName := fmt.Sprintf("pgx_sp_%d", spID)
+	if _, err := c.Exec(ctx, "SAVEPOINT "+spName); err != nil {
+		return 0, wrapPgError(err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			rollbackCtx := context.Background()
+			if ctx != nil {
+				rollbackCtx = context.WithoutCancel(ctx)
+			}
+			_, _ = c.Exec(rollbackCtx, "ROLLBACK TO SAVEPOINT "+spName)
+			_, _ = c.Exec(rollbackCtx, "RELEASE SAVEPOINT "+spName)
+			panic(p)
+		}
+		if err != nil {
+			rollbackCtx := context.Background()
+			if ctx != nil {
+				rollbackCtx = context.WithoutCancel(ctx)
+			}
+			_, _ = c.Exec(rollbackCtx, "ROLLBACK TO SAVEPOINT "+spName)
+			_, _ = c.Exec(rollbackCtx, "RELEASE SAVEPOINT "+spName)
+			total = 0
+		} else if _, relErr := c.Exec(ctx, "RELEASE SAVEPOINT "+spName); relErr != nil {
+			err = wrapPgError(relErr)
+			total = 0
+		}
+	}()
+	total, err = copyFromExecer(ctx, c, tableName, columnNames, rowSrc)
 	return total, wrapPgError(err)
 }
 
@@ -1364,6 +1445,13 @@ func (tx *pgxTx) Commit(ctx context.Context) error {
 	}
 	if tx.rawBegin {
 		_, err := tx.conn.Exec(ctx, "COMMIT")
+		if err != nil && !errors.Is(err, storage.ErrCommitIndeterminate) {
+			rollbackCtx := context.Background()
+			if ctx != nil {
+				rollbackCtx = context.WithoutCancel(ctx)
+			}
+			_, _ = tx.conn.Exec(rollbackCtx, "ROLLBACK")
+		}
 		return wrapPgError(err)
 	}
 	return wrapPgError(tx.sqlTx.Commit())
@@ -1807,16 +1895,20 @@ func (r *pgxRow) Scan(dest ...any) error {
 	}
 	defer r.rows.Close()
 	if err := r.rows.Err(); err != nil {
+		r.rows.Close()
 		return wrapPgError(err)
 	}
 	if !r.rows.Next() {
+		r.rows.Close()
 		if err := r.rows.Err(); err != nil {
 			return wrapPgError(err)
 		}
 		return ErrNoRows
 	}
-	if err := r.rows.Scan(dest...); err != nil {
-		return wrapPgError(err)
+	scanErr := r.rows.Scan(dest...)
+	r.rows.Close()
+	if scanErr != nil {
+		return wrapPgError(scanErr)
 	}
 	return wrapPgError(r.rows.Err())
 }
@@ -2476,6 +2568,7 @@ func (q *QueuedQuery) Query(fn func(rows Rows) error) {
 		if err := fn(rows); err != nil {
 			return err
 		}
+		rows.Close()
 		return rows.Err()
 	}
 }
@@ -2786,16 +2879,17 @@ func CollectOneRow[T any](rows Rows, fn RowToFunc[T]) (T, error) {
 	defer rows.Close()
 	var zero T
 	if !rows.Next() {
+		rows.Close()
 		if err := rows.Err(); err != nil {
 			return zero, err
 		}
 		return zero, ErrNoRows
 	}
 	v, err := fn(rows)
+	rows.Close()
 	if err != nil {
 		return zero, err
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		return zero, err
 	}
@@ -2807,6 +2901,7 @@ func CollectExactlyOneRow[T any](rows Rows, fn RowToFunc[T]) (T, error) {
 	defer rows.Close()
 	var zero T
 	if !rows.Next() {
+		rows.Close()
 		if err := rows.Err(); err != nil {
 			return zero, err
 		}
@@ -2814,11 +2909,14 @@ func CollectExactlyOneRow[T any](rows Rows, fn RowToFunc[T]) (T, error) {
 	}
 	v, err := fn(rows)
 	if err != nil {
+		rows.Close()
 		return zero, err
 	}
 	if rows.Next() {
+		rows.Close()
 		return zero, errors.New("pgx: too many rows")
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return zero, err
 	}

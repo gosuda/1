@@ -317,6 +317,9 @@ func (c *connection) BeginTx(ctx context.Context, options driver.TxOptions) (dri
 	if err := c.check(); err != nil {
 		return nil, err
 	}
+	if c.scope != nil && c.scope.txns != nil && c.scope.txns.Active() {
+		return nil, wrapError(&model.Error{Code: "25001", Message: "there is already a transaction in progress"})
+	}
 	var begin string
 	switch sql.IsolationLevel(options.Isolation) {
 	case sql.LevelDefault:
@@ -677,6 +680,16 @@ func (tx *transaction) Commit() error {
 		return errors.New("supersql: transaction already finished")
 	}
 	_, err := tx.conn.execSQL(tx.ctx, "COMMIT", nil)
+	if err != nil && tx.conn != nil && tx.conn.scope != nil && tx.conn.scope.txns != nil &&
+		!errors.Is(err, storage.ErrCommitIndeterminate) && tx.conn.scope.txns.Active() && !tx.conn.scope.txns.Indeterminate() {
+		rollbackCtx := context.Background()
+		if tx.ctx != nil {
+			rollbackCtx = context.WithoutCancel(tx.ctx)
+		}
+		if _, rbErr := tx.conn.execSQL(rollbackCtx, "ROLLBACK", nil); rbErr != nil && !errors.Is(rbErr, storage.ErrCommitIndeterminate) {
+			err = errors.Join(err, rbErr)
+		}
+	}
 	return wrapError(err)
 }
 

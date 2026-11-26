@@ -373,6 +373,12 @@ func (transactions *Transactions) ActiveIn(ctx context.Context) bool {
 	return transactions.Active()
 }
 
+func (transactions *Transactions) Indeterminate() bool {
+	transactions.gate <- struct{}{}
+	defer func() { <-transactions.gate }()
+	return transactions.active && transactions.transaction != nil && transactions.transaction.State() == txn.Indeterminate
+}
+
 func (transactions *Transactions) Failed() bool {
 	transactions.gate <- struct{}{}
 	defer func() { <-transactions.gate }()
@@ -563,15 +569,22 @@ func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndRe
 		}
 		return result, err
 	}
+	abortFailedCommit := func(commitErr error) (EndResult, error) {
+		rollbackErr := transactions.endRollback(context.WithoutCancel(ctx))
+		if rollbackErr == nil {
+			return EndResult{}, commitErr
+		}
+		return EndResult{}, errors.Join(commitErr, rollbackErr)
+	}
 	if transactions.transaction.State() == txn.Active {
 		if err := transactions.prepareCursorsForCommit(ctx); err != nil {
-			return EndResult{}, transactions.fail(err)
+			return abortFailedCommit(err)
 		}
 		if err := transactions.flushDeferredEvents(ctx, nil, true); err != nil {
-			return EndResult{}, transactions.fail(err)
+			return abortFailedCommit(err)
 		}
 		if err := transactions.applyTemporaryCommitActions(ctx); err != nil {
-			return EndResult{}, transactions.fail(err)
+			return abortFailedCommit(err)
 		}
 	}
 	applied, err := transactions.transaction.Commit(ctx)
@@ -589,7 +602,7 @@ func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndRe
 		if err == nil {
 			err = errSessionTransactionState
 		}
-		return result, transactions.fail(err)
+		return abortFailedCommit(err)
 	}
 	if chain {
 		chainErr := transactions.begin(ctx, modes.start())

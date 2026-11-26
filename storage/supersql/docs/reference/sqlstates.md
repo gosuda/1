@@ -10,7 +10,7 @@
 | 00000 | 00 | successful completion | 1 | internal/query/session/statistics_command.go:603 | model.Error Code field |
 | 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:777 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
-| 0A000 | 0A | feature not supported | 181 | connector.go:1563 | bindError call, model.Error Code field, sqlError call, unsupported call |
+| 0A000 | 0A | feature not supported | 181 | connector.go:1576 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:108 | bindError call |
 | 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1195 | sqlError call |
 | 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:473 | sqlError call |
@@ -60,7 +60,7 @@
 | 23503 | 23 | integrity constraint violation | 4 | internal/controlplane/schema/relational_policy.go:384 | model.Error Code field |
 | 23505 | 23 | integrity constraint violation | 5 | internal/controlplane/schema/index_set.go:16 | model.Error Code field |
 | 23514 | 23 | integrity constraint violation | 9 | internal/dataplane/txn/row_normalizer.go:586 | model.Error Code field |
-| 25001 | 25 | invalid transaction state | 6 | internal/dataplane/txn/transaction.go:93 | model.Error Code field |
+| 25001 | 25 | invalid transaction state | 7 | connector.go:321 | model.Error Code field |
 | 25006 | 25 | invalid transaction state | 2 | internal/dataplane/txn/manager_commit.go:13 | model.Error Code field |
 | 25P01 | 25 | invalid transaction state | 4 | internal/query/session/deferred_trigger.go:222 | model.Error Code field |
 | 25P02 | 25 | invalid transaction state | 4 | internal/dataplane/txn/transaction.go:88 | model.Error Code field |
