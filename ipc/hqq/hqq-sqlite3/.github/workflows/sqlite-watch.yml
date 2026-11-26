@@ -2,8 +2,7 @@ name: SQLite Release Tracker
 
 on:
   schedule:
-    # Check sqlite.org every 6 hours for new SQLite amalgamation releases.
-    - cron: '0 */6 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -26,10 +25,13 @@ concurrency:
   group: sqlite-watch
   cancel-in-progress: false
 
+env:
+  GOCACHEPROG: ""
+
 jobs:
   check:
     name: Check upstream SQLite release
-    runs-on: ubuntu-26.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 5
     outputs:
       updated: ${{ steps.check.outputs.updated }}
@@ -65,17 +67,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux amd64 (gcc-15)
-            os: ubuntu-26.04
-            cc: gcc
-          - name: Linux amd64 (clang-22)
-            os: ubuntu-26.04
-            cc: clang-22
-          - name: Linux arm64 (gcc-15)
-            os: ubuntu-26.04-arm
-            cc: gcc
+          - name: Linux amd64 (clang-18)
+            os: depot-ubuntu-24.04
+            cc: clang-18
+          - name: Linux arm64 (gcc-13)
+            os: depot-ubuntu-24.04-arm
+            cc: gcc-13
           - name: macOS arm64 (clang)
-            os: macos-26
+            os: depot-macos-latest
             cc: clang
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -92,7 +91,7 @@ jobs:
       - name: Install Ninja
         run: |
           if [ "$(uname -s)" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake clang-18 gcc-13
           else
             command -v ninja >/dev/null || brew install ninja
           fi
@@ -110,13 +109,13 @@ jobs:
         run: |
           eval "$(sqlite3/build.sh -T)"
           go vet ./...
-          go test -p 1 -v -race -timeout 10m ./...
+          go test -count=1 -p 1 -v -race -timeout 10m ./...
 
   update:
     name: Commit SQLite pin update
     needs: [check, test]
     if: (needs.check.outputs.updated == 'true' || inputs.force == true) && inputs.dry_run != true
-    runs-on: ubuntu-26.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     outputs:
       commit_sha: ${{ steps.commit.outputs.commit_sha }}

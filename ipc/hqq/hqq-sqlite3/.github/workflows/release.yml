@@ -28,6 +28,7 @@ permissions:
   attestations: write
 
 env:
+  GOCACHEPROG: ""
   ZIG_VERSION: '0.17.1'
 
 jobs:
@@ -38,22 +39,22 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-            runner: ubuntu-26.04
+            runner: depot-ubuntu-24.04
           - goos: linux
             goarch: arm64
-            runner: ubuntu-26.04
+            runner: depot-ubuntu-24.04
           - goos: darwin
             goarch: arm64
-            runner: macos-26
+            runner: depot-macos-latest
           - goos: darwin
             goarch: amd64
-            runner: macos-26
+            runner: depot-macos-latest
           - goos: windows
             goarch: amd64
-            runner: windows-2025
+            runner: depot-windows-2025
           - goos: windows
             goarch: arm64
-            runner: ubuntu-26.04
+            runner: depot-ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -66,7 +67,7 @@ jobs:
 
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build unzip xz-utils
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake clang-18 gcc-13 unzip xz-utils
 
       - name: Set up MSVC developer environment (Windows)
         if: runner.os == 'Windows'
@@ -180,7 +181,7 @@ jobs:
 
   publish:
     needs: [build]
-    runs-on: ubuntu-26.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6.0.2
@@ -272,7 +273,7 @@ jobs:
 
           go vet ./...
           HQQ_SQLITE_SERVER="$PWD/dist/hqq-sqlite-server_linux_amd64" \
-            go test -p 1 -race -timeout 10m . ./launcher ./e2e ./internal/... ./scripts/release/sync-sqlite
+            go test -count=1 -p 1 -race -timeout 10m . ./launcher ./e2e ./internal/... ./scripts/release/sync-sqlite
           go test -run TestGeneratedFilesAreFresh ./sqlite3
 
           git add hashes.go internal/embedded/bin/ README.md

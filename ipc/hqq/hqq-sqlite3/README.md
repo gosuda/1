@@ -204,3 +204,12 @@ func WithSQLiteConfig(cfg sqlite.Config) OpenOption
 | [**`launcher/README.md`**](launcher/README.md) | Child-process verification (`secureexec`), signed release manifests, and `--parent-stdin` lifeline details. |
 | [**`sqlite3/README.md`**](sqlite3/README.md) | Low-level `hqq-bindgen` IDL, C server hooks, and path-sandboxing policy. |
 | [**`PROTOCOL.md`**](PROTOCOL.md) | Wire protocol specification and resource limits. |
+
+## CI coverage
+
+Pull requests and main pushes run the C unit tests, server build, Go vet,
+and race tests once on Depot Linux amd64 with explicitly installed
+Clang 18. Weekly and manual runs also test Linux arm64 with GCC 13 and
+macOS arm64. The daily SQLite tracker runs those three platform tests
+before promotion. Release builds retain all six published platforms.
+Every job uses Depot; macOS jobs use `depot-macos-latest`.
