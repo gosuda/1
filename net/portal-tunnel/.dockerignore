@@ -1,0 +1,42 @@
+bin/
+
+# Git
+.git
+.gitignore
+
+# CI/CD
+.github/
+
+# Documentation
+docs/
+*.md
+
+# Local relay/tunnel state
+.portal-certs/
+*identity.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Go
+*.test
+*.prof
+vendor/
+
+# Frontend deps/build artifacts
+node_modules/
+**/node_modules/
