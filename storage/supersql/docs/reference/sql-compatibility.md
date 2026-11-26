@@ -669,7 +669,7 @@ No resolved catalog objects.
 
 | Location | Message |
 | --- | --- |
-| connector.go:1576 | `model.Error{Code: "0A000"}` |
+| connector.go:1587 | `model.Error{Code: "0A000"}` |
 | connector.go:338 | `model.Error{Code: "0A000"}` |
 | execution.go:271 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/catalog/type_service.go:1075 | `model.Error{Code: "0A000"}` |

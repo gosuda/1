@@ -85,6 +85,11 @@ func (transactions *Transactions) flushDeferredConstraintNames(ctx context.Conte
 		return nil
 	}
 	if err := transactions.transaction.Statement(ctx, func(statement context.Context) error {
+		if transactions.statementTypes == nil {
+			if err := transactions.activateTransactionDeclaredTypes(statement); err != nil {
+				return err
+			}
+		}
 		for _, pending := range selected {
 			if err := pending.event.Validate(statement, transactions.transaction); err != nil {
 				return relationalConstraintError(err, pending.event.Identity())

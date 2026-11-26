@@ -298,6 +298,42 @@ func addTemporaryOverlay(snapshot *catalog.CatalogSnapshot, named *sessionNamedO
 	return snapshot.AddSessionOverlay(named.temporaryDescriptors())
 }
 
+// TemporaryCatalogSnapshot returns whether a transaction is active along with a
+// race-free snapshot of the session's temporary overlay descriptors, monotonic
+// overlay version, and effective search_path (with pg_temp prepended when any
+// temporary object exists). Safe both inside and outside an active session
+// operation.
+func (transactions *Transactions) TemporaryCatalogSnapshot(ctx context.Context) (active bool, descriptors []*model.Descriptor, version uint64, searchPath []string) {
+	if transactions == nil {
+		return false, nil, 0, nil
+	}
+	if ctx != nil {
+		if token, ok := ctx.Value(sessionTransactionKey{}).(*sessionTransactionOperation); ok && token.owner == transactions && token.active.Load() {
+			return transactions.active, transactions.named.temporaryDescriptors(), transactions.named.overlayVersion(), transactions.searchPath()
+		}
+	}
+	transactions.gate <- struct{}{}
+	defer func() { <-transactions.gate }()
+	return transactions.active, transactions.named.temporaryDescriptors(), transactions.named.overlayVersion(), transactions.searchPath()
+}
+
+// SearchPathIn returns the session's effective search_path (with pg_temp
+// prepended when temporary objects exist). Safe both inside and outside an
+// active session operation.
+func (transactions *Transactions) SearchPathIn(ctx context.Context) []string {
+	if transactions == nil {
+		return nil
+	}
+	if ctx != nil {
+		if token, ok := ctx.Value(sessionTransactionKey{}).(*sessionTransactionOperation); ok && token.owner == transactions && token.active.Load() {
+			return transactions.searchPath()
+		}
+	}
+	transactions.gate <- struct{}{}
+	defer func() { <-transactions.gate }()
+	return transactions.searchPath()
+}
+
 func (transactions *Transactions) ensureTemporarySchema(ctx context.Context, options *bind.CreateDeclarationOptions) error {
 	transactions.named.ensureTemporaryMaps()
 	name := model.NamespaceName{Kind: model.ObjectSchema, Name: temporarySchemaName}
@@ -565,11 +601,15 @@ func (transactions *Transactions) applyTemporaryCommitActions(ctx context.Contex
 }
 
 func (transactions *Transactions) admitTemporaryDescriptors(ctx context.Context, descriptors []*model.Descriptor, options ObjectCommandOptions) error {
-	view, err := transactions.transaction.ReadView(ctx, options.Dependencies)
+	store := transactions.sequences.config.Catalog
+	dependencies := options.Dependencies
+	if dependencies == nil {
+		dependencies = catalogLayoutDependencies(store)
+	}
+	view, err := transactions.transaction.ReadView(ctx, dependencies)
 	if err != nil {
 		return err
 	}
-	store := transactions.sequences.config.Catalog
 	snapshot, err := store.TransactionSnapshot(view, catalog.BorrowReader)
 	if err != nil {
 		return errors.Join(err, view.Close())
@@ -580,6 +620,16 @@ func (transactions *Transactions) admitTemporaryDescriptors(ctx context.Context,
 		}
 		columns := options.Columns
 		columns.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
+		if columns.Builtin.InformationSchemaTypes == nil {
+			columns.Builtin.InformationSchemaTypes = options.Columns.Builtin.InformationSchemaTypes
+		}
+		if columns.Builtin.InformationSchemaFunctions == nil {
+			columns.Builtin.InformationSchemaFunctions = options.Columns.Builtin.InformationSchemaFunctions
+		}
+		if err := transactions.activateDeclaredTypes(ctx, snapshot, columns.Builtin); err != nil {
+			return err
+		}
+		columns.Builtin.Types = transactions.statementTypes
 		columns.Temporal = transactions.temporal
 		declarationOptions := DeclarationOptions{Catalog: store, Encoder: transactions.options.KeyEncoder, Columns: columns, Indexes: options.Indexes, Limits: options.Limits, PolicyBytes: options.PolicyBytes}
 		admitted, err := declarationTargets(ctx, transactions.transaction, snapshot, descriptors, declarationOptions, false)

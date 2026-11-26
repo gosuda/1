@@ -201,7 +201,7 @@ func (c *invocation) modify(id physical.NodeID, node physical.NodeSpec, children
 	options.LogicalOldColumns = nil
 	if options.Operation != storage.MutationInsert {
 		if relation.ModifyTarget == ir.LogicalViewModifyTarget || relation.ModifyTarget == ir.AutomaticViewTriggerModifyTarget {
-			options.LogicalOldColumns, err = c.logicalOldColumns(graph, slots, relation.Object, columns)
+			options.LogicalOldColumns, err = c.logicalOldColumns(node, graph, relation, slots, columns)
 		} else {
 			options.OldKeyColumns, err = c.originalKeyColumns(node, slots, options.KeyLayout)
 		}
@@ -419,13 +419,32 @@ func logicalViewTriggerCapable(graph *ir.Graph, relationID ir.RelID, relation ir
 	return true
 }
 
-func (c *invocation) logicalOldColumns(graph *ir.Graph, slots []physical.Slot, object model.ObjectID, columns []model.ColumnDescriptor) ([]int, error) {
+func (c *invocation) logicalOldColumns(node physical.NodeSpec, graph *ir.Graph, relation ir.Rel, slots []physical.Slot, columns []model.ColumnDescriptor) ([]int, error) {
+	explicit := relation.TargetKeyCount() != 0
+	if explicit && int(relation.TargetKeyCount()) != len(columns) {
+		return nil, ErrInvalid
+	}
+	if relation.ModifyKind == ir.Merge && !explicit {
+		return nil, ErrInvalid
+	}
 	result := make([]int, len(columns))
 	for i, column := range columns {
 		result[i] = -1
+		var targetKey model.SlotID
+		if explicit {
+			var ok bool
+			targetKey, ok = graph.TargetKey(node.Logical.Rel, uint32(i))
+			if !ok {
+				return nil, ErrInvalid
+			}
+		}
 		for j, slot := range slots {
-			info, ok := graph.Slot(slot.ID)
-			if ok && info.Object == object && info.Column == column.ID {
+			matches := slot.ID == targetKey
+			if !explicit {
+				info, ok := graph.Slot(slot.ID)
+				matches = ok && info.Object == relation.Object && info.Column == column.ID
+			}
+			if matches {
 				result[i] = j
 				break
 			}

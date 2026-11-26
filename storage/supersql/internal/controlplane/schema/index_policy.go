@@ -69,9 +69,10 @@ type IndexPolicyProvider struct {
 	columns     ColumnExpressionFactory
 	generations GenerationExpressionFactory
 	limits      IndexLimits
-	current     *catalog.CurrentDescriptors
-	base        txn.MutationResolver
-	internal    [4]storage.ObjectRef
+	current         *catalog.CurrentDescriptors
+	base            txn.MutationResolver
+	internal        [4]storage.ObjectRef
+	relationalGraph relationalGraphCache
 }
 
 func NewIndexPolicyProvider(ctx context.Context, options IndexPolicyOptions) (*IndexPolicyProvider, error) {
@@ -429,7 +430,7 @@ func (p *IndexPolicyProvider) policy(ctx context.Context, tableID model.ObjectID
 		}
 		resolver = generation.WithBaseResolver(checked)
 	}
-	sets, relationalErr := loadRelationalIndexSets(ctx, snapshot, indexes, encoder, expressions, p.limits)
+	sets, relationalErr := loadRelationalIndexSetsWithCache(ctx, snapshot, &p.relationalGraph, indexes, encoder, expressions, p.limits)
 	if relationalErr != nil {
 		return IndexWritePolicy{}, relationalErr
 	}

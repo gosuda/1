@@ -431,7 +431,7 @@ func (c *cursor) mutate(ctx context.Context, frozen []model.Value, operation sto
 		current := model.Row{Values: make([]model.Value, len(old))}
 		copy(current.Values, old)
 		defer clear(current.Values)
-		for i, column := range c.assignmentColumns {
+		for i, column := range assignmentColumns {
 			current.Values[column] = assigned[i]
 		}
 		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerUpdate, &previous, &current, c.rowPayloadBytes())

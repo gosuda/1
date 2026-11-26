@@ -432,9 +432,12 @@ func (e *relationalExecution) applyReferencedActions(ctx context.Context, parent
 			if constraint.Kind != model.ConstraintForeignKey || !constraint.Enforced || constraint.ReferencedObject != parent.target.ObjectID {
 				continue
 			}
-			oldValues, _, err := parent.values(constraint.ReferencedColumns, old)
+			oldValues, oldNulls, err := parent.values(constraint.ReferencedColumns, old)
 			if err != nil {
 				return err
+			}
+			if oldNulls != 0 {
+				continue
 			}
 			if current != nil && !current.Deleted {
 				newValues, _, valuesErr := parent.values(constraint.ReferencedColumns, current)
@@ -621,8 +624,8 @@ func (e *relationalExecution) applyAction(ctx context.Context, child *relational
 
 func (e *relationalExecution) deleteCascadeRow(ctx context.Context, child *relationalTable, old *model.Row, depth int) error {
 	if e.triggers != nil {
-		_, skip, err := e.triggers.BeforeRow(ctx, child.descriptor, model.TriggerDelete, old, nil, e.maxBytes)
-		if err != nil || skip {
+		_, proceed, err := e.triggers.BeforeRow(ctx, child.descriptor, model.TriggerDelete, old, nil, e.maxBytes)
+		if err != nil || !proceed {
 			return err
 		}
 	}
@@ -652,8 +655,8 @@ func (e *relationalExecution) updateCascadeRow(ctx context.Context, child *relat
 		return err
 	}
 	if e.triggers != nil {
-		triggered, skip, triggerErr := e.triggers.BeforeRow(ctx, child.descriptor, model.TriggerUpdate, old, &proposed, e.maxBytes)
-		if triggerErr != nil || skip {
+		triggered, proceed, triggerErr := e.triggers.BeforeRow(ctx, child.descriptor, model.TriggerUpdate, old, &proposed, e.maxBytes)
+		if triggerErr != nil || !proceed {
 			return triggerErr
 		}
 		if triggered != nil {
