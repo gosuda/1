@@ -1,0 +1,66 @@
+name: SQLite CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 (gcc-15)
+            os: ubuntu-26.04
+            cc: gcc
+          - name: Linux amd64 (clang-22)
+            os: ubuntu-26.04
+            cc: clang-22
+          - name: Linux arm64 (gcc-15)
+            os: ubuntu-26.04-arm
+            cc: gcc
+          - name: macOS arm64 (clang)
+            os: macos-26
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Checkout HQQ core
+        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install Ninja
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+          else
+            command -v ninja >/dev/null || brew install ninja
+          fi
+      - name: Print toolchain versions
+        run: |
+          go version
+          "$CC" --version
+          cmake --version
+      - name: Run C unit tests
+        run: |
+          adir=$(scripts/release/fetch-sqlite.sh)
+          cmake -S sqlite3/server -B "${RUNNER_TEMP}/c-unit-build" -G Ninja \
+            -DHQQ_SQLITE_AMALGAMATION_DIR="$adir" \
+            -DSQLSRV_BUILD_TESTS=ON
+          cmake --build "${RUNNER_TEMP}/c-unit-build" --target hqqsqlite_server_unit_tests
+          ctest --test-dir "${RUNNER_TEMP}/c-unit-build" --output-on-failure
+      - name: Build hqq-sqlite-server and run Go tests
+        run: |
+          eval "$(sqlite3/build.sh -T)"
+          go vet ./...
+          go test -p 1 -v -race -timeout 10m ./...
