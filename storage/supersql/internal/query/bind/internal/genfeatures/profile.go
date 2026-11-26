@@ -11,7 +11,8 @@ func validateFeature(entry feature) error {
 		"notifications", "server_io", "xml", "locale_providers", "physical_storage",
 		"non_btree_indexes", "advanced_exclusion", "rewrite_hooks", "physical_maintenance",
 		"server_observability", "aggregate_or_replace", "session_state",
-		"write_descriptor_expansion", "datetime_fields", "encoding_conversion":
+		"write_descriptor_expansion", "datetime_fields", "encoding_conversion",
+		"anonymous_record":
 	case "required_sql":
 		disposition, state = "required", ""
 	case "psql_commands":

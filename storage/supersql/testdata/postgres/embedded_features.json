@@ -16889,6 +16889,30 @@
       ]
     },
     {
+      "id": "anonymous_record",
+      "disposition": "unsupported",
+      "reason": "JSON record functions require a determinable row type; anonymous record values without a registered composite type (for example row(...) literals) are excluded.",
+      "ast_match": [
+        "resolved json_populate_record or json_populate_recordset with indeterminate record type"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres/sql/json.sql",
+          "line": 562
+        },
+        {
+          "file": "testdata/postgres/sql/json.sql",
+          "line": 589
+        },
+        {
+          "file": "testdata/postgres/sql/json.sql",
+          "line": 597
+        }
+      ]
+    },
+    {
       "id": "required_sql",
       "disposition": "required",
       "reason": "All PostgreSQL 18.4 SQL outside the fixed exclusions is required, including missing implementations.",

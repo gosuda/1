@@ -14,7 +14,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | catalog | ../postgres184/catalog |
 | regression | ../postgres184 |
 | auxiliary_regression_revision | 1f02a1e488f7b0f4c962a19d6b7b8e172f97d9c2 |
-| features | 25 |
+| features | 26 |
 
 ## Feature dispositions
 
@@ -43,6 +43,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | write_descriptor_expansion | unsupported | 0A000 | 1 | 0 | Writes needing unsupported descriptor expansion are unavailable. |
 | datetime_fields | unsupported | 0A000 | 1 | 0 | Only the supported temporal field units are available. |
 | encoding_conversion | unsupported | 0A000 | 1 | 0 | Only the builtin encodings can be converted. |
+| anonymous_record | unsupported | 0A000 | 1 | 0 | JSON record functions need a determinable row type. |
 | required_sql | required |  | 1 | 0 | All SQL outside the fixed exclusions is required. |
 | psql_commands | client_command |  | 0 | 0 | psql backslash commands are test-client input. |
 
@@ -423,6 +424,22 @@ Only the builtin encodings can be converted.
 AST match strings:
 
 - `convert_from unsupported encoding`
+
+No resolved catalog objects.
+
+### `anonymous_record`
+
+JSON record functions need a determinable row type.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `json_populate_record with indeterminate record type`
 
 No resolved catalog objects.
 

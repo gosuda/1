@@ -247,6 +247,17 @@
       ]
     },
     {
+      "id": "anonymous_record",
+      "disposition": "unsupported",
+      "reason": "JSON record functions need a determinable row type.",
+      "sqlstate": "0A000",
+      "ast_match": ["json_populate_record with indeterminate record type"],
+      "resolved_objects": [],
+      "regression_statements": [
+        {"file": "testdata/postgres/sql/json.sql", "line": 562}
+      ]
+    },
+    {
       "id": "required_sql",
       "disposition": "required",
       "reason": "All SQL outside the fixed exclusions is required.",

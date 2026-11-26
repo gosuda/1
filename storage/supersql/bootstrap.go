@@ -191,7 +191,11 @@ func (database *Catalog) prepareWorkers() error {
 		parallelism = max(1, goruntime.GOMAXPROCS(0))
 	}
 	queueCapacity := max(2, parallelism*2)
-	maxGroups := max(16, parallelism*4)
+	// Cursor-heavy transactions hold one group per open portal plus transient
+	// statement groups, independent of core count: floor the group cap at the
+	// runtime default instead of starving small machines (parallelism*4 is 16
+	// on a 4-core runner, where 13 open portals already exhaust it with 53200).
+	maxGroups := max(1024, parallelism*4)
 	pool, err := runtime.NewPool(runtime.PoolConfig{Parallelism: parallelism, QueueCapacity: queueCapacity, MaxGroups: maxGroups})
 	if err != nil {
 		return err

@@ -46,6 +46,10 @@ const (
 	// EncodingConversion covers character-set conversion for encodings outside
 	// the builtin conversion kernels (UTF8, LATIN1, WIN1252).
 	EncodingConversion FeatureID = "encoding_conversion"
+	// AnonymousRecord covers JSON record functions whose row type cannot be
+	// determined from an anonymous record value without a registered
+	// composite type (for example row(...) literals).
+	AnonymousRecord FeatureID = "anonymous_record"
 )
 
 // UnsupportedMessage names one profile exclusion in the diagnostic of every

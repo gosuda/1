@@ -171,6 +171,8 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 		{string(bind.DatetimeFields), `SELECT EXTRACT(MICROSECONDS FROM DATE '2020-08-11')`},
 		{string(bind.DatetimeFields), `SELECT EXTRACT(TIMEZONE FROM INTERVAL '2 days')`},
 		{string(bind.EncodingConversion), `SELECT convert_from('\xbcf6c7d0', 'EUC_KR')`},
+		{string(bind.AnonymousRecord), `SELECT json_populate_record(row(1,2), '{"f1": 0, "f2": 1}')`},
+		{string(bind.AnonymousRecord), `SELECT json_populate_recordset(row(1,2), '[{"f1": 0, "f2": 1}]')`},
 	}
 	covered := make(map[string]bool)
 	for _, excludedStatement := range excluded {

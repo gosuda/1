@@ -10,6 +10,14 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+// featureAnonymousRecord names the embedded_pg18 profile exclusion for JSON
+// record functions whose row type cannot be determined from an anonymous
+// record value. The bind package owns the canonical FeatureID
+// (bind.AnonymousRecord) but cannot be imported here: bind imports builtin.
+// gates_test.go's manifest-driven exclusion table fails if this id drifts
+// from testdata/postgres/embedded_features.json.
+const featureAnonymousRecord = "anonymous_record"
+
 type jsonRecordField struct {
 	typ       model.Type
 	name      string
@@ -75,10 +83,10 @@ func newJSONRecordPlan(ctx context.Context, id model.FunctionID, arguments []mod
 		layout = arguments[0]
 	}
 	if layout.Type.Storage != model.TypeComposite || len(layout.FieldNames) != len(layout.Children) {
-		return nil, sqlError("0A000", "could not determine row type for result of "+signature.Name)
+		return nil, &model.Error{Code: "0A000", Message: "could not determine row type for result of " + signature.Name, FeatureID: featureAnonymousRecord}
 	}
 	if layout.Type.ID == 2249 && len(layout.Children) == 0 && layout.Type.Modifier < 0 {
-		return nil, sqlError("0A000", "could not determine row type for result of "+signature.Name)
+		return nil, &model.Error{Code: "0A000", Message: "could not determine row type for result of " + signature.Name, FeatureID: featureAnonymousRecord}
 	}
 	if err := validateConcreteLayout(ctx, layout); err != nil {
 		return nil, err

@@ -14,7 +14,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | catalog | ../postgres184/catalog |
 | regression | ../postgres184 |
 | auxiliary_regression_revision | 1f02a1e488f7b0f4c962a19d6b7b8e172f97d9c2 |
-| features | 25 |
+| features | 26 |
 
 ## Feature dispositions
 
@@ -43,6 +43,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | write_descriptor_expansion | unsupported | 0A000 | 1 | 0 | A write target whose descriptor requires constraint, index, trigger, or partition expansion the embedded writer does not implement. |
 | datetime_fields | unsupported | 0A000 | 1 | 0 | EXTRACT, date_part, and date_trunc field units are limited to the units the embedded temporal kernels implement for the resolved type. |
 | encoding_conversion | unsupported | 0A000 | 1 | 0 | Character-set conversion is limited to the encodings the embedded conversion kernels implement (UTF8, LATIN1, and WIN1252). |
+| anonymous_record | unsupported | 0A000 | 1 | 0 | JSON record functions require a determinable row type; anonymous record values without a registered composite type (for example row(...) literals) are excluded. |
 | required_sql | required |  | 1 | 2970 | All PostgreSQL 18.4 SQL outside the fixed exclusions is required, including missing implementations. |
 | psql_commands | client_command |  | 0 | 0 | psql backslash commands are test-client input, not executable SQL or compatibility passes. |
 
@@ -619,6 +620,22 @@ AST match strings:
 
 No resolved catalog objects.
 
+### `anonymous_record`
+
+JSON record functions require a determinable row type; anonymous record values without a registered composite type (for example row(...) literals) are excluded.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 3 |
+
+AST match strings:
+
+- `resolved json_populate_record or json_populate_recordset with indeterminate record type`
+
+No resolved catalog objects.
+
 ### `required_sql`
 
 All PostgreSQL 18.4 SQL outside the fixed exclusions is required, including missing implementations.
@@ -665,7 +682,7 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-128 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+130 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
@@ -687,7 +704,7 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:384 | `only equality exclusion operators are supported` |
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
 | internal/query/bind/definition_declaration.go:307 | `support function arguments must be inferred from the declaration` |
-| internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/features.go:62 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/function.go:217 | `ordered-set aggregates cannot be used as window functions` |
 | internal/query/bind/function.go:542 | `routine dependency is no longer available` |
 | internal/query/bind/function.go:547 | `routine semantic definition encoding is unavailable` |
@@ -787,6 +804,8 @@ No resolved catalog objects.
 | internal/query/builtin/declared_type.go:311 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:321 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/interval_fields.go:106 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/json_record.go:86 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/json_record.go:89 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/modify/options.go:172 | `model.Error{Code: "0A000"}` |

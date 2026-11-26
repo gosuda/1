@@ -159,19 +159,19 @@ jobs:
           - shard: 1
             files: "test_setup,float4,float8,pg_lsn,numerology,line,polygon,interval,copy,create_index_spgist,constraints,union,matview,replica_identity,tablesample,collate.icu.utf8,rules,select_parallel,foreign_key,foreign_data,jsonb,plancache,conversion,with,partition_info,compression_pglz"
           - shard: 2
-            files: "int8,oid,bit,regproc,date,time,misc_sanity,insert_conflict,inherit,create_am,hash_func,select_into,select_distinct_on,transactions,brin_bloom,alter_generic,dbsize,merge,tidrangescan,collate.windows.win1252,portals_p2,tsdicts,json,sqljson_jsontable,prepare,largeobject,partition_aggregate,compression"
+            files: "test_setup,int8,oid,bit,regproc,date,time,misc_sanity,insert_conflict,inherit,create_am,hash_func,select_into,select_distinct_on,transactions,brin_bloom,alter_generic,dbsize,merge,tidrangescan,collate.windows.win1252,portals_p2,tsdicts,json,sqljson_jsontable,prepare,largeobject,partition_aggregate,compression"
           - shard: 3
-            files: "boolean,char,name,strings,point,box,copyencoding,create_aggregate,updatable_views,infinite_recurse,select_having,prepared_xacts,brin,misc,async,misc_functions,tid,tidscan,collate.utf8,psql_pipeline,maintain_every,guc,functional_deps,jsonpath_encoding,copy2,sequence,partition_prune,memoize,event_trigger_login"
+            files: "test_setup,boolean,char,name,strings,point,box,copyencoding,create_aggregate,updatable_views,infinite_recurse,select_having,prepared_xacts,brin,misc,async,misc_functions,tid,tidscan,collate.utf8,psql_pipeline,maintain_every,guc,functional_deps,jsonpath_encoding,copy2,sequence,partition_prune,memoize,event_trigger_login"
           - shard: 4
-            files: "numeric,comments,xid,copyselect,copydml,create_operator,create_procedure,create_index,create_cast,triggers,roleattributes,sanity_check,delete,namespace,gin,spgist,privileges,join_hash,brin_multi,generated_virtual,stats_ext,subscription,combocid,indirect_toast,sqljson,domain,rowtypes,hash_part,predicate,tablespace"
+            files: "test_setup,numeric,comments,xid,copyselect,copydml,create_operator,create_procedure,create_index,create_cast,triggers,roleattributes,sanity_check,delete,namespace,gin,spgist,privileges,join_hash,brin_multi,generated_virtual,stats_ext,subscription,combocid,indirect_toast,sqljson,domain,rowtypes,hash_part,predicate,tablespace"
           - shard: 5
-            files: "int2,enum,money,md5,lseg,timetz,geometry,opr_sanity,create_table,vacuum,errors,select_implicit,case,update,init_privs,groupingsets,drop_operator,identity,create_role,psql,write_parallel,cluster,window,json_encoding,limit,truncate,xml,tuplesort,oidjoins"
+            files: "test_setup,int2,enum,money,md5,lseg,timetz,geometry,opr_sanity,create_table,vacuum,errors,select_implicit,case,update,init_privs,groupingsets,drop_operator,identity,create_role,psql,write_parallel,cluster,window,json_encoding,limit,truncate,xml,tuplesort,oidjoins"
           - shard: 6
-            files: "text,uuid,path,timestamp,inet,macaddr,database,stats_import,index_including,index_including_gist,aggregates,random,portals,arrays,security_label,rowsecurity,object_address,password,sysviews,psql_crosstab,vacuum_parallel,dependency,xmlmap,jsonpath,plpgsql,alter_table,partition_join,explain,event_trigger"
+            files: "test_setup,text,uuid,path,timestamp,inet,macaddr,database,stats_import,index_including,index_including_gist,aggregates,random,portals,arrays,security_label,rowsecurity,object_address,password,sysviews,psql_crosstab,vacuum_parallel,dependency,xmlmap,jsonpath,plpgsql,alter_table,partition_join,explain,event_trigger"
           - shard: 7
-            files: "varchar,circle,timestamptz,multirangetypes,type_sanity,expressions,mvcc,encoding,euc_kr,create_function_c,create_misc,create_schema,create_function_sql,select,typed_table,drop_if_exists,select_distinct,join,hash_index,collate,create_table_like,tsrf,collate.linux.utf8,select_views,tsearch,equivclass,sqljson_queryfuncs,rangefuncs,returning,indexing,numa"
+            files: "test_setup,varchar,circle,timestamptz,multirangetypes,type_sanity,expressions,mvcc,encoding,euc_kr,create_function_c,create_misc,create_schema,create_function_sql,select,typed_table,drop_if_exists,select_distinct,join,hash_index,collate,create_table_like,tsrf,collate.linux.utf8,select_views,tsearch,equivclass,sqljson_queryfuncs,rangefuncs,returning,indexing,numa"
           - shard: 8
-            files: "int4,txid,rangetypes,macaddr8,horology,tstypes,regex,unicode,insert,create_type,create_view,subselect,btree_index,gist,lock,generated_stored,alter_operator,incremental_sort,without_overlaps,amutils,publication,bitmapops,advisory_lock,jsonb_jsonpath,temp,polymorphism,reloptions,stats,fast_default"
+            files: "test_setup,int4,txid,rangetypes,macaddr8,horology,tstypes,regex,unicode,insert,create_type,create_view,subselect,btree_index,gist,lock,generated_stored,alter_operator,incremental_sort,without_overlaps,amutils,publication,bitmapops,advisory_lock,jsonb_jsonpath,temp,polymorphism,reloptions,stats,fast_default"
     services:
       postgres:
         image: postgres:18.4

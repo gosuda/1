@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,11 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
 )
+
+// regressUpdate rewrites the committed per-file regression baselines under
+// testdata/<corpus>/baseline. It is used exactly once to record the observed
+// buckets after a fix, then the ratchet enforces equality on every run.
+var regressUpdate = flag.Bool("update", false, "rewrite the regression baseline files under testdata/<corpus>/baseline")
 
 // TestPostgres18OfficialRegression executes the vendored PostgreSQL regression
 // schedules through the public Catalog API and reports each statement's
@@ -132,6 +138,7 @@ var dependentCodes = map[string]bool{
 	"42723": true, // duplicate_function
 	"42P06": true, // duplicate_schema
 	"42710": true, // duplicate_object
+	"25P02": true, // in_failed_sql_transaction: cascade after an abort in the same session
 }
 
 func unsupportedFeatureIDs(t *testing.T) map[string]bool {
@@ -220,6 +227,7 @@ func runRegressionSchedule(t *testing.T, corpus string, unsupported map[string]b
 		}
 		var counts regressionCounts
 		broken := false
+		var observed []string
 		fileStart := time.Now()
 		for i, statement := range statements {
 			statementStart := time.Now()
@@ -245,15 +253,15 @@ func runRegressionSchedule(t *testing.T, corpus string, unsupported map[string]b
 				unsupportedLeaks++
 				dump.recordLeak(name, statement, err)
 			}
-			if outcome == regFailed && broken && dependentCodes[state] {
-				outcome = regDependent
-			}
+			outcome = mapCascadeToDependent(outcome, state, broken)
 			counts.add(outcome)
+			observed = append(observed, regressionBucketName(outcome))
 			if outcome == regFailed || outcome == regUnsupported || outcome == regExpectedError {
 				broken = true
 			}
 			dump.recordFailure(name, statement, outcome, state, err)
 		}
+		checkRegressionBaseline(t, corpus, name, statements, observed)
 		if scope.txns.Active() {
 			t.Logf("%s/%s: file ended inside a transaction; closing its session rolls it back", corpus, name)
 		}
@@ -367,6 +375,97 @@ func classifyRegressionError(err error, unsupported map[string]bool) regressionO
 		return regUnsupported
 	}
 	return regFailed
+}
+
+// mapCascadeToDependent is the schedule's session-aware dependent rule: after
+// one root failure in a file (broken), a later statement failing with a
+// dependent SQLSTATE counts as dependent, not as its own failure. Both
+// runRegressionSchedule and TestDependent25P02Cascade call it so the proof
+// pins the production mapping instead of repeating it.
+func mapCascadeToDependent(outcome regressionOutcome, state string, broken bool) regressionOutcome {
+	if outcome == regFailed && broken && dependentCodes[state] {
+		return regDependent
+	}
+	return outcome
+}
+
+// regressionBucketName names a final per-statement bucket for the baseline.
+func regressionBucketName(o regressionOutcome) string {
+	switch o {
+	case regPass:
+		return "pass"
+	case regExpectedError:
+		return "expected_error"
+	case regUnsupported:
+		return "unsupported"
+	case regDependent:
+		return "dependent"
+	case regClient:
+		return "client"
+	case regUnexpectedSuccess:
+		return "unexpected_success"
+	case regFailed:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// checkRegressionBaseline enforces the committed per-file ratchet: the
+// observed bucket sequence for one schedule file must equal its baseline
+// file under testdata/<corpus>/baseline/<name>.txt (<line> <bucket> per
+// statement). Files without a committed baseline are skipped so baselines
+// land incrementally per shard; shard 2's files are the first set. With
+// -update, the observed sequence rewrites the baseline file instead of
+// failing. A mismatch fails the test: a newly failing statement is a
+// regression, a newly passing one must update its baseline row.
+func checkRegressionBaseline(t *testing.T, corpus, name string, statements []regStatement, observed []string) {
+	t.Helper()
+	path := filepath.Join(corpus, "baseline", name+".txt")
+	var want []string
+	for i, statement := range statements {
+		want = append(want, fmt.Sprintf("%d %s", statement.line, observed[i]))
+	}
+	if *regressUpdate {
+		if err := os.MkdirAll(filepath.Join(corpus, "baseline"), 0o755); err != nil {
+			t.Fatalf("%s/%s: create baseline dir: %v", corpus, name, err)
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(want, "\n")+"\n"), 0o644); err != nil {
+			t.Fatalf("%s/%s: write baseline: %v", corpus, name, err)
+		}
+		t.Logf("%s/%s: baseline rewritten (%d statements)", corpus, name, len(want))
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Logf("%s/%s: no baseline, skipping ratchet (%d statements observed)", corpus, name, len(want))
+			return
+		}
+		t.Errorf("%s/%s: read baseline: %v", corpus, name, err)
+		return
+	}
+	var got []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			got = append(got, trimmed)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("%s/%s: baseline has %d rows, observed %d statements; run with -update to rewrite", corpus, name, len(got), len(want))
+		return
+	}
+	mismatches := 0
+	for i := range want {
+		if got[i] != want[i] {
+			if mismatches < 5 {
+				t.Errorf("%s/%s statement %d: baseline %q, observed %q", corpus, name, i, got[i], want[i])
+			}
+			mismatches++
+		}
+	}
+	if mismatches > 0 {
+		t.Errorf("%s/%s: %d baseline mismatches; run with -update to rewrite after triage", corpus, name, mismatches)
+	}
 }
 
 // regMaxClusterSamples caps the sample statements listed per cluster.
@@ -648,6 +747,7 @@ func firstSQLWord(s string) string {
 func splitRegressionSQL(source string) ([]regStatement, error) {
 	var statements []regStatement
 	var buf strings.Builder
+	var bufQuoted bool
 	line := 1
 	stmtLine := 0
 	mark := func() {
@@ -656,8 +756,14 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 		}
 	}
 	emitSQL := func(text string, lineNo int) {
+		quoted := bufQuoted
+		bufQuoted = false
 		if trimmed := strings.TrimSpace(text); trimmed != "" && !commentOnly(trimmed) {
-			statements = append(statements, regStatement{text: trimmed, line: lineNo})
+			stmt := regStatement{text: trimmed, line: lineNo}
+			if quoted {
+				stmt.kind = regClientCommand
+			}
+			statements = append(statements, stmt)
 		}
 	}
 	i := 0
@@ -799,12 +905,25 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 				i++
 			}
 		case ';':
+			if i > 0 && source[i-1] == '\\' {
+				mark()
+				atLineStart = false
+				buf.WriteByte(';')
+				bufQuoted = true
+				i++
+				break
+			}
+			quoted := bufQuoted
+			bufQuoted = false
 			text := strings.TrimSpace(buf.String())
 			buf.Reset()
 			i++
 			if len(text) != 0 && !commentOnly(text) {
 				stmt := regStatement{text: text, line: stmtLine}
-				if firstSQLWord(text) == "copy" {
+				if quoted {
+					stmt.kind = regClientCommand
+				}
+				if stmt.kind == regSQL && firstSQLWord(text) == "copy" {
 					if regCopyInPattern.MatchString(text) {
 						stmt.kind = regCopyIn
 					} else if regCopyOutPattern.MatchString(text) {
