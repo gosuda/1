@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -996,49 +997,115 @@ const (
 	numericSignNaN  uint16 = 0xC000
 	numericSignPInf uint16 = 0xD000
 	numericSignNInf uint16 = 0xF000
+
+	// Conservative single-element decode caps (prevents per-element wire amplification).
+	maxNumericDecodeWeight = 2000
+	maxNumericDecodeDscale = 1000
+	maxNumericTextBytes    = 200_000
+
+	// PostgreSQL numeric encoding limits: up to 131072 integer digits and 16383 fractional digits.
+	maxNumericEncodeIntDigits  = 131072
+	maxNumericEncodeFracDigits = 16383
+	maxNumericExpShift         = maxNumericEncodeIntDigits + maxNumericEncodeFracDigits
+
+	// Cumulative decoded text budget across a binary array (prevents ~643x numeric[] OOM).
+	maxBinaryArrayTextBytes = 16 << 20 // 16 MiB
+
+	// PostgreSQL MAXDIM (maximum array nesting depth / dimensions).
+	maxArrayDims = 6
 )
 
 func decodeBinaryNumeric(raw []byte) (string, error) {
+	var b strings.Builder
+	if err := decodeBinaryNumericInto(&b, raw, maxNumericTextBytes); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func decodeBinaryNumericInto(b *strings.Builder, raw []byte, maxBytes int) error {
 	if len(raw) < 8 {
-		return "", fmt.Errorf("numeric binary data too short: %d", len(raw))
+		return fmt.Errorf("numeric binary data too short: %d", len(raw))
 	}
 	ndigits := int(int16(binary.BigEndian.Uint16(raw[0:2])))
 	weight := int(int16(binary.BigEndian.Uint16(raw[2:4])))
 	sign := binary.BigEndian.Uint16(raw[4:6])
 	dscale := int(binary.BigEndian.Uint16(raw[6:8]))
 	if ndigits < 0 || len(raw) != 8+2*ndigits {
-		return "", fmt.Errorf("invalid numeric binary length: ndigits=%d len=%d", ndigits, len(raw))
+		return fmt.Errorf("invalid numeric binary length: ndigits=%d len=%d", ndigits, len(raw))
 	}
 	switch sign {
 	case numericSignNaN:
-		return "NaN", nil
+		if maxBytes >= 0 && len("NaN") > maxBytes {
+			return fmt.Errorf("decoded numeric text exceeds remaining budget (%d bytes)", maxBytes)
+		}
+		b.WriteString("NaN")
+		return nil
 	case numericSignPInf:
-		return "Infinity", nil
+		if maxBytes >= 0 && len("Infinity") > maxBytes {
+			return fmt.Errorf("decoded numeric text exceeds remaining budget (%d bytes)", maxBytes)
+		}
+		b.WriteString("Infinity")
+		return nil
 	case numericSignNInf:
-		return "-Infinity", nil
+		if maxBytes >= 0 && len("-Infinity") > maxBytes {
+			return fmt.Errorf("decoded numeric text exceeds remaining budget (%d bytes)", maxBytes)
+		}
+		b.WriteString("-Infinity")
+		return nil
 	case numericSignPos, numericSignNeg:
 	default:
-		return "", fmt.Errorf("invalid numeric sign: 0x%04x", sign)
+		return fmt.Errorf("invalid numeric sign: 0x%04x", sign)
 	}
-	if weight < -2000 || weight > 2000 {
-		return "", fmt.Errorf("numeric weight out of range: %d", weight)
+	if weight < -maxNumericDecodeWeight || weight > maxNumericDecodeWeight {
+		return fmt.Errorf("numeric weight out of range: %d", weight)
 	}
-	if dscale < 0 || dscale > 1000 {
-		return "", fmt.Errorf("numeric display scale out of range: %d", dscale)
+	if dscale < 0 || dscale > maxNumericDecodeDscale {
+		return fmt.Errorf("numeric display scale out of range: %d", dscale)
 	}
-	digits := make([]uint16, ndigits)
 	for i := range ndigits {
 		d := binary.BigEndian.Uint16(raw[8+2*i : 10+2*i])
 		if d > 9999 {
-			return "", fmt.Errorf("numeric base-10000 digit out of range: %d", d)
+			return fmt.Errorf("numeric base-10000 digit out of range: %d", d)
 		}
-		digits[i] = d
 	}
 
-	var b strings.Builder
+	// Compute exact rendered byte length BEFORE allocating or writing to b.
+	renderedLen := 0
+	if sign == numericSignNeg {
+		renderedLen++
+	}
+	if ndigits == 0 || weight < 0 {
+		renderedLen++
+	} else {
+		d0 := binary.BigEndian.Uint16(raw[8:10])
+		switch {
+		case d0 >= 1000:
+			renderedLen += 4
+		case d0 >= 100:
+			renderedLen += 3
+		case d0 >= 10:
+			renderedLen += 2
+		default:
+			renderedLen++
+		}
+		renderedLen += weight * 4
+	}
+	if dscale > 0 {
+		renderedLen += 1 + dscale
+	}
+	if renderedLen > maxNumericTextBytes {
+		return fmt.Errorf("numeric text representation exceeds limit: %d bytes", renderedLen)
+	}
+	if maxBytes >= 0 && renderedLen > maxBytes {
+		return fmt.Errorf("decoded numeric text (%d bytes) exceeds remaining budget (%d bytes)", renderedLen, maxBytes)
+	}
+
+	b.Grow(renderedLen)
 	if sign == numericSignNeg {
 		b.WriteByte('-')
 	}
+	var groupBuf [4]byte
 	// Integer part: digits at positions i where (weight - i) >= 0.
 	if ndigits == 0 || weight < 0 {
 		b.WriteByte('0')
@@ -1046,32 +1113,45 @@ func decodeBinaryNumeric(raw []byte) (string, error) {
 		for idx := 0; idx <= weight; idx++ {
 			var d uint16
 			if idx < ndigits {
-				d = digits[idx]
+				d = binary.BigEndian.Uint16(raw[8+2*idx : 10+2*idx])
 			}
 			if idx == 0 {
 				b.WriteString(strconv.FormatUint(uint64(d), 10))
 			} else {
-				fmt.Fprintf(&b, "%04d", d)
+				groupBuf[0] = byte('0' + d/1000)
+				groupBuf[1] = byte('0' + (d/100)%10)
+				groupBuf[2] = byte('0' + (d/10)%10)
+				groupBuf[3] = byte('0' + d%10)
+				b.Write(groupBuf[:])
 			}
 		}
 	}
 	// Fractional part: dscale digits after decimal point.
 	if dscale > 0 {
 		b.WriteByte('.')
-		var frac strings.Builder
+		rem := dscale
 		fracGroups := (dscale + 3) / 4
 		for g := 0; g < fracGroups; g++ {
 			// Group g corresponds to 10000^(-(g+1)), i.e. index = weight + 1 + g.
 			idx := weight + 1 + g
 			var d uint16
 			if idx >= 0 && idx < ndigits {
-				d = digits[idx]
+				d = binary.BigEndian.Uint16(raw[8+2*idx : 10+2*idx])
 			}
-			fmt.Fprintf(&frac, "%04d", d)
+			groupBuf[0] = byte('0' + d/1000)
+			groupBuf[1] = byte('0' + (d/100)%10)
+			groupBuf[2] = byte('0' + (d/10)%10)
+			groupBuf[3] = byte('0' + d%10)
+			if rem >= 4 {
+				b.Write(groupBuf[:])
+				rem -= 4
+			} else {
+				b.Write(groupBuf[:rem])
+				rem = 0
+			}
 		}
-		b.WriteString(frac.String()[:dscale])
 	}
-	return b.String(), nil
+	return nil
 }
 
 func encodeBinaryNumeric(s string) ([]byte, error) {
@@ -1104,6 +1184,9 @@ func encodeBinaryNumeric(s string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid numeric %q", s)
 		}
+		if e < -maxNumericExpShift || e > maxNumericExpShift {
+			return nil, fmt.Errorf("numeric exponent out of range: %d", e)
+		}
 		expShift = e
 		trimmed = trimmed[:idx]
 	}
@@ -1114,10 +1197,45 @@ func encodeBinaryNumeric(s string) ([]byte, error) {
 	} else {
 		intStr = trimmed
 	}
-	// Apply scientific exponent shift into intStr / fracStr.
+	if intStr == "" && fracStr == "" {
+		return nil, fmt.Errorf("invalid numeric %q", s)
+	}
+	for i := 0; i < len(intStr); i++ {
+		if intStr[i] < '0' || intStr[i] > '9' {
+			return nil, fmt.Errorf("invalid numeric %q", s)
+		}
+	}
+	for i := 0; i < len(fracStr); i++ {
+		if fracStr[i] < '0' || fracStr[i] > '9' {
+			return nil, fmt.Errorf("invalid numeric %q", s)
+		}
+	}
+	// Strip leading zeros from integer part before exponent and precision checks.
+	intStr = strings.TrimLeft(intStr, "0")
+
+	// Apply scientific exponent shift into intStr / fracStr, enforcing PG numeric
+	// bounds BEFORE allocating any zero-padding strings.
 	if expShift != 0 {
-		all := intStr + fracStr
+		allLen := len(intStr) + len(fracStr)
 		decPos := len(intStr) + expShift
+		var newIntLen, newFracLen int
+		if decPos <= 0 {
+			newIntLen = 1
+			newFracLen = -decPos + allLen
+		} else if decPos >= allLen {
+			newIntLen = decPos
+			newFracLen = 0
+		} else {
+			newIntLen = decPos
+			newFracLen = allLen - decPos
+		}
+		if newIntLen > maxNumericEncodeIntDigits {
+			return nil, fmt.Errorf("numeric integer precision out of range: %d digits", newIntLen)
+		}
+		if newFracLen > maxNumericEncodeFracDigits {
+			return nil, fmt.Errorf("numeric display scale out of range: %d digits", newFracLen)
+		}
+		all := intStr + fracStr
 		if decPos <= 0 {
 			intStr = "0"
 			fracStr = strings.Repeat("0", -decPos) + all
@@ -1128,8 +1246,15 @@ func encodeBinaryNumeric(s string) ([]byte, error) {
 			intStr = all[:decPos]
 			fracStr = all[decPos:]
 		}
+		intStr = strings.TrimLeft(intStr, "0")
+	}
+	if len(intStr) > maxNumericEncodeIntDigits {
+		return nil, fmt.Errorf("numeric integer precision out of range: %d digits", len(intStr))
 	}
 	dscale := len(fracStr)
+	if dscale > maxNumericEncodeFracDigits {
+		return nil, fmt.Errorf("numeric display scale out of range: %d digits", dscale)
+	}
 	if intStr == "" {
 		intStr = "0"
 	}
@@ -1173,6 +1298,16 @@ func encodeBinaryNumeric(s string) ([]byte, error) {
 		weight = 0
 		sign = numericSignPos
 	}
+	// Validate wire header field ranges BEFORE casting to signed/unsigned 16-bit ints.
+	if len(digits) > math.MaxInt16 {
+		return nil, fmt.Errorf("numeric digit count out of range: %d", len(digits))
+	}
+	if weight < math.MinInt16 || weight > math.MaxInt16 {
+		return nil, fmt.Errorf("numeric weight out of range: %d", weight)
+	}
+	if dscale < 0 || dscale > maxNumericEncodeFracDigits {
+		return nil, fmt.Errorf("numeric display scale out of range: %d", dscale)
+	}
 	out := make([]byte, 8+2*len(digits))
 	binary.BigEndian.PutUint16(out[0:2], uint16(len(digits)))
 	binary.BigEndian.PutUint16(out[2:4], uint16(int16(weight)))
@@ -1205,7 +1340,7 @@ func decodeBinaryArrayToText(expectedElemOID uint32, raw []byte) (string, error)
 	if ndim == 0 {
 		return "{}", nil
 	}
-	if ndim < 0 || ndim > 16 {
+	if ndim < 0 || ndim > maxArrayDims {
 		return "", fmt.Errorf("invalid binary array ndim: %d", ndim)
 	}
 	pos := 12
@@ -1228,76 +1363,127 @@ func decodeBinaryArrayToText(expectedElemOID uint32, raw []byte) (string, error)
 		dims[i] = int(dimLen)
 		totalElems *= uint64(dimLen)
 	}
-	elems := make([]*string, int(totalElems))
-	for i := range int(totalElems) {
-		if pos+4 > len(raw) {
-			return "", fmt.Errorf("binary array element length truncated")
-		}
-		elemLen := int(int32(binary.BigEndian.Uint32(raw[pos : pos+4])))
-		pos += 4
-		if elemLen == -1 {
-			elems[i] = nil
-			continue
-		}
-		if elemLen < 0 || pos+elemLen > len(raw) {
-			return "", fmt.Errorf("binary array element payload truncated")
-		}
-		elemRaw := raw[pos : pos+elemLen]
-		pos += elemLen
-		val, err := decodeBinaryParam(elemOID, elemRaw)
-		if err != nil {
-			return "", err
-		}
-		textBytes, err := encodeTextValue(elemOID, val)
-		if err != nil {
-			return "", err
-		}
-		s := string(textBytes)
-		elems[i] = &s
+	// Each element renders to at least 1 byte plus a separator/brace (>= 2*totalElems + 1).
+	if totalElems > (maxBinaryArrayTextBytes-1)/2 {
+		return "", fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBinaryArrayTextBytes)
 	}
+
 	var b strings.Builder
-	idx := 0
-	writePGArrayDims(&b, dims, 0, elems, &idx)
+	if err := streamBinaryArrayDims(&b, elemOID, raw, &pos, dims, 0, maxBinaryArrayTextBytes); err != nil {
+		return "", err
+	}
 	return b.String(), nil
 }
 
-func writePGArrayDims(b *strings.Builder, dims []int, level int, elems []*string, idx *int) {
+func streamBinaryArrayDims(b *strings.Builder, elemOID uint32, raw []byte, pos *int, dims []int, level int, maxBytes int) error {
+	if b.Len()+1 > maxBytes {
+		return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+	}
 	b.WriteByte('{')
 	for i := 0; i < dims[level]; i++ {
 		if i > 0 {
+			if b.Len()+1 > maxBytes {
+				return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+			}
 			b.WriteByte(',')
 		}
 		if level == len(dims)-1 {
-			e := elems[*idx]
-			*idx++
-			if e == nil {
-				b.WriteString("NULL")
-			} else {
-				writePGArrayElement(b, *e)
+			if err := streamBinaryArrayElem(b, elemOID, raw, pos, maxBytes); err != nil {
+				return err
 			}
 		} else {
-			writePGArrayDims(b, dims, level+1, elems, idx)
+			if err := streamBinaryArrayDims(b, elemOID, raw, pos, dims, level+1, maxBytes); err != nil {
+				return err
+			}
 		}
 	}
+	if b.Len()+1 > maxBytes {
+		return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+	}
 	b.WriteByte('}')
+	return nil
 }
 
-func writePGArrayElement(b *strings.Builder, s string) {
-	needsQuote := s == "" || strings.EqualFold(s, "null")
-	if !needsQuote {
-		for i := 0; i < len(s); i++ {
-			switch s[i] {
-			case '{', '}', ',', '"', '\\', ' ', '\t', '\n', '\r':
-				needsQuote = true
-			}
-			if needsQuote {
-				break
-			}
+func streamBinaryArrayElem(b *strings.Builder, elemOID uint32, raw []byte, pos *int, maxBytes int) error {
+	if *pos+4 > len(raw) {
+		return fmt.Errorf("binary array element length truncated")
+	}
+	elemLen := int(int32(binary.BigEndian.Uint32(raw[*pos : *pos+4])))
+	*pos += 4
+	if elemLen == -1 {
+		if b.Len()+4 > maxBytes {
+			return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
 		}
+		b.WriteString("NULL")
+		return nil
+	}
+	if elemLen < 0 || *pos+elemLen > len(raw) {
+		return fmt.Errorf("binary array element payload truncated")
+	}
+	elemRaw := raw[*pos : *pos+elemLen]
+	*pos += elemLen
+
+	remaining := maxBytes - b.Len()
+	if elemOID == oidNumeric {
+		// Decode numeric directly into b, enforcing the remaining output budget BEFORE
+		// allocating. Numeric text output never needs PostgreSQL array quoting.
+		return decodeBinaryNumericInto(b, elemRaw, remaining)
+	}
+	// Pre-check variable-length types before allocating decoded copies.
+	switch elemOID {
+	case oidText, oidVarchar, oidBPChar, oidName, oidChar, oidJSON, oidUnknown, 0:
+		if len(elemRaw) > remaining {
+			return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+		}
+	case oidJSONB:
+		if len(elemRaw) > 0 && len(elemRaw)-1 > remaining {
+			return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+		}
+	case oidBytea:
+		if int64(2)+int64(len(elemRaw))*2 > int64(remaining) {
+			return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
+		}
+	}
+
+	val, err := decodeBinaryParam(elemOID, elemRaw)
+	if err != nil {
+		return err
+	}
+	textBytes, err := encodeTextValue(elemOID, val)
+	if err != nil {
+		return err
+	}
+	return writePGArrayElementBounded(b, string(textBytes), maxBytes)
+}
+
+func pgArrayElementEncodedLen(s string) (encodedLen int, needsQuote bool) {
+	if s == "" || strings.EqualFold(s, "null") {
+		needsQuote = true
+	}
+	extra := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"', '\\':
+			needsQuote = true
+			extra++
+		case '{', '}', ',', ' ', '\t', '\n', '\r':
+			needsQuote = true
+		}
+	}
+	if !needsQuote {
+		return len(s), false
+	}
+	return len(s) + extra + 2, true
+}
+
+func writePGArrayElementBounded(b *strings.Builder, s string, maxBytes int) error {
+	encodedLen, needsQuote := pgArrayElementEncodedLen(s)
+	if encodedLen > maxBytes-b.Len() {
+		return fmt.Errorf("binary array decoded text exceeds maximum size (%d bytes)", maxBytes)
 	}
 	if !needsQuote {
 		b.WriteString(s)
-		return
+		return nil
 	}
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
@@ -1307,6 +1493,7 @@ func writePGArrayElement(b *strings.Builder, s string) {
 		b.WriteByte(s[i])
 	}
 	b.WriteByte('"')
+	return nil
 }
 
 type pgArrayNode struct {
@@ -1332,18 +1519,12 @@ func encodeBinaryArrayFromText(elemOID uint32, text string) ([]byte, error) {
 		return hdr[:], nil
 	}
 	pos := 0
-	root, err := parsePGArrayLiteral(s, &pos)
+	root, dims, err := parsePGArrayLiteralDepth(s, &pos, 1)
 	if err != nil {
 		return nil, err
 	}
-	var dims []int
-	cur := root
-	for !cur.isLeaf {
-		dims = append(dims, len(cur.children))
-		if len(cur.children) == 0 {
-			break
-		}
-		cur = cur.children[0]
+	if pos != len(s) {
+		return nil, fmt.Errorf("unexpected trailing characters in array literal")
 	}
 	var leaves []pgArrayNode
 	var collect func(n pgArrayNode)
@@ -1397,62 +1578,96 @@ func encodeBinaryArrayFromText(elemOID uint32, text string) ([]byte, error) {
 }
 
 func parsePGArrayLiteral(s string, pos *int) (pgArrayNode, error) {
+	node, _, err := parsePGArrayLiteralDepth(s, pos, 1)
+	return node, err
+}
+
+func parsePGArrayLiteralDepth(s string, pos *int, depth int) (pgArrayNode, []int, error) {
+	if depth > maxArrayDims {
+		return pgArrayNode{}, nil, fmt.Errorf("array literal nesting depth exceeds maximum (%d)", maxArrayDims)
+	}
 	if *pos >= len(s) || s[*pos] != '{' {
-		return pgArrayNode{}, fmt.Errorf("expected '{' in array literal %q", s)
+		return pgArrayNode{}, nil, fmt.Errorf("expected '{' in array literal")
 	}
 	*pos++
 	node := pgArrayNode{}
 	if *pos < len(s) && s[*pos] == '}' {
 		*pos++
-		return node, nil
+		if depth > 1 {
+			return pgArrayNode{}, nil, fmt.Errorf("empty sub-array is not allowed in multidimensional array literal")
+		}
+		return node, nil, nil
 	}
+	var childDims []int
+	hasChildKind := false
+	expectSubArray := false
 	for {
 		if *pos >= len(s) {
-			return pgArrayNode{}, fmt.Errorf("unterminated array literal %q", s)
+			return pgArrayNode{}, nil, fmt.Errorf("unterminated array literal")
 		}
 		if s[*pos] == '{' {
-			child, err := parsePGArrayLiteral(s, pos)
+			if hasChildKind && !expectSubArray {
+				return pgArrayNode{}, nil, fmt.Errorf("multidimensional array cannot mix scalar elements and sub-arrays")
+			}
+			child, subDims, err := parsePGArrayLiteralDepth(s, pos, depth+1)
 			if err != nil {
-				return pgArrayNode{}, err
+				return pgArrayNode{}, nil, err
+			}
+			if !hasChildKind {
+				hasChildKind = true
+				expectSubArray = true
+				childDims = subDims
+			} else if !slices.Equal(subDims, childDims) {
+				return pgArrayNode{}, nil, fmt.Errorf("multidimensional array must have sub-arrays with matching dimensions")
 			}
 			node.children = append(node.children, child)
-		} else if s[*pos] == '"' {
-			*pos++
-			var b strings.Builder
-			for {
-				if *pos >= len(s) {
-					return pgArrayNode{}, fmt.Errorf("unterminated quoted element in array literal %q", s)
-				}
-				ch := s[*pos]
-				*pos++
-				if ch == '\\' {
-					if *pos >= len(s) {
-						return pgArrayNode{}, fmt.Errorf("unterminated escape in array literal %q", s)
-					}
-					b.WriteByte(s[*pos])
-					*pos++
-					continue
-				}
-				if ch == '"' {
-					break
-				}
-				b.WriteByte(ch)
-			}
-			node.children = append(node.children, pgArrayNode{isLeaf: true, val: b.String()})
 		} else {
-			start := *pos
-			for *pos < len(s) && s[*pos] != ',' && s[*pos] != '}' {
-				*pos++
+			if hasChildKind && expectSubArray {
+				return pgArrayNode{}, nil, fmt.Errorf("multidimensional array cannot mix scalar elements and sub-arrays")
 			}
-			raw := s[start:*pos]
-			if strings.EqualFold(raw, "NULL") {
-				node.children = append(node.children, pgArrayNode{isLeaf: true, isNull: true})
+			hasChildKind = true
+			expectSubArray = false
+			if s[*pos] == '"' {
+				*pos++
+				var b strings.Builder
+				for {
+					if *pos >= len(s) {
+						return pgArrayNode{}, nil, fmt.Errorf("unterminated quoted element in array literal")
+					}
+					ch := s[*pos]
+					*pos++
+					if ch == '\\' {
+						if *pos >= len(s) {
+							return pgArrayNode{}, nil, fmt.Errorf("unterminated escape in array literal")
+						}
+						b.WriteByte(s[*pos])
+						*pos++
+						continue
+					}
+					if ch == '"' {
+						break
+					}
+					b.WriteByte(ch)
+				}
+				node.children = append(node.children, pgArrayNode{isLeaf: true, val: b.String()})
 			} else {
-				node.children = append(node.children, pgArrayNode{isLeaf: true, val: raw})
+				start := *pos
+				for *pos < len(s) && s[*pos] != ',' && s[*pos] != '}' {
+					if s[*pos] == '{' {
+						return pgArrayNode{}, nil, fmt.Errorf("unexpected '{' in unquoted array element")
+					}
+					*pos++
+				}
+				raw := s[start:*pos]
+				if strings.EqualFold(raw, "NULL") {
+					node.children = append(node.children, pgArrayNode{isLeaf: true, isNull: true})
+				} else {
+					node.children = append(node.children, pgArrayNode{isLeaf: true, val: raw})
+				}
 			}
 		}
 		if *pos >= len(s) {
-			return pgArrayNode{}, fmt.Errorf("unterminated array literal %q", s)
+			return pgArrayNode{}, nil, fmt.Errorf("unterminated array literal")
 		}
 		if s[*pos] == ',' {
 			*pos++
@@ -1460,8 +1675,11 @@ func parsePGArrayLiteral(s string, pos *int) (pgArrayNode, error) {
 		}
 		if s[*pos] == '}' {
 			*pos++
-			return node, nil
+			dims := make([]int, 1+len(childDims))
+			dims[0] = len(node.children)
+			copy(dims[1:], childDims)
+			return node, dims, nil
 		}
-		return pgArrayNode{}, fmt.Errorf("unexpected character %q in array literal", s[*pos])
+		return pgArrayNode{}, nil, fmt.Errorf("unexpected character %q in array literal", s[*pos])
 	}
 }

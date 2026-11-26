@@ -679,7 +679,7 @@ No resolved catalog objects.
 | internal/query/bind/aggregate_invocation.go:208 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/aggregate_invocation.go:211 | `aggregate ORDER BY is not implemented for window functions` |
 | internal/query/bind/catalog_relation.go:17 | `cross-database reference is not supported` |
-| internal/query/bind/declaration.go:1010 | `cross-database reference is not supported` |
+| internal/query/bind/declaration.go:1013 | `cross-database reference is not supported` |
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
 | internal/query/bind/declaration_constraint.go:30 | `NOT NULL constraint does not support NOT VALID` |
 | internal/query/bind/declaration_constraint.go:34 | `constraint does not support NOT VALID` |
@@ -750,7 +750,7 @@ No resolved catalog objects.
 | internal/query/bind/schema_constraint_ddl.go:26 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/schema_constraint_ddl.go:492 | `constraint type is not deferrable` |
 | internal/query/bind/schema_constraint_ddl.go:500 | `constraint enforceability cannot be altered` |
-| internal/query/bind/schema_ddl.go:1765 | `cannot drop a partitioned index concurrently` |
+| internal/query/bind/schema_ddl.go:1787 | `cannot drop a partitioned index concurrently` |
 | internal/query/bind/select.go:252 | `row locking is not allowed with aggregate or window queries` |
 | internal/query/bind/select.go:361 | `row locking is not allowed with set-returning targets` |
 | internal/query/bind/select.go:41 | `row locking is not allowed with this query form` |
@@ -779,10 +779,10 @@ No resolved catalog objects.
 | internal/query/bind/type_declaration.go:375 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:580 | `domain constraints cannot be DEFERRABLE` |
 | internal/query/bind/utility.go:388 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/utility.go:706 | `cannot update a non-updatable view column` |
+| internal/query/bind/utility.go:710 | `cannot update a non-updatable view column` |
 | internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:333 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility_merge.go:384 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
 | internal/query/builtin/context_only.go:21 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/date_fields.go:132 | `model.Error{Code: "0A000"}` |
@@ -802,5 +802,5 @@ No resolved catalog objects.
 | internal/query/session/prepare.go:113 | `model.Error{Code: "0A000"}` |
 | internal/query/session/sequence_runtime.go:194 | `model.Error{Code: "0A000"}` |
 | internal/query/session/settings_values.go:207 | `model.Error{Code: "0A000"}` |
-| pgwire/conn.go:522 | `model.Error{Code: "0A000"}` |
+| pgwire/conn.go:600 | `model.Error{Code: "0A000"}` |
 

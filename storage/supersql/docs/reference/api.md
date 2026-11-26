@@ -2197,6 +2197,11 @@ type Config struct {
 	// Defaults to 128.
 	MaxConnections	int
 
+	// MaxPreAuthPerIP caps concurrent unauthenticated (pre-auth) connections
+	// allowed from a single remote IP address. Defaults to 32 (capped at the
+	// global pre-auth limit) when zero or negative.
+	MaxPreAuthPerIP	int
+
 	// MaxPreparedStatements caps the number of prepared statements cached per
 	// connection. Defaults to 1024 when zero or negative.
 	MaxPreparedStatements	int
@@ -2209,6 +2214,10 @@ type Config struct {
 	// TLS handshakes. Defaults to 30s when zero; set a negative duration to
 	// disable read timeouts.
 	ReadTimeout	time.Duration
+
+	// WriteTimeout bounds socket write and flush operations. Defaults to 30s
+	// when zero; set a negative duration to disable write timeouts.
+	WriteTimeout	time.Duration
 
 	// IdleTimeout bounds how long an idle connection may wait for the next
 	// frontend message before being closed. Defaults to 5m when zero; set a

@@ -303,6 +303,10 @@ func (transactions *Transactions) discard(ctx context.Context, command bind.Disc
 		err = errors.Join(err, transactions.deallocatePrepared(bind.DeallocateCommand{All: true}))
 		err = errors.Join(err, resetSequenceSession(ctx, options.Environment.Sequences))
 		err = errors.Join(err, transactions.settings.ResetAll(ctx))
+		if transactions.advisory.Manager != nil {
+			transactions.advisory.Manager.UnlockAllSession(transactions.advisory.SessionID)
+		}
+		transactions.resetNotify()
 		return commit, err
 	default:
 		return EndResult{}, errPreparedInvocation

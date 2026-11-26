@@ -527,6 +527,8 @@ func emitSequences(ctx context.Context, snapshot Snapshot, view ReadView, relati
 	if relation.ID == IDPgSequences && options.Sequences == nil {
 		return &model.Error{Code: "55000", Message: "sequence catalog state is unavailable"}
 	}
+	var cachedRoles map[string]model.RoleMetadata
+	rolesLoaded := false
 	return scanObjects(ctx, snapshot, options, []model.ObjectKind{model.ObjectSequence}, func(object objectDescriptor) error {
 		sequence := object.spec.Sequence
 		if sequence == nil {
@@ -541,7 +543,7 @@ func emitSequences(ctx context.Context, snapshot Snapshot, view ReadView, relati
 		if err != nil {
 			return err
 		}
-		state, err := options.Sequences.Get(ctx, view, schema.SequenceIncarnation(sequence.Incarnation))
+		canReadLastValue, err := sequencePrivilegeAllowed(ctx, snapshot, options, sequence, model.PrivilegeSelect|model.PrivilegeUsage, &cachedRoles, &rolesLoaded)
 		if err != nil {
 			return err
 		}
@@ -550,8 +552,14 @@ func emitSequences(ctx context.Context, snapshot Snapshot, view ReadView, relati
 			fv("data_type", intValue(int64(sequence.Type.ID))), fv("start_value", intValue(sequence.Start)), fv("min_value", intValue(sequence.Min)), fv("max_value", intValue(sequence.Max)),
 			fv("increment_by", intValue(sequence.Increment)), fv("cycle", boolValue(sequence.Cycle)), fv("cache_size", intValue(sequence.Cache)),
 		}
-		if state.Called {
-			fields = append(fields, fv("last_value", intValue(state.Last)))
+		if canReadLastValue {
+			state, err := options.Sequences.Get(ctx, view, schema.SequenceIncarnation(sequence.Incarnation))
+			if err != nil {
+				return err
+			}
+			if state.Called {
+				fields = append(fields, fv("last_value", intValue(state.Last)))
+			}
 		}
 		return emitCatalogRow(relation, emit, fields...)
 	})

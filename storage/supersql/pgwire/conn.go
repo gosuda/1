@@ -94,16 +94,18 @@ func (p *portal) close() error {
 }
 
 type clientConn struct {
-	server    *Server
-	connMu    sync.Mutex
-	rawConn   net.Conn
-	closing   bool
-	br        *bufio.Reader
-	bw        *bufio.Writer
-	writeMu   sync.Mutex
-	closed    bool
-	pid       int32
-	secretKey int32
+	server          *Server
+	connMu          sync.Mutex
+	rawConn         net.Conn
+	remoteIP        string
+	closing         bool
+	br              *bufio.Reader
+	bw              *bufio.Writer
+	writeMu         sync.Mutex
+	closed          bool
+	pid             int32
+	secretKey       int32
+	preAuthDeadline time.Time
 
 	driverConn  driver.Conn
 	user        string
@@ -158,35 +160,75 @@ func (c *clientConn) forceClose() {
 	}
 }
 
+func (c *clientConn) effectiveWriteTimeout() time.Duration {
+	if c.server != nil {
+		return c.server.writeTimeout
+	}
+	return 0
+}
+
+func (c *clientConn) effectivePreAuthDeadline() time.Time {
+	if !c.preAuthDeadline.IsZero() {
+		return c.preAuthDeadline
+	}
+	if c.server != nil && c.server.readTimeout > 0 {
+		return time.Now().Add(c.server.readTimeout)
+	}
+	return time.Time{}
+}
+
 func (c *clientConn) writeFrame(frame []byte) error {
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if c.closed {
+		c.writeMu.Unlock()
 		return net.ErrClosed
 	}
+	timeout := c.effectiveWriteTimeout()
+	rc := c.currentConn()
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+	}
 	_, err := c.bw.Write(frame)
-	return err
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		c.closed = true
+		c.writeMu.Unlock()
+		c.forceClose()
+		return err
+	}
+	c.writeMu.Unlock()
+	return nil
 }
 
 func (c *clientConn) flush() error {
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if c.closed {
+		c.writeMu.Unlock()
 		return net.ErrClosed
 	}
-	return c.bw.Flush()
+	timeout := c.effectiveWriteTimeout()
+	rc := c.currentConn()
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	err := c.bw.Flush()
+	if rc != nil && timeout > 0 {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		c.closed = true
+		c.writeMu.Unlock()
+		c.forceClose()
+		return err
+	}
+	c.writeMu.Unlock()
+	return nil
 }
 
 func (c *clientConn) writeAndFlush(frame []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.closed {
-		return net.ErrClosed
-	}
-	if _, err := c.bw.Write(frame); err != nil {
-		return err
-	}
-	return c.bw.Flush()
+	return c.writeAndFlushWithDeadline(frame, c.effectiveWriteTimeout())
 }
 
 func (c *clientConn) writeAndFlushWithDeadline(frame []byte, timeout time.Duration) error {
@@ -223,7 +265,11 @@ func (c *clientConn) sendNotification(n Notification) error {
 		pid = c.pid
 	}
 	frame := encodeNotificationResponse(pid, n.Channel, n.Payload)
-	return c.writeAndFlushWithDeadline(frame, defaultNotifyWriteTimeout)
+	timeout := defaultNotifyWriteTimeout
+	if wt := c.effectiveWriteTimeout(); wt > 0 && wt < timeout {
+		timeout = wt
+	}
+	return c.writeAndFlushWithDeadline(frame, timeout)
 }
 
 func (c *clientConn) setActiveCancel(cancel context.CancelFunc) {
@@ -265,14 +311,11 @@ func (c *clientConn) safeSendFatalPanic() {
 	defer func() {
 		_ = recover()
 	}()
-	if rc := c.currentConn(); rc != nil {
-		_ = rc.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	}
-	_ = c.writeAndFlush(encodeErrorResponse(wireError{
+	_ = c.writeAndFlushWithDeadline(encodeErrorResponse(wireError{
 		Severity: "FATAL",
 		Code:     "XX000",
 		Message:  "internal server error",
-	}))
+	}), 2*time.Second)
 }
 
 func (c *clientConn) recoverPanic(r any) {
@@ -283,16 +326,8 @@ func (c *clientConn) recoverPanic(r any) {
 }
 
 func (c *clientConn) serve(ctx context.Context) {
-	preAuthReleased := false
-	releasePreAuth := func() {
-		if !preAuthReleased {
-			preAuthReleased = true
-			c.server.unregisterPreAuth(c)
-			c.server.releasePreAuthSlot()
-		}
-	}
 	defer func() {
-		releasePreAuth()
+		c.server.unregisterPreAuth(c)
 		c.closeResources()
 	}()
 	defer func() {
@@ -300,6 +335,23 @@ func (c *clientConn) serve(ctx context.Context) {
 			c.recoverPanic(r)
 		}
 	}()
+
+	// Wake blocked socket reads/writes and cancel active queries promptly on ctx cancellation.
+	stopCancel := context.AfterFunc(ctx, func() {
+		c.cancelActiveQuery()
+		c.forceClose()
+	})
+	defer stopCancel()
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Single total pre-auth deadline bounding startup negotiation, TLS handshake,
+	// and authentication exchanges so repeated SSL/GSS frames cannot stretch it.
+	if c.server != nil && c.server.readTimeout > 0 {
+		c.preAuthDeadline = time.Now().Add(c.server.readTimeout)
+	}
 
 	// 1. Startup negotiation (SSLRequest / GSSENCRequest / CancelRequest / StartupMessage).
 	params, isCancel, err := c.handshake(ctx)
@@ -316,6 +368,13 @@ func (c *clientConn) serve(ctx context.Context) {
 	c.user = params["user"]
 	if c.user == "" {
 		c.user = "postgres"
+	} else if strings.TrimSpace(c.user) == "" {
+		_ = c.writeAndFlush(encodeErrorResponse(wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("invalid role name %q", c.user),
+		}))
+		return
 	}
 	c.database = params["database"]
 	if c.database == "" {
@@ -334,6 +393,7 @@ func (c *clientConn) serve(ctx context.Context) {
 	if err := c.authenticate(ctx); err != nil {
 		return
 	}
+	c.preAuthDeadline = time.Time{}
 
 	// 3. Enforce MaxConnections immediately after authentication succeeds and
 	// before opening a SuperSQL session.
@@ -366,7 +426,6 @@ func (c *clientConn) serve(ctx context.Context) {
 
 	// 5. Promote from pre-auth tracking to active connection registry.
 	c.server.registerConn(c)
-	releasePreAuth()
 	defer c.server.unregisterConn(c.pid)
 
 	// 6. Send Backend startup parameters, BackendKeyData, and ReadyForQuery.
@@ -450,12 +509,31 @@ func (c *clientConn) serve(ctx context.Context) {
 	c.commandLoop(ctx)
 }
 
+func (c *clientConn) writeHandshakeByte(rc net.Conn, b byte) error {
+	var dl time.Time
+	if wt := c.effectiveWriteTimeout(); wt > 0 {
+		dl = time.Now().Add(wt)
+	}
+	if pre := c.effectivePreAuthDeadline(); !pre.IsZero() && (dl.IsZero() || pre.Before(dl)) {
+		dl = pre
+	}
+	if !dl.IsZero() {
+		_ = rc.SetWriteDeadline(dl)
+		defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	}
+	_, err := rc.Write([]byte{b})
+	return err
+}
+
 func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, error) {
 	var sawSSL, sawGSS, tlsUpgraded bool
 	for {
 		rc := c.currentConn()
-		if c.server.readTimeout > 0 {
-			_ = rc.SetReadDeadline(time.Now().Add(c.server.readTimeout))
+		if dl := c.effectivePreAuthDeadline(); !dl.IsZero() {
+			if !time.Now().Before(dl) {
+				return nil, false, context.DeadlineExceeded
+			}
+			_ = rc.SetReadDeadline(dl)
 		}
 		pkt, err := readStartupPacket(rc)
 		if err != nil {
@@ -468,15 +546,15 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 			}
 			sawSSL = true
 			if c.server.cfg.TLSConfig != nil {
-				if _, err := rc.Write([]byte{'S'}); err != nil {
+				if err := c.writeHandshakeByte(rc, 'S'); err != nil {
 					return nil, false, err
 				}
 				_ = rc.SetReadDeadline(time.Time{})
 				tlsConn := tls.Server(rc, c.server.cfg.TLSConfig.Clone())
 				hsCtx := ctx
 				var cancelHS context.CancelFunc
-				if c.server.readTimeout > 0 {
-					hsCtx, cancelHS = context.WithTimeout(ctx, c.server.readTimeout)
+				if dl := c.effectivePreAuthDeadline(); !dl.IsZero() {
+					hsCtx, cancelHS = context.WithDeadline(ctx, dl)
 				}
 				err := tlsConn.HandshakeContext(hsCtx)
 				if cancelHS != nil {
@@ -490,7 +568,7 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 				}
 				tlsUpgraded = true
 			} else {
-				if _, err := rc.Write([]byte{'N'}); err != nil {
+				if err := c.writeHandshakeByte(rc, 'N'); err != nil {
 					return nil, false, err
 				}
 			}
@@ -499,7 +577,7 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 				return nil, false, errors.New("repeated GSSENCRequest during startup")
 			}
 			sawGSS = true
-			if _, err := rc.Write([]byte{'N'}); err != nil {
+			if err := c.writeHandshakeByte(rc, 'N'); err != nil {
 				return nil, false, err
 			}
 		case cancelRequestCode:
@@ -528,14 +606,20 @@ func (c *clientConn) handshake(ctx context.Context) (map[string]string, bool, er
 }
 
 func (c *clientConn) authenticate(ctx context.Context) error {
+	authCtx := ctx
+	if dl := c.effectivePreAuthDeadline(); !dl.IsZero() {
+		var cancel context.CancelFunc
+		authCtx, cancel = context.WithDeadline(ctx, dl)
+		defer cancel()
+	}
 	switch {
 	case c.server.cfg.PasswordLookup != nil:
-		return c.authenticateSCRAM(ctx, c.server.cfg.PasswordLookup)
+		return c.authenticateSCRAM(authCtx, c.server.cfg.PasswordLookup)
 	case c.server.cfg.AuthFunc != nil:
-		return c.authenticateCleartext(ctx)
+		return c.authenticateCleartext(authCtx)
 	case c.server.cfg.Password != "":
 		pw := c.server.cfg.Password
-		return c.authenticateSCRAM(ctx, func(_ context.Context, _, _ string) (string, error) {
+		return c.authenticateSCRAM(authCtx, func(_ context.Context, _, _ string) (string, error) {
 			return pw, nil
 		})
 	default:
@@ -608,17 +692,30 @@ func (c *clientConn) applyStartupParams(ctx context.Context, params map[string]s
 	}
 }
 
+func isBuiltinBootstrapSuperuser(user string) bool {
+	return user == "" || user == "postgres" || user == "supersql" || user == "embedded"
+}
+
 // bindAuthenticatedRole verifies and binds the SQL session to the authenticated
-// username. Built-in embedded superuser aliases ("", "postgres", "supersql",
-// "embedded") retain superuser privileges. Every other username is verified
-// fail-closed against pg_catalog.pg_roles (must exist and have rolcanlogin = true)
-// and pinned on the session so RESET ROLE / RESET ALL / SET ROLE NONE cannot
-// escalate back to the default embedded superuser.
+// username. Every non-empty username (including "postgres", "supersql", and
+// "embedded") is checked against pg_catalog.pg_roles first so operator-managed
+// rolcanlogin and rolsuper flags always take effect. Only if no matching catalog
+// role exists AND the username is a built-in bootstrap superuser alias ("",
+// "postgres", "supersql", "embedded") does it fall back to the built-in
+// bootstrap superuser. Whitespace-only usernames are rejected fail-closed with
+// FATAL 28000.
 func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
 	c.isSuperuser = false
 	c.boundRole = ""
-	user := strings.ToLower(strings.TrimSpace(c.user))
-	if user == "" || user == "postgres" || user == "supersql" || user == "embedded" {
+	if c.user != "" && strings.TrimSpace(c.user) == "" {
+		return &wireError{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  fmt.Sprintf("invalid role name %q", c.user),
+		}
+	}
+	user := strings.ToLower(c.user)
+	if user == "" {
 		c.isSuperuser = true
 		return nil
 	}
@@ -631,7 +728,7 @@ func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
 		}
 	}
 	rows, err := queryer.QueryContext(ctx,
-		`SELECT rolsuper, rolcanlogin FROM pg_catalog.pg_roles WHERE lower(rolname) = $1`,
+		`SELECT rolsuper, rolcanlogin, oid FROM pg_catalog.pg_roles WHERE lower(rolname) = $1`,
 		[]driver.NamedValue{{Ordinal: 1, Value: user}},
 	)
 	if err != nil {
@@ -644,7 +741,8 @@ func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
 	var found bool
 	var rolsuper bool
 	var rolcanlogin bool
-	dest := make([]driver.Value, 2)
+	var rolOID int64
+	dest := make([]driver.Value, 3)
 	if nextErr := rows.Next(dest); nextErr == nil {
 		found = true
 		if b, ok := dest[0].(bool); ok {
@@ -652,6 +750,14 @@ func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
 		}
 		if b, ok := dest[1].(bool); ok {
 			rolcanlogin = b
+		}
+		switch v := dest[2].(type) {
+		case int64:
+			rolOID = v
+		case uint32:
+			rolOID = int64(v)
+		case int32:
+			rolOID = int64(v)
 		}
 	} else if !errors.Is(nextErr, io.EOF) {
 		_ = rows.Close()
@@ -668,7 +774,20 @@ func (c *clientConn) bindAuthenticatedRole(ctx context.Context) error {
 			Message:  fmt.Sprintf("failed to authenticate role %q", c.user),
 		}
 	}
+	// The catalog synthesizes a default "embedded" principal row (OID 10) with
+	// rolsuper=false; treat that synthetic bootstrap row as absent so the
+	// built-in bootstrap superuser alias retains superuser privileges unless an
+	// explicit catalog role exists.
+	const defaultPrincipalOID = 10
+	if found && user == "embedded" && rolOID == defaultPrincipalOID {
+		found = false
+	}
 	if !found {
+		if isBuiltinBootstrapSuperuser(user) {
+			c.user = user
+			c.isSuperuser = true
+			return nil
+		}
 		return &wireError{
 			Severity: "FATAL",
 			Code:     "28000",

@@ -28,9 +28,9 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 	if reader.Timestamp() != view.Timestamp() {
 		return &model.Error{Code: "55000", Message: "statistics snapshot timestamp mismatch"}
 	}
-	activeRole := ""
-	if provider, ok := options.Settings.(RoleProvider); ok {
-		activeRole = provider.CurrentRole()
+	activeRole, roleOK := resolveCatalogRole(options)
+	if !roleOK {
+		return nil
 	}
 	var cachedRoles map[string]model.RoleMetadata
 	rolesLoaded := false
@@ -69,6 +69,67 @@ func emitStatistics(ctx context.Context, snapshot Snapshot, view ReadView, relat
 		}
 		return nil
 	})
+}
+
+// resolveCatalogRole extracts the session's active role from options.Settings.
+// When options.Settings is nil (standalone catalog unit tests), it falls back to
+// the embedded superuser role (""). When options.Settings is non-nil but does
+// not implement RoleProvider, ok is false so callers fail closed.
+func resolveCatalogRole(options SourceOptions) (string, bool) {
+	if options.Settings == nil {
+		return "", true
+	}
+	provider, ok := options.Settings.(RoleProvider)
+	if !ok {
+		return "", false
+	}
+	return provider.CurrentRole(), true
+}
+
+func sequencePrivilegeAllowed(ctx context.Context, snapshot Snapshot, options SourceOptions, sequence *model.SequenceMetadata, anyOf model.PrivilegeMask, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
+	if sequence == nil {
+		return false, nil
+	}
+	activeRole, roleOK := resolveCatalogRole(options)
+	if !roleOK {
+		return false, nil
+	}
+	role := strings.ToLower(strings.TrimSpace(activeRole))
+	if role == "" || role == "none" {
+		return true, nil
+	}
+	if !*rolesLoaded {
+		roles, err := loadCatalogRoles(ctx, snapshot, options)
+		if err != nil {
+			return false, err
+		}
+		*cachedRoles = roles
+		*rolesLoaded = true
+	}
+	roles := *cachedRoles
+	meta, ok := roles[role]
+	if !ok {
+		return isDefaultSuperuserRole(role, options.Database.RoleName), nil
+	}
+	if meta.Superuser {
+		return true, nil
+	}
+	if sequence.OwnerName != "" {
+		owner := strings.ToLower(strings.TrimSpace(sequence.OwnerName))
+		if role == owner || roleIsMemberOf(roles, role, owner) {
+			return true, nil
+		}
+	}
+	for _, grant := range sequence.ACL {
+		if (grant.Privileges & anyOf) == 0 {
+			continue
+		}
+		grantee := strings.ToLower(strings.TrimSpace(grant.Grantee))
+		if grantee == "public" || role == grantee || roleIsMemberOf(roles, role, grantee) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func isCatalogSuperuser(ctx context.Context, snapshot Snapshot, options SourceOptions, activeRole string, cachedRoles *map[string]model.RoleMetadata, rolesLoaded *bool) (bool, error) {
@@ -263,9 +324,9 @@ func emitExtendedStatisticData(ctx context.Context, snapshot Snapshot, view Read
 	if reader == nil || reader.Timestamp() != view.Timestamp() {
 		return &model.Error{Code: "55000", Message: "statistics snapshot timestamp mismatch"}
 	}
-	activeRole := ""
-	if provider, ok := options.Settings.(RoleProvider); ok {
-		activeRole = provider.CurrentRole()
+	activeRole, roleOK := resolveCatalogRole(options)
+	if !roleOK {
+		return nil
 	}
 	var cachedRoles map[string]model.RoleMetadata
 	rolesLoaded := false

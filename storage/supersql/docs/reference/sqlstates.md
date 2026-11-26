@@ -11,7 +11,7 @@
 | 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:839 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
 | 0A000 | 0A | feature not supported | 181 | connector.go:1587 | bindError call, model.Error Code field, sqlError call, unsupported call |
-| 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:108 | bindError call |
+| 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:112 | bindError call |
 | 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1207 | sqlError call |
 | 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:481 | sqlError call |
 | 21000 | 21 | cardinality violation | 12 | internal/query/builtin/multirange_scalar.go:265 | model.Error Code field, sqlError call |
@@ -65,7 +65,7 @@
 | 25P01 | 25 | invalid transaction state | 4 | internal/query/session/deferred_trigger.go:222 | model.Error Code field |
 | 25P02 | 25 | invalid transaction state | 4 | internal/dataplane/txn/transaction.go:88 | model.Error Code field |
 | 26000 | 26 | invalid SQL statement name | 2 | internal/query/session/named_commands.go:270 | model.Error Code field |
-| 2BP01 | 2B | dependent privilege descriptors still exist | 22 | internal/controlplane/catalog/object_service.go:153 | bindError call, model.Error Code field |
+| 2BP01 | 2B | dependent privilege descriptors still exist | 23 | internal/controlplane/catalog/object_service.go:153 | bindError call, model.Error Code field |
 | 2D000 | 2D | invalid transaction termination | 1 | internal/query/procedural/compile.go:614 | sqlError call |
 | 2F005 | 2F | SQL routine exception | 1 | internal/query/procedural/execute.go:284 | sqlError call |
 | 34000 | 34 | invalid cursor name | 6 | internal/query/procedural/execute.go:1062 | model.Error Code field, sqlError call |
@@ -73,7 +73,7 @@
 | 3F000 | 3F | invalid schema name | 24 | internal/query/bind/collation_ddl.go:39 | bindError call, sqlError call |
 | 40001 | 40 | transaction rollback | 6 | internal/controlplane/catalog/store.go:27 | model.Error Code field |
 | 40P01 | 40 | transaction rollback | 1 | internal/locks/wait_graph.go:13 | model.Error Code field |
-| 42501 | 42 | syntax error or access rule violation | 21 | internal/query/bind/declaration.go:136 | bindError call, model.Error Code field |
+| 42501 | 42 | syntax error or access rule violation | 22 | internal/query/bind/declaration.go:139 | bindError call, model.Error Code field |
 | 42601 | 42 | syntax error or access rule violation | 624 | connector.go:270 | bindError call, model.Error Code field, sqlError call |
 | 42602 | 42 | syntax error or access rule violation | 5 | internal/query/bind/regclass.go:23 | bindError call, model.Error Code field |
 | 42622 | 42 | syntax error or access rule violation | 4 | internal/query/bind/declaration.go:103 | bindError call |
@@ -97,15 +97,15 @@
 | 42P02 | 42 | syntax error or access rule violation | 12 | execution.go:257 | bindError call, model.Error Code field |
 | 42P03 | 42 | syntax error or access rule violation | 3 | internal/query/procedural/execute.go:1024 | model.Error Code field, sqlError call |
 | 42P05 | 42 | syntax error or access rule violation | 2 | internal/query/session/named_commands.go:121 | model.Error Code field |
-| 42P06 | 42 | syntax error or access rule violation | 2 | internal/query/bind/declaration.go:153 | bindError call |
+| 42P06 | 42 | syntax error or access rule violation | 2 | internal/query/bind/declaration.go:156 | bindError call |
 | 42P07 | 42 | syntax error or access rule violation | 10 | internal/query/bind/constraint_rename.go:156 | bindError call, model.Error Code field |
 | 42P08 | 42 | syntax error or access rule violation | 2 | internal/query/bind/bind.go:263 | bindError call |
 | 42P09 | 42 | syntax error or access rule violation | 3 | internal/query/bind/relation_qualifier.go:23 | bindError call |
 | 42P10 | 42 | syntax error or access rule violation | 17 | internal/query/bind/aggregate_order.go:89 | bindError call |
-| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:151 | model.Error Code field |
+| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:160 | model.Error Code field |
 | 42P13 | 42 | syntax error or access rule violation | 45 | internal/query/bind/definition_declaration.go:1389 | bindError call, model.Error Code field, sqlError call |
 | 42P16 | 42 | syntax error or access rule violation | 29 | internal/query/bind/constraint_rename.go:121 | bindError call, model.Error Code field |
-| 42P17 | 42 | syntax error or access rule violation | 41 | internal/query/bind/definition_declaration.go:700 | bindError call, model.Error Code field |
+| 42P17 | 42 | syntax error or access rule violation | 42 | internal/query/bind/definition_declaration.go:700 | bindError call, model.Error Code field |
 | 42P18 | 42 | syntax error or access rule violation | 4 | internal/query/bind/array.go:50 | bindError call, sqlError call |
 | 42P19 | 42 | syntax error or access rule violation | 3 | internal/query/bind/select_recursive.go:21 | bindError call |
 | 42P20 | 42 | syntax error or access rule violation | 8 | internal/query/bind/function.go:237 | bindError call |
@@ -117,7 +117,7 @@
 | 54000 | 54 | program limit exceeded | 446 | internal/controlplane/catalog/object_service.go:132 | bindError call, model.Error Code field, sqlError call |
 | 54001 | 54 | program limit exceeded | 13 | internal/query/bind/view_mutation.go:240 | bindError call, sqlError call |
 | 54023 | 54 | program limit exceeded | 3 | internal/query/bind/aggregate_order.go:12 | bindError call |
-| 55000 | 55 | object not in prerequisite state | 175 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |
+| 55000 | 55 | object not in prerequisite state | 177 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |
 | 55006 | 55 | object not in prerequisite state | 3 | internal/controlplane/schema/index_scheduler.go:27 | model.Error Code field |
 | 55P03 | 55 | object not in prerequisite state | 4 | internal/dataplane/txn/locks.go:27 | model.Error Code field |
 | 55P04 | 55 | object not in prerequisite state | 1 | internal/query/builtin/declared_type.go:742 | model.Error Code field |
