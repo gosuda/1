@@ -1,0 +1,31 @@
+name: PostgreSQL 18.4 exhaustive corpus
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supersql-exhaustive-corpus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    # The ordered corpus exceeded six hours in run 45754127530. It remains
+    # explicit and bounded while engine throughput is addressed separately.
+    name: postgres 18.4 exhaustive corpus
+    runs-on: depot-ubuntu-24.04-4
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Complete ordered regression corpus
+        # One catalog retains every scheduled producer for its consumers.
+        # This embedded-catalog test needs no PostgreSQL service.
+        env:
+          SUPERSQL_REGRESS_CORPORA: postgres184
+        run: NEOSEPIA_POSTGRES_REGRESS=1 go test -count=1 -timeout 0 -run '^TestPostgres18OfficialRegression$' -v .
