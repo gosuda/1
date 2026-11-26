@@ -1,0 +1,103 @@
+// Package shm provides a minimal cross-platform wrapper around named shared
+// memory objects: POSIX shm_open on Linux (/dev/shm), macOS and FreeBSD, and
+// named file mappings on Windows.
+package shm
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// ErrInvalidName reports a shared-memory name that is empty, contains path
+// separators or NUL bytes, refers to "." or "..", or exceeds the platform
+// limit.
+var ErrInvalidName = errors.New("shm: invalid shared memory name")
+
+// SharedMemory represents a shared memory region for inter-process communication
+// This structure provides a cross-platform interface for creating and managing
+// shared memory segments that can be accessed by multiple processes.
+//
+// Shared memory is the foundation of HQQ's high-performance IPC, allowing
+// processes to exchange data without kernel-mediated copying.
+type SharedMemory struct {
+	name string  // Name/identifier of the shared memory region
+	size int     // Size of the shared memory region in bytes
+	fd   uintptr // File descriptor or handle for the shared memory region
+
+	// sems are the wake semaphores that go with the region on platforms that
+	// need them (Windows); see Semaphore.
+	sems [SemaphoreCount]Semaphore
+}
+
+// SemaphoreCount is the number of wake semaphores that accompany a segment
+// on platforms where waiters cannot park on words inside the shared memory
+// itself (Windows).
+const SemaphoreCount = 4
+
+// Semaphore is a counting semaphore shared between every process that opened
+// the same segment: on Windows, a named kernel semaphore whose name is
+// derived from the mapping's kernel object name.
+type Semaphore interface {
+	// Wait blocks until a token is available, consuming it, or timeout
+	// elapses. Timeouts are rounded up to whole milliseconds.
+	Wait(timeout time.Duration)
+	// Release adds n tokens. It never blocks and ignores a full semaphore.
+	Release(n uint32)
+}
+
+// Semaphore returns the i-th (0 <= i < SemaphoreCount) wake semaphore of the
+// segment, or nil if the platform parks waiters on futex-style words inside
+// the shared memory and the segment has no semaphores. The semaphores are
+// created together with the segment, opened by every other endpoint, and
+// closed by Close; they must not be used after Close.
+func (s *SharedMemory) Semaphore(i int) Semaphore {
+	if i < 0 || i >= SemaphoreCount {
+		return nil
+	}
+	return s.sems[i]
+}
+
+// Name returns the name/identifier of the shared memory region
+// This name is used to identify the shared memory segment across processes
+func (s *SharedMemory) Name() string {
+	return s.name
+}
+
+// Size returns the size of the shared memory region in bytes
+// This is the total size allocated for the shared memory segment
+func (s *SharedMemory) Size() int {
+	return s.size
+}
+
+// FD returns the file descriptor or handle for the shared memory region
+// The exact type and meaning of this value depends on the platform:
+// - On Unix-like systems: file descriptor from shm_open()
+// - On Windows: handle from CreateFileMapping()
+//
+// The handle is passed to mmap.Map to map the region into the process.
+func (s *SharedMemory) FD() uintptr {
+	return s.fd
+}
+
+// baseName validates name and returns it without its optional leading slash.
+// maxLen limits the length of the full name as passed by the caller
+// (0 means no extra limit).
+func baseName(name string, maxLen int) (string, error) {
+	if maxLen > 0 && len(name) > maxLen {
+		return "", fmt.Errorf("%w: %q is longer than %d bytes", ErrInvalidName, name, maxLen)
+	}
+	base := strings.TrimPrefix(name, "/")
+	switch {
+	case base == "":
+		return "", fmt.Errorf("%w: empty name", ErrInvalidName)
+	case base == "." || base == "..":
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
+	case strings.ContainsAny(base, "/\\\x00"):
+		return "", fmt.Errorf("%w: %q must not contain path separators or NUL", ErrInvalidName, name)
+	case len(base) > 255:
+		return "", fmt.Errorf("%w: %q is longer than 255 bytes", ErrInvalidName, name)
+	}
+	return base, nil
+}
