@@ -81,7 +81,7 @@ Linux/x86_64)
 	# The source tree (~12 GB, ~500k files) lives on an ext4lite volume: one host file instead of
 	# per-file host calls. Build outputs (~2 GB per target, written and memory-mapped by rustc and
 	# lld) go to a tmpfs.
-	"$work/rungv/rungv" run --rm \
+	"$work/rungv/rungv" run -platform=systrap --rm \
 		--mount "type=volume,src=$work/build.ext4,dst=/work" \
 		--tmpfs /work/src/out:size=12g \
 		-v "$root:/chromenet:ro" \
