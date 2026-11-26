@@ -267,8 +267,11 @@ func (p *Plan) joinPredicate(ctx context.Context, relation RelRef, root ir.Scala
 	}
 	leftID, _ := g.Operand(key.Predicate.Scalar, 0)
 	rightID, _ := g.Operand(key.Predicate.Scalar, 1)
-	left, _ := g.Scalar(leftID)
-	right, _ := g.Scalar(rightID)
+	// Binary Relabel wrappers are transparent to hashing (see the planner's
+	// joinKeys): verification unwraps them exactly the same way, so the
+	// physical keys still name the comparison's operands.
+	left, _ := g.UnwrapRelabel(leftID)
+	right, _ := g.UnwrapRelabel(rightID)
 	leftMatches := left.Kind == ir.Slot && key.Left.Slot.Graph == relation.Graph && left.Slot == key.Left.Slot.ID
 	rightMatches := right.Kind == ir.Slot && key.Right.Slot.Graph == relation.Graph && right.Slot == key.Right.Slot.ID
 	if !leftMatches || !rightMatches {

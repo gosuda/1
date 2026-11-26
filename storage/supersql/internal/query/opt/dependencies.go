@@ -146,7 +146,10 @@ func prepareGraph(ctx context.Context, graph *ir.Graph, options Options) (*ir.Gr
 
 // joinKeyCommutator reports whether scalarID is a reversed hash/merge-joinable
 // slot equality (LHS in rightSlots, RHS in leftSlots) and returns the commuted
-// operator OID when reversible.
+// operator OID when reversible. Binary Relabel wrappers are transparent, like
+// in joinKeys: verification guarantees they preserve the operand's runtime
+// representation, so the check runs on the coerced operand layouts the binder
+// resolved for the operator's argument types.
 func joinKeyCommutator(graph *ir.Graph, scalarID ir.ScalarID, leftSlots, rightSlots []model.SlotID) (model.OperatorID, bool) {
 	s, ok := graph.Scalar(scalarID)
 	if !ok || s.Kind != ir.Call || s.OperandCount() != 2 || !s.Strict || s.Effects.Volatility != ir.Immutable || s.Effects.MayError || s.Operator == 0 {
@@ -158,8 +161,13 @@ func joinKeyCommutator(graph *ir.Graph, scalarID ir.ScalarID, leftSlots, rightSl
 	}
 	lhsID, _ := graph.Operand(scalarID, 0)
 	rhsID, _ := graph.Operand(scalarID, 1)
-	lhs, _ := graph.Scalar(lhsID)
-	rhs, _ := graph.Scalar(rhsID)
+	lo, _ := graph.Scalar(lhsID)
+	ro, _ := graph.Scalar(rhsID)
+	lhs, lok := graph.UnwrapRelabel(lhsID)
+	rhs, rok := graph.UnwrapRelabel(rhsID)
+	if !lok || !rok {
+		return 0, false
+	}
 	if lhs.Kind != ir.Slot || rhs.Kind != ir.Slot {
 		return 0, false
 	}
@@ -169,8 +177,10 @@ func joinKeyCommutator(graph *ir.Graph, scalarID ir.ScalarID, leftSlots, rightSl
 	if slices.Contains(leftSlots, lhs.Slot) && slices.Contains(rightSlots, rhs.Slot) {
 		return 0, false
 	}
-	lType, lOK := graph.Type(lhs.Layout)
-	rType, rOK := graph.Type(rhs.Layout)
+	// The compared types are the coerced operand layouts, which the binder
+	// already matched to the operator's argument types.
+	lType, lOK := graph.Type(lo.Layout)
+	rType, rOK := graph.Type(ro.Layout)
 	if !lOK || !rOK || lType != rType || lType.Collation != rType.Collation {
 		return 0, false
 	}
@@ -303,7 +313,12 @@ func normalizeJoinPredicates(ctx context.Context, graph *ir.Graph, options Optio
 		}
 		seen[id] = true
 		r, _ := graph.Rel(id)
-		if r.Kind == ir.Join && r.Predicate != 0 && r.JoinKind != ir.CrossJoin && r.JoinKind != ir.MarkJoin && r.InputCount() == 2 && r.Effects.Volatility == ir.Immutable && !r.Effects.MayError {
+		// Only the shape matters here: commuting a conjunct only fires for a
+		// clean strict immutable non-erroring equality (checked inside
+		// joinKeyCommutator), whose slot and relabel operands evaluate
+		// without observable effects in either order. The join's own effects
+		// therefore do not constrain this rewrite.
+		if r.Kind == ir.Join && r.Predicate != 0 && r.JoinKind != ir.CrossJoin && r.JoinKind != ir.MarkJoin && r.InputCount() == 2 {
 			leftID, _ := graph.Input(id, 0)
 			rightID, _ := graph.Input(id, 1)
 			if hasReversedJoinKey(graph, r.Predicate, relOutputSlots(graph, leftID), relOutputSlots(graph, rightID), options.IR.MaxDepth, 0) {
@@ -425,7 +440,9 @@ func normalizeJoinPredicates(ctx context.Context, graph *ir.Graph, options Optio
 			}
 			return nil
 		}
-		if spec.Kind == ir.Join && spec.Predicate != 0 && spec.JoinKind != ir.CrossJoin && spec.JoinKind != ir.MarkJoin && len(spec.Inputs) == 2 && spec.Effects.Volatility == ir.Immutable && !spec.Effects.MayError {
+		// Same shape-only gate as the scan above: the rewrite only commutes
+		// clean equality conjuncts vetted by joinKeyCommutator.
+		if spec.Kind == ir.Join && spec.Predicate != 0 && spec.JoinKind != ir.CrossJoin && spec.JoinKind != ir.MarkJoin && len(spec.Inputs) == 2 {
 			origLeft, _ := graph.Input(id, 0)
 			origRight, _ := graph.Input(id, 1)
 			leftSlots, rightSlots := relOutputSlots(graph, origLeft), relOutputSlots(graph, origRight)

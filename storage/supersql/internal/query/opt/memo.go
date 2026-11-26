@@ -346,7 +346,18 @@ func (o *optimizer) explorePartialAggregate(id ir.RelID, relation ir.Rel, seed *
 }
 
 func (o *optimizer) exploreJoin(id ir.RelID, r ir.Rel, seed *expression) {
-	if r.Effects.Volatility != ir.Immutable || r.Effects.MayError || r.JoinKind == ir.CrossJoin || r.JoinKind == ir.MarkJoin {
+	// Hash, merge and lookup join candidates only reorder fully-consumed sides
+	// and recheck every candidate pair against the original predicate, so a
+	// join over stable inputs returns the same rows as the nested loop: both
+	// sides share one statement snapshot, and a stable input scanned once
+	// reads exactly what rescanning it would read. Volatile inputs stay on the
+	// nested loop because materializing them once would change their values.
+	// Error behavior is pinned by the keys, not the whole relation: joinKeys
+	// only admits strict immutable non-erroring equalities, and the residual
+	// rechecks those same conjuncts on every candidate pair. A relation whose
+	// key conjuncts are clean therefore raises exactly when the nested loop
+	// would: on the same pair, on the same conjunct.
+	if r.Effects.Volatility == ir.Volatile || r.JoinKind == ir.CrossJoin || r.JoinKind == ir.MarkJoin {
 		return
 	}
 	keys := o.joinKeys(id, seed.children[0].node.Output, seed.children[1].node.Output)
@@ -486,21 +497,36 @@ func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physica
 			}
 			return
 		}
-		if s.Kind != ir.Call || s.OperandCount() != 2 || !s.Strict || s.Effects.Volatility != ir.Immutable || s.Effects.MayError {
-			return
-		}
-		op, ok := builtin.LookupOperator(s.Operator)
-		if !ok || !op.HashJoinable && !op.MergeJoinable {
-			return
-		}
 		lhs, _ := o.graph.Operand(id, 0)
 		rhs, _ := o.graph.Operand(id, 1)
-		l, _ := o.graph.Scalar(lhs)
-		rr, _ := o.graph.Scalar(rhs)
+		lo, _ := o.graph.Scalar(lhs)
+		ro, _ := o.graph.Scalar(rhs)
+		l, ok := o.graph.UnwrapRelabel(lhs)
+		if !ok {
+			return
+		}
+		rr, ok := o.graph.UnwrapRelabel(rhs)
+		if !ok {
+			return
+		}
 		if l.Kind != ir.Slot || rr.Kind != ir.Slot {
 			return
 		}
 		lk, rk := o.key(l.Slot), o.key(rr.Slot)
+		// The key types come from the predicate operands, not the slots: the
+		// binder coerced each side to the resolved operator's argument type,
+		// so a relabeled slot carries its coerced type here. Verification
+		// (ir/verify_scalar.go) guarantees a Relabel preserves its operand's
+		// runtime representation, therefore hashing the underlying slot bytes
+		// is consistent with the resolved equality, and the residual
+		// rechecks every candidate pair with the original predicate.
+		lType, lOK := o.graph.Type(lo.Layout)
+		rType, rOK := o.graph.Type(ro.Layout)
+		if !lOK || !rOK {
+			return
+		}
+		lk.Type, rk.Type = lType, rType
+		lk.Collation, rk.Collation = lType.Collation, rType.Collation
 		if lk.Type != rk.Type || lk.Collation != rk.Collation {
 			return
 		}

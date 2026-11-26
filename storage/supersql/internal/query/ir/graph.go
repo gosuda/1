@@ -54,7 +54,6 @@ func (b *Builder) Comparison(id ScalarID, index uint32) (SignatureID, bool) {
 	return b.graph.Comparison(id, index)
 }
 
-
 func (b *Builder) Signature(id SignatureID) (Signature, bool) {
 	return atID(b.graph.signatures, id)
 }
@@ -163,6 +162,33 @@ func (g *Graph) Operand(id ScalarID, index uint32) (ScalarID, bool) {
 	}
 	return atRange(g.scalarRefs, n.operands, index)
 }
+
+// UnwrapRelabel strips binary Relabel wrappers from a scalar operand. A Relabel
+// preserves its operand's runtime representation (checked in verify_scalar.go),
+// so the underlying slot hashes and compares exactly like the coerced value.
+// Only single-operand Relabels are followed, and Collate is never stripped:
+// a collation change can alter comparison semantics.
+func (g *Graph) UnwrapRelabel(id ScalarID) (Scalar, bool) {
+	for range 8 {
+		s, ok := g.Scalar(id)
+		if !ok {
+			return Scalar{}, false
+		}
+		if s.Kind != Relabel {
+			return s, true
+		}
+		if s.OperandCount() != 1 {
+			return Scalar{}, false
+		}
+		child, _ := g.Operand(id, 0)
+		if child == 0 {
+			return Scalar{}, false
+		}
+		id = child
+	}
+	return Scalar{}, false
+}
+
 func (n Scalar) ComparisonCount() uint32 { return n.comparisons.count }
 func (g *Graph) Comparison(id ScalarID, index uint32) (SignatureID, bool) {
 	n, ok := g.Scalar(id)
@@ -171,33 +197,33 @@ func (g *Graph) Comparison(id ScalarID, index uint32) (SignatureID, bool) {
 	}
 	return atRange(g.comparisonRefs, n.comparisons, index)
 }
-func (n Rel) InputCount() uint32              { return n.inputs.count }
-func (n Rel) ExpressionCount() uint32         { return n.expressions.count }
-func (n Rel) OutputCount() uint32             { return n.outputs.count }
-func (n Rel) BindingCount() uint32            { return n.bindings.count }
-func (n Rel) OrderCount() uint32              { return n.order.count }
-func (n Rel) GroupingSetCount() uint32        { return n.groups.count }
-func (n Rel) AggregateCount() uint32          { return n.aggregates.count }
-func (n Rel) GroupingCount() uint32           { return n.groupings.count }
-func (n Rel) WindowCount() uint32             { return n.windows.count }
-func (n Rel) PartitionCount() uint32          { return n.partition.count }
-func (n Rel) LockCount() uint32               { return n.locks.count }
-func (n RowLock) KeyCount() uint32            { return n.keys.count }
-func (n Rel) ActionCount() uint32             { return n.actions.count }
-func (n Rel) JSONTableColumnCount() uint32    { return n.jsonTableColumns.count }
-func (n Rel) ViewMutationStepCount() uint32 { return n.viewMutationSteps.count }
-func (n ViewMutationStep) InputCount() uint32 { return n.inputs.count }
-func (n ViewMutationStep) ProjectionCount() uint32 { return n.projections.count }
+func (n Rel) InputCount() uint32                     { return n.inputs.count }
+func (n Rel) ExpressionCount() uint32                { return n.expressions.count }
+func (n Rel) OutputCount() uint32                    { return n.outputs.count }
+func (n Rel) BindingCount() uint32                   { return n.bindings.count }
+func (n Rel) OrderCount() uint32                     { return n.order.count }
+func (n Rel) GroupingSetCount() uint32               { return n.groups.count }
+func (n Rel) AggregateCount() uint32                 { return n.aggregates.count }
+func (n Rel) GroupingCount() uint32                  { return n.groupings.count }
+func (n Rel) WindowCount() uint32                    { return n.windows.count }
+func (n Rel) PartitionCount() uint32                 { return n.partition.count }
+func (n Rel) LockCount() uint32                      { return n.locks.count }
+func (n RowLock) KeyCount() uint32                   { return n.keys.count }
+func (n Rel) ActionCount() uint32                    { return n.actions.count }
+func (n Rel) JSONTableColumnCount() uint32           { return n.jsonTableColumns.count }
+func (n Rel) ViewMutationStepCount() uint32          { return n.viewMutationSteps.count }
+func (n ViewMutationStep) InputCount() uint32        { return n.inputs.count }
+func (n ViewMutationStep) ProjectionCount() uint32   { return n.projections.count }
 func (n ViewMutationStep) OutputColumnCount() uint32 { return n.outputColumns.count }
-func (n CTE) OutputCount() uint32             { return n.outputs.count }
-func (n AggregateCall) DirectArgumentCount() uint32 { return n.direct.count }
-func (n AggregateCall) ArgumentCount() uint32       { return n.args.count }
-func (n AggregateCall) OrderCount() uint32          { return n.order.count }
-func (n GroupingCall) ArgumentCount() uint32  { return n.args.count }
-func (n WindowCall) ArgumentCount() uint32    { return n.args.count }
-func (n MergeAction) AssignmentCount() uint32 { return n.assignments.count }
-func (n Recursion) SearchKeyCount() uint32    { return n.searchKeys.count }
-func (n Recursion) CycleKeyCount() uint32     { return n.cycleKeys.count }
+func (n CTE) OutputCount() uint32                    { return n.outputs.count }
+func (n AggregateCall) DirectArgumentCount() uint32  { return n.direct.count }
+func (n AggregateCall) ArgumentCount() uint32        { return n.args.count }
+func (n AggregateCall) OrderCount() uint32           { return n.order.count }
+func (n GroupingCall) ArgumentCount() uint32         { return n.args.count }
+func (n WindowCall) ArgumentCount() uint32           { return n.args.count }
+func (n MergeAction) AssignmentCount() uint32        { return n.assignments.count }
+func (n Recursion) SearchKeyCount() uint32           { return n.searchKeys.count }
+func (n Recursion) CycleKeyCount() uint32            { return n.cycleKeys.count }
 func (g *Graph) JSONTableColumn(id RelID, index uint32) (JSONTableColumn, bool) {
 	n, ok := g.Rel(id)
 	if !ok {

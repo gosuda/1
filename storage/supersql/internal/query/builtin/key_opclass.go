@@ -18,6 +18,53 @@ func ValidateOperatorClassInput(typ model.Type, classID model.OID) error {
 	return err
 }
 
+// BinaryCoercibleTypes reports whether two SQL types share one key
+// representation: identical types, or a direct implicit binary cast ('b'
+// method) in either direction. This mirrors the binder's Relabel criterion
+// and the operator class input rule above: matching storage kinds or
+// assignment casts are insufficient. A slot read as a binary-coercible type
+// yields byte-identical values, so key, ordering and distribution checks may
+// name the coerced type for a slot carrying the original one.
+func BinaryCoercibleTypes(a, b model.Type) bool {
+	if a == b {
+		return true
+	}
+	if a.Storage != b.Storage || a.Collation != b.Collation {
+		return false
+	}
+	if a.ID == b.ID {
+		return true
+	}
+	if cast, ok := LookupCast(a.ID, b.ID); ok && cast.Context == 'i' && cast.Method == 'b' {
+		return true
+	}
+	if cast, ok := LookupCast(b.ID, a.ID); ok && cast.Context == 'i' && cast.Method == 'b' {
+		return true
+	}
+	return false
+}
+
+// BinaryCoercibleKeyLayouts reports whether two key column layouts share one
+// hash/merge key representation: identical layouts, or binary-coercible types
+// applied recursively to children. The planner emits cross-type join keys
+// only for such pairs, and the executor encodes both sides with the left
+// layout, so byte-identical values hash identically and the residual rechecks
+// every candidate pair.
+func BinaryCoercibleKeyLayouts(a, b model.TypeLayout) bool {
+	if model.TypeLayoutsEqual(a, b) {
+		return true
+	}
+	if len(a.Children) != len(b.Children) || !BinaryCoercibleTypes(a.Type, b.Type) {
+		return false
+	}
+	for i := range a.Children {
+		if !BinaryCoercibleKeyLayouts(a.Children[i], b.Children[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func lookupKeyOperatorClass(typ model.Type, classID model.OID) (OperatorClassInfo, error) {
 	class, ok := LookupOperatorClass(classID)
 	if !ok {
