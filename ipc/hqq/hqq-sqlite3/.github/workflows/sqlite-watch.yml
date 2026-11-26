@@ -1,0 +1,156 @@
+name: SQLite Release Tracker
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Run test and release pipeline even if pinned SQLite version matches upstream'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Run tests only without committing or publishing a release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: sqlite-watch
+  cancel-in-progress: false
+
+env:
+  GOCACHEPROG: ""
+
+jobs:
+  check:
+    name: Check upstream SQLite release
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      updated: ${{ steps.check.outputs.updated }}
+      version: ${{ steps.check.outputs.version }}
+      version_number: ${{ steps.check.outputs.version_number }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check sqlite.org/download.html
+        id: check
+        env:
+          FORCE_RUN: ${{ inputs.force == true }}
+        run: |
+          set -euo pipefail
+          go run ./scripts/release/sync-sqlite -github-output
+          tag=$(grep -E '^tag=' "$GITHUB_OUTPUT" | tail -n1 | cut -d= -f2)
+          if [ "$FORCE_RUN" != "true" ] && git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists; skipping update."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Test SQLite ${{ needs.check.outputs.version }} (${{ matrix.name }})
+    needs: [check]
+    if: needs.check.outputs.updated == 'true' || inputs.force == true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 (clang-18)
+            os: depot-ubuntu-24.04
+            cc: clang-18
+          - name: Linux arm64 (gcc-13)
+            os: depot-ubuntu-24.04-arm
+            cc: gcc-13
+          - name: macOS arm64 (clang)
+            os: depot-macos-latest
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Checkout HQQ core
+        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install Ninja
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake clang-18 gcc-13
+          else
+            command -v ninja >/dev/null || brew install ninja
+          fi
+      - name: Apply upstream SQLite pin locally for testing
+        run: go run ./scripts/release/sync-sqlite -apply -force
+      - name: Run C unit tests
+        run: |
+          adir=$(scripts/release/fetch-sqlite.sh)
+          cmake -S sqlite3/server -B "${RUNNER_TEMP}/c-unit-build" -G Ninja \
+            -DHQQ_SQLITE_AMALGAMATION_DIR="$adir" \
+            -DSQLSRV_BUILD_TESTS=ON
+          cmake --build "${RUNNER_TEMP}/c-unit-build" --target hqqsqlite_server_unit_tests
+          ctest --test-dir "${RUNNER_TEMP}/c-unit-build" --output-on-failure
+      - name: Build hqq-sqlite-server and run Go tests
+        run: |
+          eval "$(sqlite3/build.sh -T)"
+          go vet ./...
+          go test -count=1 -p 1 -v -race -timeout 10m ./...
+
+  update:
+    name: Commit SQLite pin update
+    needs: [check, test]
+    if: (needs.check.outputs.updated == 'true' || inputs.force == true) && inputs.dry_run != true
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: main
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Update SQLite pins and metadata
+        run: go run ./scripts/release/sync-sqlite -apply -force
+      - name: Commit and push SQLite update
+        id: commit
+        env:
+          SQLITE_VERSION: ${{ needs.check.outputs.version }}
+          SQLITE_VERNUM: ${{ needs.check.outputs.version_number }}
+        run: |
+          set -euo pipefail
+          git add third_party/sqlite/VERSION third_party/sqlite/SHA256 third_party/sqlite/SHA3-256 hashes.go README.md sqlite3/README.md
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore(sqlite): update SQLite to ${SQLITE_VERSION} (${SQLITE_VERNUM})"
+            git push origin HEAD:main
+          fi
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build, attest, and publish release
+    needs: [check, update]
+    if: (needs.check.outputs.updated == 'true' || inputs.force == true) && inputs.dry_run != true
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}
+      ref: ${{ needs.update.outputs.commit_sha }}
+    secrets: inherit

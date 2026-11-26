@@ -1,0 +1,140 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: hqq-benchmark-history
+  cancel-in-progress: false
+
+jobs:
+  benchmarks:
+    name: HQQ benchmarks
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Linux profiling dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+          dot -V
+
+      - name: Restore the latest trusted benchmark history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=success&per_page=20" \
+            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | .id')
+          for run_id in $runs; do
+            artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '.artifacts[] | select(.name == "hqq-benchmark-artifacts-Linux" and .expired == false) | .id')
+            if [ -n "$artifact" ]; then
+              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                --name hqq-benchmark-artifacts-Linux --dir "$RUNNER_TEMP/benchmark-history"
+              test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
+              cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
+              exit 0
+            fi
+          done
+          echo '::error::No trusted benchmark history remains; restore the baseline before publishing another benchmark.'
+          exit 1
+
+      - name: Run CPU-ratio performance tests
+        env:
+          HQQ_PERF_TESTS: '1'
+        run: |
+          go test ./... \
+            -count=1 \
+            -timeout 3m \
+            -run '^(TestIdleLinkDoesNotBurnCPU|TestMPMCIdleWaitDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU)$' \
+            -v
+
+      - name: Run HQQ benchmarks
+        run: |
+          mkdir -p benchmark-artifacts/pprof
+          go test . \
+            -timeout 2m \
+            -run '^$' \
+            -bench 'Benchmark(StandardLink|AdvancedLink)' \
+            -benchmem \
+            -benchtime 100ms \
+            -count 3 \
+            -cpuprofile benchmark-artifacts/pprof/cpu.pprof \
+            -memprofile benchmark-artifacts/pprof/mem.pprof \
+            | tee benchmark.txt
+          test_binary=$(find . -maxdepth 1 -type f -name '*.test' -print -quit)
+          if [ -z "$test_binary" ]; then
+            echo "expected go test to leave a test binary for pprof" >&2
+            exit 1
+          fi
+          mv "$test_binary" benchmark-artifacts/pprof/hqq.test
+
+      - name: Publish benchmark summary
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
+        with:
+          name: HQQ Go Benchmark
+          tool: go
+          output-file-path: benchmark.txt
+          external-data-json-path: benchmark-data.json
+          summary-always: true
+          # Informational only. Shared runners are noisy, and the action
+          # treats every extra metric as smaller-is-better, so a throughput
+          # (MB/s) improvement is reported as a regression; failing the job on
+          # alerts would therefore flag improvements too.
+          fail-on-alert: false
+          alert-threshold: '130%'
+          auto-push: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Render pprof reports
+        if: runner.os == 'Linux'
+        run: |
+          go tool pprof -top -nodecount=50 \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/cpu.pprof \
+            > benchmark-artifacts/pprof/cpu-top.txt
+          go tool pprof -svg \
+            -output benchmark-artifacts/pprof/cpu.svg \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/cpu.pprof
+          go tool pprof -top -sample_index=alloc_space -nodecount=50 \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/mem.pprof \
+            > benchmark-artifacts/pprof/mem-alloc-top.txt
+          go tool pprof -svg -sample_index=alloc_space \
+            -output benchmark-artifacts/pprof/mem-alloc.svg \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/mem.pprof
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hqq-benchmark-artifacts-${{ runner.os }}
+          path: |
+            benchmark.txt
+            benchmark-data.json
+            benchmark-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

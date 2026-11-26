@@ -1,0 +1,343 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "API server for x402 payment facilitator",
+        "title": "x402 Facilitator API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "paths": {
+        "/settle": {
+            "post": {
+                "description": "Settle a payment using the facilitator",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Settle payment",
+                "parameters": [
+                    {
+                        "description": "Settlement request",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/types.PaymentSettleRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/types.PaymentSettleResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/echo.HTTPError"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/echo.HTTPError"
+                        }
+                    }
+                }
+            }
+        },
+        "/supported": {
+            "get": {
+                "description": "Get supported payment kinds",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "List supported kinds",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/types.SupportedResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/echo.HTTPError"
+                        }
+                    }
+                }
+            }
+        },
+        "/verify": {
+            "post": {
+                "description": "Verify a payment using the facilitator",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "payments"
+                ],
+                "summary": "Verify payment",
+                "parameters": [
+                    {
+                        "description": "Payment verification request",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/types.PaymentVerifyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/types.PaymentVerifyResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/echo.HTTPError"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/echo.HTTPError"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "echo.HTTPError": {
+            "type": "object",
+            "properties": {
+                "message": {}
+            }
+        },
+        "types.PaymentPayload": {
+            "type": "object",
+            "properties": {
+                "accepted": {
+                    "description": "Accepted echoes the PaymentRequirements the client is paying\nagainst. Facilitators read scheme/network from here.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.PaymentRequirements"
+                        }
+                    ]
+                },
+                "extensions": {
+                    "description": "Extensions carries protocol extension data. Optional.",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "payload": {
+                    "description": "Payload is the scheme-specific payment material (e.g. an EIP-3009\nauthorization + signature). Its shape depends on Accepted.Scheme.",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "resource": {
+                    "description": "Resource describes the resource being paid for. Optional.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.ResourceInfo"
+                        }
+                    ]
+                },
+                "x402Version": {
+                    "description": "X402Version is the protocol version (always 2 for v2 payloads).",
+                    "type": "integer"
+                }
+            }
+        },
+        "types.PaymentRequirements": {
+            "type": "object",
+            "properties": {
+                "amount": {
+                    "description": "Amount required to pay for the resource in atomic units, as a\ndecimal string. This replaces the v1 field \"maxAmountRequired\".",
+                    "type": "string"
+                },
+                "asset": {
+                    "description": "Asset is the token contract address (EVM) or mint (SVM) being paid.",
+                    "type": "string"
+                },
+                "extra": {
+                    "description": "Extra carries scheme-specific metadata (e.g. the EIP-712 domain\nname and version for EIP-3009).",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "maxTimeoutSeconds": {
+                    "description": "MaxTimeoutSeconds is the maximum time the resource server will\nwait for the payment to be facilitated.",
+                    "type": "integer"
+                },
+                "network": {
+                    "description": "Network in CAIP-2 format (e.g. \"eip155:84532\").",
+                    "type": "string"
+                },
+                "payTo": {
+                    "description": "PayTo is the address that receives the payment.",
+                    "type": "string"
+                },
+                "scheme": {
+                    "description": "Scheme of the payment protocol to use (e.g. \"exact\").",
+                    "type": "string"
+                }
+            }
+        },
+        "types.PaymentSettleRequest": {
+            "type": "object",
+            "properties": {
+                "paymentPayload": {
+                    "$ref": "#/definitions/types.PaymentPayload"
+                },
+                "paymentRequirements": {
+                    "$ref": "#/definitions/types.PaymentRequirements"
+                }
+            }
+        },
+        "types.PaymentSettleResponse": {
+            "type": "object",
+            "properties": {
+                "errorMessage": {
+                    "description": "ErrorMessage is a human-readable explanation when Success is false.",
+                    "type": "string"
+                },
+                "errorReason": {
+                    "description": "ErrorReason is a short machine-readable code when Success is false.",
+                    "type": "string"
+                },
+                "network": {
+                    "description": "Network is the CAIP-2 network the transaction was submitted to.\nThis replaces the v1 field \"networkId\".",
+                    "type": "string"
+                },
+                "payer": {
+                    "description": "Payer is the address that signed the payment, when recoverable.",
+                    "type": "string"
+                },
+                "success": {
+                    "description": "Success reports whether settlement broadcast was accepted.",
+                    "type": "boolean"
+                },
+                "transaction": {
+                    "description": "Transaction is the on-chain transaction hash of the settled payment.\nThis replaces the v1 field \"txHash\".",
+                    "type": "string"
+                }
+            }
+        },
+        "types.PaymentVerifyRequest": {
+            "type": "object",
+            "properties": {
+                "paymentPayload": {
+                    "$ref": "#/definitions/types.PaymentPayload"
+                },
+                "paymentRequirements": {
+                    "$ref": "#/definitions/types.PaymentRequirements"
+                }
+            }
+        },
+        "types.PaymentVerifyResponse": {
+            "type": "object",
+            "properties": {
+                "invalidMessage": {
+                    "description": "InvalidMessage is a human-readable explanation when IsValid is\nfalse. Clients may surface this to end users.",
+                    "type": "string"
+                },
+                "invalidReason": {
+                    "description": "InvalidReason is a short machine-readable code (e.g.\n\"insufficient_balance\") when IsValid is false.",
+                    "type": "string"
+                },
+                "isValid": {
+                    "description": "IsValid reports whether the payment payload is valid.",
+                    "type": "boolean"
+                },
+                "payer": {
+                    "description": "Payer is the address that signed the payment, when recoverable.",
+                    "type": "string"
+                }
+            }
+        },
+        "types.ResourceInfo": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "mimeType": {
+                    "type": "string"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "types.SupportedKind": {
+            "type": "object",
+            "properties": {
+                "extra": {
+                    "description": "Extra carries scheme-specific metadata (e.g. the SVM fee payer).",
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "network": {
+                    "description": "Network in CAIP-2 format.",
+                    "type": "string"
+                },
+                "scheme": {
+                    "description": "Scheme of the payment protocol (e.g. \"exact\").",
+                    "type": "string"
+                },
+                "x402Version": {
+                    "description": "X402Version is the protocol version supported for this pair.",
+                    "type": "integer"
+                }
+            }
+        },
+        "types.SupportedResponse": {
+            "type": "object",
+            "properties": {
+                "extensions": {
+                    "description": "Extensions lists the x402 protocol extensions this facilitator\nhonours. Empty when no extensions are supported.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "kinds": {
+                    "description": "Kinds lists every accepted (scheme, network) pair.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.SupportedKind"
+                    }
+                },
+                "signers": {
+                    "description": "Signers maps a CAIP-2 family pattern (e.g. \"eip155:*\") to the\naddresses this facilitator may use as the sender of settlement\ntransactions on that family. Clients use this to allowlist or\naudit the facilitator's on-chain footprint.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
