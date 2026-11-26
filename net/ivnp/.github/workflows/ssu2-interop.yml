@@ -1,0 +1,40 @@
+name: SSU2 pinned-router interop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssu2-interop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ssu2-interop:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Bootstrap NetDB and acquire pinned RouterInfo
+        shell: bash
+        run: |
+          set -euo pipefail
+          IVNP_STABLE_ROUTERINFO_ACQUIRE=1 \
+          IVNP_STABLE_ROUTER_INFO_OUTPUT="$RUNNER_TEMP/stable-router.info" \
+            go test -tags integration ./controlplane/internal/runtime \
+              -run '^TestAcquireStableRouterInfo$' -count=1 -timeout=3m -v
+      - name: Run exact-hash SSU2 round trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          IVNP_STABLE_SSU2_INTEGRATION=1 \
+          IVNP_STABLE_SSU2_ROUTER_INFO="$RUNNER_TEMP/stable-router.info" \
+            go test -tags integration ./dataplane/internal/router \
+              -run '^TestStableRouterSSU2Interop$' -count=1 -timeout=90s -v
