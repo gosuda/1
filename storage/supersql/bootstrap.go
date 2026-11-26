@@ -190,8 +190,12 @@ func (database *Catalog) prepareWorkers() error {
 	if parallelism <= 0 {
 		parallelism = max(1, goruntime.GOMAXPROCS(0))
 	}
+	maxTxns := database.maxTransactions
+	if maxTxns <= 0 {
+		maxTxns = nativeMaxTransactions
+	}
 	queueCapacity := max(2, parallelism*2)
-	maxGroups := max(16, parallelism*4)
+	maxGroups := max(1024, maxTxns*4, parallelism*4)
 	pool, err := runtime.NewPool(runtime.PoolConfig{Parallelism: parallelism, QueueCapacity: queueCapacity, MaxGroups: maxGroups})
 	if err != nil {
 		return err

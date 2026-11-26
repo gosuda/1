@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -31,15 +32,20 @@ var ErrInvalidEncryptionKey = errors.New("neosepia: invalid or missing encryptio
 const (
 	encryptionMagic           = "NSE1"
 	encryptionKeySize         = 32
+	encryptionSaltSize        = 32
 	encryptionNonceSize       = 12
 	encryptionTagSize         = 16
-	encryptionHeaderSize      = 4 + 4 + encryptionNonceSize
+	encryptionHeaderSizeV1    = 4 + 4 + encryptionNonceSize
+	encryptionHeaderSizeV2    = 4 + 4 + encryptionSaltSize
+	encryptionHeaderSize      = encryptionHeaderSizeV2
+	encryptionHeaderV2Bit     = uint32(1 << 31)
 	encryptionChunkHeaderSize = 4
 	encryptionChunkOverhead   = encryptionChunkHeaderSize + encryptionTagSize
 	encryptionDefaultChunk    = 64 << 10
 	encryptionMaxChunk        = 4 << 20
 	encryptionFinalBit        = uint32(1 << 31)
 	encryptionKeyDomain       = "supersql-enc-key-v1"
+	encryptionDEKInfo         = "supersql-nse2-dek-v1"
 
 	encryptionMetaName    = "encryption.meta"
 	encryptionMetaPending = ".encryption.meta.pending"
@@ -68,9 +74,11 @@ type WALArchiveMetadata struct {
 	SHA256         string          `json:"sha256"`
 }
 
-// storageCipher holds an immutable AES-256-GCM AEAD and key fingerprint.
+// storageCipher holds an immutable AES-256 master key, a legacy v1 AES-256-GCM
+// AEAD for backwards-compatible reads, and the canonical key fingerprint.
 // cipher.AEAD is safe for concurrent Seal and Open calls.
 type storageCipher struct {
+	masterKey   [encryptionKeySize]byte
 	aead        cipher.AEAD
 	fingerprint [sha256.Size]byte
 }
@@ -105,7 +113,29 @@ func newStorageCipher(key []byte) (*storageCipher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
 	}
-	return &storageCipher{aead: aead, fingerprint: fp}, nil
+	var masterKey [encryptionKeySize]byte
+	copy(masterKey[:], key)
+	return &storageCipher{masterKey: masterKey, aead: aead, fingerprint: fp}, nil
+}
+
+func (c *storageCipher) deriveFileAEAD(salt [encryptionSaltSize]byte) (cipher.AEAD, error) {
+	if c == nil {
+		return nil, ErrInvalidEncryptionKey
+	}
+	dek, err := hkdf.Key(sha256.New, c.masterKey[:], salt[:], encryptionDEKInfo, encryptionKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	defer clear(dek)
+	block, err := aes.NewCipher(dek)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidEncryptionKey, err)
+	}
+	return aead, nil
 }
 
 func (c *storageCipher) matchesFingerprint(fp [sha256.Size]byte) bool {
@@ -132,6 +162,12 @@ func deriveChunkNonce(base [encryptionNonceSize]byte, chunkIndex uint64) [encryp
 	return nonce
 }
 
+func deriveChunkNonceV2(chunkIndex uint64) [encryptionNonceSize]byte {
+	var nonce [encryptionNonceSize]byte
+	binary.BigEndian.PutUint64(nonce[4:12], chunkIndex)
+	return nonce
+}
+
 func buildChunkAAD(chunkIndex uint64, plainLen uint32, isFinal bool) [17]byte {
 	var aad [17]byte
 	copy(aad[0:4], encryptionMagic)
@@ -139,6 +175,25 @@ func buildChunkAAD(chunkIndex uint64, plainLen uint32, isFinal bool) [17]byte {
 	binary.BigEndian.PutUint32(aad[12:16], plainLen)
 	if isFinal {
 		aad[16] = 1
+	}
+	return aad
+}
+
+func buildHeaderV2(chunkSize uint32, salt [encryptionSaltSize]byte) [encryptionHeaderSizeV2]byte {
+	var hdr [encryptionHeaderSizeV2]byte
+	copy(hdr[0:4], encryptionMagic)
+	binary.BigEndian.PutUint32(hdr[4:8], encryptionHeaderV2Bit|chunkSize)
+	copy(hdr[8:encryptionHeaderSizeV2], salt[:])
+	return hdr
+}
+
+func buildChunkAADV2(header [encryptionHeaderSizeV2]byte, chunkIndex uint64, plainLen uint32, isFinal bool) [encryptionHeaderSizeV2 + 13]byte {
+	var aad [encryptionHeaderSizeV2 + 13]byte
+	copy(aad[0:encryptionHeaderSizeV2], header[:])
+	binary.BigEndian.PutUint64(aad[encryptionHeaderSizeV2:encryptionHeaderSizeV2+8], chunkIndex)
+	binary.BigEndian.PutUint32(aad[encryptionHeaderSizeV2+8:encryptionHeaderSizeV2+12], plainLen)
+	if isFinal {
+		aad[encryptionHeaderSizeV2+12] = 1
 	}
 	return aad
 }
@@ -151,25 +206,77 @@ func encryptedFileSize(plainSize uint64) uint64 {
 	return encryptionHeaderSize + plainSize + chunks*encryptionChunkOverhead
 }
 
-func parseEncryptedHeader(header []byte) (chunkSize uint64, baseNonce [encryptionNonceSize]byte, err error) {
-	if len(header) != encryptionHeaderSize || string(header[:4]) != encryptionMagic {
-		return 0, baseNonce, storage.ErrCorruptStorage
-	}
-	cs := uint64(binary.BigEndian.Uint32(header[4:8]))
-	if cs == 0 || cs > encryptionMaxChunk {
-		return 0, baseNonce, storage.ErrCorruptStorage
-	}
-	copy(baseNonce[:], header[8:20])
-	return cs, baseNonce, nil
+type encryptedHeader struct {
+	version    uint8
+	headerSize uint64
+	chunkSize  uint64
+	baseNonce  [encryptionNonceSize]byte
+	salt       [encryptionSaltSize]byte
+	rawV2      [encryptionHeaderSizeV2]byte
 }
 
-// encryptStreamWriter streams plaintext into chunked NSE1 AES-256-GCM frames
-// using O(chunkSize) memory.
+func readEncryptedHeader(r io.Reader) (encryptedHeader, error) {
+	var prefix [8]byte
+	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+		return encryptedHeader{}, errors.Join(storage.ErrCorruptStorage, err)
+	}
+	if string(prefix[0:4]) != encryptionMagic {
+		return encryptedHeader{}, storage.ErrCorruptStorage
+	}
+	flags := binary.BigEndian.Uint32(prefix[4:8])
+	isV2 := (flags & encryptionHeaderV2Bit) != 0
+	cs := uint64(flags &^ encryptionHeaderV2Bit)
+	if cs == 0 || cs > encryptionMaxChunk {
+		return encryptedHeader{}, storage.ErrCorruptStorage
+	}
+	hdr := encryptedHeader{chunkSize: cs}
+	if isV2 {
+		hdr.version = 2
+		hdr.headerSize = encryptionHeaderSizeV2
+		if _, err := io.ReadFull(r, hdr.salt[:]); err != nil {
+			return encryptedHeader{}, errors.Join(storage.ErrCorruptStorage, err)
+		}
+		copy(hdr.rawV2[0:8], prefix[:])
+		copy(hdr.rawV2[8:encryptionHeaderSizeV2], hdr.salt[:])
+		return hdr, nil
+	}
+	hdr.version = 1
+	hdr.headerSize = encryptionHeaderSizeV1
+	if _, err := io.ReadFull(r, hdr.baseNonce[:]); err != nil {
+		return encryptedHeader{}, errors.Join(storage.ErrCorruptStorage, err)
+	}
+	return hdr, nil
+}
+
+func (h *encryptedHeader) fileAEAD(c *storageCipher) (cipher.AEAD, error) {
+	if c == nil {
+		return nil, ErrInvalidEncryptionKey
+	}
+	if h.version == 2 {
+		return c.deriveFileAEAD(h.salt)
+	}
+	return c.aead, nil
+}
+
+func (h *encryptedHeader) openChunk(aead cipher.AEAD, dst []byte, chunkIndex uint64, plainLen uint32, isFinal bool, ciphertext []byte) ([]byte, error) {
+	if h.version == 2 {
+		nonce := deriveChunkNonceV2(chunkIndex)
+		aad := buildChunkAADV2(h.rawV2, chunkIndex, plainLen, isFinal)
+		return aead.Open(dst, nonce[:], ciphertext, aad[:])
+	}
+	nonce := deriveChunkNonce(h.baseNonce, chunkIndex)
+	aad := buildChunkAAD(chunkIndex, plainLen, isFinal)
+	return aead.Open(dst, nonce[:], ciphertext, aad[:])
+}
+
+// encryptStreamWriter streams plaintext into chunked NSE1 v2 AES-256-GCM frames
+// with a per-file HKDF-SHA256 DEK and deterministic chunk counter nonces using
+// O(chunkSize) memory.
 type encryptStreamWriter struct {
 	out           io.Writer
-	cipher        *storageCipher
+	aead          cipher.AEAD
 	chunkSize     int
-	baseNonce     [encryptionNonceSize]byte
+	hdr           [encryptionHeaderSizeV2]byte
 	headerWritten bool
 	chunkIndex    uint64
 	buf           []byte
@@ -182,15 +289,19 @@ func newEncryptStreamWriter(out io.Writer, c *storageCipher) (*encryptStreamWrit
 	if c == nil {
 		return nil, ErrInvalidEncryptionKey
 	}
-	var baseNonce [encryptionNonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, baseNonce[:]); err != nil {
+	var salt [encryptionSaltSize]byte
+	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
+		return nil, err
+	}
+	aead, err := c.deriveFileAEAD(salt)
+	if err != nil {
 		return nil, err
 	}
 	return &encryptStreamWriter{
 		out:       out,
-		cipher:    c,
+		aead:      aead,
 		chunkSize: encryptionDefaultChunk,
-		baseNonce: baseNonce,
+		hdr:       buildHeaderV2(encryptionDefaultChunk, salt),
 		buf:       make([]byte, 0, encryptionDefaultChunk),
 		sealed:    make([]byte, 0, encryptionChunkHeaderSize+encryptionDefaultChunk+encryptionTagSize),
 	}, nil
@@ -200,15 +311,11 @@ func (w *encryptStreamWriter) writeHeader() error {
 	if w.headerWritten {
 		return nil
 	}
-	var hdr [encryptionHeaderSize]byte
-	copy(hdr[0:4], encryptionMagic)
-	binary.BigEndian.PutUint32(hdr[4:8], uint32(w.chunkSize))
-	copy(hdr[8:20], w.baseNonce[:])
-	n, err := w.out.Write(hdr[:])
+	n, err := w.out.Write(w.hdr[:])
 	if err != nil {
 		return err
 	}
-	if n != len(hdr) {
+	if n != len(w.hdr) {
 		return io.ErrShortWrite
 	}
 	w.headerWritten = true
@@ -226,9 +333,9 @@ func (w *encryptStreamWriter) flushChunk(isFinal bool) error {
 	}
 	w.sealed = w.sealed[:encryptionChunkHeaderSize]
 	binary.BigEndian.PutUint32(w.sealed[:encryptionChunkHeaderSize], flags)
-	nonce := deriveChunkNonce(w.baseNonce, w.chunkIndex)
-	aad := buildChunkAAD(w.chunkIndex, plainLen, isFinal)
-	w.sealed = w.cipher.aead.Seal(w.sealed, nonce[:], w.buf, aad[:])
+	nonce := deriveChunkNonceV2(w.chunkIndex)
+	aad := buildChunkAADV2(w.hdr, w.chunkIndex, plainLen, isFinal)
+	w.sealed = w.aead.Seal(w.sealed, nonce[:], w.buf, aad[:])
 	n, err := w.out.Write(w.sealed)
 	if err != nil {
 		return err
@@ -279,83 +386,151 @@ func (w *encryptStreamWriter) Close() error {
 	return w.err
 }
 
-// decryptStreamToBytes decrypts an NSE1 stream into memory with a strict upper
-// bound on plaintext length, verifying every chunk's GCM tag and trailing EOF.
-func decryptStreamToBytes(ctx context.Context, r io.Reader, c *storageCipher, maxPlain uint64) ([]byte, error) {
+// decryptStreamReader streams authenticated plaintext from an NSE1 (v1 or v2)
+// AES-256-GCM stream using O(chunkSize) memory. It verifies every chunk's GCM
+// tag, enforces maxPlain, requires a final chunk, and verifies trailing EOF.
+type decryptStreamReader struct {
+	ctx        context.Context
+	r          io.Reader
+	hdr        encryptedHeader
+	aead       cipher.AEAD
+	maxPlain   uint64
+	totalPlain uint64
+	chunkIdx   uint64
+	encBuf     []byte
+	plainBuf   []byte
+	pending    []byte
+	eof        bool
+	err        error
+}
+
+func newDecryptStreamReader(ctx context.Context, r io.Reader, c *storageCipher, maxPlain uint64) (*decryptStreamReader, error) {
 	if c == nil {
 		return nil, ErrInvalidEncryptionKey
 	}
-	var hdr [encryptionHeaderSize]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, errors.Join(storage.ErrCorruptStorage, err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	chunkSize, baseNonce, err := parseEncryptedHeader(hdr[:])
+	hdr, err := readEncryptedHeader(r)
 	if err != nil {
 		return nil, err
 	}
-	var out bytes.Buffer
-	var chunkIdx uint64
-	var encBuf []byte
-	var plainBuf []byte
+	aead, err := hdr.fileAEAD(c)
+	if err != nil {
+		return nil, err
+	}
+	return &decryptStreamReader{
+		ctx:      ctx,
+		r:        r,
+		hdr:      hdr,
+		aead:     aead,
+		maxPlain: maxPlain,
+	}, nil
+}
+
+func (d *decryptStreamReader) Read(p []byte) (int, error) {
+	if d.err != nil {
+		return 0, d.err
+	}
+	if len(d.pending) > 0 {
+		n := copy(p, d.pending)
+		d.pending = d.pending[n:]
+		return n, nil
+	}
+	if d.eof {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+		if err := d.ctx.Err(); err != nil {
+			d.err = err
+			return 0, err
 		}
 		var ch [encryptionChunkHeaderSize]byte
-		if _, err := io.ReadFull(r, ch[:]); err != nil {
-			return nil, errors.Join(storage.ErrCorruptStorage, err)
+		if _, err := io.ReadFull(d.r, ch[:]); err != nil {
+			d.err = errors.Join(storage.ErrCorruptStorage, err)
+			return 0, d.err
 		}
 		flags := binary.BigEndian.Uint32(ch[:])
 		isFinal := (flags & encryptionFinalBit) != 0
 		plainLen := uint64(flags &^ encryptionFinalBit)
-		if plainLen > chunkSize || (!isFinal && plainLen != chunkSize) {
-			return nil, storage.ErrCorruptStorage
+		if plainLen > d.hdr.chunkSize || (!isFinal && plainLen != d.hdr.chunkSize) {
+			d.err = storage.ErrCorruptStorage
+			return 0, d.err
 		}
-		if uint64(out.Len()) > maxPlain || plainLen > maxPlain-uint64(out.Len()) {
-			return nil, storage.ErrDecodeBudget
+		if d.totalPlain > d.maxPlain || plainLen > d.maxPlain-d.totalPlain {
+			d.err = storage.ErrDecodeBudget
+			return 0, d.err
 		}
 		ctLen := int(plainLen) + encryptionTagSize
-		if cap(encBuf) < ctLen {
-			encBuf = make([]byte, ctLen)
+		if cap(d.encBuf) < ctLen {
+			d.encBuf = make([]byte, ctLen)
 		} else {
-			encBuf = encBuf[:ctLen]
+			d.encBuf = d.encBuf[:ctLen]
 		}
-		if _, err := io.ReadFull(r, encBuf); err != nil {
-			return nil, errors.Join(storage.ErrCorruptStorage, err)
+		if _, err := io.ReadFull(d.r, d.encBuf); err != nil {
+			d.err = errors.Join(storage.ErrCorruptStorage, err)
+			return 0, d.err
 		}
-		nonce := deriveChunkNonce(baseNonce, chunkIdx)
-		aad := buildChunkAAD(chunkIdx, uint32(plainLen), isFinal)
 		var decErr error
-		plainBuf, decErr = c.aead.Open(plainBuf[:0], nonce[:], encBuf, aad[:])
+		d.plainBuf, decErr = d.hdr.openChunk(d.aead, d.plainBuf[:0], d.chunkIdx, uint32(plainLen), isFinal, d.encBuf)
 		if decErr != nil {
-			return nil, errors.Join(ErrInvalidEncryptionKey, storage.ErrCorruptStorage, decErr)
+			d.err = errors.Join(ErrInvalidEncryptionKey, storage.ErrCorruptStorage, decErr)
+			return 0, d.err
 		}
-		if uint64(len(plainBuf)) != plainLen {
-			return nil, storage.ErrCorruptStorage
+		if uint64(len(d.plainBuf)) != plainLen {
+			d.err = storage.ErrCorruptStorage
+			return 0, d.err
 		}
-		_, _ = out.Write(plainBuf)
-		chunkIdx++
+		d.totalPlain += plainLen
+		d.chunkIdx++
 		if isFinal {
-			break
+			var trailing [1]byte
+			n, err := d.r.Read(trailing[:])
+			if n != 0 || (err != nil && !errors.Is(err, io.EOF)) {
+				d.err = storage.ErrCorruptStorage
+				return 0, d.err
+			}
+			d.eof = true
+		}
+		if len(d.plainBuf) > 0 {
+			n := copy(p, d.plainBuf)
+			d.pending = d.plainBuf[n:]
+			return n, nil
+		}
+		if d.eof {
+			return 0, io.EOF
 		}
 	}
-	var trailing [1]byte
-	n, err := r.Read(trailing[:])
-	if n != 0 || (err != nil && !errors.Is(err, io.EOF)) {
-		return nil, storage.ErrCorruptStorage
+}
+
+// decryptStreamToBytes decrypts an NSE1 (v1 or v2) stream into memory with a
+// strict upper bound on plaintext length, verifying every chunk's GCM tag and
+// trailing EOF.
+func decryptStreamToBytes(ctx context.Context, r io.Reader, c *storageCipher, maxPlain uint64) ([]byte, error) {
+	dr, err := newDecryptStreamReader(ctx, r, c, maxPlain)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	buf := make([]byte, encryptionDefaultChunk)
+	if _, err := io.CopyBuffer(&out, dr, buf); err != nil {
+		return nil, err
 	}
 	return out.Bytes(), nil
 }
 
 // sstEncWriter streams encrypted SSTable chunks directly to w.file with O(2 * chunkSize)
 // memory: chunk 0 is held in memory until Finish writes the 80-byte SST header
-// at plaintext offset 0, while chunks >= 1 stream straight to their final NSE1
+// at plaintext offset 0, while chunks >= 1 stream straight to their final NSE1 v2
 // offsets on disk.
 type sstEncWriter struct {
 	file        *os.File
-	cipher      *storageCipher
+	aead        cipher.AEAD
 	chunkSize   uint64
-	baseNonce   [encryptionNonceSize]byte
+	hdr         [encryptionHeaderSizeV2]byte
 	chunk0      []byte
 	curChunk    []byte
 	curIdx      uint64
@@ -369,15 +544,19 @@ func newSSTEncWriter(file *os.File, c *storageCipher) (*sstEncWriter, error) {
 	if c == nil {
 		return nil, ErrInvalidEncryptionKey
 	}
-	var baseNonce [encryptionNonceSize]byte
-	if _, err := io.ReadFull(rand.Reader, baseNonce[:]); err != nil {
+	var salt [encryptionSaltSize]byte
+	if _, err := io.ReadFull(rand.Reader, salt[:]); err != nil {
+		return nil, err
+	}
+	aead, err := c.deriveFileAEAD(salt)
+	if err != nil {
 		return nil, err
 	}
 	return &sstEncWriter{
 		file:      file,
-		cipher:    c,
+		aead:      aead,
 		chunkSize: encryptionDefaultChunk,
-		baseNonce: baseNonce,
+		hdr:       buildHeaderV2(encryptionDefaultChunk, salt),
 		chunk0:    make([]byte, encryptionDefaultChunk),
 		curChunk:  make([]byte, encryptionDefaultChunk),
 		sealed:    make([]byte, 0, encryptionChunkHeaderSize+encryptionDefaultChunk+encryptionTagSize),
@@ -385,7 +564,7 @@ func newSSTEncWriter(file *os.File, c *storageCipher) (*sstEncWriter, error) {
 }
 
 func (ew *sstEncWriter) chunkDiskOffset(chunkIdx uint64) int64 {
-	return int64(encryptionHeaderSize + chunkIdx*(ew.chunkSize+encryptionChunkOverhead))
+	return int64(encryptionHeaderSizeV2 + chunkIdx*(ew.chunkSize+encryptionChunkOverhead))
 }
 
 func (ew *sstEncWriter) writeEncryptedChunk(chunkIdx uint64, plain []byte, isFinal bool) error {
@@ -396,9 +575,9 @@ func (ew *sstEncWriter) writeEncryptedChunk(chunkIdx uint64, plain []byte, isFin
 	}
 	ew.sealed = ew.sealed[:encryptionChunkHeaderSize]
 	binary.BigEndian.PutUint32(ew.sealed[:encryptionChunkHeaderSize], flags)
-	nonce := deriveChunkNonce(ew.baseNonce, chunkIdx)
-	aad := buildChunkAAD(chunkIdx, plainLen, isFinal)
-	ew.sealed = ew.cipher.aead.Seal(ew.sealed, nonce[:], plain, aad[:])
+	nonce := deriveChunkNonceV2(chunkIdx)
+	aad := buildChunkAADV2(ew.hdr, chunkIdx, plainLen, isFinal)
+	ew.sealed = ew.aead.Seal(ew.sealed, nonce[:], plain, aad[:])
 	n, err := ew.file.WriteAt(ew.sealed, ew.chunkDiskOffset(chunkIdx))
 	if err != nil {
 		return err
@@ -469,26 +648,21 @@ func (ew *sstEncWriter) Finish() error {
 			return err
 		}
 	}
-	var hdr [encryptionHeaderSize]byte
-	copy(hdr[0:4], encryptionMagic)
-	binary.BigEndian.PutUint32(hdr[4:8], uint32(ew.chunkSize))
-	copy(hdr[8:20], ew.baseNonce[:])
-	n, err := ew.file.WriteAt(hdr[:], 0)
+	n, err := ew.file.WriteAt(ew.hdr[:], 0)
 	if err != nil {
 		return err
 	}
-	if n != len(hdr) {
+	if n != len(ew.hdr) {
 		return io.ErrShortWrite
 	}
 	return nil
 }
 
 // sstEncState provides thread-safe, random-access authenticated decryption over
-// an NSE1-encrypted SSTable file. All fields are immutable after openSST.
+// an NSE1-encrypted (v1 or v2) SSTable file. All fields are immutable after openSST.
 type sstEncState struct {
-	cipher     *storageCipher
-	chunkSize  uint64
-	baseNonce  [encryptionNonceSize]byte
+	aead       cipher.AEAD
+	hdr        encryptedHeader
 	diskSize   uint64
 	plainSize  uint64
 	fullChunks uint64
@@ -499,30 +673,32 @@ func newSSTEncState(file *os.File, diskSize int64, c *storageCipher) (*sstEncSta
 	if c == nil {
 		return nil, ErrInvalidEncryptionKey
 	}
-	if diskSize < encryptionHeaderSize+encryptionChunkOverhead {
+	if diskSize < encryptionHeaderSizeV1+encryptionChunkOverhead {
 		return nil, storage.ErrCorruptStorage
 	}
-	var hdr [encryptionHeaderSize]byte
-	if _, err := file.ReadAt(hdr[:], 0); err != nil {
-		return nil, errors.Join(storage.ErrCorruptStorage, err)
-	}
-	chunkSize, baseNonce, err := parseEncryptedHeader(hdr[:])
+	hdr, err := readEncryptedHeader(io.NewSectionReader(file, 0, min(diskSize, encryptionHeaderSizeV2)))
 	if err != nil {
 		return nil, err
 	}
-	encChunkSize := chunkSize + encryptionChunkOverhead
-	bodySize := uint64(diskSize) - encryptionHeaderSize
+	if uint64(diskSize) < hdr.headerSize+encryptionChunkOverhead {
+		return nil, storage.ErrCorruptStorage
+	}
+	aead, err := hdr.fileAEAD(c)
+	if err != nil {
+		return nil, err
+	}
+	encChunkSize := hdr.chunkSize + encryptionChunkOverhead
+	bodySize := uint64(diskSize) - hdr.headerSize
 	fullChunks := (bodySize - encryptionChunkOverhead) / encChunkSize
 	lastDisk := bodySize - fullChunks*encChunkSize
 	if lastDisk < encryptionChunkOverhead || lastDisk > encChunkSize {
 		return nil, storage.ErrCorruptStorage
 	}
 	lastPlain := lastDisk - encryptionChunkOverhead
-	plainSize := fullChunks*chunkSize + lastPlain
+	plainSize := fullChunks*hdr.chunkSize + lastPlain
 	return &sstEncState{
-		cipher:     c,
-		chunkSize:  chunkSize,
-		baseNonce:  baseNonce,
+		aead:       aead,
+		hdr:        hdr,
 		diskSize:   uint64(diskSize),
 		plainSize:  plainSize,
 		fullChunks: fullChunks,
@@ -547,20 +723,20 @@ func (es *sstEncState) readAt(r io.ReaderAt, p []byte, off int64) (int, error) {
 		remaining = es.plainSize - start
 		wantEOF = true
 	}
-	encChunkSize := es.chunkSize + encryptionChunkOverhead
-	firstChunk := start / es.chunkSize
-	lastChunk := (start + remaining - 1) / es.chunkSize
+	encChunkSize := es.hdr.chunkSize + encryptionChunkOverhead
+	firstChunk := start / es.hdr.chunkSize
+	lastChunk := (start + remaining - 1) / es.hdr.chunkSize
 	copied := 0
 	var rawBuf []byte
 	var plainBuf []byte
 	for chunkIdx := firstChunk; chunkIdx <= lastChunk; chunkIdx++ {
 		isFinal := chunkIdx == es.fullChunks
-		expectedPlain := es.chunkSize
+		expectedPlain := es.hdr.chunkSize
 		if isFinal {
 			expectedPlain = es.lastPlain
 		}
 		chunkDiskLen := encryptionChunkHeaderSize + expectedPlain + encryptionTagSize
-		diskOff := int64(encryptionHeaderSize + chunkIdx*encChunkSize)
+		diskOff := int64(es.hdr.headerSize + chunkIdx*encChunkSize)
 		if uint64(cap(rawBuf)) < chunkDiskLen {
 			rawBuf = make([]byte, chunkDiskLen)
 		} else {
@@ -575,10 +751,8 @@ func (es *sstEncState) readAt(r io.ReaderAt, p []byte, off int64) (int, error) {
 		if gotFinal != isFinal || gotPlainLen != expectedPlain {
 			return copied, storage.ErrCorruptStorage
 		}
-		nonce := deriveChunkNonce(es.baseNonce, chunkIdx)
-		aad := buildChunkAAD(chunkIdx, uint32(expectedPlain), isFinal)
 		var decErr error
-		plainBuf, decErr = es.cipher.aead.Open(plainBuf[:0], nonce[:], rawBuf[encryptionChunkHeaderSize:], aad[:])
+		plainBuf, decErr = es.hdr.openChunk(es.aead, plainBuf[:0], chunkIdx, uint32(expectedPlain), isFinal, rawBuf[encryptionChunkHeaderSize:])
 		if decErr != nil {
 			return copied, errors.Join(ErrInvalidEncryptionKey, storage.ErrCorruptStorage, decErr)
 		}
@@ -587,7 +761,7 @@ func (es *sstEncState) readAt(r io.ReaderAt, p []byte, off int64) (int, error) {
 		}
 		sliceStart := uint64(0)
 		if chunkIdx == firstChunk {
-			sliceStart = start % es.chunkSize
+			sliceStart = start % es.hdr.chunkSize
 		}
 		sliceEnd := expectedPlain
 		if sliceEnd-sliceStart > remaining-uint64(copied) {
@@ -1228,37 +1402,50 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 	sameCipher := (a.dbCipher == nil && a.archiveCipher == nil) ||
 		(a.dbCipher != nil && a.archiveCipher != nil && a.dbCipher.matchesFingerprint(a.archiveCipher.fingerprint))
 
+	buf := make([]byte, 64<<10)
 	if sameCipher {
-		buf := make([]byte, 64<<10)
-		if _, err := io.CopyBuffer(cw, src, buf); err != nil {
+		if _, err := io.CopyBuffer(cw, &ctxReader{ctx: ctx, r: src}, buf); err != nil {
 			return 0, sum, err
 		}
 	} else {
-		var plain []byte
-		if a.dbCipher != nil {
-			plain, err = decryptStreamToBytes(ctx, src, a.dbCipher, math.MaxInt64)
-			if err != nil {
-				return 0, sum, err
-			}
-		} else {
-			plain, err = io.ReadAll(src)
-			if err != nil {
-				return 0, sum, err
-			}
+		maxPlain := a.limits.MaxBytes
+		if maxPlain > math.MaxInt64-2*commitHeaderSize-1 {
+			maxPlain = math.MaxInt64 - 2*commitHeaderSize - 1
 		}
-		if a.archiveCipher != nil {
-			ew, err := newEncryptStreamWriter(cw, a.archiveCipher)
+		maxPlain += 2 * commitHeaderSize
+
+		var plainReader io.Reader
+		if a.dbCipher != nil {
+			dr, err := newDecryptStreamReader(ctx, src, a.dbCipher, maxPlain)
 			if err != nil {
 				return 0, sum, err
 			}
-			if _, err := ew.Write(plain); err != nil {
-				return 0, sum, err
-			}
-			if err := ew.Close(); err != nil {
-				return 0, sum, err
-			}
+			plainReader = dr
 		} else {
-			if _, err := cw.Write(plain); err != nil {
+			plainReader = &ctxReader{ctx: ctx, r: src}
+		}
+
+		limited := io.LimitReader(plainReader, int64(maxPlain)+1)
+
+		var out io.Writer = cw
+		var ew *encryptStreamWriter
+		if a.archiveCipher != nil {
+			ew, err = newEncryptStreamWriter(cw, a.archiveCipher)
+			if err != nil {
+				return 0, sum, err
+			}
+			out = ew
+		}
+
+		copied, err := io.CopyBuffer(out, limited, buf)
+		if err != nil {
+			return 0, sum, err
+		}
+		if uint64(copied) > maxPlain {
+			return 0, sum, storage.ErrDecodeBudget
+		}
+		if ew != nil {
+			if err := ew.Close(); err != nil {
 				return 0, sum, err
 			}
 		}
@@ -1277,6 +1464,18 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 	}
 	hash.Sum(sum[:0])
 	return cw.n, sum, nil
+}
+
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *ctxReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
 }
 
 func writeArchivedMeta(archiveRoot *os.Root, metaFile string, meta WALArchiveMetadata) (err error) {
@@ -1387,7 +1586,11 @@ func (backend *Backend) EnableWALArchive(ctx context.Context, archiveDir string,
 		backend.mu.Unlock()
 		return storage.ErrClosed
 	}
-	archiver, err := newWALArchiver(archiveDir, backend.cipher, archiveCipher, backend.limits.recovery().Batch, nil)
+	var existingHook func(context.Context, WALArchiveEntry) error
+	if backend.archiver != nil {
+		existingHook = backend.archiver.hook
+	}
+	archiver, err := newWALArchiver(archiveDir, backend.cipher, archiveCipher, backend.limits.recovery().Batch, existingHook)
 	if err != nil {
 		backend.mu.Unlock()
 		return err

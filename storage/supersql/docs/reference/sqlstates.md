@@ -36,7 +36,7 @@
 | 2201F | 22 | data exception | 7 | internal/query/builtin/float_math.go:32 | sqlError call |
 | 2201G | 22 | data exception | 8 | internal/query/builtin/width_bucket_range.go:100 | sqlError call |
 | 22021 | 22 | data exception | 28 | internal/query/builtin/array_output.go:126 | sqlError call |
-| 22023 | 22 | data exception | 517 | catalog.go:124 | bindError call, model.Error Code field, sqlError call |
+| 22023 | 22 | data exception | 519 | catalog.go:124 | bindError call, model.Error Code field, sqlError call |
 | 22025 | 22 | data exception | 5 | internal/query/builtin/like.go:135 | sqlError call |
 | 22026 | 22 | data exception | 3 | internal/query/builtin/bit_string.go:185 | sqlError call |
 | 2202E | 22 | data exception | 65 | internal/query/builtin/aggregate_collection_scalar.go:72 | model.Error Code field, sqlError call |

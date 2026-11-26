@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -31,6 +32,7 @@ type runRecoveryLimits struct {
 	Preparation                 runPreparationLimits
 	Resident                    runSetLimits
 	StagingBytes, IdentityBytes uint64
+	ReadOnly                    bool
 }
 
 type recoveredRuns struct {
@@ -145,12 +147,23 @@ func recoverPublishedRuns(ctx context.Context, directory *databaseDirectory, sta
 		}
 	}
 	identities := base.Transactions
+	prunedPosition := base.PrunedPosition
+	prunedCommitTS := base.PrunedCommitTS
 	position := recoveredPosition{LogPosition: base.Position, CommitTS: base.CommitTS}
 	publishedEpoch := base.Epoch
 	var mem memtable
+	var sawUnflushed bool
+	var cleanedStaleRuns bool
 	var pendingSpan runManifestSpan
 	var pendingDecisions []runDecision
 	var pendingTSs []model.Timestamp
+
+	flushThreshold := recoveryMemtableMaxBytes(limits)
+	nodeBudget := recoveryMemtableNodeBudget(limits)
+	prepLimits := limits.Preparation
+	if prepLimits.File.cipher == nil {
+		prepLimits.File.cipher = limits.Log.cipher
+	}
 
 	position, err = recoverCommits(ctx, directory.commits, position, limits.Log, func(record *storedCommit) error {
 		id := recoveryTxnID(record.Batch.TxID)
@@ -162,25 +175,48 @@ func recoverPublishedRuns(ctx context.Context, directory *databaseDirectory, sta
 				return err
 			}
 		}
-		next, _, err := identities.Set(id, transactionRecord{Identity: record.Identity, Result: record.Result}, limits.IdentityBytes-identities.NodeBytes())
+		var err error
+		identities, prunedPosition, prunedCommitTS, err = insertRecoveredTransaction(
+			ctx, identities, prunedPosition, prunedCommitTS,
+			id, transactionRecord{Identity: record.Identity, Result: record.Result},
+			limits.IdentityBytes,
+		)
 		if err != nil {
 			return err
 		}
 		publishedEpoch = record.Batch.Epoch
-		identities = next
 		pos := record.Result.LogPosition
 		decision := runDecision{Position: pos, TxID: record.Batch.TxID, CommitTS: record.Result.CommitTS, Identity: record.Identity, MutationCount: record.Result.AppliedCount}
 
 		span, hasManifest := manifests[pos]
 		if !hasManifest {
-			// Unflushed WAL commit (crashed while buffered in memtable): replay cleanly.
+			// Unflushed WAL commit (crashed while buffered in memtable or PITR replay): replay cleanly.
 			if len(pendingDecisions) > 0 {
 				return storage.ErrCorruptStorage
 			}
-			return mem.stageBatch(ctx, decision, record.Batch.Epoch, record.Batch, limits.Log.Batch.MaxAllocation)
+			sawUnflushed = true
+			if err := mem.stageBatchWithBudget(ctx, decision, record.Batch.Epoch, record.Batch, limits.Log.Batch.MaxAllocation, nodeBudget); err != nil {
+				return err
+			}
+			if !limits.ReadOnly && prepLimits.MaxRuns > 0 && limits.StagingBytes > 0 && mem.shouldFlushThreshold(flushThreshold) {
+				if limits.Log.maxCommitTS > 0 && !cleanedStaleRuns {
+					if err := cleanupObsoleteRuns(ctx, directory.runs, set); err != nil {
+						return err
+					}
+					cleanedStaleRuns = true
+				} else if limits.Log.maxCommitTS == 0 {
+					if err := removeOrphanedRunSSTs(directory.runs, mem.lastPos); err != nil {
+						return err
+					}
+				}
+				if err := mem.flushToRunsWithLimits(ctx, directory.runs, set, prepLimits, limits.StagingBytes, nodeBudget, 0); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		// Manifested commits must precede any unflushed tail memtable commits.
-		if !mem.empty() {
+		if sawUnflushed || !mem.empty() {
 			return storage.ErrCorruptStorage
 		}
 		if !span.coalesced {
@@ -246,12 +282,122 @@ func recoverPublishedRuns(ctx context.Context, directory *databaseDirectory, sta
 		Set:            set,
 		Position:       position,
 		Transactions:   identities,
-		PrunedPosition: base.PrunedPosition,
-		PrunedCommitTS: base.PrunedCommitTS,
+		PrunedPosition: prunedPosition,
+		PrunedCommitTS: prunedCommitTS,
 		FenceIndex:     fenceIndex,
 		PublishedEpoch: publishedEpoch,
 		Memtable:       mem,
 	}, nil
+}
+
+func recoveryMemtableMaxBytes(limits runRecoveryLimits) uint64 {
+	threshold := defaultMemtableMaxBytes
+	if limits.Preparation.Chunk.BuildBytes > 0 {
+		threshold = min(threshold, limits.Preparation.Chunk.BuildBytes/4)
+	}
+	if limits.Resident.MaxBytes > 0 {
+		threshold = min(threshold, limits.Resident.MaxBytes/4)
+	}
+	if limits.StagingBytes > 0 {
+		threshold = min(threshold, limits.StagingBytes/4)
+	}
+	return threshold
+}
+
+func recoveryMemtableNodeBudget(limits runRecoveryLimits) uint64 {
+	return max(defaultMemtableNodeBudget, limits.Resident.MaxBytes)
+}
+
+func removeOrphanedRunSSTs(runsRoot *os.Root, position uint64) error {
+	for idx := 0; ; idx++ {
+		err := runsRoot.Remove(preparedRunName(position, idx))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func insertRecoveredTransaction(
+	ctx context.Context,
+	identities ordered.Tree[recoveryTxnID, transactionRecord],
+	prunedPosition uint64,
+	prunedCommitTS model.Timestamp,
+	id recoveryTxnID,
+	record transactionRecord,
+	identityBytes uint64,
+) (ordered.Tree[recoveryTxnID, transactionRecord], uint64, model.Timestamp, error) {
+	var remaining uint64
+	if identityBytes > identities.NodeBytes() {
+		remaining = identityBytes - identities.NodeBytes()
+	}
+	next, _, err := identities.Set(id, record, remaining)
+	if err == nil {
+		return next, prunedPosition, prunedCommitTS, nil
+	}
+	if !errors.Is(err, ordered.ErrBudget) || identities.Len() == 0 {
+		return identities, prunedPosition, prunedCommitTS, err
+	}
+	// Evict oldest committed transaction identities (lowest LogPosition / CommitTS)
+	// in contiguous prefix order, matching pruneBaseTransactions semantics so large
+	// WAL/PITR replays keep a bounded recent dedup window within IdentityBytes.
+	entries := make([]baseTransaction, 0, int(identities.Len()))
+	cursor := identities.First(false)
+	for {
+		if err := ctx.Err(); err != nil {
+			return identities, prunedPosition, prunedCommitTS, err
+		}
+		entryID, entryRec, ok := cursor.Next()
+		if !ok {
+			break
+		}
+		entries = append(entries, baseTransaction{id: entryID, record: entryRec})
+	}
+	slices.SortFunc(entries, func(a, b baseTransaction) int {
+		if a.record.Result.LogPosition < b.record.Result.LogPosition {
+			return -1
+		}
+		if a.record.Result.LogPosition > b.record.Result.LogPosition {
+			return 1
+		}
+		return a.id.Compare(b.id)
+	})
+	keep := min(len(entries)/2, int(defaultMaxRetainedTransactions))
+	for {
+		var rebuilt ordered.Tree[recoveryTxnID, transactionRecord]
+		var buildErr error
+		keepFrom := len(entries) - keep
+		for _, entry := range entries[keepFrom:] {
+			if err := ctx.Err(); err != nil {
+				return identities, prunedPosition, prunedCommitTS, err
+			}
+			var rem uint64
+			if identityBytes > rebuilt.NodeBytes() {
+				rem = identityBytes - rebuilt.NodeBytes()
+			}
+			rebuilt, _, buildErr = rebuilt.Set(entry.id, entry.record, rem)
+			if buildErr != nil {
+				break
+			}
+		}
+		if buildErr == nil {
+			var rem uint64
+			if identityBytes > rebuilt.NodeBytes() {
+				rem = identityBytes - rebuilt.NodeBytes()
+			}
+			rebuilt, _, buildErr = rebuilt.Set(id, record, rem)
+		}
+		if buildErr == nil {
+			evicted := entries[keepFrom-1]
+			return rebuilt, evicted.record.Result.LogPosition, evicted.record.Result.CommitTS, nil
+		}
+		if !errors.Is(buildErr, ordered.ErrBudget) || keep == 0 {
+			return identities, prunedPosition, prunedCommitTS, buildErr
+		}
+		keep /= 2
+	}
 }
 
 func sameTransactionRecords(a, b ordered.Tree[recoveryTxnID, transactionRecord]) bool {

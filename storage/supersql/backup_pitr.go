@@ -98,16 +98,30 @@ func (database *Catalog) CreateHotBackupWithOptions(ctx context.Context, targetD
 	if targetDir == "" {
 		return ErrDirectoryRequired
 	}
-	spec, err := database.manager.CheckpointSpec(ctx)
-	if err != nil {
-		return err
+	var lastErr error
+	attempts := database.hotBackupAttempts()
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		spec, err := database.manager.CheckpointSpec(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = maintenance.CreateBackup(ctx, database.backend, storage.CheckpointRequest{Snapshot: spec}, maintenance.BackupOptions{
+			Destination:   targetDir,
+			Limits:        backupLimits,
+			EncryptionKey: options.EncryptionKey,
+		})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableHotBackupError(err) {
+			return backupError(err)
+		}
 	}
-	_, err = maintenance.CreateBackup(ctx, database.backend, storage.CheckpointRequest{Snapshot: spec}, maintenance.BackupOptions{
-		Destination:   targetDir,
-		Limits:        backupLimits,
-		EncryptionKey: options.EncryptionKey,
-	})
-	return backupError(err)
+	return backupError(lastErr)
 }
 
 // CreateIncrementalBackup captures one certified closed snapshot relative to
@@ -124,17 +138,33 @@ func (database *Catalog) CreateIncrementalBackup(ctx context.Context, baseBackup
 	if baseBackupDir == "" || options.Destination == "" {
 		return IncrementalBackupInfo{}, ErrDirectoryRequired
 	}
-	spec, err := database.manager.CheckpointSpec(ctx)
-	if err != nil {
-		return IncrementalBackupInfo{}, err
+	var inc maintenance.IncrementalManifest
+	var lastErr error
+	attempts := database.hotBackupAttempts()
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return IncrementalBackupInfo{}, err
+		}
+		spec, err := database.manager.CheckpointSpec(ctx)
+		if err != nil {
+			return IncrementalBackupInfo{}, err
+		}
+		inc, err = maintenance.CreateIncrementalBackup(ctx, database.backend, storage.CheckpointRequest{Snapshot: spec}, baseBackupDir, maintenance.BackupOptions{
+			Destination:   options.Destination,
+			Limits:        backupLimits,
+			EncryptionKey: options.EncryptionKey,
+		})
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		if !isRetryableHotBackupError(err) {
+			return IncrementalBackupInfo{}, backupError(err)
+		}
 	}
-	inc, err := maintenance.CreateIncrementalBackup(ctx, database.backend, storage.CheckpointRequest{Snapshot: spec}, baseBackupDir, maintenance.BackupOptions{
-		Destination:   options.Destination,
-		Limits:        backupLimits,
-		EncryptionKey: options.EncryptionKey,
-	})
-	if err != nil {
-		return IncrementalBackupInfo{}, backupError(err)
+	if lastErr != nil {
+		return IncrementalBackupInfo{}, backupError(lastErr)
 	}
 	changedNames := make([]string, len(inc.ChangedFiles))
 	for i, f := range inc.ChangedFiles {
@@ -186,6 +216,9 @@ func RestoreEncryptedCheckpoint(ctx context.Context, backupDir string, encryptio
 	if options.Directory == "" || backupDir == "" {
 		return nil, ErrDirectoryRequired
 	}
+	if err := validateRestoreOpenOptions(options); err != nil {
+		return nil, err
+	}
 	secret, err := readChainFenceSecret(ctx, []string{backupDir}, encryptionKey, options.EncryptionKey)
 	if err != nil {
 		return nil, err
@@ -194,6 +227,7 @@ func RestoreEncryptedCheckpoint(ctx context.Context, backupDir string, encryptio
 	if err != nil {
 		return nil, err
 	}
+	dirPreExisted := destinationPreExistedDir(options.Directory)
 	_, err = maintenance.RestoreCheckpoint(ctx, backupDir, maintenance.RestoreOptions{
 		Destination:       options.Directory,
 		Limits:            backupLimits,
@@ -209,7 +243,7 @@ func RestoreEncryptedCheckpoint(ctx context.Context, backupDir string, encryptio
 	if err != nil {
 		return nil, backupError(err)
 	}
-	return Open(ctx, options)
+	return openRestoredDatabase(ctx, options, dirPreExisted)
 }
 
 // RestoreIncremental validates a full-plus-incremental backup chain
@@ -223,6 +257,9 @@ func RestoreIncremental(ctx context.Context, chainDirs []string, options Increme
 	if options.Open.Directory == "" || len(chainDirs) == 0 {
 		return nil, ErrDirectoryRequired
 	}
+	if err := validateRestoreOpenOptions(options.Open); err != nil {
+		return nil, err
+	}
 	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey, options.Open.EncryptionKey)
 	if err != nil {
 		return nil, err
@@ -231,6 +268,7 @@ func RestoreIncremental(ctx context.Context, chainDirs []string, options Increme
 	if err != nil {
 		return nil, err
 	}
+	dirPreExisted := destinationPreExistedDir(options.Open.Directory)
 	_, err = maintenance.RestoreIncremental(ctx, chainDirs, maintenance.RestoreOptions{
 		Destination:       options.Open.Directory,
 		Limits:            backupLimits,
@@ -246,7 +284,7 @@ func RestoreIncremental(ctx context.Context, chainDirs []string, options Increme
 	if err != nil {
 		return nil, backupError(err)
 	}
-	return Open(ctx, options.Open)
+	return openRestoredDatabase(ctx, options.Open, dirPreExisted)
 }
 
 // RestorePITR restores baseBackupDir into options.Open.Directory, replays every
@@ -269,6 +307,9 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 	if options.Open.Directory == "" || len(chainDirs) == 0 || walArchiveDir == "" {
 		return nil, PITRResult{}, ErrDirectoryRequired
 	}
+	if err := validateRestoreOpenOptions(options.Open); err != nil {
+		return nil, PITRResult{}, err
+	}
 	secret, err := readChainFenceSecret(ctx, chainDirs, options.EncryptionKey, options.Open.EncryptionKey)
 	if err != nil {
 		return nil, PITRResult{}, err
@@ -282,6 +323,7 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 		archiveKey = options.Open.EncryptionKey
 	}
 	limits := mergeCompactionConfig(options.Open.Compaction)
+	dirPreExisted := destinationPreExistedDir(options.Open.Directory)
 	pitrRes, err := maintenance.RestorePITRFromChain(ctx, chainDirs, walArchiveDir, model.Timestamp(targetTS), maintenance.RestoreOptions{
 		Destination:       options.Open.Directory,
 		Limits:            backupLimits,
@@ -299,7 +341,7 @@ func RestorePITRFromChain(ctx context.Context, chainDirs []string, walArchiveDir
 	if err != nil {
 		return nil, PITRResult{}, backupError(err)
 	}
-	db, err := Open(ctx, options.Open)
+	db, err := openRestoredDatabase(ctx, options.Open, dirPreExisted)
 	if err != nil {
 		return nil, PITRResult{}, err
 	}

@@ -148,9 +148,28 @@ func (check *checkpointVerification) verifyCoalescedDecisions(ctx context.Contex
 	if err := check.consume("runs/"+runManifestName(lastPos), nil); err != nil {
 		return recoveredPosition{}, err
 	}
-	decisions := make([]runDecision, 0, int(lastPos-firstPos+1))
+	spanCount := lastPos - firstPos + 1
+	decisionUnit := uint64(unsafe.Sizeof(runDecision{}))
+	var availableMeta uint64
+	if usedMeta := check.metadata + check.layouts.NodeBytes(); usedMeta < check.limits.MetadataBytes {
+		availableMeta = check.limits.MetadataBytes - usedMeta
+	}
+	if spanCount > uint64(math.MaxInt) || spanCount > availableMeta/decisionUnit {
+		return recoveredPosition{}, columnar.ErrBatchBudget
+	}
+	decisionsBytes := spanCount * decisionUnit
+	if err := check.reserveMetadata(decisionsBytes); err != nil {
+		return recoveredPosition{}, err
+	}
+	defer func() { check.metadata -= decisionsBytes }()
+
+	decisions := make([]runDecision, 0, int(spanCount))
 	var allIdentities []checkpointCoalescedIdentity
 	var allLayouts []storage.ObjectLayout
+	var identitiesBytes uint64
+	var layoutsBytes uint64
+	defer func() { check.metadata -= layoutsBytes }()
+	coalescedIdentityUnit := uint64(unsafe.Sizeof(checkpointCoalescedIdentity{}))
 	curr := previous
 	for pos := firstPos; pos <= lastPos; pos++ {
 		if err := ctx.Err(); err != nil {
@@ -173,13 +192,36 @@ func (check *checkpointVerification) verifyCoalescedDecisions(ctx context.Contex
 		if _, exists := check.transactions.Get(id); exists {
 			return recoveredPosition{}, errors.Join(storage.ErrCorruptStorage, storage.ErrTxnIDReused, record.Close())
 		}
-		ids, err := checkpointMutationIdentities(ctx, record.Batch, check.limits.IdentityBytes-check.transactions.NodeBytes())
+		if check.transactions.NodeBytes() > check.limits.IdentityBytes || identitiesBytes > check.limits.IdentityBytes-check.transactions.NodeBytes() {
+			return recoveredPosition{}, errors.Join(columnar.ErrBatchBudget, record.Close())
+		}
+		remIdentity := check.limits.IdentityBytes - check.transactions.NodeBytes() - identitiesBytes
+		if record.Batch.Count() > remIdentity/coalescedIdentityUnit {
+			return recoveredPosition{}, errors.Join(columnar.ErrBatchBudget, record.Close())
+		}
+		ids, err := checkpointMutationIdentities(ctx, record.Batch, remIdentity)
 		if err != nil {
 			return recoveredPosition{}, errors.Join(err, record.Close())
 		}
+		if uint64(len(ids)) > remIdentity/coalescedIdentityUnit {
+			return recoveredPosition{}, errors.Join(columnar.ErrBatchBudget, record.Close())
+		}
+		identitiesBytes += uint64(len(ids)) * coalescedIdentityUnit
 		for _, item := range ids {
 			allIdentities = append(allIdentities, checkpointCoalescedIdentity{commitTS: record.Result.CommitTS, ordinal: item.ordinal, digest: item.digest})
 		}
+		var remMeta uint64
+		if usedMeta := check.metadata + check.layouts.NodeBytes(); usedMeta < check.limits.MetadataBytes {
+			remMeta = check.limits.MetadataBytes - usedMeta
+		}
+		batchLayoutsBytes, err := checkpointObjectLayoutsBytes(ctx, record.Batch.Layouts, remMeta)
+		if err != nil {
+			return recoveredPosition{}, errors.Join(err, record.Close())
+		}
+		if err := check.reserveMetadata(batchLayoutsBytes); err != nil {
+			return recoveredPosition{}, errors.Join(err, record.Close())
+		}
+		layoutsBytes += batchLayoutsBytes
 		allLayouts = append(allLayouts, record.Batch.Layouts...)
 		decisions = append(decisions, runDecision{
 			Position:      pos,
@@ -188,7 +230,10 @@ func (check *checkpointVerification) verifyCoalescedDecisions(ctx context.Contex
 			Identity:      record.Identity,
 			MutationCount: record.Result.AppliedCount,
 		})
-		next, _, setErr := check.transactions.Set(id, transactionRecord{Identity: record.Identity, Result: record.Result}, check.limits.IdentityBytes-check.transactions.NodeBytes())
+		if check.transactions.NodeBytes() > check.limits.IdentityBytes || identitiesBytes > check.limits.IdentityBytes-check.transactions.NodeBytes() {
+			return recoveredPosition{}, errors.Join(columnar.ErrBatchBudget, record.Close())
+		}
+		next, _, setErr := check.transactions.Set(id, transactionRecord{Identity: record.Identity, Result: record.Result}, check.limits.IdentityBytes-check.transactions.NodeBytes()-identitiesBytes)
 		closeErr := record.Close()
 		if setErr != nil {
 			return recoveredPosition{}, errors.Join(setErr, closeErr)
@@ -264,6 +309,44 @@ func (check *checkpointVerification) verifyCoalescedDecisions(ctx context.Contex
 		}
 	}
 	return curr, nil
+}
+
+func checkpointObjectLayoutsBytes(ctx context.Context, layouts []storage.ObjectLayout, limit uint64) (uint64, error) {
+	layoutUnit := uint64(unsafe.Sizeof(storage.ObjectLayout{}))
+	if uint64(len(layouts)) > limit/layoutUnit {
+		return 0, columnar.ErrBatchBudget
+	}
+	used := uint64(len(layouts)) * layoutUnit
+	colUnit := uint64(unsafe.Sizeof(storage.ColumnLayout{}))
+	for _, layout := range layouts {
+		if uint64(len(layout.Columns)) > (limit-used)/colUnit {
+			return 0, columnar.ErrBatchBudget
+		}
+		used += uint64(len(layout.Columns)) * colUnit
+		for _, col := range layout.Columns {
+			if len(col.Children) > 0 {
+				childBytes, err := model.TypeLayoutBytes(ctx, model.TypeLayout{Type: col.Type, Children: col.Children}, limit-used)
+				if err != nil {
+					if errors.Is(err, model.ErrValueBudget) {
+						return 0, columnar.ErrBatchBudget
+					}
+					return 0, err
+				}
+				used += childBytes
+			}
+			if col.HasMissingValue {
+				valBytes, err := model.ValueBytes(ctx, col.MissingValue, limit-used)
+				if err != nil {
+					if errors.Is(err, model.ErrValueBudget) {
+						return 0, columnar.ErrBatchBudget
+					}
+					return 0, err
+				}
+				used += valBytes
+			}
+		}
+	}
+	return used, nil
 }
 
 func checkpointMutationIdentities(ctx context.Context, batch storage.MutationBatch, maximum uint64) (_ []checkpointMutationIdentity, err error) {
