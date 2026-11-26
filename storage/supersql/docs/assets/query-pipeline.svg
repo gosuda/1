@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 340" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #0f172a; rx: 14px; }
+      .stage-card { fill: #1e293b; stroke: #334155; stroke-width: 1.5; rx: 10px; }
+      .accent-parse { fill: #38bdf8; }
+      .accent-bind { fill: #818cf8; }
+      .accent-opt { fill: #34d399; }
+      .accent-exec { fill: #f59e0b; }
+      .stage-title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13.5px; font-weight: 700; fill: #f8fafc; }
+      .stage-pkg { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #38bdf8; }
+      .stage-item { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; fill: #cbd5e1; }
+      .edge-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 600; fill: #94a3b8; text-anchor: middle; }
+      .arrow { stroke: #64748b; stroke-width: 2; fill: none; }
+    </style>
+    <marker id="right-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="920" height="340" />
+
+  <!-- Stage 1: Parser -->
+  <g transform="translate(20, 24)">
+    <rect class="stage-card" x="0" y="0" width="185" height="292" />
+    <rect class="accent-parse" x="0" y="0" width="185" height="5" rx="2.5" />
+    <text class="stage-title" x="16" y="30">1. SQL Parser</text>
+    <text class="stage-pkg" x="16" y="48">internal/zpgparse</text>
+    <text class="stage-item" x="16" y="82">• PG 18.4 Lexer</text>
+    <text class="stage-item" x="16" y="106">• Ragel + goyacc</text>
+    <text class="stage-item" x="16" y="130">• AST Construction</text>
+    <text class="stage-item" x="16" y="154">• RLS Policy Rewrite</text>
+    <text class="stage-item" x="16" y="178">• Temporal Sidecars</text>
+  </g>
+
+  <line class="arrow" x1="205" y1="170" x2="237" y2="170" marker-end="url(#right-arrow)" />
+  <text class="edge-text" x="221" y="158">AST</text>
+
+  <!-- Stage 2: Binder -->
+  <g transform="translate(240, 24)">
+    <rect class="stage-card" x="0" y="0" width="195" height="292" />
+    <rect class="accent-bind" x="0" y="0" width="195" height="5" rx="2.5" />
+    <text class="stage-title" x="16" y="30">2. Name &amp; Type Binder</text>
+    <text class="stage-pkg" x="16" y="48">internal/query/bind</text>
+    <text class="stage-item" x="16" y="82">• Relation Resolution</text>
+    <text class="stage-item" x="16" y="106">• Type Coercion &amp; Casts</text>
+    <text class="stage-item" x="16" y="130">• Dependency Tracking</text>
+    <text class="stage-item" x="16" y="154">• Parameter Inference</text>
+    <text class="stage-item" x="16" y="178">• Relational/Scalar IR</text>
+  </g>
+
+  <line class="arrow" x1="435" y1="170" x2="467" y2="170" marker-end="url(#right-arrow)" />
+  <text class="edge-text" x="451" y="158">IR</text>
+
+  <!-- Stage 3: Cascades CBO -->
+  <g transform="translate(470, 24)">
+    <rect class="stage-card" x="0" y="0" width="205" height="292" />
+    <rect class="accent-opt" x="0" y="0" width="205" height="5" rx="2.5" />
+    <text class="stage-title" x="16" y="30">3. Cascades CBO</text>
+    <text class="stage-pkg" x="16" y="48">internal/query/opt</text>
+    <text class="stage-item" x="16" y="82">• Memo Exploration</text>
+    <text class="stage-item" x="16" y="106">• PK vs Index Spans</text>
+    <text class="stage-item" x="16" y="130">• Predicate Pushdown</text>
+    <text class="stage-item" x="16" y="154">• Subquery Decorrelate</text>
+    <text class="stage-item" x="16" y="178">• Zone Map Pruning</text>
+  </g>
+
+  <line class="arrow" x1="675" y1="170" x2="707" y2="170" marker-end="url(#right-arrow)" />
+  <text class="edge-text" x="691" y="158">Plan</text>
+
+  <!-- Stage 4: Vectorized Execution -->
+  <g transform="translate(710, 24)">
+    <rect class="stage-card" x="0" y="0" width="190" height="292" />
+    <rect class="accent-exec" x="0" y="0" width="190" height="5" rx="2.5" />
+    <text class="stage-title" x="16" y="30">4. Vector Executor</text>
+    <text class="stage-pkg" x="16" y="48">internal/query/exec</text>
+    <text class="stage-item" x="16" y="82">• PAX Batch Decoding</text>
+    <text class="stage-item" x="16" y="106">• Vectorized Hash Join</text>
+    <text class="stage-item" x="16" y="130">• GroupBy &amp; Window VM</text>
+    <text class="stage-item" x="16" y="154">• Bounded Disk Spill</text>
+    <text class="stage-item" x="16" y="178">• sql &amp; pgx Portals</text>
+  </g>
+</svg>
