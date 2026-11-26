@@ -1,0 +1,45 @@
+{
+  "__doc": [
+    "Single source of truth for target response headers that must not be forwarded to the browser.",
+    "",
+    "The build injects these lists into `__ZP_*_HEADERS__`, and `static-policy`",
+    "verifies parity against the built output.",
+    "",
+    "Categories:",
+    "  reporting: Headers that instruct the browser to send reports directly to target",
+    "             endpoints outside Service Worker interception (direct IP leak path).",
+    "  directive: Headers that control browser navigation, storage, or client hints",
+    "             (such as `Refresh`, `Set-Cookie`, `Accept-CH`, and `Critical-CH`).",
+    "  hop_by_hop: Hop-by-hop headers and `Location` (handled inside the SW redirect loop)."
+  ],
+  "reporting": [
+    "Content-Security-Policy-Report-Only",
+    "Report-To",
+    "Reporting-Endpoints",
+    "NEL"
+  ],
+  "directive": [
+    "Refresh",
+    "Link",
+    "Clear-Site-Data",
+    "Alt-Svc",
+    "Service-Worker-Allowed",
+    "SourceMap",
+    "X-SourceMap",
+    "Set-Cookie",
+    "Set-Cookie2",
+    "Accept-CH",
+    "Critical-CH"
+  ],
+  "hop_by_hop": [
+    "Connection",
+    "Keep-Alive",
+    "Proxy-Authenticate",
+    "Proxy-Authorization",
+    "TE",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
+    "Location"
+  ]
+}

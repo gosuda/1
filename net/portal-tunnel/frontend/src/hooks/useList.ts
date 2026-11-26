@@ -1,0 +1,191 @@
+import { useEffect, useMemo, useState } from "react";
+import type { SortOption, StatusFilter } from "@/types/filters";
+import type { ReputationSummary } from "@/types/api";
+
+export interface BaseServer {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  thumbnail: string;
+  owner: string;
+  online: boolean;
+  dns: string;
+  link: string;
+  tcpAddr?: string;
+  udpAddr?: string;
+  lastUpdated?: string;
+  firstSeen?: string;
+  paymentEnabled?: boolean;
+  paymentLabel?: string;
+  reputation?: ReputationSummary;
+}
+
+export interface UseListOptions<T extends BaseServer> {
+  servers: T[];
+  additionalFilter?: (server: T) => boolean;
+}
+
+export interface UseListReturn<T extends BaseServer> {
+  searchQuery: string;
+  status: StatusFilter;
+  sortBy: SortOption;
+  selectedTags: string[];
+  availableTags: string[];
+  filteredServers: T[];
+  handleSearchChange: (value: string) => void;
+  handleStatusChange: (value: StatusFilter) => void;
+  handleSortByChange: (value: SortOption) => void;
+  handleTagToggle: (tag: string) => void;
+}
+
+function parseTimestamp(value?: string, fallback = 0): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
+function matchesStatus(online: boolean, status: StatusFilter): boolean {
+  switch (status) {
+    case "online":
+      return online;
+    case "offline":
+      return !online;
+    default:
+      return true;
+  }
+}
+
+export function useList<T extends BaseServer>({
+  servers,
+  additionalFilter,
+}: UseListOptions<T>): UseListReturn<T> {
+  const [searchQuery, setSearchQuery] = useState("");
+  const [status, setStatus] = useState<StatusFilter>("all");
+  const [sortBy, setSortBy] = useState<SortOption>("duration");
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const availableTags = useMemo(() => {
+    const counts = new Map<string, number>();
+    servers.forEach((server) => {
+      server.tags.forEach((tag) => {
+        const normalizedTag = tag.trim().toLowerCase();
+        if (!normalizedTag) {
+          return;
+        }
+        counts.set(normalizedTag, (counts.get(normalizedTag) || 0) + 1);
+      });
+    });
+
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([tag]) => tag);
+  }, [servers]);
+
+  useEffect(() => {
+    const availableTagSet = new Set(availableTags);
+    setSelectedTags((prev) => {
+      const next = prev.filter((tag) => availableTagSet.has(tag));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [availableTags]);
+
+  const filteredServers = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    const selectedTagSet = new Set(selectedTags);
+    const now = Date.now();
+
+    const matchesTags = (server: T): boolean => {
+      if (selectedTagSet.size === 0) {
+        return true;
+      }
+
+      return server.tags.some((tag) => selectedTagSet.has(tag.toLowerCase().trim()));
+    };
+
+    const matchesSearch = (server: T): boolean => {
+      if (query === "") {
+        return true;
+      }
+
+      return (
+        server.name.toLowerCase().includes(query) ||
+        server.description.toLowerCase().includes(query) ||
+        (server.paymentLabel || "").toLowerCase().includes(query) ||
+        server.tags.some((tag) => tag.toLowerCase().includes(query))
+      );
+    };
+
+    const filtered = servers.filter((server) => {
+      const matchesAdditional = additionalFilter ? additionalFilter(server) : true;
+
+      return (
+        matchesSearch(server) &&
+        matchesStatus(server.online, status) &&
+        matchesTags(server) &&
+        matchesAdditional
+      );
+    });
+
+    const sortByField = (sortValue: SortOption) => {
+      switch (sortValue) {
+        case "recommended":
+          return (a: T, b: T) =>
+            (b.reputation?.up ?? 0) - (a.reputation?.up ?? 0) ||
+            a.name.localeCompare(b.name) ||
+            a.id.localeCompare(b.id);
+        case "name-asc":
+          return (a: T, b: T) => a.name.localeCompare(b.name);
+        case "name-desc":
+          return (a: T, b: T) => b.name.localeCompare(a.name);
+        case "updated":
+          return (a: T, b: T) =>
+            parseTimestamp(b.lastUpdated, 0) - parseTimestamp(a.lastUpdated, 0);
+        case "duration":
+          return (a: T, b: T) =>
+            parseTimestamp(a.firstSeen, now) - parseTimestamp(b.firstSeen, now);
+        case "description":
+          return (a: T, b: T) => a.description.localeCompare(b.description);
+        case "tags":
+          return (a: T, b: T) => (a.tags[0] || "").localeCompare(b.tags[0] || "");
+        case "owner":
+          return (a: T, b: T) => a.owner.localeCompare(b.owner);
+        case "default":
+          return (a: T, b: T) => a.id.localeCompare(b.id);
+        default:
+          return (a: T, b: T) => a.id.localeCompare(b.id);
+      }
+    };
+
+    const compare = sortByField(sortBy);
+    return filtered.sort(compare);
+  }, [servers, searchQuery, status, sortBy, selectedTags, additionalFilter]);
+
+  function handleTagToggle(tag: string): void {
+    const normalizedTag = tag.trim().toLowerCase();
+    if (!normalizedTag) {
+      return;
+    }
+
+    setSelectedTags((prev) =>
+      prev.includes(normalizedTag)
+        ? prev.filter((candidate) => candidate !== normalizedTag)
+        : [...prev, normalizedTag]
+    );
+  }
+
+  return {
+    searchQuery,
+    status,
+    sortBy,
+    selectedTags,
+    availableTags,
+    filteredServers,
+    handleSearchChange: setSearchQuery,
+    handleStatusChange: setStatus,
+    handleSortByChange: setSortBy,
+    handleTagToggle,
+  };
+}
