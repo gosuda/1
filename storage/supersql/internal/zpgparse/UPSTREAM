@@ -1,0 +1,17 @@
+Repository: https://github.com/gosuda/pg18_query_go
+Commit: 10d566809991b10ff1182369705c19743e16c155
+Commit-Date: 2026-09-05T17:34:43+09:00
+
+Source copied from the upstream default branch, not from local parser code.
+Go module paths (including generator output templates) relocated from
+  github.com/gosuda/pg18_query_go
+to
+  z.gfire.dev/supersql/internal/zpgparse
+Root Go package renamed from pg_query to zpgparse.
+
+Upstream .git, .github, go.mod and go.sum excluded; dependencies and the
+existing goyacc tool declaration are managed by the SuperSQL root module.
+Upstream parser sources, generators, generated code, tests and fixtures retained.
+Upstream BSD-3-Clause notices are restored in THIRD_PARTY_NOTICES.md.
+README installation and license references adapted for this internal copy.
+Module path later relocated to github.com/gosuda/supersql-alpha/internal/zpgparse.
