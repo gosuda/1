@@ -29,6 +29,7 @@ permissions:
 
 env:
   GOCACHEPROG: ""
+  GOENV: "off"
   ZIG_VERSION: '0.17.1'
 
 jobs:
@@ -191,6 +192,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+
+      - name: Verify release Go cache isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_program=$(go env GOCACHEPROG)
+          test -z "$cache_program"
 
       - name: Download artifacts
         uses: actions/download-artifact@v8.0.2
