@@ -1,0 +1,1893 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha512"
+	"crypto/x509"
+	"encoding/binary"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"filippo.io/keygen"
+	"golang.org/x/crypto/hkdf"
+	"gosuda.org/ivnp/controlplane"
+	"gosuda.org/ivnp/foundation"
+)
+
+var errMockDialFailed = errors.New("mock dial failed")
+
+func createTestRouterInfo(t *testing.T, caps string) (foundation.NetworkDatabaseRouterInfo, []byte) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	identity := make([]byte, foundation.IdentityBaseLength+7)
+	copy(identity[352:384], public)
+	identity[384] = byte(foundation.CertificateKey)
+	identity[385], identity[386] = 0, 4
+	identity[387], identity[388] = 0, byte(foundation.SigningEdDSASHA512Ed25519)
+	identity[389], identity[390] = 0, byte(foundation.CryptoElGamal)
+
+	options := make([]byte, 64)
+	entries := []foundation.MappingEntry{
+		{Key: []byte("caps"), Value: []byte(caps)},
+		{Key: []byte("netId"), Value: []byte("2")},
+	}
+	optionLen, err := foundation.MarshalMappingTo(options, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// unsigned: identity + 8 bytes date + 1 byte addressCount + 1 byte peerCount + options
+	unsigned := append(identity, make([]byte, 10)...)
+	unsigned = append(unsigned, options[:optionLen]...)
+	wire := append(unsigned, ed25519.Sign(private, unsigned)...)
+
+	info, err := foundation.NetworkDatabaseParseRouterInfo(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info, wire
+}
+
+func createTestRouterInfoWithEndpoint(t *testing.T, seed []byte, caps, host, port, family string, published uint64) (foundation.NetworkDatabaseRouterInfo, []byte) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(bytes.NewReader(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	identity := make([]byte, foundation.IdentityBaseLength+7)
+	copy(identity[352:384], public)
+	identity[384] = byte(foundation.CertificateKey)
+	identity[385], identity[386] = 0, 4
+	identity[387], identity[388] = 0, byte(foundation.SigningEdDSASHA512Ed25519)
+	identity[389], identity[390] = 0, byte(foundation.CryptoElGamal)
+
+	addrOptions := make([]byte, 128)
+	addrLen, err := foundation.MarshalMappingTo(addrOptions, []foundation.MappingEntry{
+		{Key: []byte("host"), Value: []byte(host)},
+		{Key: []byte("port"), Value: []byte(port)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	style := []byte("NTCP2")
+	address := make([]byte, 0, 10+len(style)+addrLen)
+	address = append(address, 4)
+	address = append(address, make([]byte, 8)...)
+	address = append(address, byte(len(style)))
+	address = append(address, style...)
+	address = append(address, addrOptions[:addrLen]...)
+
+	entries := []foundation.MappingEntry{
+		{Key: []byte("caps"), Value: []byte(caps)},
+	}
+	if family != "" {
+		entries = append(entries, foundation.MappingEntry{Key: []byte("family"), Value: []byte(family)})
+	}
+	entries = append(entries, foundation.MappingEntry{Key: []byte("netId"), Value: []byte("2")})
+	options := make([]byte, 128)
+	optionLen, err := foundation.MarshalMappingTo(options, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unsigned := append(identity, make([]byte, 8)...)
+	binary.BigEndian.PutUint64(unsigned[len(identity):], published)
+	unsigned = append(unsigned, 1)
+	unsigned = append(unsigned, address...)
+	unsigned = append(unsigned, 0)
+	unsigned = append(unsigned, options[:optionLen]...)
+	wire := append(unsigned, ed25519.Sign(private, unsigned)...)
+
+	info, err := foundation.NetworkDatabaseParseRouterInfo(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info, wire
+}
+
+func TestPeerStoreAndScoring(t *testing.T) {
+	store := NewPeerStore()
+	info, raw := createTestRouterInfo(t, "f")
+
+	rec, isNew := store.AddOrUpdate(info, raw)
+	if !isNew {
+		t.Fatal("expected isNew = true")
+	}
+	if !rec.IsFloodfill {
+		t.Fatal("expected IsFloodfill = true")
+	}
+
+	// Probe success with 50ms
+	store.RecordProbeResult(info.Hash(), true, 50*time.Millisecond)
+	snapshot := store.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("snapshot length = %d, want 1", len(snapshot))
+	}
+	if !snapshot[0].Stats.IsReachable {
+		t.Fatal("expected peer to be reachable")
+	}
+	if snapshot[0].Stats.EWMARTT != 50*time.Millisecond {
+		t.Fatalf("EWMARTT = %v, want 50ms", snapshot[0].Stats.EWMARTT)
+	}
+	if snapshot[0].Score <= 0 {
+		t.Fatalf("expected positive score, got %v", snapshot[0].Score)
+	}
+
+	// Test file persistence
+	tmpFile := filepath.Join(t.TempDir(), "peers.json")
+	if err := store.SaveToFile(tmpFile); err != nil {
+		t.Fatalf("SaveToFile: %v", err)
+	}
+
+	store2 := NewPeerStore()
+	if err := store2.LoadFromFile(tmpFile); err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	if store2.Len() != 1 {
+		t.Fatalf("loaded store length = %d, want 1", store2.Len())
+	}
+}
+
+func TestProductionScoringRules(t *testing.T) {
+	now := time.Now()
+
+	// 1. Test Laplace smoothing: 1/1 probe vs 99/100 probes
+	singleProbe := &PeerRecord{
+		PublishedAt: now,
+		Stats: PeerStats{
+			TotalProbes:   1,
+			SuccessProbes: 1,
+		},
+	}
+	establishedProbe := &PeerRecord{
+		PublishedAt: now,
+		Stats: PeerStats{
+			TotalProbes:   100,
+			SuccessProbes: 99,
+		},
+	}
+	scoreSingle := calculateScore(singleProbe)
+	scoreEstablished := calculateScore(establishedProbe)
+	if scoreSingle >= scoreEstablished {
+		t.Fatalf("expected established reliable peer (score %v) to beat single-probe newcomer (score %v)",
+			scoreEstablished, scoreSingle)
+	}
+
+	// 2. Test Non-linear RTT decay beyond 300ms
+	peer350ms := &PeerRecord{
+		PublishedAt: now,
+		Stats: PeerStats{
+			IsReachable: true,
+			EWMARTT:     350 * time.Millisecond,
+		},
+	}
+	peer1500ms := &PeerRecord{
+		PublishedAt: now,
+		Stats: PeerStats{
+			IsReachable: true,
+			EWMARTT:     1500 * time.Millisecond,
+		},
+	}
+	score350 := calculateScore(peer350ms)
+	score1500 := calculateScore(peer1500ms)
+	if score350 <= score1500 {
+		t.Fatalf("expected 350ms peer (score %v) to have higher score than 1500ms peer (score %v)",
+			score350, score1500)
+	}
+
+	// 3. Test RouterInfo Recency bonus
+	freshPeer := &PeerRecord{
+		PublishedAt: now.Add(-1 * time.Hour),
+	}
+	stalePeer := &PeerRecord{
+		PublishedAt: now.Add(-22 * time.Hour),
+	}
+	if calculateScore(freshPeer) <= calculateScore(stalePeer) {
+		t.Fatalf("expected fresh peer to score higher than stale peer")
+	}
+
+	// 4. Test Dual-stack IPv4 + IPv6 bonus
+	v4Peer := &PeerRecord{
+		PublishedAt: now,
+		IPv4:        []netip.Addr{netip.MustParseAddr("1.2.3.4")},
+	}
+	dualPeer := &PeerRecord{
+		PublishedAt: now,
+		IPv4:        []netip.Addr{netip.MustParseAddr("1.2.3.4")},
+		IPv6:        []netip.Addr{netip.MustParseAddr("2001:db8::1")},
+	}
+	if calculateScore(dualPeer)-calculateScore(v4Peer) < 4.9 {
+		t.Fatalf("expected dual-stack peer to receive +5 bonus")
+	}
+}
+
+func TestProberWithRateLimiter(t *testing.T) {
+	store := NewPeerStore()
+	info, raw := createTestRouterInfo(t, "LR")
+	rec, _ := store.AddOrUpdate(info, raw)
+	rec.IPv4 = []netip.Addr{netip.MustParseAddr("198.51.100.1")}
+	rec.Ports = []uint16{8080}
+
+	prober := NewProber(store, 4)
+	mockDialerCalled := false
+	prober.SetDialer(func(ctx context.Context, network, address string) (time.Duration, error) {
+		mockDialerCalled = true
+		return 35 * time.Millisecond, nil
+	})
+
+	success := prober.ProbeAll(context.Background())
+	if success != 1 {
+		t.Fatalf("successful probes = %d, want 1", success)
+	}
+	if !mockDialerCalled {
+		t.Fatal("expected mock dialer to be called")
+	}
+
+	snap := store.Snapshot()
+	if !snap[0].Stats.IsReachable {
+		t.Fatal("expected peer to be marked reachable")
+	}
+	if snap[0].Stats.EWMARTT != 35*time.Millisecond {
+		t.Fatalf("EWMARTT = %v, want 35ms", snap[0].Stats.EWMARTT)
+	}
+}
+
+// qualifiedPeer builds a PeerRecord that passes the strict qualification gate:
+// both v2 transports, reachable, and a 48h observation uptime.
+func qualifiedPeer(hash foundation.Hash, ip string, flood bool) PeerRecord {
+	return PeerRecord{
+		Hash:        hash,
+		Raw:         []byte("raw"),
+		IsFloodfill: flood,
+		IPv4:        []netip.Addr{netip.MustParseAddr(ip)},
+		HasNTCP2:    true,
+		HasSSU2:     true,
+		Stats: PeerStats{
+			IsReachable: true,
+			FirstSeen:   time.Now().Add(-48 * time.Hour),
+			EWMARTT:     50 * time.Millisecond,
+		},
+	}
+}
+
+func TestSelectorFloodfillPriority(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 20; i++ {
+		var hash foundation.Hash
+		hash[0] = byte(i % 5)
+		hash[1] = byte(i)
+		isFlood := i%3 == 0 // 1/3 are floodfills
+		p := qualifiedPeer(hash, fmt.Sprintf("192.%d.1.1", i+1), isFlood)
+		p.Stats.EWMARTT = time.Duration(10+i) * time.Millisecond
+		p.Score = float64(100 - i)
+		peers = append(peers, p)
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 6
+	cfg.PreferFloodfillRatio = 0.5 // request 50% floodfills
+	selected := SelectDiversePeers(peers, cfg)
+
+	if len(selected) != 6 {
+		t.Fatalf("selected = %d, want 6", len(selected))
+	}
+
+	floodCount := 0
+	for _, p := range selected {
+		if p.IsFloodfill {
+			floodCount++
+		}
+	}
+	if floodCount < 3 {
+		t.Fatalf("floodfill count = %d, want >= 3 (50%% quota filled first)", floodCount)
+	}
+}
+
+func TestSelectorFPSUniformCoverage(t *testing.T) {
+	// 30 clustered peers in first-byte bucket 0 plus one peer each in
+	// buckets 1..20. Farthest-point sampling must spread selection across
+	// the sparse regions instead of stacking the dense cluster.
+	var peers []PeerRecord
+	for i := 0; i < 30; i++ {
+		var h foundation.Hash
+		h[0] = 0
+		h[1] = byte(i)
+		peers = append(peers, qualifiedPeer(h, fmt.Sprintf("10.%d.1.1", i+1), false))
+	}
+	for i := 1; i <= 20; i++ {
+		var h foundation.Hash
+		h[0] = byte(i)
+		h[1] = byte(i * 7)
+		peers = append(peers, qualifiedPeer(h, fmt.Sprintf("20.%d.1.1", i), false))
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 20
+	selected := SelectDiversePeers(peers, cfg)
+
+	if len(selected) != 20 {
+		t.Fatalf("selected = %d, want 20", len(selected))
+	}
+	sparse := 0
+	for _, p := range selected {
+		if p.Hash[0] != 0 {
+			sparse++
+		}
+	}
+	if sparse < 10 {
+		t.Fatalf("sparse-region picks = %d, want >= 10 of 20", sparse)
+	}
+}
+
+func TestSelectorRequireReachable(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 100; i++ {
+		var h [32]byte
+		h[0] = byte(i % 50)
+		h[1] = byte(i)
+		peers = append(peers, qualifiedPeer(h, fmt.Sprintf("%d.%d.1.1", 10+i, i), false))
+	}
+	for i := 100; i < 200; i++ {
+		var h [32]byte
+		h[0] = byte(i % 50)
+		h[1] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("%d.%d.1.1", 10+i, i), false)
+		p.Stats.IsReachable = false // Unreachable
+		peers = append(peers, p)
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 1024
+	selected := SelectDiversePeers(peers, cfg)
+
+	if len(selected) > 100 {
+		t.Fatalf("selected = %d, want <= 100", len(selected))
+	}
+	for _, p := range selected {
+		if !p.Stats.IsReachable {
+			t.Fatal("selected unreachable peer")
+		}
+	}
+}
+
+func TestSelectorIPv4Subnet16Filter(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 5; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("198.51.%d.%d", i+1, i+10), false) // Same /16: 198.51.0.0/16
+		p.Score = float64(100 - i)
+		peers = append(peers, p)
+	}
+
+	// Add an outsider peer on another /16
+	var hOther [32]byte
+	hOther[0] = 5
+	p := qualifiedPeer(hOther, "203.0.113.1", false)
+	p.Score = 50
+	peers = append(peers, p)
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 2
+	cfg.MaxPerSubnet = 1
+	selected := SelectDiversePeers(peers, cfg)
+
+	if len(selected) != 2 {
+		t.Fatalf("selected = %d, want 2", len(selected))
+	}
+
+	seen198 := 0
+	for _, p := range selected {
+		if IPv4Subnet16(p.IPv4[0]) == [2]byte{198, 51} {
+			seen198++
+		}
+	}
+	if seen198 != 1 {
+		t.Fatalf("seen /16 subnet count = %d, want 1", seen198)
+	}
+}
+
+func TestSelectorIPv6Subnet48Filter(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 5; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("198.51.%d.%d", i+1, i+10), false)
+		p.IPv6 = []netip.Addr{netip.MustParseAddr(fmt.Sprintf("2001:db8:1000::%x", i+1))} // same /48
+		peers = append(peers, p)
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 10
+	cfg.ExcludeIPv6Only = false
+	cfg.MaxPerSubnet = 1
+	selected := SelectDiversePeers(peers, cfg)
+
+	// Distinct IPv4 /16s let all five through the v4 key, but the shared
+	// IPv6 /48 must collapse them to a single claimant.
+	if len(selected) != 1 {
+		t.Fatalf("selected = %d, want 1 (shared IPv6 /48 gate)", len(selected))
+	}
+}
+
+func TestSelectorWindowedSuccessGate(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 10; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("10.%d.1.1", i+1), false)
+		// Windowed success 50%: fails the strict success-rate gate.
+		p.Stats.WinStart = time.Now()
+		p.Stats.WinProbes = 10
+		p.Stats.WinSuccess = 5
+		p.Stats.TotalProbes = 10
+		p.Stats.SuccessProbes = 5
+		peers = append(peers, p)
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 5
+	_, stats := SelectDiversePeersWithStats(peers, cfg)
+	if stats.GateLevel == gateStrict {
+		t.Fatal("50%% windowed success should not pass the strict gate")
+	}
+	// At gateReachable the windowed/cumulative rate is ignored.
+	if len(SelectDiversePeers(peers, cfg)) != 5 {
+		t.Fatal("reachable-level gate should still admit the peers")
+	}
+}
+
+func TestSelectorGateLadderRelaxation(t *testing.T) {
+	// No probes at all and fresh FirstSeen: strict and uptime gates fail,
+	// cumulative-rate passes since there is no failure history.
+	var peers []PeerRecord
+	for i := 0; i < 10; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("10.%d.1.1", i+1), false)
+		p.Stats.FirstSeen = time.Now().Add(-time.Hour) // < 24h uptime
+		peers = append(peers, p)
+	}
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 5
+	_, stats := SelectDiversePeersWithStats(peers, cfg)
+	if stats.GateLevel != gateNoUptime && stats.GateLevel != gateCumulativeRate && stats.GateLevel != gateReachable {
+		t.Fatalf("GateLevel = %v, want a relaxed level", stats.GateLevel)
+	}
+	if len(SelectDiversePeers(peers, cfg)) != 5 {
+		t.Fatal("relaxed ladder should admit fresh reachable peers")
+	}
+}
+
+func TestSelectorFPSAnchorIsFloodfill(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 20; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		h[1] = byte(i * 3)
+		p := qualifiedPeer(h, fmt.Sprintf("30.%d.1.1", i+1), i == 7)
+		p.Stats.EWMARTT = time.Duration(10+i) * time.Millisecond
+		p.Score = float64(100 - i)
+		peers = append(peers, p)
+	}
+	// Give the single floodfill the best quality score via long uptime.
+	peers[7].Stats.FirstSeen = time.Now().Add(-900 * time.Hour)
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 10
+	selected := SelectDiversePeers(peers, cfg)
+	if len(selected) == 0 {
+		t.Fatal("no peers selected")
+	}
+	found := false
+	for _, p := range selected {
+		if p.IsFloodfill {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("floodfill peer must be selected when prioritized")
+	}
+}
+
+func TestSelectorRejectsStaleRouterInfos(t *testing.T) {
+	var peers []PeerRecord
+	for i := 0; i < 5; i++ {
+		var h [32]byte
+		h[0] = byte(i)
+		p := qualifiedPeer(h, fmt.Sprintf("10.%d.1.1", i+1), false)
+		p.PublishedAt = time.Now()
+		if i == 0 {
+			p.PublishedAt = time.Now().Add(-25 * time.Hour) // stale: > 24h
+		}
+		if i == 1 {
+			p.PublishedAt = time.Now().Add(10 * time.Minute) // future: > 2m skew
+		}
+		peers = append(peers, p)
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 5
+	selected := SelectDiversePeers(peers, cfg)
+	if len(selected) != 3 {
+		t.Fatalf("selected = %d, want 3 (stale and far-future RouterInfos rejected)", len(selected))
+	}
+	for _, p := range selected {
+		if age := time.Since(p.PublishedAt); age > 24*time.Hour || age < -2*time.Minute {
+			t.Fatalf("stale/future RouterInfo admitted: published %v ago", age)
+		}
+	}
+}
+
+func TestLeadingZerosXOR(t *testing.T) {
+	var a, b foundation.Hash
+	if lz := leadingZerosXOR(a, b); lz != 256 {
+		t.Fatalf("lz equal = %d, want 256", lz)
+	}
+	b[0] = 0x80
+	if lz := leadingZerosXOR(a, b); lz != 0 {
+		t.Fatalf("lz = %d, want 0", lz)
+	}
+	b[0] = 0x01
+	if lz := leadingZerosXOR(a, b); lz != 7 {
+		t.Fatalf("lz = %d, want 7", lz)
+	}
+	b[0] = 0
+	b[1] = 0x40
+	if lz := leadingZerosXOR(a, b); lz != 9 {
+		t.Fatalf("lz = %d, want 9", lz)
+	}
+}
+
+func TestActiveCrawlerHarvestRefs(t *testing.T) {
+	store := NewPeerStore()
+	crawler := NewActiveCrawler(store)
+
+	info1, _ := createTestRouterInfo(t, "f")
+	info2, _ := createTestRouterInfo(t, "LR")
+
+	refs := []controlplane.NetworkDatabaseRouterRef{
+		{Hash: info1.Hash(), Info: info1, Floodfill: true},
+		{Hash: info2.Hash(), Info: info2, Floodfill: false},
+	}
+
+	admitted := crawler.HarvestRefs(refs)
+	if admitted != 2 {
+		t.Fatalf("admitted = %d, want 2", admitted)
+	}
+	if store.Len() != 2 {
+		t.Fatalf("store.Len = %d, want 2", store.Len())
+	}
+}
+
+func TestPackagerSU3AndVerify(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, raw := createTestRouterInfo(t, "f")
+	peers := []PeerRecord{
+		{
+			Hash: info.Hash(),
+			Raw:  raw,
+		},
+	}
+
+	signerID := "test-signer@ivnp.network"
+	su3Bytes, err := BuildSU3(peers, signerID, rsaKey, time.Now())
+	if err != nil {
+		t.Fatalf("BuildSU3: %v", err)
+	}
+
+	signers := map[string]controlplane.ReseedSU3Signer{
+		signerID: {
+			SigningType: foundation.SigningRSASHA512_4096,
+			PublicKey:   rsaKey.N.FillBytes(make([]byte, 512)),
+		},
+	}
+
+	extracted, err := controlplane.ReseedVerifySU3(su3Bytes, signers, int64(len(su3Bytes)))
+	if err != nil {
+		t.Fatalf("controlplane.ReseedVerifySU3 failed: %v", err)
+	}
+	if len(extracted) == 0 {
+		t.Fatal("extracted empty ZIP payload from SU3")
+	}
+}
+
+func TestTreeExplorationTargets(t *testing.T) {
+	target0 := generatePrefixTarget(0x42, 0x00)
+	if target0[0] != 0x42 {
+		t.Fatalf("target0[0] = 0x%02x, want 0x42", target0[0])
+	}
+	if target0[1]&0x80 != 0 {
+		t.Fatalf("target0[1] bit 7 = 1, want 0 for subBranch 0x00")
+	}
+
+	target1 := generatePrefixTarget(0x42, 0x80)
+	if target1[0] != 0x42 {
+		t.Fatalf("target1[0] = 0x%02x, want 0x42", target1[0])
+	}
+	if target1[1]&0x80 == 0 {
+		t.Fatalf("target1[1] bit 7 = 0, want 1 for subBranch 0x80")
+	}
+
+	store := NewPeerStore()
+	info1, raw1 := createTestRouterInfo(t, "f")
+	store.AddOrUpdate(info1, raw1)
+
+	dist := store.BucketDistribution()
+	if dist[info1.Hash()[0]] != 1 {
+		t.Fatalf("dist[%d] = %d, want 1", info1.Hash()[0], dist[info1.Hash()[0]])
+	}
+	if store.ReachableCount() != 1 {
+		t.Fatalf("ReachableCount = %d, want 1", store.ReachableCount())
+	}
+
+	crawler := NewActiveCrawler(store)
+	dispatched, err := crawler.TreeExplore(context.Background(), nil, 16)
+	if err != nil {
+		t.Fatalf("TreeExplore with nil subsystem error: %v", err)
+	}
+	if dispatched != 0 {
+		t.Fatalf("TreeExplore with nil subsystem dispatched = %d, want 0", dispatched)
+	}
+}
+
+func TestReseedServer(t *testing.T) {
+	store := NewPeerStore()
+	info, raw := createTestRouterInfo(t, "f")
+	store.AddOrUpdate(info, raw)
+
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nMIIB...mock-cert\n-----END CERTIFICATE-----\n")
+	pubKeyPEM := []byte("-----BEGIN PUBLIC KEY-----\nMIIB...mock-pubkey\n-----END PUBLIC KEY-----\n")
+	signerID := "test-signer@ivnp.network"
+
+	server := NewReseedServer(ServerConfig{
+		NetworkID:     2,
+		ListenAddress: ":8443",
+		CacheDuration: time.Minute,
+		SignerID:      signerID,
+	}, store)
+
+	// Certificate endpoints report unavailable until signing material is set.
+	req := httptest.NewRequest(http.MethodGet, "/reseed-rsa.crt", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /reseed-rsa.crt before SetSigningMaterial code = %d, want 404", rec.Code)
+	}
+	server.SetSigningMaterial(certPEM, pubKeyPEM)
+
+	server.UpdatePackage(ReseedPackage{
+		GeneratedAt: time.Now(),
+		PeerCount:   1,
+		SU3Data:     []byte("mock-su3-archive"),
+		ETag:        `"mock-etag"`,
+	})
+
+	req = httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/health code = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/i2pseeds.su3?netid=2", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/i2pseeds.su3 code = %d, want 200", rec.Code)
+	}
+
+	// Test certificate endpoints
+	req = httptest.NewRequest(http.MethodGet, "/reseed-rsa.crt", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /reseed-rsa.crt code = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-x509-ca-cert" {
+		t.Fatalf("GET /reseed-rsa.crt Content-Type = %q, want 'application/x-x509-ca-cert'", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "test-signer_at_ivnp.network.crt") {
+		t.Fatalf("GET /reseed-rsa.crt Content-Disposition = %q, want filename containing test-signer_at_ivnp.network.crt", cd)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), certPEM) {
+		t.Fatal("GET /reseed-rsa.crt body does not match expected certPEM")
+	}
+
+	// Test certificate alias /reseed.crt
+	req = httptest.NewRequest(http.MethodGet, "/reseed.crt", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /reseed.crt code = %d, want 200", rec.Code)
+	}
+
+	// Test public key endpoint /reseed-rsa.pub.pem
+	req = httptest.NewRequest(http.MethodGet, "/reseed-rsa.pub.pem", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /reseed-rsa.pub.pem code = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Fatalf("GET /reseed-rsa.pub.pem Content-Type = %q, want text/plain", ct)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), pubKeyPEM) {
+		t.Fatal("GET /reseed-rsa.pub.pem body does not match expected pubKeyPEM")
+	}
+
+	// Test public key alias /reseed.pub
+	req = httptest.NewRequest(http.MethodGet, "/reseed.pub", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /reseed.pub code = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/stats code = %d, want 200", rec.Code)
+	}
+
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Fatalf("GET /stats Cache-Control = %q, want no-store", cc)
+	}
+
+	var stats DetailedStatsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("failed to decode /stats JSON: %v", err)
+	}
+	if stats.NetworkID != 2 {
+		t.Fatalf("stats.NetworkID = %d, want 2", stats.NetworkID)
+	}
+	if stats.SignerID != signerID {
+		t.Fatalf("stats.SignerID = %q, want %q", stats.SignerID, signerID)
+	}
+	if stats.CertificatePEM != string(certPEM) {
+		t.Fatalf("stats.CertificatePEM mismatch")
+	}
+	if stats.PublicKeyPEM != string(pubKeyPEM) {
+		t.Fatalf("stats.PublicKeyPEM mismatch")
+	}
+	if stats.KBuckets.TotalBuckets != 256 {
+		t.Fatalf("stats.KBuckets.TotalBuckets = %d, want 256", stats.KBuckets.TotalBuckets)
+	}
+	if stats.KBuckets.CoveredBuckets < 1 {
+		t.Fatalf("stats.KBuckets.CoveredBuckets = %d, want >= 1", stats.KBuckets.CoveredBuckets)
+	}
+	if stats.Package.PeerCount != 1 {
+		t.Fatalf("stats.Package.PeerCount = %d, want 1", stats.Package.PeerCount)
+	}
+	if stats.Package.SU3SizeBytes != len("mock-su3-archive") {
+		t.Fatalf("stats.Package.SU3SizeBytes = %d, want %d", stats.Package.SU3SizeBytes, len("mock-su3-archive"))
+	}
+
+	// Test Web Dashboard root endpoint
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / code = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Fatalf("GET / Content-Type = %q, want 'text/html; charset=utf-8'", ct)
+	}
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+		t.Fatalf("GET / Cache-Control = %q, want no-store", cc)
+	}
+
+	// Test 404 for unknown path
+	req = httptest.NewRequest(http.MethodGet, "/unknown/path", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /unknown/path code = %d, want 404", rec.Code)
+	}
+}
+
+func TestHealthCheckFlag(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-healthcheck", ts.URL}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected healthcheck code 0, got %d", code)
+	}
+
+	codeFail := run([]string{"-healthcheck", "http://127.0.0.1:0/unreachable"}, &stdout, &stderr)
+	if codeFail != 1 {
+		t.Fatalf("expected healthcheck failure code 1, got %d", codeFail)
+	}
+}
+
+func TestStratifyByBucketDiversityForJavaI2P(t *testing.T) {
+	// Create 1024 peers across diverse buckets
+	var peers []PeerRecord
+	for i := 0; i < 1024; i++ {
+		var hash [32]byte
+		// Distribute across 256 buckets
+		hash[0] = byte(i % 256)
+		hash[1] = byte(i / 256)
+		isFlood := (i / 256) == 0
+		peers = append(peers, PeerRecord{
+			Hash:        hash,
+			IsFloodfill: isFlood,
+			Score:       100.0 - float64(i%10),
+			Stats: PeerStats{
+				IsReachable: true,
+			},
+		})
+	}
+
+	stratified := StratifyByBucketDiversity(peers)
+	if len(stratified) != len(peers) {
+		t.Fatalf("stratified len = %d, want %d", len(stratified), len(peers))
+	}
+
+	// Verify the first 256 entries each come from a distinct bucket
+	seenBuckets := make(map[byte]bool)
+	for i := 0; i < 256; i++ {
+		b := stratified[i].Hash[0]
+		if seenBuckets[b] {
+			t.Fatalf("duplicate bucket %d at index %d in first 256 entries", b, i)
+		}
+		seenBuckets[b] = true
+	}
+
+	// Verify that the first 200 entries (which Java I2P parses) are 200 distinct buckets
+	if len(seenBuckets) < 256 {
+		t.Fatalf("expected 256 distinct buckets in first 256 entries, got %d", len(seenBuckets))
+	}
+
+	// Verify floodfills are prioritized in front slots where available
+	for i := 0; i < 256; i++ {
+		if !stratified[i].IsFloodfill {
+			t.Fatalf("expected floodfill at front index %d", i)
+		}
+	}
+}
+
+func TestTargetPeersDefault1024(t *testing.T) {
+	cfg := DefaultSelectorConfig()
+	if cfg.TargetCount != 1024 {
+		t.Fatalf("DefaultSelectorConfig.TargetCount = %d, want 1024", cfg.TargetCount)
+	}
+}
+
+func TestInitReseedMaterial(t *testing.T) {
+	tempDir := t.TempDir()
+	certPath := filepath.Join(tempDir, "reseed-rsa.crt")
+	pubKeyPath := filepath.Join(tempDir, "reseed-rsa.pub.pem")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	key, err := initSigningKey("", logger)
+	if err != nil {
+		t.Fatalf("initSigningKey failed: %v", err)
+	}
+
+	signerID := "test-signer@ivnp.network"
+	certPEM, pubPEM, err := initReseedMaterial(certPath, pubKeyPath, signerID, key, logger)
+	if err != nil {
+		t.Fatalf("initReseedMaterial failed: %v", err)
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatal("expected valid CERTIFICATE PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	if cert.Subject.CommonName != signerID {
+		t.Fatalf("cert CommonName = %q, want %q", cert.Subject.CommonName, signerID)
+	}
+	rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || rsaPub.N.BitLen() != 4096 {
+		t.Fatal("expected 4096-bit RSA public key in certificate")
+	}
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		t.Fatal("expected KeyUsageDigitalSignature in certificate")
+	}
+
+	pubBlock, _ := pem.Decode(pubPEM)
+	if pubBlock == nil || pubBlock.Type != "PUBLIC KEY" {
+		t.Fatal("expected valid PUBLIC KEY PEM block")
+	}
+
+	// The public artifacts are persisted for operators; they wrap the same key.
+	for _, path := range []string{certPath, pubKeyPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected %s to be persisted: %v", path, err)
+		}
+	}
+	certPEM2, pubPEM2, err := initReseedMaterial(certPath, pubKeyPath, signerID, key, logger)
+	if err != nil {
+		t.Fatalf("second initReseedMaterial failed: %v", err)
+	}
+	if !bytes.Equal(pubPEM, pubPEM2) {
+		t.Fatal("public key artifact must wrap the same signing key")
+	}
+	block2, _ := pem.Decode(certPEM2)
+	cert2, err := x509.ParseCertificate(block2.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate regenerated: %v", err)
+	}
+	if cert2.PublicKey.(*rsa.PublicKey).N.Cmp(key.N) != 0 {
+		t.Fatal("regenerated certificate must wrap the same signing key")
+	}
+}
+
+func TestTunnelBuildAcceptedTrackingAndScoring(t *testing.T) {
+	store := NewPeerStore()
+	info, raw := createTestRouterInfo(t, "LR")
+	rec, _ := store.AddOrUpdate(info, raw)
+
+	baseScore := rec.Score
+	store.RecordTunnelBuildResult(info.Hash(), true)
+
+	snap := store.Snapshot()
+	if !snap[0].Stats.TunnelBuildAccepted {
+		t.Fatal("expected TunnelBuildAccepted = true")
+	}
+	if snap[0].Stats.LastTunnelAccepted.IsZero() {
+		t.Fatal("expected LastTunnelAccepted to be set")
+	}
+	if snap[0].Score-baseScore < 14.9 {
+		t.Fatalf("expected +15 bonus for accepted tunnel, got diff %v", snap[0].Score-baseScore)
+	}
+}
+
+// +checklocksignore
+func TestEvictionDiversityProtection(t *testing.T) {
+	store := NewPeerStore()
+
+	// Fill bucket 0 with 6 peers with very low scores
+	for i := 0; i < 6; i++ {
+		var h [32]byte
+		h[0] = 0
+		h[1] = byte(i)
+		store.peers[h] = &PeerRecord{
+			Hash:  h,
+			Score: float64(10 + i), // low score
+		}
+	}
+
+	// Fill bucket 1 with 1 peer with even lower score
+	var hSparse [32]byte
+	hSparse[0] = 1
+	store.peers[hSparse] = &PeerRecord{
+		Hash:  hSparse,
+		Score: 1.0, // lowest score in entire store!
+	}
+
+	store.evictWorstLocked()
+
+	// The sparse bucket (bucket 1) should be protected despite having the lowest score!
+	if _, found := store.peers[hSparse]; !found {
+		t.Fatal("expected sparse bucket peer to be protected from eviction")
+	}
+
+	// Bucket 0 should have evicted its lowest peer
+	var hLowestBucket0 [32]byte
+	hLowestBucket0[0] = 0
+	hLowestBucket0[1] = 0
+	if _, found := store.peers[hLowestBucket0]; found {
+		t.Fatal("expected lowest peer from crowded bucket 0 to be evicted")
+	}
+}
+
+func TestCalculatePackageStats(t *testing.T) {
+	now := time.Now()
+	v4Addr := netip.MustParseAddr("198.51.100.1")
+	v6Addr := netip.MustParseAddr("2001:db8::1")
+
+	peers := []PeerRecord{
+		{
+			Hash:        foundation.Hash{1},
+			IsFloodfill: true,
+			Family:      "alpha",
+			IPv4:        []netip.Addr{v4Addr},
+			HasNTCP2:    true,
+			Stats: PeerStats{
+				IsReachable:         true,
+				TotalProbes:         10,
+				SuccessProbes:       10,
+				TunnelBuildAccepted: true,
+				EWMARTT:             40 * time.Millisecond,
+			},
+		},
+		{
+			Hash:        foundation.Hash{2},
+			IsFloodfill: false,
+			Family:      "beta",
+			IPv4:        []netip.Addr{v4Addr},
+			IPv6:        []netip.Addr{v6Addr},
+			HasSSU2:     true,
+			Stats: PeerStats{
+				IsReachable:         true,
+				TotalProbes:         10,
+				SuccessProbes:       8,
+				TunnelBuildAccepted: false,
+				EWMARTT:             80 * time.Millisecond,
+			},
+		},
+		{
+			Hash:        foundation.Hash{3},
+			IsFloodfill: false,
+			IPv6:        []netip.Addr{v6Addr},
+			Stats: PeerStats{
+				IsReachable:         false,
+				TotalProbes:         5,
+				SuccessProbes:       0,
+				TunnelBuildAccepted: false,
+			},
+		},
+	}
+
+	sel := SelectionStats{GateLevel: gateStrict, Qualified: 10, DiversePool: 5, CoverageGapLZ: 7}
+	stats := CalculatePackageStats(peers, 4096, `"test-etag"`, now, sel)
+
+	if stats.PeerCount != 3 {
+		t.Fatalf("PeerCount = %d, want 3", stats.PeerCount)
+	}
+	if stats.FloodfillCount != 1 || stats.FloodfillRatio != 1.0/3.0 {
+		t.Fatalf("FloodfillCount = %d, ratio = %f", stats.FloodfillCount, stats.FloodfillRatio)
+	}
+	if stats.IPv4OnlyCount != 1 || stats.DualStackCount != 1 || stats.IPv6OnlyCount != 1 {
+		t.Fatalf("IP stack counts: v4=%d, dual=%d, v6=%d", stats.IPv4OnlyCount, stats.DualStackCount, stats.IPv6OnlyCount)
+	}
+	if stats.DirectlyReachableCount != 2 || stats.DirectlyReachableRatio != 2.0/3.0 {
+		t.Fatalf("DirectlyReachable: count=%d, ratio=%f", stats.DirectlyReachableCount, stats.DirectlyReachableRatio)
+	}
+	if stats.TunnelBuildAcceptedCount != 1 || stats.TunnelBuildAcceptedRatio != 1.0/3.0 {
+		t.Fatalf("TunnelBuildAccepted: count=%d, ratio=%f", stats.TunnelBuildAcceptedCount, stats.TunnelBuildAcceptedRatio)
+	}
+	expectedAvail := (1.0 + 0.8 + 0.0) / 3.0
+	if diff := stats.AverageAvailability - expectedAvail; diff > 0.001 || diff < -0.001 {
+		t.Fatalf("AverageAvailability = %f, want %f", stats.AverageAvailability, expectedAvail)
+	}
+	if stats.RTT.MinMs != 40 || stats.RTT.MaxMs != 80 || stats.RTT.AvgMs != 60 {
+		t.Fatalf("RTT stats: min=%d, max=%d, avg=%d", stats.RTT.MinMs, stats.RTT.MaxMs, stats.RTT.AvgMs)
+	}
+	if stats.GateLevel != "strict" {
+		t.Fatalf("GateLevel = %q, want strict", stats.GateLevel)
+	}
+	if stats.CoverageGapLZ != 7 {
+		t.Fatalf("CoverageGapLZ = %d, want 7", stats.CoverageGapLZ)
+	}
+	var bucketTotal, bucketFFTotal int
+	for i := 0; i < 256; i++ {
+		bucketTotal += stats.BucketDistribution[i]
+		bucketFFTotal += stats.BucketFloodfill[i]
+		if stats.BucketFloodfill[i] > stats.BucketDistribution[i] {
+			t.Fatalf("BucketFloodfill[%d] = %d exceeds BucketDistribution[%d] = %d",
+				i, stats.BucketFloodfill[i], i, stats.BucketDistribution[i])
+		}
+	}
+	if bucketTotal != stats.PeerCount {
+		t.Fatalf("BucketDistribution sum = %d, want %d", bucketTotal, stats.PeerCount)
+	}
+	if bucketFFTotal != stats.FloodfillCount {
+		t.Fatalf("BucketFloodfill sum = %d, want %d", bucketFFTotal, stats.FloodfillCount)
+	}
+	if stats.BucketDistribution[1] != 1 || stats.BucketDistribution[2] != 1 || stats.BucketDistribution[3] != 1 {
+		t.Fatalf("BucketDistribution[1..3] = %d,%d,%d, want 1,1,1",
+			stats.BucketDistribution[1], stats.BucketDistribution[2], stats.BucketDistribution[3])
+	}
+	if stats.BucketFloodfill[1] != 1 {
+		t.Fatalf("BucketFloodfill[1] = %d, want 1", stats.BucketFloodfill[1])
+	}
+	if stats.UniqueIPv4Subnets16 != 1 {
+		t.Fatalf("UniqueIPv4Subnets16 = %d, want 1", stats.UniqueIPv4Subnets16)
+	}
+	if stats.UniqueIPv6Subnets48 != 1 {
+		t.Fatalf("UniqueIPv6Subnets48 = %d, want 1", stats.UniqueIPv6Subnets48)
+	}
+	if stats.UniqueFamilies != 2 {
+		t.Fatalf("UniqueFamilies = %d, want 2", stats.UniqueFamilies)
+	}
+	if stats.V2TransportCount != 2 {
+		t.Fatalf("V2TransportCount = %d, want 2", stats.V2TransportCount)
+	}
+
+	stats.EpochStartedAt = now.Truncate(10 * time.Minute)
+	raw, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("marshal PackageStats: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal PackageStats: %v", err)
+	}
+	for _, key := range []string{
+		"bucket_distribution", "bucket_floodfill", "unique_ipv4_subnets_16",
+		"unique_ipv6_subnets_48", "unique_families", "v2_transport_count", "epoch_started_at",
+	} {
+		if _, ok := decoded[key]; !ok {
+			t.Fatalf("PackageStats JSON missing key %q", key)
+		}
+	}
+	if dist, ok := decoded["bucket_distribution"].([]any); !ok || len(dist) != 256 {
+		t.Fatalf("bucket_distribution length = %v, want 256", len(dist))
+	}
+}
+
+func TestRenderDashboardBundleSection(t *testing.T) {
+	now := time.Now()
+	stats := DetailedStatsResponse{
+		Version:   "test",
+		NetworkID: 2,
+		Package: PackageStats{
+			PeerCount:           100,
+			GateLevel:           "strict",
+			QualifiedCount:      400,
+			DiversePoolCount:    250,
+			CoverageGapLZ:       7,
+			V2TransportCount:    90,
+			UniqueIPv4Subnets16: 80,
+			EpochStartedAt:      now.Truncate(10 * time.Minute),
+		},
+	}
+	stats.Package.BucketDistribution[7] = 3
+	stats.Package.BucketFloodfill[7] = 2
+
+	var buf bytes.Buffer
+	if err := RenderDashboard(&buf, stats); err != nil {
+		t.Fatalf("RenderDashboard: %v", err)
+	}
+	html := buf.String()
+	for _, id := range []string{
+		`id="gate-badge"`, `id="epoch-window"`, `id="funnel-qualified"`,
+		`id="funnel-diverse"`, `id="funnel-selected"`, `id="bundle-chips"`,
+		`id="b-gap"`, `id="bundle-heatmap-grid"`, `id="d-gate"`, `id="d-epoch"`,
+	} {
+		if !strings.Contains(html, id) {
+			t.Fatalf("dashboard HTML missing %s", id)
+		}
+	}
+	for _, key := range []string{
+		`"epoch_started_at"`, `"bucket_distribution"`, `"gate_level"`, `"coverage_gap_lz"`,
+	} {
+		if !strings.Contains(html, key) {
+			t.Fatalf("dashboard embedded JSON missing %s", key)
+		}
+	}
+}
+
+func TestSelectorExcludesIPv6Only(t *testing.T) {
+	v4Addr := netip.MustParseAddr("198.51.100.1")
+	v6Addr := netip.MustParseAddr("2001:db8::1")
+
+	v2 := PeerStats{IsReachable: true, FirstSeen: time.Now().Add(-48 * time.Hour)}
+	peers := []PeerRecord{
+		{
+			Hash:     foundation.Hash{1},
+			Raw:      []byte("raw-dual"),
+			IPv4:     []netip.Addr{v4Addr},
+			IPv6:     []netip.Addr{v6Addr},
+			HasNTCP2: true,
+			HasSSU2:  true,
+			Stats:    v2,
+			Score:    100,
+		},
+		{
+			Hash:     foundation.Hash{2},
+			Raw:      []byte("raw-v4only"),
+			IPv4:     []netip.Addr{netip.MustParseAddr("198.52.100.1")},
+			HasNTCP2: true,
+			HasSSU2:  true,
+			Stats:    v2,
+			Score:    90,
+		},
+		{
+			Hash:     foundation.Hash{3},
+			Raw:      []byte("raw-v6only"),
+			IPv6:     []netip.Addr{v6Addr},
+			HasNTCP2: true,
+			HasSSU2:  true,
+			Stats:    v2,
+			Score:    95,
+		},
+	}
+
+	cfg := DefaultSelectorConfig()
+	cfg.TargetCount = 10
+	selected := SelectDiversePeers(peers, cfg)
+
+	if len(selected) != 2 {
+		t.Fatalf("selected = %d, want 2", len(selected))
+	}
+	for _, p := range selected {
+		if len(p.IPv4) == 0 {
+			t.Fatalf("selected peer %x has no IPv4 (IPv6 only), must be excluded", p.Hash)
+		}
+	}
+}
+
+func TestProberRejectsLocalAndFastRTT(t *testing.T) {
+	store := NewPeerStore()
+
+	// 1. Peer with only loopback / link-local addresses
+	info1, raw1 := createTestRouterInfo(t, "LR")
+	rec1, _ := store.AddOrUpdate(info1, raw1)
+	rec1.IPv4 = []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("0.0.0.0")}
+	rec1.Ports = []uint16{8080}
+	rec1.Stats.IsReachable = false
+
+	// 2. Peer with public IP, but dial returns in < 5ms (e.g. 2ms local bridge)
+	info2, raw2 := createTestRouterInfo(t, "LR")
+	rec2, _ := store.AddOrUpdate(info2, raw2)
+	rec2.IPv4 = []netip.Addr{netip.MustParseAddr("198.51.100.1")}
+	rec2.Ports = []uint16{8081}
+	rec2.Stats.IsReachable = false
+
+	// 3. Peer with public IP and normal network latency (30ms)
+	info3, raw3 := createTestRouterInfo(t, "LR")
+	rec3, _ := store.AddOrUpdate(info3, raw3)
+	rec3.IPv4 = []netip.Addr{netip.MustParseAddr("198.51.100.2")}
+	rec3.Ports = []uint16{8082}
+	rec3.Stats.IsReachable = false
+
+	prober := NewProber(store, 4)
+	prober.SetDialer(func(ctx context.Context, network, address string) (time.Duration, error) {
+		if strings.Contains(address, "198.51.100.1") {
+			return 2 * time.Millisecond, nil // too fast, local socket!
+		}
+		if strings.Contains(address, "198.51.100.2") {
+			return 30 * time.Millisecond, nil // normal Internet latency
+		}
+		t.Fatalf("unexpected dial to %s", address)
+		return 0, errMockDialFailed
+	})
+
+	success := prober.ProbeAll(context.Background())
+	if success != 1 {
+		t.Fatalf("successful probes = %d, want 1", success)
+	}
+
+	snap := store.Snapshot()
+	for _, p := range snap {
+		if p.Hash == rec1.Hash && p.Stats.IsReachable {
+			t.Fatal("loopback peer should not be marked reachable")
+		}
+		if p.Hash == rec2.Hash && p.Stats.IsReachable {
+			t.Fatal("local bridge (<5ms) peer should not be marked reachable")
+		}
+		if p.Hash == rec3.Hash && !p.Stats.IsReachable {
+			t.Fatal("normal peer should be marked reachable")
+		}
+	}
+}
+
+func TestPeerStoreLocalHashFilter(t *testing.T) {
+	store := NewPeerStore()
+	info, raw := createTestRouterInfo(t, "LR")
+	localHash := info.Hash()
+
+	rec, isNew := store.AddOrUpdate(info, raw)
+	if !isNew || rec == nil {
+		t.Fatal("initial peer should be added")
+	}
+
+	// Setting local hash removes existing entry
+	store.SetLocalHash(localHash)
+	if store.Len() != 0 {
+		t.Fatalf("store len = %d, want 0 after SetLocalHash", store.Len())
+	}
+
+	// Re-adding local hash is rejected
+	rec2, isNew2 := store.AddOrUpdate(info, raw)
+	if isNew2 || rec2 != nil {
+		t.Fatal("re-adding local hash router info must be rejected")
+	}
+}
+
+// +checklocksignore
+func TestPeerStoreContinuousBatchEviction(t *testing.T) {
+	store := NewPeerStore()
+	store.maxPeers = 100
+
+	// Populate 100 peers in bucket 0
+	for i := 0; i < 100; i++ {
+		var h foundation.Hash
+		h[0] = 0
+		h[1] = byte(i)
+		store.peers[h] = &PeerRecord{
+			Hash:  h,
+			Score: float64(100 + i),
+		}
+	}
+	if store.Len() != 100 {
+		t.Fatalf("store len = %d, want 100", store.Len())
+	}
+
+	// Add a new peer (which should trigger batch eviction)
+	info, raw := createTestRouterInfo(t, "LR")
+	rec, isNew := store.AddOrUpdate(info, raw)
+	if !isNew || rec == nil {
+		t.Fatal("new peer should be admitted after batch eviction")
+	}
+
+	// Store size should have dropped below maxPeers to give breathing room for discoveries
+	if store.Len() >= 100 {
+		t.Fatalf("store len = %d, want < 100 after batch eviction", store.Len())
+	}
+}
+
+// +checklocksignore
+func TestPeerStorePruneStale(t *testing.T) {
+	store := NewPeerStore()
+	now := time.Now()
+
+	// Crowded bucket (bucket 0) with 6 peers: 2 dead, 4 healthy
+	for i := 0; i < 6; i++ {
+		var h foundation.Hash
+		h[0] = 0
+		h[1] = byte(i)
+		fails := 0
+		reachable := true
+		if i < 2 {
+			fails = 5
+			reachable = false
+		}
+		store.peers[h] = &PeerRecord{
+			Hash:  h,
+			Score: float64(50 + i),
+			Stats: PeerStats{
+				ConsecutiveFails: fails,
+				IsReachable:      reachable,
+				LastSeen:         now,
+			},
+		}
+	}
+
+	// Sparse bucket (bucket 1) with 1 dead peer
+	var hSparse foundation.Hash
+	hSparse[0] = 1
+	store.peers[hSparse] = &PeerRecord{
+		Hash:  hSparse,
+		Score: 10,
+		Stats: PeerStats{
+			ConsecutiveFails: 10,
+			IsReachable:      false,
+			LastSeen:         now.Add(-48 * time.Hour),
+		},
+	}
+
+	pruned := store.PruneStale(24 * time.Hour)
+	if pruned != 2 {
+		t.Fatalf("pruned = %d, want 2", pruned)
+	}
+
+	// Sparse bucket peer must be preserved
+	if _, found := store.peers[hSparse]; !found {
+		t.Fatal("sparse bucket peer must be protected even if stale/dead")
+	}
+}
+
+func TestPeerStoreSubnetContention(t *testing.T) {
+	store := NewPeerStore()
+
+	info1, raw1 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{1}, 32), "LR", "198.51.100.1", "1234", "", 1000)
+	rec1, isNew := store.AddOrUpdate(info1, raw1)
+	if !isNew || rec1 == nil {
+		t.Fatal("incumbent peer should be admitted")
+	}
+	store.RecordProbeResult(info1.Hash(), true, 40*time.Millisecond)
+
+	// A weaker peer in the same /16 loses its only contention group.
+	info2, raw2 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{2}, 32), "LR", "198.51.100.2", "1234", "", 1000)
+	if rec2, isNew2 := store.AddOrUpdate(info2, raw2); isNew2 || rec2 != nil {
+		t.Fatal("weaker same-/16 peer should be rejected")
+	}
+	if store.Len() != 1 {
+		t.Fatalf("store len = %d, want 1", store.Len())
+	}
+
+	// A peer on an uncontested /16 tops its own group and is admitted.
+	info3, raw3 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{3}, 32), "LR", "203.0.113.7", "1234", "", 1000)
+	if rec3, isNew3 := store.AddOrUpdate(info3, raw3); !isNew3 || rec3 == nil {
+		t.Fatal("peer on uncontested /16 should be admitted")
+	}
+	if store.Len() != 2 {
+		t.Fatalf("store len = %d, want 2", store.Len())
+	}
+}
+
+func TestPeerStoreSubnetDisplacement(t *testing.T) {
+	store := NewPeerStore()
+
+	info1, raw1 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{1}, 32), "LR", "198.51.100.1", "1234", "", 1000)
+	if _, isNew := store.AddOrUpdate(info1, raw1); !isNew {
+		t.Fatal("incumbent peer should be admitted")
+	}
+	store.RecordProbeResult(info1.Hash(), true, 40*time.Millisecond)
+
+	// A floodfill in the same /16 outranks the incumbent and displaces it.
+	info2, raw2 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{2}, 32), "f", "198.51.100.9", "1234", "", 1000)
+	rec2, isNew2 := store.AddOrUpdate(info2, raw2)
+	if !isNew2 || rec2 == nil {
+		t.Fatal("stronger floodfill peer should be admitted")
+	}
+	if store.Len() != 1 {
+		t.Fatalf("store len = %d, want 1 (incumbent evicted)", store.Len())
+	}
+	if snap := store.Snapshot(); snap[0].Hash != info2.Hash() {
+		t.Fatal("incumbent should be evicted after losing its only contention group")
+	}
+}
+
+func TestPeerStoreSubnetReadmissionAfterIncumbentFails(t *testing.T) {
+	store := NewPeerStore()
+
+	info1, raw1 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{1}, 32), "f", "198.51.100.1", "1234", "", 1000)
+	if _, isNew := store.AddOrUpdate(info1, raw1); !isNew {
+		t.Fatal("incumbent peer should be admitted")
+	}
+	store.RecordProbeResult(info1.Hash(), false, 0)
+	store.RecordProbeResult(info1.Hash(), false, 0)
+
+	// The failed incumbent no longer outranks a fresh same-/16 peer.
+	info2, raw2 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{2}, 32), "LR", "198.51.100.2", "1234", "", 1000)
+	rec2, isNew2 := store.AddOrUpdate(info2, raw2)
+	if !isNew2 || rec2 == nil {
+		t.Fatal("fresh peer should be admitted once the incumbent is failing")
+	}
+	if store.Len() != 1 {
+		t.Fatalf("store len = %d, want 1 (failed incumbent evicted)", store.Len())
+	}
+	if snap := store.Snapshot(); snap[0].Hash != info2.Hash() {
+		t.Fatal("failed incumbent should be evicted")
+	}
+}
+
+func TestPeerStoreFamilyContention(t *testing.T) {
+	store := NewPeerStore()
+
+	info1, raw1 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{1}, 32), "f", "198.51.100.1", "1234", "acme", 1000)
+	if _, isNew := store.AddOrUpdate(info1, raw1); !isNew {
+		t.Fatal("incumbent peer should be admitted")
+	}
+	store.RecordProbeResult(info1.Hash(), true, 40*time.Millisecond)
+
+	// Same family and same /16: loses every contention group.
+	info2, raw2 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{2}, 32), "LR", "198.51.100.2", "1234", "acme", 1000)
+	if rec2, isNew2 := store.AddOrUpdate(info2, raw2); isNew2 || rec2 != nil {
+		t.Fatal("family member losing all contention groups should be rejected")
+	}
+
+	// Same family but sole occupant of another /16: loses the family claim
+	// yet tops its subnet group, so it is retained.
+	info3, raw3 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{3}, 32), "LR", "203.0.113.9", "1234", "acme", 1000)
+	if rec3, isNew3 := store.AddOrUpdate(info3, raw3); !isNew3 || rec3 == nil {
+		t.Fatal("family member topping its own /16 should be admitted")
+	}
+	if store.Len() != 2 {
+		t.Fatalf("store len = %d, want 2", store.Len())
+	}
+}
+
+func TestPeerStoreUpdateEvictsOnLostContention(t *testing.T) {
+	store := NewPeerStore()
+	seed := bytes.Repeat([]byte{7}, 32)
+
+	info1, raw1 := createTestRouterInfoWithEndpoint(t, seed, "LR", "10.9.9.9", "1234", "", 1000)
+	rec1, isNew := store.AddOrUpdate(info1, raw1)
+	if !isNew || rec1 == nil {
+		t.Fatal("initial peer should be admitted")
+	}
+	store.RecordProbeResult(info1.Hash(), true, 40*time.Millisecond)
+
+	info2, raw2 := createTestRouterInfoWithEndpoint(t, bytes.Repeat([]byte{2}, 32), "f", "198.51.100.1", "1234", "", 1000)
+	if _, isNew2 := store.AddOrUpdate(info2, raw2); !isNew2 {
+		t.Fatal("floodfill incumbent should be admitted")
+	}
+	store.RecordProbeResult(info2.Hash(), true, 30*time.Millisecond)
+
+	// Re-publishing moves the first peer into the contested /16: it loses
+	// its only group and is evicted rather than updated.
+	info3, raw3 := createTestRouterInfoWithEndpoint(t, seed, "LR", "198.51.100.9", "1234", "", 2000)
+	if rec3, isNew3 := store.AddOrUpdate(info3, raw3); isNew3 || rec3 != nil {
+		t.Fatal("re-published peer losing all groups should be evicted")
+	}
+	if store.Len() != 1 {
+		t.Fatalf("store len = %d, want 1", store.Len())
+	}
+	if snap := store.Snapshot(); snap[0].Hash != info2.Hash() {
+		t.Fatal("only the group winner should remain")
+	}
+}
+
+// +checklocksignore
+func TestPeerStorePruneRedundant(t *testing.T) {
+	store := NewPeerStore()
+	mkPeer := func(b0, b1 byte, ip string, family string, score float64) foundation.Hash {
+		var h foundation.Hash
+		h[0] = b0
+		h[1] = b1
+		store.peers[h] = &PeerRecord{
+			Hash:   h,
+			Raw:    []byte("raw"),
+			IPv4:   []netip.Addr{netip.MustParseAddr(ip)},
+			Family: family,
+			Stats:  PeerStats{IsReachable: true},
+			Score:  score,
+		}
+		return h
+	}
+
+	top198 := mkPeer(0, 1, "198.51.1.1", "", 90)
+	dup198 := mkPeer(0, 2, "198.51.1.2", "", 10)
+	solo203 := mkPeer(0, 3, "203.0.113.1", "", 5)
+	famA := mkPeer(0, 4, "10.1.0.1", "acme", 80)
+	famB := mkPeer(0, 5, "10.1.0.2", "acme", 70)
+	famC := mkPeer(0, 6, "10.2.0.1", "acme", 60)
+
+	// IPv6-only peer joins no contention group and is never pruned.
+	var v6h foundation.Hash
+	v6h[0] = 9
+	store.peers[v6h] = &PeerRecord{
+		Hash:  v6h,
+		Raw:   []byte("raw"),
+		IPv6:  []netip.Addr{netip.MustParseAddr("2001:db8::1")},
+		Stats: PeerStats{IsReachable: true},
+		Score: 1,
+	}
+
+	if pruned := store.PruneRedundant(); pruned != 2 {
+		t.Fatalf("pruned = %d, want 2", pruned)
+	}
+	for _, h := range []foundation.Hash{dup198, famB} {
+		if _, found := store.peers[h]; found {
+			t.Fatalf("dominated peer %x should be evicted", h[:4])
+		}
+	}
+	for _, h := range []foundation.Hash{top198, solo203, famA, famC, v6h} {
+		if _, found := store.peers[h]; !found {
+			t.Fatalf("peer %x topping a group or groupless should be kept", h[:4])
+		}
+	}
+}
+
+func TestKeygenRSADeterministic(t *testing.T) {
+	secret := func(seed string) []byte {
+		s := make([]byte, 64)
+		if _, err := io.ReadFull(hkdf.New(sha512.New, []byte(seed), []byte("ivnp-reseed"), []byte("reseed-rsa-4096")), s); err != nil {
+			t.Fatalf("hkdf expand: %v", err)
+		}
+		return s
+	}
+	key1, err := keygen.RSA(2048, secret("alpha bravo charlie"))
+	if err != nil {
+		t.Fatalf("keygen.RSA: %v", err)
+	}
+	key2, err := keygen.RSA(2048, secret("alpha bravo charlie"))
+	if err != nil {
+		t.Fatalf("keygen.RSA rerun: %v", err)
+	}
+	key3, err := keygen.RSA(2048, secret("alpha bravo delta"))
+	if err != nil {
+		t.Fatalf("keygen.RSA other seed: %v", err)
+	}
+
+	if key1.N.Cmp(key2.N) != 0 || key1.D.Cmp(key2.D) != 0 {
+		t.Fatal("same secret must derive the same key")
+	}
+	if key1.N.Cmp(key3.N) == 0 {
+		t.Fatal("different secrets must derive different keys")
+	}
+	if err := key1.Validate(); err != nil {
+		t.Fatalf("derived key must validate: %v", err)
+	}
+	if key1.N.BitLen() != 2048 {
+		t.Fatalf("derived key size = %d bits, want 2048", key1.N.BitLen())
+	}
+}
+
+func TestNormalizeSeedPhrase(t *testing.T) {
+	got, err := normalizeSeedPhrase("  alpha   bravo\tcharlie\ndelta  ")
+	if err != nil {
+		t.Fatalf("normalizeSeedPhrase: %v", err)
+	}
+	if got != "alpha bravo charlie delta" {
+		t.Fatalf("normalized phrase = %q", got)
+	}
+	if _, err := normalizeSeedPhrase("  \t \n "); err == nil {
+		t.Fatal("whitespace-only seed phrase must fail")
+	}
+}
+
+func TestSeedPhraseKeyDerivationAndCert(t *testing.T) {
+	tempDir := t.TempDir()
+	keyPath := filepath.Join(tempDir, "reseed-rsa.key")
+	certPath := filepath.Join(tempDir, "reseed-rsa.crt")
+	pubKeyPath := filepath.Join(tempDir, "reseed-rsa.pub.pem")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	phrase := "legal winner thank year wave sausage worth useful legal winner thank yellow"
+	key, err := initSigningKey(phrase, logger)
+	if err != nil {
+		t.Fatalf("initSigningKey with phrase: %v", err)
+	}
+	if key.N.BitLen() != 4096 {
+		t.Fatalf("derived key size = %d bits, want 4096", key.N.BitLen())
+	}
+
+	// The same phrase always reproduces the same key without any key file.
+	reloaded, err := initSigningKey(phrase, logger)
+	if err != nil {
+		t.Fatalf("initSigningKey rerun: %v", err)
+	}
+	if reloaded.N.Cmp(key.N) != 0 || reloaded.D.Cmp(key.D) != 0 {
+		t.Fatal("same phrase must derive the same key")
+	}
+	if _, err := os.Stat(keyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("key file must never be read or written")
+	}
+
+	rotated, err := initSigningKey("other seed phrase entirely", logger)
+	if err != nil {
+		t.Fatalf("initSigningKey rotated: %v", err)
+	}
+	if rotated.N.Cmp(key.N) == 0 {
+		t.Fatal("different phrase must produce a different key")
+	}
+
+	certPEM, _, err := initReseedMaterial(certPath, pubKeyPath, "reseed@test.network", key, logger)
+	if err != nil {
+		t.Fatalf("initReseedMaterial: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok || rsaPub.N.Cmp(key.N) != 0 {
+		t.Fatal("certificate public key must match derived key")
+	}
+}
+
+func TestAtomicStateFileWrites(t *testing.T) {
+	tempDir := t.TempDir()
+	path := filepath.Join(tempDir, "state.json")
+
+	if err := writeFileAtomic(path, []byte(`{"v":1}`), 0600); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("temporary file must not remain after atomic rename")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != `{"v":1}` {
+		t.Fatalf("file content = %q", data)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("file mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	// A stale .tmp left by an interrupted write is removed at startup.
+	stale := filepath.Join(tempDir, "stale.json")
+	if err := os.WriteFile(stale+".tmp", []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	removeStaleTempFile(stale, logger)
+	if _, err := os.Stat(stale + ".tmp"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale temporary file should be removed")
+	}
+	removeStaleTempFile(stale, logger) // no leftover: must not error or log
+}
+
+func TestCalculateProbeCooldown(t *testing.T) {
+	// Newcomer (total probes = 0): immediate probe (cooldown = 0)
+	newcomer := PeerRecord{
+		Stats: PeerStats{TotalProbes: 0},
+	}
+	if cd := CalculateProbeCooldown(newcomer, 100); cd != 0 {
+		t.Fatalf("newcomer cooldown = %v, want 0", cd)
+	}
+
+	// Reachable peer (consecutive fails = 0): standard reachable cooldown
+	reachable := PeerRecord{
+		Stats: PeerStats{TotalProbes: 5, ConsecutiveFails: 0, IsReachable: true},
+	}
+	if cd := CalculateProbeCooldown(reachable, 100); cd != ProbeCooldownReachable {
+		t.Fatalf("reachable cooldown = %v, want %v", cd, ProbeCooldownReachable)
+	}
+
+	// Single fail: base fail cooldown
+	singleFail := PeerRecord{
+		Stats: PeerStats{TotalProbes: 1, ConsecutiveFails: 1},
+	}
+	if cd := CalculateProbeCooldown(singleFail, 500); cd != 60*time.Second {
+		t.Fatalf("expansion 1 fail cooldown = %v, want 60s", cd)
+	}
+	if cd := CalculateProbeCooldown(singleFail, 1500); cd != 3*time.Minute {
+		t.Fatalf("maintenance 1 fail cooldown = %v, want 3m", cd)
+	}
+
+	// Exponential backoff tests
+	tests := []struct {
+		fails          int
+		reachableCount int
+		want           time.Duration
+	}{
+		// Expansion mode (base 60s)
+		{fails: 2, reachableCount: 500, want: 120 * time.Second},
+		{fails: 3, reachableCount: 500, want: 240 * time.Second},
+		{fails: 4, reachableCount: 500, want: 480 * time.Second},
+		{fails: 5, reachableCount: 500, want: 960 * time.Second},
+		{fails: 10, reachableCount: 500, want: ProbeCooldownMaxFailed}, // capped at 30m
+
+		// Maintenance mode (base 3m)
+		{fails: 2, reachableCount: 1200, want: 6 * time.Minute},
+		{fails: 3, reachableCount: 1200, want: 12 * time.Minute},
+		{fails: 4, reachableCount: 1200, want: 24 * time.Minute},
+		{fails: 5, reachableCount: 1200, want: ProbeCooldownMaxFailed}, // 48m capped to 30m
+		{fails: 20, reachableCount: 1200, want: ProbeCooldownMaxFailed},
+	}
+
+	for _, tt := range tests {
+		rec := PeerRecord{
+			Stats: PeerStats{TotalProbes: int64(tt.fails), ConsecutiveFails: tt.fails},
+		}
+		if got := CalculateProbeCooldown(rec, tt.reachableCount); got != tt.want {
+			t.Errorf("CalculateProbeCooldown(fails=%d, reachable=%d) = %v, want %v",
+				tt.fails, tt.reachableCount, got, tt.want)
+		}
+	}
+}
+
+// +checklocksignore
+func TestDynamicExplorationBudget(t *testing.T) {
+	var nilCrawler *ActiveCrawler
+	if b := nilCrawler.DynamicExplorationBudget(24); b != 0 {
+		t.Fatalf("nil crawler budget = %d, want 0", b)
+	}
+
+	store := NewPeerStore()
+	crawler := NewActiveCrawler(store)
+	if b := crawler.DynamicExplorationBudget(0); b != 0 {
+		t.Fatalf("zero maxCap budget = %d, want 0", b)
+	}
+
+	// Empty store: 256 empty buckets -> needed = 256 * 4 = 1024 -> capped at maxCap
+	if b := crawler.DynamicExplorationBudget(24); b != 24 {
+		t.Fatalf("expansion empty store budget = %d, want 24", b)
+	}
+	if b := crawler.DynamicExplorationBudget(8); b != 8 {
+		t.Fatalf("maintenance empty store budget = %d, want 8", b)
+	}
+
+	// Populate all 256 buckets with 4 reachable peers each
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 4; j++ {
+			var h foundation.Hash
+			h[0] = byte(i)
+			h[1] = byte(j)
+			store.peers[h] = &PeerRecord{
+				Hash: h,
+				Stats: PeerStats{
+					IsReachable: true,
+				},
+			}
+		}
+	}
+
+	// Fully saturated store: no deficits -> minimal probe (at most 2)
+	if b := crawler.DynamicExplorationBudget(24); b != 2 {
+		t.Fatalf("saturated store budget = %d, want 2", b)
+	}
+	if b := crawler.DynamicExplorationBudget(8); b != 2 {
+		t.Fatalf("saturated store budget = %d, want 2", b)
+	}
+}
+
+func TestInspectSU3Archive(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info1, raw1 := createTestRouterInfo(t, "f") // floodfill
+	info2, raw2 := createTestRouterInfo(t, "")  // non-floodfill
+	peers := []PeerRecord{
+		{Hash: info1.Hash(), Raw: raw1, IsFloodfill: true},
+		{Hash: info2.Hash(), Raw: raw2, IsFloodfill: false},
+	}
+
+	signerID := "inspect-test@ivnp.network"
+	su3Bytes, err := BuildSU3(peers, signerID, rsaKey, time.Now())
+	if err != nil {
+		t.Fatalf("BuildSU3: %v", err)
+	}
+
+	peerCount, floodCount, err := InspectSU3Archive(su3Bytes)
+	if err != nil {
+		t.Fatalf("InspectSU3Archive failed: %v", err)
+	}
+	if peerCount != 2 {
+		t.Fatalf("peerCount = %d, want 2", peerCount)
+	}
+	if floodCount != 1 {
+		t.Fatalf("floodCount = %d, want 1", floodCount)
+	}
+}
+
+func TestDashboardOmitsNoUptime(t *testing.T) {
+	stats := DetailedStatsResponse{
+		Version:   "test",
+		NetworkID: 2,
+		Package: PackageStats{
+			PeerCount: 10,
+			GateLevel: "standard",
+		},
+	}
+	var buf bytes.Buffer
+	if err := RenderDashboard(&buf, stats); err != nil {
+		t.Fatalf("RenderDashboard: %v", err)
+	}
+	html := buf.String()
+	if strings.Contains(html, "NO-UPTIME") || strings.Contains(html, "no-uptime") {
+		t.Fatal("rendered dashboard contains 'no-uptime' string")
+	}
+}
