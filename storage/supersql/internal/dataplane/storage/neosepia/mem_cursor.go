@@ -3,6 +3,7 @@ package neosepia
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"slices"
@@ -12,6 +13,40 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+func (mb *memPAXBlock) keyAt(row int) []byte {
+	rec := mb.vis[row*paxVersionSize:]
+	keyOff := uint64(binary.LittleEndian.Uint32(rec[24:]))
+	keyLen := uint64(binary.LittleEndian.Uint32(rec[28:]))
+	return mb.vis[keyOff : keyOff+keyLen]
+}
+
+func reverseFirstMemBlock(blocks []*memPAXBlock, key []byte, last int) int {
+	low, high := 0, last+1
+	for low < high {
+		mid := low + (high-low)/2
+		mb := blocks[mid]
+		if mb.rows == 0 || bytes.Compare(mb.keyAt(mb.rows-1), key) < 0 {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	return low
+}
+
+func reverseFirstMemRow(mb *memPAXBlock, key []byte) int {
+	low, high := 0, mb.rows
+	for low < high {
+		mid := low + (high-low)/2
+		if bytes.Compare(mb.keyAt(mid), key) < 0 {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	return low
+}
+
 type memRangeItem struct {
 	start, end []byte
 	timestamp  model.Timestamp
@@ -19,28 +54,34 @@ type memRangeItem struct {
 }
 
 type memCursorState struct {
-	blocks    []*memPAXBlock
-	direction storage.ScanDirection
-	nextBlock int
-	row       int
-	lease     *blockLease
+	blocks     []*memPAXBlock
+	direction  storage.ScanDirection
+	nextBlock  int
+	row        int
+	lease      *blockLease
+	leaseBlock int
 	// Reverse scan state
-	revRanges  []memRangeItem
-	revRangeAt int
-	revGroup   []int // row indices within current reverse key group
-	revGroupAt int
-	revBlock   int
-	revRow     int
-	revPoint   versionRow
-	revHasPt   bool
+	revRanges         []memRangeItem
+	revRangeAt        int
+	revKey            []byte
+	revGroupBlock     int
+	revGroupRow       int
+	revGroupLastBlock int
+	revGroupLastRow   int
+	revGroupActive    bool
+	revBlock          int
+	revRow            int
+	revPoint          versionRow
+	revHasPt          bool
 }
 
 func newMemVersionCursor(blocks []*memPAXBlock, direction storage.ScanDirection, maxBytes uint64, memory *sourceMemory) *runVersionCursor {
 	state := &memCursorState{
-		blocks:    blocks,
-		direction: direction,
-		revBlock:  len(blocks) - 1,
-		revRow:    -1,
+		blocks:     blocks,
+		direction:  direction,
+		leaseBlock: -1,
+		revBlock:   len(blocks) - 1,
+		revRow:     -1,
 	}
 	if direction == storage.ScanReverse {
 		// Collect range tombstones across all memtable blocks, sorted by
@@ -52,12 +93,12 @@ func newMemVersionCursor(blocks []*memPAXBlock, direction storage.ScanDirection,
 				if op != storage.MutationDeleteRange {
 					continue
 				}
-				kOff := uint64(mb.vis[r*paxVersionSize+24]) | uint64(mb.vis[r*paxVersionSize+25])<<8 | uint64(mb.vis[r*paxVersionSize+26])<<16 | uint64(mb.vis[r*paxVersionSize+27])<<24
-				kLen := uint64(mb.vis[r*paxVersionSize+28]) | uint64(mb.vis[r*paxVersionSize+29])<<8 | uint64(mb.vis[r*paxVersionSize+30])<<16 | uint64(mb.vis[r*paxVersionSize+31])<<24
-				eOff := uint64(mb.vis[r*paxVersionSize+32]) | uint64(mb.vis[r*paxVersionSize+33])<<8 | uint64(mb.vis[r*paxVersionSize+34])<<16 | uint64(mb.vis[r*paxVersionSize+35])<<24
-				eLen := uint64(mb.vis[r*paxVersionSize+36]) | uint64(mb.vis[r*paxVersionSize+37])<<8 | uint64(mb.vis[r*paxVersionSize+38])<<16 | uint64(mb.vis[r*paxVersionSize+39])<<24
-				ts := model.Timestamp(int64(uint64(rec[0]) | uint64(rec[1])<<8 | uint64(rec[2])<<16 | uint64(rec[3])<<24 | uint64(rec[4])<<32 | uint64(rec[5])<<40 | uint64(rec[6])<<48 | uint64(rec[7])<<56))
-				ord := uint64(rec[8]) | uint64(rec[9])<<8 | uint64(rec[10])<<16 | uint64(rec[11])<<24 | uint64(rec[12])<<32 | uint64(rec[13])<<40 | uint64(rec[14])<<48 | uint64(rec[15])<<56
+				kOff := uint64(binary.LittleEndian.Uint32(rec[24:]))
+				kLen := uint64(binary.LittleEndian.Uint32(rec[28:]))
+				eOff := uint64(binary.LittleEndian.Uint32(rec[32:]))
+				eLen := uint64(binary.LittleEndian.Uint32(rec[36:]))
+				ts := model.Timestamp(int64(binary.LittleEndian.Uint64(rec[0:])))
+				ord := binary.LittleEndian.Uint64(rec[8:])
 				state.revRanges = append(state.revRanges, memRangeItem{
 					start:     mb.vis[kOff : kOff+kLen],
 					end:       mb.vis[eOff : eOff+eLen],
@@ -92,6 +133,29 @@ func (cursor *runVersionCursor) openMemLease(mb *memPAXBlock) (*blockLease, erro
 	return &blockLease{block: block, references: 1}, nil
 }
 
+func (cursor *runVersionCursor) ensureMemLease(blockIdx int) error {
+	state := cursor.mem
+	if state.lease != nil && state.leaseBlock == blockIdx {
+		return nil
+	}
+	if state.lease != nil {
+		if err := state.lease.release(); err != nil {
+			state.lease = nil
+			state.leaseBlock = -1
+			return err
+		}
+		state.lease = nil
+		state.leaseBlock = -1
+	}
+	lease, err := cursor.openMemLease(state.blocks[blockIdx])
+	if err != nil {
+		return err
+	}
+	state.lease = lease
+	state.leaseBlock = blockIdx
+	return nil
+}
+
 func (cursor *runVersionCursor) nextMem(ctx context.Context) (versionRow, error) {
 	state := cursor.mem
 	if state.direction == storage.ScanReverse {
@@ -105,9 +169,11 @@ func (cursor *runVersionCursor) nextMem(ctx context.Context) (versionRow, error)
 			if state.lease != nil {
 				if err := state.lease.release(); err != nil {
 					state.lease = nil
+					state.leaseBlock = -1
 					return versionRow{}, err
 				}
 				state.lease = nil
+				state.leaseBlock = -1
 			}
 			for state.nextBlock < len(state.blocks) && cursor.snapshotTS > 0 && state.blocks[state.nextBlock].minCommitTS > cursor.snapshotTS {
 				state.nextBlock++
@@ -115,11 +181,9 @@ func (cursor *runVersionCursor) nextMem(ctx context.Context) (versionRow, error)
 			if state.nextBlock >= len(state.blocks) {
 				return versionRow{}, io.EOF
 			}
-			lease, err := cursor.openMemLease(state.blocks[state.nextBlock])
-			if err != nil {
+			if err := cursor.ensureMemLease(state.nextBlock); err != nil {
 				return versionRow{}, err
 			}
-			state.lease = lease
 			state.row = 0
 			state.nextBlock++
 		}
@@ -164,66 +228,98 @@ func (cursor *runVersionCursor) nextMemReversePoint(ctx context.Context) (versio
 		if err := ctx.Err(); err != nil {
 			return versionRow{}, err
 		}
-		// Emit remaining versions of the current reverse key group (newest first).
-		if state.revGroupAt < len(state.revGroup) {
-			rowIdx := state.revGroup[state.revGroupAt]
-			state.revGroupAt++
+		// Stream remaining versions of the current cross-block key group in
+		// forward block/row order (strictly descending commitTS, ordinal).
+		if state.revGroupActive {
+			for state.revGroupBlock <= state.revGroupLastBlock {
+				mb := state.blocks[state.revGroupBlock]
+				endRow := mb.rows - 1
+				if state.revGroupBlock == state.revGroupLastBlock {
+					endRow = state.revGroupLastRow
+				}
+				if mb.rows == 0 || (cursor.snapshotTS > 0 && mb.minCommitTS > cursor.snapshotTS) || state.revGroupRow > endRow {
+					state.revGroupBlock++
+					state.revGroupRow = 0
+					continue
+				}
+				break
+			}
+			if state.revGroupBlock > state.revGroupLastBlock {
+				state.revGroupActive = false
+				continue
+			}
+			if err := cursor.ensureMemLease(state.revGroupBlock); err != nil {
+				return versionRow{}, err
+			}
+			rowIdx := state.revGroupRow
+			state.revGroupRow++
 			key, end, ts, ord, kind, err := state.lease.block.Version(rowIdx)
 			if err != nil {
 				return versionRow{}, err
+			}
+			if !bytes.Equal(key, state.revKey) {
+				return versionRow{}, storage.ErrCorruptStorage
 			}
 			if kind == storage.MutationDeleteRange {
 				continue
 			}
 			return versionRow{lease: state.lease, row: rowIdx, key: key, end: end, timestamp: ts, ordinal: ord, kind: kind}, nil
 		}
-		// Advance to previous block if needed.
-		if state.lease == nil || state.revRow < 0 {
+
+		// Skip empty or snapshot-pruned blocks to find the next key's trailing block.
+		for state.revBlock >= 0 {
+			mb := state.blocks[state.revBlock]
+			if mb.rows == 0 || (cursor.snapshotTS > 0 && mb.minCommitTS > cursor.snapshotTS) {
+				state.revBlock--
+				state.revRow = -1
+				continue
+			}
+			break
+		}
+		if state.revBlock < 0 {
 			if state.lease != nil {
 				if err := state.lease.release(); err != nil {
 					state.lease = nil
+					state.leaseBlock = -1
 					return versionRow{}, err
 				}
 				state.lease = nil
+				state.leaseBlock = -1
 			}
-			for state.revBlock >= 0 && cursor.snapshotTS > 0 && state.blocks[state.revBlock].minCommitTS > cursor.snapshotTS {
-				state.revBlock--
-			}
-			if state.revBlock < 0 {
-				return versionRow{}, io.EOF
-			}
-			lease, err := cursor.openMemLease(state.blocks[state.revBlock])
-			if err != nil {
-				return versionRow{}, err
-			}
-			state.lease = lease
-			state.revRow = lease.block.Rows() - 1
-			state.revBlock--
+			return versionRow{}, io.EOF
 		}
-		// Gather all contiguous rows in this block sharing state.revRow's key,
-		// emitting them in ascending row index order (newest version first!).
-		targetKey, _, _, _, _, err := state.lease.block.Version(state.revRow)
-		if err != nil {
-			return versionRow{}, err
-		}
+
+		lastBlock := state.revBlock
 		endRow := state.revRow
-		startRow := endRow
-		for startRow > 0 {
-			prevKey, _, _, _, _, err := state.lease.block.Version(startRow - 1)
-			if err != nil {
-				return versionRow{}, err
-			}
-			if !bytes.Equal(prevKey, targetKey) {
-				break
-			}
-			startRow--
+		if endRow < 0 {
+			endRow = state.blocks[lastBlock].rows - 1
 		}
-		state.revGroup = state.revGroup[:0]
-		for r := startRow; r <= endRow; r++ {
-			state.revGroup = append(state.revGroup, r)
+		targetKey := state.blocks[lastBlock].keyAt(endRow)
+		state.revKey = append(state.revKey[:0], targetKey...)
+
+		firstBlock := reverseFirstMemBlock(state.blocks, state.revKey, lastBlock)
+		if firstBlock > lastBlock {
+			return versionRow{}, storage.ErrCorruptStorage
 		}
-		state.revGroupAt = 0
-		state.revRow = startRow - 1
+		firstRow := reverseFirstMemRow(state.blocks[firstBlock], state.revKey)
+		if firstRow >= state.blocks[firstBlock].rows || !bytes.Equal(state.blocks[firstBlock].keyAt(firstRow), state.revKey) {
+			return versionRow{}, storage.ErrCorruptStorage
+		}
+
+		// Position predecessor strictly before [firstBlock:firstRow].
+		if firstRow > 0 {
+			state.revBlock = firstBlock
+			state.revRow = firstRow - 1
+		} else {
+			state.revBlock = firstBlock - 1
+			state.revRow = -1
+		}
+
+		state.revGroupBlock = firstBlock
+		state.revGroupRow = firstRow
+		state.revGroupLastBlock = lastBlock
+		state.revGroupLastRow = endRow
+		state.revGroupActive = true
 	}
 }
 
@@ -233,8 +329,19 @@ func (state *memCursorState) close() error {
 		err = errors.Join(err, state.lease.release())
 		state.lease = nil
 	}
+	state.leaseBlock = -1
 	state.blocks = nil
 	state.revRanges = nil
-	state.revGroup = nil
+	state.revRangeAt = 0
+	state.revKey = nil
+	state.revGroupBlock = 0
+	state.revGroupRow = 0
+	state.revGroupLastBlock = 0
+	state.revGroupLastRow = 0
+	state.revGroupActive = false
+	state.revBlock = -1
+	state.revRow = -1
+	state.revPoint = versionRow{}
+	state.revHasPt = false
 	return err
 }

@@ -26,10 +26,25 @@ type groupCommitReq struct {
 
 type stagedGroupCommit struct {
 	req          *groupCommitReq
+	duplicates   []*groupCommitReq
 	position     uint64
 	decision     runDecision
 	result       storage.ApplyResult
 	transactions ordered.Tree[recoveryTxnID, transactionRecord]
+}
+
+func (s *stagedGroupCommit) setError(err error) {
+	s.req.err = err
+	for _, dup := range s.duplicates {
+		dup.err = err
+	}
+}
+
+func (s *stagedGroupCommit) setResult(result storage.ApplyResult) {
+	s.req.result = result
+	for _, dup := range s.duplicates {
+		dup.result = result
+	}
 }
 
 // writeCommitGroup writes and fsyncs one or more WAL segments in commits/ and

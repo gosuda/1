@@ -77,6 +77,9 @@ func cleanupObsoleteRuns(ctx context.Context, root *os.Root, set *runSet) (err e
 }
 
 func obsoleteRunArtifactName(name string) bool {
+	if isPendingRunManifestName(name) {
+		return true
+	}
 	if strings.HasPrefix(name, "base-") && strings.HasSuffix(name, ".runs") {
 		return true
 	}
@@ -90,6 +93,10 @@ func obsoleteRunArtifactName(name string) bool {
 		return decimalPrefix(name[:20])
 	}
 	return false
+}
+
+func isPendingRunManifestName(name string) bool {
+	return len(name) == 34 && name[0] == '.' && strings.HasSuffix(name, ".runs.pending") && decimalPrefix(name[1:21])
 }
 
 func decimalPrefix(value string) bool {

@@ -23,11 +23,13 @@ type tierWindowKey struct {
 // so an omitted lower level cannot resurrect a deleted key.
 func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Timestamp, limits blockLimits, maxKeyBytes uint64, output *compactedRuns) (err error) {
 	coalescers := make(map[tierWindowKey]*paxBlockCoalescer)
+	tierRanges := newActiveRanges(source.ranges.limit)
 	defer func() {
 		for key, c := range coalescers {
 			err = errors.Join(err, c.Close())
 			delete(coalescers, key)
 		}
+		tierRanges.Close()
 		err = errors.Join(err, source.Close())
 	}()
 	if maxKeyBytes > limits.MaxDecodedBytes || uint64(limits.MaxRows) > (limits.MaxDecodedBytes-maxKeyBytes)/4 {
@@ -122,16 +124,17 @@ func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Tim
 		if nextErr != nil {
 			return nextErr
 		}
+		tierRanges.advance(row.key)
 		rowTier, rowWindow, until := activeTier, uint64(0), model.Timestamp(0)
 		if row.kind == storage.MutationDeleteRange {
-			if source.ranges.suppresses(row.timestamp, row.ordinal) {
-				covering := source.ranges.entries[source.ranges.heaps[1].slots[0]]
+			if tierRanges.suppresses(row.timestamp, row.ordinal) {
+				covering := tierRanges.entries[tierRanges.heaps[1].slots[0]]
 				if bytes.Compare(covering.end, row.end) >= 0 {
 					until = covering.timestamp
 				}
 			}
 			if until == 0 {
-				if err := source.ranges.add(row.end, row.timestamp, row.ordinal); err != nil {
+				if err := tierRanges.add(row.end, row.timestamp, row.ordinal); err != nil {
 					return err
 				}
 			}
@@ -146,8 +149,13 @@ func appendTieredBlocks(ctx context.Context, source *mvccCursor, floor model.Tim
 				key = append(key[:0], row.key...)
 				haveKey, newer = true, row.timestamp
 			}
-			if source.ranges.suppresses(row.timestamp, row.ordinal) {
-				until = max(until, source.ranges.entries[source.ranges.heaps[1].slots[0]].timestamp)
+			if tierRanges.suppresses(row.timestamp, row.ordinal) {
+				rangeTS := tierRanges.entries[tierRanges.heaps[1].slots[0]].timestamp
+				if until == 0 {
+					until = rangeTS
+				} else {
+					until = min(until, rangeTS)
+				}
 			}
 		}
 		if until != 0 {

@@ -146,9 +146,6 @@ func prepareMutationRuns(ctx context.Context, root *os.Root, position uint64, ba
 	if err := prepared.persistManifest(ctx, decision, limits.MetadataBytes); err != nil {
 		return nil, err
 	}
-	if err := syncCommitDirectory(root); err != nil {
-		return nil, err
-	}
 	return prepared, nil
 }
 

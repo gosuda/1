@@ -64,7 +64,7 @@ A database directory contains:
 | commitName | `%020d.wal` | internal/dataplane/storage/neosepia/commit_store.go:155 |
 | pendingCommitName | `.%020d.pending` | internal/dataplane/storage/neosepia/commit_store.go:156 |
 | runManifestName | `%020d.runs` | internal/dataplane/storage/neosepia/run_manifest.go:92 |
-| preparedRunName | `%020d-%08x.sst` | internal/dataplane/storage/neosepia/run_manifest.go:93 |
+| preparedRunName | `%020d-%08x.sst` | internal/dataplane/storage/neosepia/run_manifest.go:96 |
 | baseManifestName | `base-%020d.runs` | internal/dataplane/storage/neosepia/base_manifest.go:59 |
 
 ## Legacy format markers

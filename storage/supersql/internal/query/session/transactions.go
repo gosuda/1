@@ -553,7 +553,7 @@ func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndRe
 		return EndResult{}, storage.ErrCommitIndeterminate
 	}
 	modes := transactions.characteristics()
-	if transactions.failed() && transactions.transaction.State() != txn.Committed {
+	if (transactions.failure != nil || transactions.fence != nil) && transactions.transaction.State() != txn.Committed {
 		err := transactions.endRollback(ctx)
 		result := EndResult{}
 		if !transactions.active && chain {
@@ -563,14 +563,16 @@ func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndRe
 		}
 		return result, err
 	}
-	if err := transactions.prepareCursorsForCommit(ctx); err != nil {
-		return EndResult{}, transactions.fail(err)
-	}
-	if err := transactions.flushDeferredEvents(ctx, nil, true); err != nil {
-		return EndResult{}, transactions.fail(err)
-	}
-	if err := transactions.applyTemporaryCommitActions(ctx); err != nil {
-		return EndResult{}, transactions.fail(err)
+	if transactions.transaction.State() == txn.Active {
+		if err := transactions.prepareCursorsForCommit(ctx); err != nil {
+			return EndResult{}, transactions.fail(err)
+		}
+		if err := transactions.flushDeferredEvents(ctx, nil, true); err != nil {
+			return EndResult{}, transactions.fail(err)
+		}
+		if err := transactions.applyTemporaryCommitActions(ctx); err != nil {
+			return EndResult{}, transactions.fail(err)
+		}
 	}
 	applied, err := transactions.transaction.Commit(ctx)
 	result := EndResult{Result: applied}
