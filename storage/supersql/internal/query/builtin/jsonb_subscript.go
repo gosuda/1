@@ -69,7 +69,7 @@ func JSONBSubscriptStore(ctx context.Context, args []model.Value, callBudget Cal
 	}
 	// The tree is final here. Its depth can exceed the depth of the parsed inputs,
 	// so the traversal stack used by encode is resized before sizing and encoding.
-	if err = document.ensureJSONBTraversalFrames(budget, claim); err != nil {
+	if err = document.ensureJSONBTraversalFrames(ctx, budget, claim); err != nil {
 		return model.Value{}, err
 	}
 	for index := len(document.nodes) - 1; index >= 0; index-- {
@@ -231,9 +231,15 @@ func (document *jsonbDocument) growJSONBSubscriptNodes(extra, budget int64, clai
 // tree. Assigning a subscript can deepen the tree without changing its node count
 // (a replacement subtree is grafted into freshly built intermediate containers), so
 // the depth observed while parsing the inputs is not a bound on the depth that
-// appendJSONBNodes will descend to. The required depth is at most the node count.
-func (document *jsonbDocument) ensureJSONBTraversalFrames(budget int64, claim columnar.Allocation) error {
-	required := document.jsonbNodeDepth()
+// appendJSONBNodes will descend to.
+func (document *jsonbDocument) ensureJSONBTraversalFrames(ctx context.Context, budget int64, claim columnar.Allocation) error {
+	required, err := document.jsonbNodeDepth(ctx)
+	if err != nil {
+		return err
+	}
+	if required > jsonTextMaxDepth {
+		return sqlError("54001", "JSONB nesting depth exceeds maximum")
+	}
 	if required <= len(document.frames) {
 		return nil
 	}
@@ -255,18 +261,20 @@ func (document *jsonbDocument) ensureJSONBTraversalFrames(budget int64, claim co
 }
 
 // jsonbNodeDepth returns the nesting depth of the container tree, counting the
-// root container itself. A scalar root has depth zero. The depth is bounded by
-// jsonTextMaxDepth because walkJSONB rejects deeper input, and subscript
-// assignment only ever builds one container per path level.
-func (document *jsonbDocument) jsonbNodeDepth() int {
+// root container itself. A scalar root has depth zero. It returns SQLSTATE
+// 54001 if the resulting tree exceeds jsonTextMaxDepth.
+func (document *jsonbDocument) jsonbNodeDepth(ctx context.Context) (int, error) {
 	if len(document.nodes) == 0 || (document.nodes[0].kind != jsonTextObject && document.nodes[0].kind != jsonTextArray) {
-		return 0
+		return 0, nil
 	}
 	type frame struct{ index, depth int }
 	stack := make([]frame, 0, 8)
 	stack = append(stack, frame{index: 0, depth: 1})
 	maximum := 0
 	for len(stack) != 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		if current.depth > maximum {
@@ -274,14 +282,15 @@ func (document *jsonbDocument) jsonbNodeDepth() int {
 		}
 		for child := document.nodes[current.index].child; child >= 0; child = document.nodes[child].next {
 			if document.nodes[child].kind == jsonTextObject || document.nodes[child].kind == jsonTextArray {
-				if current.depth+1 > jsonTextMaxDepth {
-					return jsonTextMaxDepth
+				nextDepth := current.depth + 1
+				if nextDepth > jsonTextMaxDepth {
+					return 0, sqlError("54001", "JSONB nesting depth exceeds maximum")
 				}
-				stack = append(stack, frame{index: child, depth: current.depth + 1})
+				stack = append(stack, frame{index: child, depth: nextDepth})
 			}
 		}
 	}
-	return maximum
+	return maximum, nil
 }
 
 func (document *jsonbDocument) writeJSONBSubscript(ctx context.Context, path []model.Value, newRoot int) error {

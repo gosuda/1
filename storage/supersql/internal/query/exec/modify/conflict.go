@@ -109,6 +109,13 @@ func (c *cursor) configureConflict(ctx context.Context, table *model.TableMetada
 	return err
 }
 
+func (c *cursor) hasConflictIdentity(ctx context.Context, row []model.Value) (bool, error) {
+	for i, column := range c.keyColumns {
+		c.keyValues[i] = row[column]
+	}
+	return c.mutatedTargets.Contains(ctx, c.keyValues)
+}
+
 func (c *cursor) recordConflictIdentity(ctx context.Context, row []model.Value) error {
 	for i, column := range c.keyColumns {
 		c.keyValues[i] = row[column]
@@ -218,7 +225,7 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		for i, layout := range c.tableLayouts {
 			proposed.Values[i] = model.NullVal(layout.Type.Storage)
 		}
-		for i, column := range c.assignmentColumns {
+		for i, column := range columns {
 			proposed.Values[column] = assigned[i]
 		}
 		replacement, proceed, err := o.Triggers.BeforeRow(ctx, c.descriptor, model.TriggerInsert, nil, &proposed, c.rowPayloadBytes())
@@ -366,14 +373,24 @@ func (c *cursor) updateConflict(ctx context.Context, frozen []model.Value, sourc
 			return false, err
 		}
 	}
-	if err := c.recordConflictIdentity(ctx, old.Values); err != nil {
+	seen, err := c.hasConflictIdentity(ctx, old.Values)
+	if err != nil {
 		return false, err
+	}
+	if seen {
+		return false, &model.Error{Code: "21000", Message: "ON CONFLICT DO UPDATE command cannot affect row a second time"}
 	}
 	assigned, err := c.assignments(ctx, images, c.conflictState.assignment, c.conflictState.columns)
 	if err != nil {
 		return false, err
 	}
 	if err := c.applyAssigned(ctx, frozen, storage.MutationUpdate, source, old.Values, old.Key, assigned, c.options.Conflict.AssignmentColumns); err != nil {
+		if errors.Is(err, errTriggerSkipped) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := c.recordConflictIdentity(ctx, old.Values); err != nil {
 		return false, err
 	}
 	return true, nil

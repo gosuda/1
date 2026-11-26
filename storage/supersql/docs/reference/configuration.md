@@ -99,13 +99,13 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/controlplane/schema/constraint_validation.go:75 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/generation_plan.go:81 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=int(min(limits.MetadataBytes, uint64(math.MaxInt))) |
 | internal/controlplane/schema/index_plan.go:127 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=int(limits.MetadataBytes) |
-| internal/controlplane/schema/index_policy.go:310 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
+| internal/controlplane/schema/index_policy.go:311 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/index_resolver.go:193 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=max(s.limits.MaxColumns, len(s.indexes)) |
 | internal/controlplane/schema/index_resolver.go:246 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=max(s.limits.MaxColumns, len(s.indexes)) |
 | internal/controlplane/schema/job_definition.go:63 | MaxBytes=maximum MaxDepth=64 MaxItems=int(min(maximum, uint64(math.MaxInt))) |
 | internal/controlplane/schema/mutation_policy.go:89 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=p.limits.MaxColumns |
-| internal/controlplane/schema/relational_loader.go:45 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=max(limits.MaxColumns, len(seed.indexes)) |
-| internal/controlplane/schema/relational_loader.go:90 | MaxBytes=remaining - fixed MaxDepth=64 MaxItems=max(limits.MaxColumns, int((remaining-fixed)/uint64(unsafe.Sizeof(model.ConstraintDescriptor{}))+1)) |
+| internal/controlplane/schema/relational_loader.go:289 | MaxBytes=limits.MetadataBytes MaxDepth=64 MaxItems=max(limits.MaxColumns, len(seed.indexes)) |
+| internal/controlplane/schema/relational_loader.go:362 | MaxBytes=remaining - fixed MaxDepth=64 MaxItems=max(limits.MaxColumns, int((remaining-fixed)/uint64(unsafe.Sizeof(model.ConstraintDescriptor{}))+1)) |
 | internal/controlplane/schema/relational_policy.go:203 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=max(s.limits.MaxColumns, len(s.indexes)) |
 | internal/controlplane/schema/relational_policy.go:244 | MaxBytes=s.limits.MetadataBytes MaxDepth=64 MaxItems=s.limits.MaxColumns |
 | internal/controlplane/schema/relational_policy.go:68 | MaxBytes=maxBytes - fixed MaxDepth=64 MaxItems=max(set.limits.MaxColumns, len(set.indexes)) |
@@ -117,7 +117,7 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/query/procedural/trigger.go:267 | MaxBytes=maxBytes MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
 | internal/query/procedural/trigger.go:322 | MaxBytes=max(maxBytes, runtime.limits.MaxResultBytes) MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
 | internal/query/session/catalog_access.go:124 | MaxBytes=budget.remaining MaxDepth=64 MaxItems=int(budget.remaining) |
-| internal/query/session/declaration.go:909 | MaxBytes=options.Limits.MetadataBytes MaxDepth=64 MaxItems=options.Limits.MaxColumns |
+| internal/query/session/declaration.go:981 | MaxBytes=options.Limits.MetadataBytes MaxDepth=64 MaxItems=options.Limits.MaxColumns |
 | internal/query/session/native_catalog.go:452 | MaxBytes=1 << 16 MaxDepth=8 MaxItems=8 |
 
 ## `ir.Limits`

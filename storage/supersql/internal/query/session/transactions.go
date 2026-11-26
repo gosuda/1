@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gosuda/supersql-alpha/clock"
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/notify"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
@@ -566,6 +567,59 @@ func (transactions *Transactions) Commit(ctx context.Context, chain bool) (EndRe
 	return transactions.commit(operation, chain)
 }
 
+func (transactions *Transactions) hasHoldableCursorsForCommit() bool {
+	if transactions == nil || transactions.transaction == nil {
+		return false
+	}
+	for _, cursor := range transactions.named.cursors {
+		if cursor.transaction == transactions.transaction && cursor.holdable && !cursor.sealed {
+			return true
+		}
+	}
+	return false
+}
+
+// activateTransactionDeclaredTypes pins declared types and custom collations
+// from the active transaction's catalog snapshot (plus any session-temporary
+// overlay) onto transactions.statementTypes. Paths such as COMMIT (holdable
+// cursor materialization and deferred constraint validation) do not run
+// statementPlanning, so without this step sessionTypeResolver would see nil
+// statementTypes. Callers must hold the session gate; enterOperation restores
+// transactions.statementTypes on exit.
+func (transactions *Transactions) activateTransactionDeclaredTypes(ctx context.Context) error {
+	if transactions == nil || transactions.typeRuntime == nil || transactions.transaction == nil {
+		return nil
+	}
+	if transactions.sequences == nil || transactions.sequences.config.Catalog == nil {
+		return nil
+	}
+	store := transactions.sequences.config.Catalog
+	readCtx := txn.WithLockTimeout(ctx, transactions.settings.Resources().LockTimeout)
+	view, err := transactions.transaction.ReadView(readCtx, catalogLayoutDependencies(store))
+	if err != nil {
+		return err
+	}
+	snapshot, err := store.TransactionSnapshot(view, catalog.BorrowReader)
+	if err != nil {
+		return errors.Join(err, view.Close())
+	}
+	activateErr := func() error {
+		if err := addTemporaryOverlay(snapshot, &transactions.named); err != nil {
+			return err
+		}
+		base := transactions.typeRuntime.Expressions.Builtin
+		builtins := transactions.settings.BuiltinOptions(base.Collation, base.DefaultCollation)
+		if builtins.InformationSchemaTypes == nil {
+			builtins.InformationSchemaTypes = base.InformationSchemaTypes
+		}
+		if builtins.InformationSchemaFunctions == nil {
+			builtins.InformationSchemaFunctions = base.InformationSchemaFunctions
+		}
+		return transactions.activateDeclaredTypes(ctx, snapshot, builtins)
+	}()
+	return errors.Join(activateErr, snapshot.Close(), view.Close())
+}
+
 func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndResult, error) {
 	if !transactions.active {
 		return EndResult{}, settingError("25P01", "no active transaction")
@@ -595,6 +649,11 @@ func (transactions *Transactions) commit(ctx context.Context, chain bool) (EndRe
 		return EndResult{}, errors.Join(commitErr, rollbackErr)
 	}
 	if transactions.transaction.State() == txn.Active {
+		if transactions.hasHoldableCursorsForCommit() || transactions.selectedDeferredEvents(nil, true) {
+			if err := transactions.activateTransactionDeclaredTypes(ctx); err != nil {
+				return abortFailedCommit(err)
+			}
+		}
 		if err := transactions.prepareCursorsForCommit(ctx); err != nil {
 			return abortFailedCommit(err)
 		}

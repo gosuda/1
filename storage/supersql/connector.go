@@ -711,6 +711,7 @@ type cachedStatementPlan struct {
 	prepared     *session.Prepared
 	identity     txn.CatalogReadIdentity
 	ddlSeq       uint64
+	tempVersion  uint64
 	currentRole  string
 	sessionUser  string
 	searchPath   []string
@@ -880,13 +881,17 @@ func isStalePreparedError(err error) bool {
 }
 
 // resolveCachedPlan returns a cached *session.Prepared when the statement is
-// eligible and the catalog identity, role, search_path, semantic settings, and
-// declared parameter layouts match. Parameterized queries containing table or
-// index scans bypass the generic cache so runtime parameters specialize index
-// spans on every invocation.
+// eligible and the catalog identity, temporary catalog version, role,
+// search_path, semantic settings, and declared parameter layouts match.
+// Parameterized queries containing table or index scans bypass the generic
+// cache so runtime parameters specialize index spans on every invocation.
 func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.ParameterValue) (*session.Prepared, bool) {
 	c := s.conn
-	if c == nil || c.database == nil || c.scope == nil || c.database.readOnly || c.scope.txns.Active() {
+	if c == nil || c.database == nil || c.scope == nil || c.database.readOnly {
+		return nil, false
+	}
+	active, tempDescriptors, tempVersion, searchPath := c.scope.txns.TemporaryCatalogSnapshot(ctx)
+	if active {
 		return nil, false
 	}
 	if !cacheablePreparedStmt(s.parsed) {
@@ -917,13 +922,13 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 	ddlSeq := c.scope.ddlSeq.Load()
 	currentRole := c.scope.settings.CurrentRole()
 	sessionUser := c.scope.settings.SessionUser()
-	searchPath := c.scope.settings.SearchPath()
 	builtins := c.scope.builtins()
 	declaredLayouts := declaredParameterLayouts(parameters)
 
 	if cached != nil &&
 		cached.identity == identity &&
 		cached.ddlSeq == ddlSeq &&
+		cached.tempVersion == tempVersion &&
 		cached.currentRole == currentRole &&
 		cached.sessionUser == sessionUser &&
 		slices.Equal(cached.searchPath, searchPath) &&
@@ -938,6 +943,10 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 	}
 	defer func() { _ = snapshot.Close() }()
 
+	if err := snapshot.AddSessionOverlay(tempDescriptors); err != nil {
+		return nil, false
+	}
+
 	types, err := c.scope.txns.DeclaredTypeRuntime(ctx, snapshot, *c.database.typeRuntimeOptions(builtins))
 	if err != nil {
 		return nil, false
@@ -950,6 +959,7 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 	}
 	prepareOpts.Normalize.Builtin = builtins
 	prepareOpts.Bind.Builtin = builtins
+	prepareOpts.Bind.SearchPath = searchPath
 	if effectiveWork := c.scope.settings.Resources().EffectiveWorkMemoryBytes; effectiveWork > 0 && prepareOpts.Optimize.WorkingMemory > 0 {
 		prepareOpts.Optimize.WorkingMemory = uint64(effectiveWork)
 	}
@@ -973,6 +983,7 @@ func (s *statement) resolveCachedPlan(ctx context.Context, parameters []expr.Par
 		prepared:     prepared,
 		identity:     identity,
 		ddlSeq:       ddlSeq,
+		tempVersion:  tempVersion,
 		currentRole:  currentRole,
 		sessionUser:  sessionUser,
 		searchPath:   slices.Clone(searchPath),

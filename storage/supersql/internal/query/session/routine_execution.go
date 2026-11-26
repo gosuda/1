@@ -11,6 +11,7 @@ import (
 
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/runtime"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/bind"
@@ -55,6 +56,8 @@ type routineExecutor struct {
 	nonAtomic       bool
 	controlAllowed  bool
 	routineDepth    int
+	rootCtx         context.Context
+	nestedQuery     *runtime.Query
 	options         *RoutineExecutionOptions
 	planCache       routineStatementCache
 }
@@ -214,10 +217,20 @@ func (executor *routineExecutor) RunRoutine(ctx context.Context, invocation proc
 	invoke := func(invocationCtx context.Context) (result procedural.SQLResult, err error) {
 		previousAllowed := executor.controlAllowed
 		executor.controlAllowed = executor.nonAtomic && invocation.Procedure && !invocation.Atomic && !invocation.SecurityDefiner && len(invocation.Settings) == 0 && (executor.routineDepth == 0 || previousAllowed)
+		if executor.routineDepth == 0 {
+			executor.rootCtx = invocationCtx
+		}
 		executor.routineDepth++
 		defer func() {
 			executor.routineDepth--
 			executor.controlAllowed = previousAllowed
+			if executor.routineDepth == 0 {
+				executor.rootCtx = nil
+				if executor.nestedQuery != nil {
+					err = errors.Join(err, executor.nestedQuery.Close())
+					executor.nestedQuery = nil
+				}
+			}
 		}()
 		if invocation.SecurityDefiner {
 			executor.transactions.settingMu.Lock()
@@ -440,14 +453,42 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 		}
 		hasScans, hasCatalogScan, hasParams = boundRoutineGraphShape(bound)
 	}
-	query, err := executor.options.NewQuery(ctx)
-	if err != nil {
-		return result, err
-	}
-	defer func() { err = errors.Join(err, query.Close()) }()
+	var (
+		query       *runtime.Query
+		borrowQuery bool
+	)
 	resources = executor.resources()
-	if err := query.Constrain(resources.EffectiveWorkMemoryBytes, resources.EffectiveTempFileBytes); err != nil {
-		return result, err
+	workBytes := resources.EffectiveWorkMemoryBytes
+	if executor.routineDepth > 1 {
+		// Reuse one runtime.Query across nested recursive frames so deep
+		// recursion (up to MaxDepth=64) does not exhaust runtime.Pool.MaxGroups
+		// or stack full work_mem reservations per frame.
+		if executor.nestedQuery == nil {
+			queryCtx := executor.rootCtx
+			if queryCtx == nil {
+				queryCtx = ctx
+			}
+			executor.nestedQuery, err = executor.options.NewQuery(queryCtx)
+			if err != nil {
+				return result, err
+			}
+			if err := executor.nestedQuery.Constrain(resources.EffectiveWorkMemoryBytes, resources.EffectiveTempFileBytes); err != nil {
+				_ = executor.nestedQuery.Close()
+				executor.nestedQuery = nil
+				return result, err
+			}
+		}
+		query = executor.nestedQuery
+		borrowQuery = true
+	} else {
+		query, err = executor.options.NewQuery(ctx)
+		if err != nil {
+			return result, err
+		}
+		defer func() { err = errors.Join(err, query.Close()) }()
+		if err := query.Constrain(workBytes, resources.EffectiveTempFileBytes); err != nil {
+			return result, err
+		}
 	}
 	var (
 		reader       txn.ReadView
@@ -461,9 +502,10 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 		}
 		return runErr
 	}
-	if cachedPrepared != nil && !hasScans && !hasCatalogScan && !preparedWrites(cachedPrepared) && len(boundRowLockPolicies(bound)) == 0 && bound.DependencyCount() == 0 {
-		// Pure expression/scalar statement cached for this exact catalog
-		// identity: reuse the compiled plan directly against the frame view.
+	if cachedPrepared != nil && !hasScans && !hasCatalogScan && !preparedWrites(cachedPrepared) && len(boundRowLockPolicies(bound)) == 0 && len(cachedScanDeps) == 0 {
+		// Pure expression/scalar statement (including routine calls whose
+		// definitions are already installed for this exact catalog identity):
+		// reuse the compiled plan directly against the frame view.
 		prepared = cachedPrepared
 		reader = executor.view
 		borrowReader = true
@@ -544,7 +586,14 @@ func (executor *routineExecutor) executeSQL(ctx context.Context, request procedu
 	}
 	environment := executor.environment
 	environment.Query = query
-	environment.BorrowQuery = false
+	environment.BorrowQuery = borrowQuery
+	if borrowQuery {
+		constrainEnvironment(&environment, workBytes, resources.EffectiveTempFileBytes)
+		nestedExprCap := uint64(min(int64(512<<10), max(int64(64<<10), resources.EffectiveWorkMemoryBytes/64)))
+		if environment.Limits.Expressions.MaxStateBytes > nestedExprCap {
+			environment.Limits.Expressions.MaxStateBytes = nestedExprCap
+		}
+	}
 	environment.Reader = reader
 	environment.BorrowReader = borrowReader
 	environment.Catalog, err = attachCatalogView(executor.environment.Catalog, reader)

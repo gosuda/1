@@ -3,6 +3,8 @@ package procedural
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
@@ -146,4 +148,65 @@ func SQLExecutorFromContext(ctx context.Context) (SQLExecutor, error) {
 
 func sqlError(code, message string, cause error) error {
 	return &model.Error{Code: code, Message: message, Cause: cause}
+}
+
+type executionBudgetKey struct{}
+
+// executionBudget tracks cumulative step, SQL row, emitted result row, and
+// result-byte consumption across an entire nested/recursive procedural call
+// tree so branching recursion cannot bypass resource limits by resetting
+// counters per frame.
+type executionBudget struct {
+	steps      atomic.Int64
+	resultRows atomic.Int64
+	mu         sync.Mutex
+	rows       int
+	bytes      uint64
+}
+
+func ensureExecutionBudget(ctx context.Context) (context.Context, *executionBudget) {
+	if budget, ok := ctx.Value(executionBudgetKey{}).(*executionBudget); ok && budget != nil {
+		return ctx, budget
+	}
+	budget := &executionBudget{}
+	return context.WithValue(ctx, executionBudgetKey{}, budget), budget
+}
+
+func (b *executionBudget) addStep(maxSteps int) error {
+	if b.steps.Add(1) > int64(maxSteps) {
+		return ErrLimit
+	}
+	return nil
+}
+
+func (b *executionBudget) addResultRow(maxRows int) error {
+	if b.resultRows.Add(1) > int64(maxRows) {
+		return ErrLimit
+	}
+	return nil
+}
+
+func (b *executionBudget) remainingSQL(maxRows int, maxBytes uint64) (int, uint64, error) {
+	b.mu.Lock()
+	rows := b.rows
+	bytes := b.bytes
+	b.mu.Unlock()
+	if rows >= maxRows || bytes >= maxBytes {
+		return 0, 0, ErrLimit
+	}
+	return maxRows - rows, maxBytes - bytes, nil
+}
+
+func (b *executionBudget) consumeSQL(rows int, bytes uint64, maxRows int, maxBytes uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rows < 0 || b.rows > maxRows || rows > maxRows-b.rows {
+		return ErrLimit
+	}
+	if b.bytes > maxBytes || bytes > maxBytes-b.bytes {
+		return ErrLimit
+	}
+	b.rows += rows
+	b.bytes += bytes
+	return nil
 }

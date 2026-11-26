@@ -188,18 +188,54 @@ func StageDeclaration(ctx context.Context, transaction *txn.Transaction, bound *
 	return result, nil
 }
 
+var errIncomingForeignKeyFound = errors.New("incoming foreign key found")
+
+func snapshotHasIncomingForeignKey(ctx context.Context, snapshot *catalog.CatalogSnapshot, targets map[model.ObjectID]struct{}) (bool, error) {
+	if snapshot == nil || len(targets) == 0 {
+		return false, nil
+	}
+	err := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schema catalog.PublishedDescriptor) error {
+		if schema.Descriptor == nil || schema.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		return snapshot.ScanNamespace(ctx, schema.Descriptor.ID(), model.ObjectTable, func(table catalog.PublishedDescriptor) error {
+			if table.Descriptor == nil || table.Descriptor.Kind() != model.ObjectTable || table.Descriptor.State() != model.StatePublic {
+				return nil
+			}
+			meta, ok := table.Descriptor.Table()
+			if !ok {
+				return nil
+			}
+			for _, constraint := range meta.Constraints {
+				if constraint.Kind == model.ConstraintForeignKey && constraint.Enforced {
+					if _, referenced := targets[constraint.ReferencedObject]; referenced {
+						return errIncomingForeignKeyFound
+					}
+				}
+			}
+			return nil
+		})
+	})
+	if errors.Is(err, errIncomingForeignKeyFound) {
+		return true, nil
+	}
+	return false, err
+}
+
 func declarationRelationalRequirements(ctx context.Context, snapshot *catalog.CatalogSnapshot, descriptors []*model.Descriptor, maxBytes uint64) (bool, []model.ObjectID, error) {
 	tables, err := declarationHierarchy(ctx, snapshot, descriptors, maxBytes)
 	if err != nil {
 		return false, nil, err
 	}
 	schemaSet := make(map[model.ObjectID]struct{})
+	tableIDs := make(map[model.ObjectID]struct{}, len(tables))
 	inventory := false
 	for _, descriptor := range tables {
 		table, ok := descriptor.Table()
 		if !ok {
 			continue
 		}
+		tableIDs[descriptor.ID()] = struct{}{}
 		link := false
 		for _, constraint := range table.Constraints {
 			relational := constraint.Enforced && (constraint.Kind == model.ConstraintForeignKey || constraint.Kind == model.ConstraintExclude)
@@ -210,6 +246,13 @@ func declarationRelationalRequirements(ctx context.Context, snapshot *catalog.Ca
 			schemaSet[descriptor.Name().Parent] = struct{}{}
 		}
 		inventory = inventory || schema.DeclarationRelationalInventoryRequired(descriptor)
+	}
+	if !inventory && len(tableIDs) != 0 {
+		hasIncoming, incomingErr := snapshotHasIncomingForeignKey(ctx, snapshot, tableIDs)
+		if incomingErr != nil {
+			return false, nil, incomingErr
+		}
+		inventory = hasIncoming
 	}
 	schemas := make([]model.ObjectID, 0, len(schemaSet))
 	for schemaID := range schemaSet {
@@ -523,6 +566,12 @@ func declarationTargets(ctx context.Context, transaction *txn.Transaction, snaps
 	if err != nil {
 		return nil, err
 	}
+	emitted := make(map[model.ObjectID]struct{}, len(tables))
+	for _, table := range tables {
+		if table != nil {
+			emitted[table.ID()] = struct{}{}
+		}
+	}
 	for _, table := range tables {
 		if table.Kind() != model.ObjectTable && table.Kind() != model.ObjectMaterializedView {
 			continue
@@ -567,7 +616,8 @@ func declarationTargets(ctx context.Context, transaction *txn.Transaction, snaps
 		if err != nil {
 			return nil, err
 		}
-		if _, err := schema.LoadDeclarationRelationalConstraints(ctx, snapshot, expansion, options.Encoder, indexes, options.Limits); err != nil {
+		relatedSets, err := schema.LoadDeclarationRelationalConstraints(ctx, snapshot, expansion, options.Encoder, indexes, options.Limits)
+		if err != nil {
 			return nil, err
 		}
 		if admit {
@@ -603,6 +653,28 @@ func declarationTargets(ctx context.Context, transaction *txn.Transaction, snaps
 			}
 		}
 		result.targets = append(result.targets, execution.MutationTarget{Descriptor: table, Expansion: expansion, PartitionExpressions: partitionExpressions})
+		// When a session-temporary table links to other temporary tables in its
+		// FK component (e.g. a newly created temporary child referencing an
+		// existing temporary parent), refresh those temporary parents' targets
+		// with their newly linked IndexSets so parent-side DELETE/UPDATE sees
+		// the incoming FK.
+		if metadata.Persistence == "t" && len(relatedSets) > 1 {
+			for _, relatedSet := range relatedSets[1:] {
+				relDesc := relatedSet.TableDescriptor()
+				if relDesc == nil {
+					continue
+				}
+				if _, seen := emitted[relDesc.ID()]; seen {
+					continue
+				}
+				relMeta, ok := relDesc.Table()
+				if !ok || relMeta.Persistence != "t" || relMeta.PartitionStrategy != 0 || relMeta.PartitionBound != nil || relMeta.InheritanceChildren != 0 {
+					continue
+				}
+				emitted[relDesc.ID()] = struct{}{}
+				result.targets = append(result.targets, execution.MutationTarget{Descriptor: relDesc, Expansion: relatedSet})
+			}
+		}
 	}
 	if err := result.linkHierarchy(); err != nil {
 		return nil, err

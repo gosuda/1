@@ -99,6 +99,9 @@ func (plan *routineRowSourcePlan) Open(ctx context.Context, arguments []model.Va
 	if plan == nil || plan.program == nil || len(arguments) != len(plan.inputs) || options.MaxInputBytes == 0 || options.MaxRowBytes == 0 || options.MaxMemoryBytes == 0 {
 		return nil, ErrInvalidProgram
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	remaining := options.MaxInputBytes
 	for _, value := range arguments {
 		bytes, err := model.ValueBytes(ctx, value, remaining)
@@ -107,45 +110,72 @@ func (plan *routineRowSourcePlan) Open(ctx context.Context, arguments []model.Va
 		}
 		remaining -= bytes
 	}
-	call, cancel := context.WithCancel(ctx)
-	iterator := &routineRowIterator{cancel: cancel, packets: make(chan routineRowPacket, 1), done: make(chan struct{})}
 	strictNull := false
 	if plan.strict {
 		for _, value := range arguments {
 			strictNull = strictNull || value.IsNull
 		}
 	}
-	go func() {
-		defer close(iterator.done)
-		defer close(iterator.packets)
-		if strictNull {
-			// A strict set routine yields no rows on NULL input; a strict
-			// non-set routine still produces its single NULL result.
-			if !plan.set {
-				_ = iterator.send(call, routineRowPacket{row: plan.nullRow()})
-			}
-			return
-		}
+	if strictNull {
+		// A strict set routine yields no rows on NULL input; a strict
+		// non-set routine still produces its single NULL result.
 		if !plan.set {
-			iterator.runSingle(call, plan, arguments, options)
-			return
+			return materializeSingleRow(ctx, plan.nullRow(), options)
 		}
-		err := plan.program.executeRowsResolved(call, arguments, func(encoded []model.Value) error {
-			row, err := plan.splitRow(encoded)
+		return &routineRowIterator{}, nil
+	}
+	if !plan.set {
+		return plan.openSingle(ctx, arguments, options)
+	}
+	// Materialize set-returning routine output synchronously before returning
+	// (matching PostgreSQL's SFRM_Materialize for PL/pgSQL SRFs). This guarantees
+	// the session routine mutex and SECURITY DEFINER / SET state are released
+	// before peer SRFs or outer scalar PL/pgSQL calls execute.
+	var (
+		rows     [][]model.Value
+		retained uint64
+		claim    columnar.Allocation
+	)
+	rowHeader := uint64(unsafe.Sizeof([]model.Value{}))
+	err := plan.program.executeRowsResolved(ctx, arguments, func(encoded []model.Value) error {
+		row, err := plan.splitRow(encoded)
+		if err != nil {
+			return err
+		}
+		if rowHeader > options.MaxMemoryBytes || retained > options.MaxMemoryBytes-rowHeader {
+			return ErrLimit
+		}
+		limit := min(options.MaxRowBytes, options.MaxMemoryBytes-retained-rowHeader)
+		owned, used, err := ownRowValues(ctx, row, limit)
+		if err != nil {
+			return err
+		}
+		nextRetained := retained + rowHeader + used
+		if options.Allocator != nil {
+			if claim == nil {
+				claim, err = options.Allocator.Reserve(nextRetained)
+			} else {
+				err = claim.Resize(nextRetained)
+			}
 			if err != nil {
 				return err
 			}
-			owned, claim, err := ownRow(call, row, options)
-			if err != nil {
-				return err
-			}
-			return iterator.send(call, routineRowPacket{row: owned, claim: claim})
-		}, plan.signature)
-		if err != nil && call.Err() == nil {
-			iterator.send(call, routineRowPacket{err: err})
 		}
-	}()
-	return iterator, nil
+		retained = nextRetained
+		rows = append(rows, owned)
+		return nil
+	}, plan.signature)
+	if err != nil {
+		if claim != nil {
+			claim.Release()
+		}
+		for i := range rows {
+			clear(rows[i])
+		}
+		clear(rows)
+		return nil, err
+	}
+	return &routineRowIterator{rows: rows, claim: claim}, nil
 }
 
 // splitRow converts one emitted routine value into the relation's output row:
@@ -190,122 +220,97 @@ func (plan *routineRowSourcePlan) nullRow() []model.Value {
 	return []model.Value{model.NullVal(plan.result.Type.Storage)}
 }
 
-// ownRow copies a delivered row's payloads and reserves the copy under the
-// caller's allocator so a packet owns its bytes independently of the routine
-// frame that produced them.
-func ownRow(call context.Context, row []model.Value, options builtin.RowSourceOptions) ([]model.Value, columnar.Allocation, error) {
+// ownRowValues copies a delivered row's payloads within limit and reports the
+// retained byte count so the materialized iterator owns its bytes independently
+// of the routine frame that produced them.
+func ownRowValues(ctx context.Context, row []model.Value, limit uint64) ([]model.Value, uint64, error) {
 	owned := make([]model.Value, len(row))
-	limit := min(options.MaxRowBytes, options.MaxMemoryBytes)
 	used := uint64(len(row)) * uint64(unsafe.Sizeof(model.Value{}))
 	if used > limit {
-		return nil, nil, ErrLimit
+		return nil, 0, ErrLimit
 	}
 	for i, value := range row {
-		copy, bytes, err := model.CopyValue(call, value, limit-used)
+		copied, bytes, err := model.CopyValue(ctx, value, limit-used)
 		if err != nil || bytes > limit-used {
-			return nil, nil, ErrLimit
+			return nil, 0, ErrLimit
 		}
-		owned[i], used = copy, used+bytes
+		owned[i], used = copied, used+bytes
 	}
-	if options.Allocator == nil {
-		return owned, nil, nil
-	}
-	claim, err := options.Allocator.Reserve(used)
-	if err != nil {
-		return nil, nil, err
-	}
-	return owned, claim, nil
+	return owned, used, nil
 }
 
-// runSingle executes a non-set routine: PostgreSQL yields the result row once —
+func materializeSingleRow(ctx context.Context, row []model.Value, options builtin.RowSourceOptions) (builtin.RowSourceIterator, error) {
+	rowHeader := uint64(unsafe.Sizeof([]model.Value{}))
+	if rowHeader > options.MaxMemoryBytes {
+		return nil, ErrLimit
+	}
+	limit := min(options.MaxRowBytes, options.MaxMemoryBytes-rowHeader)
+	owned, used, err := ownRowValues(ctx, row, limit)
+	if err != nil {
+		return nil, err
+	}
+	var claim columnar.Allocation
+	if options.Allocator != nil {
+		claim, err = options.Allocator.Reserve(rowHeader + used)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &routineRowIterator{rows: [][]model.Value{owned}, claim: claim}, nil
+}
+
+// openSingle executes a non-set routine: PostgreSQL yields the result row once —
 // the last row of a multi-row SQL body, or a NULL row when the body produced
 // nothing.
-func (iterator *routineRowIterator) runSingle(call context.Context, plan *routineRowSourcePlan, arguments []model.Value, options builtin.RowSourceOptions) {
-	result, err := plan.program.executeResolved(call, arguments, plan.signature)
+func (plan *routineRowSourcePlan) openSingle(ctx context.Context, arguments []model.Value, options builtin.RowSourceOptions) (builtin.RowSourceIterator, error) {
+	result, err := plan.program.executeResolved(ctx, arguments, plan.signature)
 	if err != nil {
 		var sqlErr *model.Error
 		if errors.As(err, &sqlErr) && sqlErr.Code == "42804" && sqlErr.Message == "declared value has wrong storage" {
 			err = sqlError("42804", "function return row and query-specified return row do not match", nil)
 		}
+		return nil, err
 	}
 	var encoded []model.Value
-	if err == nil && len(result.Rows) != 0 {
+	if len(result.Rows) != 0 {
 		encoded = result.Rows[len(result.Rows)-1]
 	}
 	var row []model.Value
-	var claim columnar.Allocation
-	if err == nil {
-		switch {
-		case encoded == nil:
-			row = plan.nullRow()
-		case len(encoded) != 1 && plan.expand:
-			// A multi-column body row supplies the record's fields directly.
-			row, err = plan.splitRow([]model.Value{{Type: model.TypeComposite, ArrayVal: encoded}})
-		default:
-			row, err = plan.splitRow(encoded)
-		}
+	switch {
+	case encoded == nil:
+		row = plan.nullRow()
+	case len(encoded) != 1 && plan.expand:
+		// A multi-column body row supplies the record's fields directly.
+		row, err = plan.splitRow([]model.Value{{Type: model.TypeComposite, ArrayVal: encoded}})
+	default:
+		row, err = plan.splitRow(encoded)
 	}
-	if err == nil {
-		row, claim, err = ownRow(call, row, options)
+	if err != nil {
+		return nil, err
 	}
-	if err != nil && call.Err() == nil {
-		_ = iterator.send(call, routineRowPacket{err: err})
-		return
-	}
-	if row != nil {
-		_ = iterator.send(call, routineRowPacket{row: row, claim: claim})
-	}
-}
-
-// send delivers a packet; call cancellation reports it back to the program so
-// an abandoned iterator stops routine execution instead of leaking it.
-func (iterator *routineRowIterator) send(call context.Context, packet routineRowPacket) error {
-	select {
-	case iterator.packets <- packet:
-		return nil
-	case <-call.Done():
-		if packet.claim != nil {
-			packet.claim.Release()
-		}
-		return call.Err()
-	}
-}
-
-type routineRowPacket struct {
-	row   []model.Value
-	claim columnar.Allocation
-	err   error
+	return materializeSingleRow(ctx, row, options)
 }
 
 type routineRowIterator struct {
-	cancel  context.CancelFunc
-	packets chan routineRowPacket
-	done    chan struct{}
-	current columnar.Allocation
-	closed  bool
+	rows     [][]model.Value
+	position int
+	claim    columnar.Allocation
+	closed   bool
 }
 
 func (iterator *routineRowIterator) Next(ctx context.Context) ([]model.Value, bool, error) {
 	if iterator.closed {
 		return nil, false, io.EOF
 	}
-	if iterator.current != nil {
-		iterator.current.Release()
-		iterator.current = nil
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
-	select {
-	case packet, ok := <-iterator.packets:
-		if !ok {
-			return nil, false, nil
-		}
-		if packet.err != nil {
-			return nil, false, packet.err
-		}
-		iterator.current = packet.claim
-		return packet.row, true, nil
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
+	if iterator.position >= len(iterator.rows) {
+		return nil, false, nil
 	}
+	row := iterator.rows[iterator.position]
+	iterator.position++
+	return row, true, nil
 }
 
 func (iterator *routineRowIterator) Close() error {
@@ -313,17 +318,15 @@ func (iterator *routineRowIterator) Close() error {
 		return nil
 	}
 	iterator.closed = true
-	iterator.cancel()
-	if iterator.current != nil {
-		iterator.current.Release()
-		iterator.current = nil
+	for i := range iterator.rows {
+		clear(iterator.rows[i])
 	}
-	for packet := range iterator.packets {
-		if packet.claim != nil {
-			packet.claim.Release()
-		}
+	clear(iterator.rows)
+	iterator.rows = nil
+	if iterator.claim != nil {
+		iterator.claim.Release()
+		iterator.claim = nil
 	}
-	<-iterator.done
 	return nil
 }
 

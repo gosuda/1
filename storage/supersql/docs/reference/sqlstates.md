@@ -10,16 +10,16 @@
 | 00000 | 00 | successful completion | 1 | internal/query/session/statistics_command.go:603 | model.Error Code field |
 | 01000 | 01 | warning | 1 | internal/query/bind/definition_declaration.go:839 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
-| 0A000 | 0A | feature not supported | 181 | connector.go:1576 | bindError call, model.Error Code field, sqlError call, unsupported call |
+| 0A000 | 0A | feature not supported | 181 | connector.go:1587 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 4 | internal/query/bind/grant_ddl.go:108 | bindError call |
-| 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1195 | sqlError call |
-| 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:473 | sqlError call |
-| 21000 | 21 | cardinality violation | 11 | internal/query/builtin/multirange_scalar.go:265 | model.Error Code field, sqlError call |
+| 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1207 | sqlError call |
+| 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:481 | sqlError call |
+| 21000 | 21 | cardinality violation | 12 | internal/query/builtin/multirange_scalar.go:265 | model.Error Code field, sqlError call |
 | 22000 | 22 | data exception | 8 | internal/query/builtin/array_push.go:17 | sqlError call |
 | 22001 | 22 | data exception | 4 | internal/query/builtin/bit_string.go:183 | sqlError call |
 | 22003 | 22 | data exception | 112 | internal/controlplane/schema/identity.go:132 | bindError call, model.Error Code field, sqlError call |
 | 22004 | 22 | data exception | 26 | internal/query/builtin/aggregate_collection_scalar.go:89 | model.Error Code field, sqlError call |
-| 22005 | 22 | data exception | 1 | internal/query/procedural/execute.go:1512 | sqlError call |
+| 22005 | 22 | data exception | 1 | internal/query/procedural/execute.go:1552 | sqlError call |
 | 22007 | 22 | data exception | 4 | internal/query/builtin/interval_input.go:51 | sqlError call |
 | 22008 | 22 | data exception | 93 | internal/query/builtin/date.go:105 | sqlError call |
 | 22009 | 22 | data exception | 4 | internal/query/builtin/temporal_input.go:107 | sqlError call |
@@ -67,8 +67,8 @@
 | 26000 | 26 | invalid SQL statement name | 2 | internal/query/session/named_commands.go:270 | model.Error Code field |
 | 2BP01 | 2B | dependent privilege descriptors still exist | 22 | internal/controlplane/catalog/object_service.go:153 | bindError call, model.Error Code field |
 | 2D000 | 2D | invalid transaction termination | 1 | internal/query/procedural/compile.go:614 | sqlError call |
-| 2F005 | 2F | SQL routine exception | 1 | internal/query/procedural/execute.go:280 | sqlError call |
-| 34000 | 34 | invalid cursor name | 6 | internal/query/procedural/execute.go:1050 | model.Error Code field, sqlError call |
+| 2F005 | 2F | SQL routine exception | 1 | internal/query/procedural/execute.go:284 | sqlError call |
+| 34000 | 34 | invalid cursor name | 6 | internal/query/procedural/execute.go:1062 | model.Error Code field, sqlError call |
 | 3B001 | 3B | savepoint exception | 1 | internal/dataplane/txn/transaction.go:89 | model.Error Code field |
 | 3F000 | 3F | invalid schema name | 24 | internal/query/bind/collation_ddl.go:39 | bindError call, sqlError call |
 | 40001 | 40 | transaction rollback | 6 | internal/controlplane/catalog/store.go:27 | model.Error Code field |
@@ -80,7 +80,7 @@
 | 42701 | 42 | syntax error or access rule violation | 36 | internal/query/bind/copy.go:250 | bindError call, model.Error Code field |
 | 42702 | 42 | syntax error or access rule violation | 5 | internal/query/bind/composite_field.go:38 | bindError call |
 | 42703 | 42 | syntax error or access rule violation | 69 | internal/dataplane/txn/row_normalizer.go:407 | bindError call, model.Error Code field, sqlError call |
-| 42704 | 42 | syntax error or access rule violation | 132 | internal/controlplane/catalog/store.go:26 | bindError call, model.Error Code field, sqlError call |
+| 42704 | 42 | syntax error or access rule violation | 133 | internal/controlplane/catalog/store.go:26 | bindError call, model.Error Code field, sqlError call |
 | 42710 | 42 | syntax error or access rule violation | 64 | internal/controlplane/catalog/store.go:25 | bindError call, model.Error Code field, sqlError call |
 | 42712 | 42 | syntax error or access rule violation | 11 | internal/query/bind/conflict.go:41 | bindError call |
 | 42723 | 42 | syntax error or access rule violation | 5 | internal/query/bind/definition_declaration.go:1337 | bindError call |
@@ -95,7 +95,7 @@
 | 42939 | 42 | syntax error or access rule violation | 1 | internal/query/bind/rls_ddl.go:55 | bindError call |
 | 42P01 | 42 | syntax error or access rule violation | 23 | internal/query/bind/catalog_relation.go:50 | bindError call, model.Error Code field, sqlError call |
 | 42P02 | 42 | syntax error or access rule violation | 12 | execution.go:257 | bindError call, model.Error Code field |
-| 42P03 | 42 | syntax error or access rule violation | 3 | internal/query/procedural/execute.go:1012 | model.Error Code field, sqlError call |
+| 42P03 | 42 | syntax error or access rule violation | 3 | internal/query/procedural/execute.go:1024 | model.Error Code field, sqlError call |
 | 42P05 | 42 | syntax error or access rule violation | 2 | internal/query/session/named_commands.go:121 | model.Error Code field |
 | 42P06 | 42 | syntax error or access rule violation | 2 | internal/query/bind/declaration.go:153 | bindError call |
 | 42P07 | 42 | syntax error or access rule violation | 10 | internal/query/bind/constraint_rename.go:156 | bindError call, model.Error Code field |
@@ -115,7 +115,7 @@
 | 53200 | 53 | insufficient resources | 24 | internal/controlplane/schema/jobs.go:59 | model.Error Code field |
 | 53300 | 53 | insufficient resources | 3 | internal/dataplane/txn/locks.go:24 | model.Error Code field |
 | 54000 | 54 | program limit exceeded | 446 | internal/controlplane/catalog/object_service.go:132 | bindError call, model.Error Code field, sqlError call |
-| 54001 | 54 | program limit exceeded | 9 | internal/query/bind/view_mutation.go:240 | bindError call, sqlError call |
+| 54001 | 54 | program limit exceeded | 13 | internal/query/bind/view_mutation.go:240 | bindError call, sqlError call |
 | 54023 | 54 | program limit exceeded | 3 | internal/query/bind/aggregate_order.go:12 | bindError call |
 | 55000 | 55 | object not in prerequisite state | 175 | bootstrap.go:87 | bindError call, model.Error Code field, sqlError call |
 | 55006 | 55 | object not in prerequisite state | 3 | internal/controlplane/schema/index_scheduler.go:27 | model.Error Code field |
@@ -123,7 +123,7 @@
 | 55P04 | 55 | object not in prerequisite state | 1 | internal/query/builtin/declared_type.go:742 | model.Error Code field |
 | 57014 | 57 | operator intervention | 6 | internal/controlplane/schema/index_runner.go:40 | model.Error Code field |
 | F0000 | F0 | configuration file error | 32 | internal/query/bind/text_search_declaration.go:615 | bindError call, sqlError call |
-| P0004 | P0 | PL/pgSQL error | 1 | internal/query/procedural/execute.go:536 | sqlError call |
+| P0004 | P0 | PL/pgSQL error | 1 | internal/query/procedural/execute.go:544 | sqlError call |
 | XX000 | XX | internal error | 273 | internal/query/bind/bind.go:260 | bindError call, model.Error Code field, sqlError call |
 | XX001 | XX | internal error | 20 | internal/controlplane/schema/catalog_manifest.go:21 | bindError call, model.Error Code field |
 
@@ -149,9 +149,9 @@ None.
 | internal/query/builtin/registry.go:369 | model.Error Code field | `code` |
 | internal/query/copy/plan.go:260 | model.Error Code field | `code` |
 | internal/query/exec/compile.go:824 | model.Error Code field | `code` |
-| internal/query/procedural/execute.go:1648 | model.Error Code field | `code` |
-| internal/query/procedural/execute.go:995 | sqlError call | `code` |
-| internal/query/procedural/types.go:148 | model.Error Code field | `code` |
+| internal/query/procedural/execute.go:1007 | sqlError call | `code` |
+| internal/query/procedural/execute.go:1696 | model.Error Code field | `code` |
+| internal/query/procedural/types.go:150 | model.Error Code field | `code` |
 | internal/query/session/parse.go:39 | model.Error Code field | `code` |
 | internal/query/session/sequence.go:74 | model.Error Code field | `code` |
 | internal/query/session/settings.go:978 | model.Error Code field | `code` |
@@ -163,7 +163,7 @@ None.
 | internal/query/bind/object_declaration.go:848 | model.Error Code field | `diagnostic.Code` |
 | internal/query/bind/routine_lifecycle.go:180 | model.Error Code field | `diagnostic.Code` |
 | internal/query/bind/text_search_lifecycle.go:90 | model.Error Code field | `diagnostic.Code` |
-| internal/controlplane/schema/relational_policy.go:809 | model.Error Code field | `e.code` |
+| internal/controlplane/schema/relational_policy.go:812 | model.Error Code field | `e.code` |
 | internal/dataplane/txn/transaction.go:107 | model.Error Code field | `errTransactionCoverage.Code` |
 | internal/controlplane/schema/index_runner_steps.go:342 | model.Error Code field | `job.ErrorCode` |
 | internal/controlplane/schema/index_runner_steps.go:345 | model.Error Code field | `job.ErrorCode` |

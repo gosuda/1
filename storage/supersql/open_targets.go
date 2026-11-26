@@ -6,6 +6,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
+	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/catalogrel"
 	"github.com/gosuda/supersql-alpha/internal/query/exec"
 )
@@ -29,6 +30,9 @@ func (targets newStackMutationTargets) ResolveMutationTarget(ctx context.Context
 	descriptor, err := targets.descriptors.Descriptor(ctx, ref.ObjectID)
 	if err != nil {
 		return exec.MutationTarget{}, err
+	}
+	if descriptor.Kind() == model.ObjectView {
+		return exec.MutationTarget{Descriptor: descriptor}.ResolveMutationTarget(ctx, ref)
 	}
 	policy, err := targets.policies.TablePolicy(ctx, ref)
 	if err != nil {

@@ -355,12 +355,18 @@ func appendJSONBNodes(ctx context.Context, output *strings.Builder, nodes []json
 		node := &nodes[current]
 		switch node.kind {
 		case jsonTextObject, jsonTextArray:
+			if depth >= jsonTextMaxDepth {
+				return sqlError("54001", "JSONB nesting depth exceeds maximum")
+			}
 			open, close := byte('['), byte(']')
 			if node.kind == jsonTextObject {
 				open, close = '{', '}'
 			}
 			output.WriteByte(open)
 			if node.child >= 0 {
+				if depth >= len(frames) {
+					return sqlError("54001", "JSONB nesting depth exceeds maximum")
+				}
 				frames[depth].parent = current
 				depth++
 				current = node.child

@@ -246,6 +246,13 @@ func (a *statisticsProviderAdapter) Lookup(ctx context.Context, target storage.O
 	return snapshot.Lookup(ctx, target)
 }
 
+func (scope *sessionScope) searchPath(ctx context.Context) []string {
+	if scope.txns != nil {
+		return scope.txns.SearchPathIn(ctx)
+	}
+	return scope.settings.SearchPath()
+}
+
 // prepareOptions supplies the immutable planning collaborators for one
 // statement: the catalog access planner is bound to the snapshot and reader the
 // caller already pinned, and committed ANALYZE statistics are wired into the
@@ -253,13 +260,15 @@ func (a *statisticsProviderAdapter) Lookup(ctx context.Context, target storage.O
 func (scope *sessionScope) prepareOptions(ctx context.Context, snapshot *catalog.CatalogSnapshot, reader storage.SnapshotReader, builtins builtin.ResolveOptions) (session.PrepareOptions, error) {
 	database := scope.database
 	limits := database.irLimits()
+	searchPath := scope.searchPath(ctx)
 	textSearch := database.customTextSearchRuntime()
 	if snapshot != nil {
-		if runtimeTS, tsErr := session.NewTextSearchRuntimeWithCustom(snapshot, scope.settings.SearchPath(), 4096, nil, nil, database.textSearchRegistry); tsErr == nil {
+		if runtimeTS, tsErr := session.NewTextSearchRuntimeWithCustom(snapshot, searchPath, 4096, nil, nil, database.textSearchRegistry); tsErr == nil {
 			textSearch = runtimeTS
 		}
 	}
 	bindOpts := scope.bindOptions(builtins)
+	bindOpts.SearchPath = searchPath
 	bindOpts.TextSearch = textSearch
 	options := session.PrepareOptions{
 		Bind:      bindOpts,

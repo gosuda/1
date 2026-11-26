@@ -46,7 +46,11 @@ func (n *normalizer) scalar(id ir.ScalarID, depth uint32) scalarResult {
 		}
 		value, found := model.Value{}, false
 		if n.foldBounds {
-			value, found = n.constantSlot(source.Slot)
+			if candidate, candidateType, ok := n.constantSlot(source.Slot); ok {
+				if slotType, ok := n.g.Type(source.Layout); ok && candidateType == slotType && candidate.Type == slotType.Storage {
+					value, found = candidate, true
+				}
+			}
 		}
 		if found {
 			result = n.constant(meta, value)
@@ -300,9 +304,12 @@ func (n *normalizer) fold(source ir.Scalar, args []scalarResult) (model.Value, b
 	}
 	if relabel {
 		value := args[0].value
+		to, ok := n.g.Type(source.Layout)
+		if !ok || value.Type != to.Storage {
+			return model.Value{}, false
+		}
 		if source.Kind == ir.Relabel && !value.IsNull {
 			from, _ := n.g.Type(args[0].sourceLayout)
-			to, _ := n.g.Type(source.Layout)
 			if from.ID == 23 && builtin.IsOIDType(to.ID) {
 				value.IntVal = int64(uint32(value.IntVal))
 			} else if builtin.IsOIDType(from.ID) && to.ID == 23 {
@@ -312,6 +319,9 @@ func (n *normalizer) fold(source ir.Scalar, args []scalarResult) (model.Value, b
 		return value, true
 	}
 	if source.Kind == ir.NullTest {
+		if resultType, ok := n.g.Type(source.Layout); !ok || resultType.Storage != model.TypeBoolean {
+			return model.Value{}, false
+		}
 		value := args[0].value
 		isNull, isNotNull := value.IsNull, !value.IsNull
 		if !value.IsNull && value.Type == model.TypeComposite {
@@ -373,6 +383,9 @@ func (n *normalizer) fold(source ir.Scalar, args []scalarResult) (model.Value, b
 	value, err := callable.Call(n.ctx, values[:len(args)], builtin.CallBudget{OutputBytes: int64(remaining), MemoryBytes: remaining, TextSearch: n.o.TextSearch})
 	if err != nil {
 		n.foldError(err)
+		return model.Value{}, false
+	}
+	if value.Type != resultType.Storage {
 		return model.Value{}, false
 	}
 	n.valueBytes(value)
