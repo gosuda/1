@@ -98,8 +98,8 @@ func bindCreateStatistics(ctx context.Context, statement *zpgparse.CreateStatsSt
 	if spec.Table == nil {
 		return nil, bindError("42809", "statistics require a table", int(relation.Location)+1)
 	}
-	if spec.Table.Owner != options.Owner {
-		return nil, bindError("42501", "must be owner of table to create statistics", int(relation.Location)+1)
+	if err := b.requireTableOwner(table, int(relation.Location)+1); err != nil {
+		return nil, err
 	}
 	nameParts, err := names(statement.Defnames)
 	if err != nil {
@@ -141,6 +141,9 @@ func bindCreateStatistics(ctx context.Context, statement *zpgparse.CreateStatsSt
 		}
 	}
 	b.dependency(statisticsSchema, 0)
+	if err := b.checkSchemaCreate(statisticsSchema, 0); err != nil {
+		return nil, err
+	}
 	keys, expressions, bindings, err := bindStatisticsElements(ctx, b, statement.Exprs, table, spec.Table.Columns, snapshot, options.Bind)
 	if err != nil {
 		return nil, err
@@ -170,7 +173,7 @@ func bindCreateStatistics(ctx context.Context, statement *zpgparse.CreateStatsSt
 	if err != nil {
 		return nil, err
 	}
-	descriptor := model.ExtendedStatisticDescriptor{OID: oid, Name: name, Description: statement.Stxcomment, Owner: options.Owner, Namespace: statisticsSchema.ID(), Keys: keys, Expressions: expressions, Kinds: kinds}
+	descriptor := model.ExtendedStatisticDescriptor{OID: oid, Name: name, Description: statement.Stxcomment, Owner: options.Owner, OwnerName: normalizeOwnerName(options.Bind.CurrentRole), Namespace: statisticsSchema.ID(), Keys: keys, Expressions: expressions, Kinds: kinds}
 	spec.Table.ExtendedStatistics = append(spec.Table.ExtendedStatistics, descriptor)
 	slices.SortFunc(spec.Table.ExtendedStatistics, func(a, b model.ExtendedStatisticDescriptor) int { return cmp.Compare(a.OID, b.OID) })
 	dependencies := slices.Clone(b.dependencies)
@@ -348,6 +351,36 @@ func resolveStatistics(ctx context.Context, b *binder, parts []string, limits mo
 	return foundStatistic{}, bindError("42704", "statistics object does not exist", 0)
 }
 
+func (b *binder) requireStatisticsOwner(found foundStatistic, position int) error {
+	if normalizeRoleName(b.options.CurrentRole) == "" {
+		return nil
+	}
+	roles, err := b.cachedRoles()
+	if err != nil {
+		return err
+	}
+	if roleIsSuperuser(roles, b.options.CurrentRole) {
+		return nil
+	}
+	if found.statistic.OwnerName != "" {
+		if roleIsOwner(roles, b.options.CurrentRole, found.statistic.OwnerName) {
+			return nil
+		}
+		return bindError("42501", "must be owner of statistics object", position)
+	}
+	if found.table == nil {
+		return bindError("42501", "must be owner of statistics object", position)
+	}
+	if err := b.requireTableOwner(found.table, position); err != nil {
+		var diagnostic *model.Error
+		if errors.As(err, &diagnostic) && diagnostic.Code == "42501" {
+			return bindError("42501", "must be owner of statistics object", position)
+		}
+		return err
+	}
+	return nil
+}
+
 func bindAlterStatistics(ctx context.Context, statement *zpgparse.AlterStatsStmt, snapshot CatalogSnapshot, options CreateDeclarationOptions) (*BoundStatisticsCommand, error) {
 	if statement == nil || statement.Stxstattarget == nil {
 		return nil, bindError("42601", "ALTER STATISTICS requires a target", 0)
@@ -368,8 +401,8 @@ func bindAlterStatistics(ctx context.Context, statement *zpgparse.AlterStatsStmt
 		}
 		return nil, err
 	}
-	if found.statistic.Owner != options.Owner {
-		return nil, bindError("42501", "must be owner of statistics object", 0)
+	if err := b.requireStatisticsOwner(found, 0); err != nil {
+		return nil, err
 	}
 	integer := statement.Stxstattarget.GetInteger()
 	if integer == nil || integer.Ival < -1 || integer.Ival > 10000 {
@@ -413,8 +446,8 @@ func bindRenameStatistics(ctx context.Context, statement *zpgparse.RenameStmt, s
 	if err != nil {
 		return nil, err
 	}
-	if found.statistic.Owner != options.Owner {
-		return nil, bindError("42501", "must be owner of statistics object", 0)
+	if err := b.requireStatisticsOwner(found, 0); err != nil {
+		return nil, err
 	}
 	conflict, err := findStatisticsInSchema(ctx, snapshot, found.statistic.Namespace, statement.Newname, options.Descriptors, options.Bind.Limits.MaxNodes)
 	if err != nil {
@@ -454,8 +487,8 @@ func bindSetStatisticsSchema(ctx context.Context, statement *zpgparse.AlterObjec
 		}
 		return nil, err
 	}
-	if found.statistic.Owner != options.Owner {
-		return nil, bindError("42501", "must be owner of statistics object", 0)
+	if err := b.requireStatisticsOwner(found, 0); err != nil {
+		return nil, err
 	}
 	destination, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: statement.Newschema})
 	if err != nil {
@@ -468,6 +501,9 @@ func bindSetStatisticsSchema(ctx context.Context, statement *zpgparse.AlterObjec
 		return nil, bindError("3F000", "schema does not exist", 0)
 	}
 	b.dependency(destination.Descriptor, 0)
+	if err := b.checkSchemaCreate(destination.Descriptor, 0); err != nil {
+		return nil, err
+	}
 	conflict, err := findStatisticsInSchema(ctx, snapshot, destination.Descriptor.ID(), found.statistic.Name, options.Descriptors, options.Bind.Limits.MaxNodes)
 	if err != nil {
 		return nil, err
@@ -543,8 +579,8 @@ func bindDropStatistics(ctx context.Context, statement *zpgparse.DropStmt, snaps
 			}
 			return nil, err
 		}
-		if found.statistic.Owner != options.Owner {
-			return nil, bindError("42501", "must be owner of statistics object", 0)
+		if err := b.requireStatisticsOwner(found, 0); err != nil {
+			return nil, err
 		}
 		if slices.Contains(byTable[found.table.ID()], found.statistic.OID) {
 			return nil, bindError("42701", "statistics object specified more than once", 0)
@@ -674,12 +710,15 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 					return bindError("54000", "ANALYZE relation limit exceeded", 0)
 				}
 				if table.Descriptor.State() == model.StatePublic {
-					metadata, ok := table.Descriptor.Table()
-					if !ok {
+					if _, ok := table.Descriptor.Table(); !ok {
 						return bindError("42809", "ANALYZE target is not a table", 0)
 					}
-					if metadata.Owner != options.Owner {
-						return bindError("42501", "must be owner of table to analyze it", 0)
+					if err := b.requireTableOwner(table.Descriptor, 0); err != nil {
+						var diagnostic *model.Error
+						if errors.As(err, &diagnostic) && diagnostic.Code == "42501" {
+							return nil
+						}
+						return err
 					}
 					b.dependency(table.Descriptor, 0)
 					bound.targets = append(bound.targets, AnalyzeTarget{Table: table.Descriptor})
@@ -716,8 +755,8 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 			if err != nil {
 				return nil, err
 			}
-			if spec.Table.Owner != options.Owner {
-				return nil, bindError("42501", "must be owner of table to analyze it", int(rangeVar.Location)+1)
+			if err := b.requireTableOwner(table, int(rangeVar.Location)+1); err != nil {
+				return nil, err
 			}
 			columns := make([]model.ColumnID, 0, len(relation.VaCols))
 			for _, columnNode := range relation.VaCols {

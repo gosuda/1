@@ -392,17 +392,67 @@ func (target mutationTarget) conflictTarget() mutationTarget {
 	return target
 }
 
+func (b *binder) checkViewMutationPrivileges(target mutationTarget, required model.PrivilegeMask, pos int) error {
+	if len(target.viewLayers) == 0 || required == 0 {
+		return nil
+	}
+	effectiveRole := b.options.CurrentRole
+	for _, layer := range target.viewLayers {
+		if !layer.view.SecurityInvoker {
+			effectiveRole = layer.view.OwnerName
+		}
+		if normalizeRoleName(effectiveRole) == "" {
+			continue
+		}
+		roles, err := b.cachedRoles()
+		if err != nil {
+			return err
+		}
+		if !hasObjectPrivilege(roles, effectiveRole, layer.base, required, false) {
+			return permissionDeniedError(layer.base, pos)
+		}
+	}
+	return nil
+}
+
+func (b *binder) viewMutationEffectiveRole(target mutationTarget) string {
+	effectiveRole := b.options.CurrentRole
+	if len(target.viewLayers) > 0 {
+		for _, layer := range target.viewLayers {
+			if !layer.view.SecurityInvoker {
+				effectiveRole = layer.view.OwnerName
+			}
+		}
+		return effectiveRole
+	}
+	if target.view && target.descriptor != nil {
+		if vmeta, ok := target.descriptor.View(); ok && !vmeta.SecurityInvoker {
+			return vmeta.OwnerName
+		}
+	}
+	return effectiveRole
+}
+
 func (b *binder) bindViewMutationSteps(s *scope, target mutationTarget) ([]ir.ViewMutationStepSpec, ir.Effects, error) {
 	checks := make([]bool, len(target.viewLayers))
+	layerRoles := make([]string, len(target.viewLayers))
 	cascade := false
+	effectiveRole := b.options.CurrentRole
 	for i, layer := range target.viewLayers {
 		checks[i] = cascade || layer.view.CheckOption != ""
 		cascade = cascade || layer.view.CheckOption == "cascaded"
+		if !layer.view.SecurityInvoker {
+			effectiveRole = layer.view.OwnerName
+		}
+		layerRoles[i] = effectiveRole
 	}
+	savedRole := b.options.CurrentRole
+	defer func() { b.options.CurrentRole = savedRole }()
 	steps := make([]ir.ViewMutationStepSpec, 0, len(target.viewLayers))
 	var effects ir.Effects
 	for i := len(target.viewLayers) - 1; i >= 0; i-- {
 		layer := target.viewLayers[i]
+		b.options.CurrentRole = layerRoles[i]
 		parsed := &zpgparse.RawStmt{}
 		if err := proto.Unmarshal(layer.view.Query.Encoding, parsed); err != nil || parsed.Stmt == nil || parsed.Stmt.GetSelectStmt() == nil {
 			return nil, effects, model.ErrInvalidDescriptor

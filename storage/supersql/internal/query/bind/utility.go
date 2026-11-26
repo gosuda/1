@@ -297,6 +297,9 @@ func (b *binder) insert(n *zpgparse.InsertStmt, s *scope) (relation, error) {
 	if err != nil {
 		return relation{}, err
 	}
+	if err := b.checkViewMutationPrivileges(target, required, pos); err != nil {
+		return relation{}, err
+	}
 	columns := publicColumns(table)
 	targets := columns
 	paths := make([][]*zpgparse.Node, len(targets))
@@ -567,6 +570,9 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 	}
 	target, err = b.prepareMutationTarget(target, []string{"update"})
 	if err != nil {
+		return relation{}, err
+	}
+	if err := b.checkViewMutationPrivileges(target, required, pos); err != nil {
 		return relation{}, err
 	}
 	previousProvenance := b.mutationProvenance
@@ -932,6 +938,9 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 	}
 	target, err = b.prepareMutationTarget(target, []string{"delete"})
 	if err != nil {
+		return relation{}, err
+	}
+	if err := b.checkViewMutationPrivileges(target, required, pos); err != nil {
 		return relation{}, err
 	}
 	previousProvenance := b.mutationProvenance

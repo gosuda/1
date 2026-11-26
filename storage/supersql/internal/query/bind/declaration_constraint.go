@@ -198,8 +198,18 @@ func (s *declarationState) bindForeignKey(ctx context.Context, spec *model.Descr
 		if c.Pktable.Schemaname != "" {
 			parts = []string{c.Pktable.Schemaname, c.Pktable.Relname}
 		}
-		referenced, _, err = s.b.resolve(parts, []model.ObjectKind{model.ObjectTable}, "42P01", int(c.Pktable.Location)+1)
+		refPos := int(c.Pktable.Location) + 1
+		var refSchema *model.Descriptor
+		referenced, refSchema, err = resolveNamespaceObject(ctx, s.b.catalog, s.b.options.SearchPath, parts, []model.ObjectKind{model.ObjectTable}, "42P01", refPos)
 		if err != nil {
+			return constraint, nil, err
+		}
+		s.b.dependency(refSchema, 0)
+		s.b.dependency(referenced, 0)
+		if err := s.b.checkSchemaUsage(refSchema, refPos); err != nil {
+			return constraint, nil, err
+		}
+		if err := s.b.checkObjectPrivilege(referenced, model.PrivilegeReferences, refPos); err != nil {
 			return constraint, nil, err
 		}
 		referencedSpec, specErr := referenced.SpecWithin(ctx, s.options.Descriptors)

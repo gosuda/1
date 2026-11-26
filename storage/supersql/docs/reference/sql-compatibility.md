@@ -683,8 +683,8 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
 | internal/query/bind/declaration_constraint.go:30 | `NOT NULL constraint does not support NOT VALID` |
 | internal/query/bind/declaration_constraint.go:34 | `constraint does not support NOT VALID` |
-| internal/query/bind/declaration_constraint.go:360 | `only B-tree exclusion constraints are supported` |
-| internal/query/bind/declaration_constraint.go:384 | `only equality exclusion operators are supported` |
+| internal/query/bind/declaration_constraint.go:370 | `only B-tree exclusion constraints are supported` |
+| internal/query/bind/declaration_constraint.go:394 | `only equality exclusion operators are supported` |
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
 | internal/query/bind/definition_declaration.go:307 | `support function arguments must be inferred from the declaration` |
 | internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
@@ -758,9 +758,9 @@ No resolved catalog objects.
 | internal/query/bind/select_set.go:127 | `WITH clause containing a data-modifying statement must be at the top level` |
 | internal/query/bind/sequence_identity_owner.go:22 | `cannot change ownership of identity sequence` |
 | internal/query/bind/sqljson.go:501 | `JSON FORMAT ENCODING requires bytea input` |
-| internal/query/bind/statistics_declaration.go:255 | `unsupported statistics kind` |
-| internal/query/bind/statistics_declaration.go:523 | `DROP STATISTICS CONCURRENTLY is not supported` |
-| internal/query/bind/statistics_declaration.go:660 | `unsupported ANALYZE option` |
+| internal/query/bind/statistics_declaration.go:258 | `unsupported statistics kind` |
+| internal/query/bind/statistics_declaration.go:559 | `DROP STATISTICS CONCURRENTLY is not supported` |
+| internal/query/bind/statistics_declaration.go:696 | `unsupported ANALYZE option` |
 | internal/query/bind/statistics_declaration.go:71 | `CREATE STATISTICS requires one ordinary table` |
 | internal/query/bind/subquery_compare.go:45 | `cannot compare rows of zero length` |
 | internal/query/bind/subquery_compare.go:80 | `row comparison operators must belong to compatible btree families` |
@@ -778,11 +778,11 @@ No resolved catalog objects.
 | internal/query/bind/type_declaration.go:260 | `only shell CREATE TYPE declarations are supported` |
 | internal/query/bind/type_declaration.go:370 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:575 | `domain constraints cannot be DEFERRABLE` |
-| internal/query/bind/utility.go:385 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/utility.go:700 | `cannot update a non-updatable view column` |
+| internal/query/bind/utility.go:388 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility.go:706 | `cannot update a non-updatable view column` |
 | internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:330 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility_merge.go:333 | `cannot insert into a non-updatable view column` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
 | internal/query/builtin/context_only.go:21 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/date_fields.go:132 | `model.Error{Code: "0A000"}` |
@@ -802,5 +802,5 @@ No resolved catalog objects.
 | internal/query/session/prepare.go:113 | `model.Error{Code: "0A000"}` |
 | internal/query/session/sequence_runtime.go:194 | `model.Error{Code: "0A000"}` |
 | internal/query/session/settings_values.go:207 | `model.Error{Code: "0A000"}` |
-| pgwire/conn.go:412 | `model.Error{Code: "0A000"}` |
+| pgwire/conn.go:444 | `model.Error{Code: "0A000"}` |
 

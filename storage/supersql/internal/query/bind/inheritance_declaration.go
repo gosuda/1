@@ -58,8 +58,15 @@ func (b *binder) prepareTableInheritance(ctx context.Context, statement *zpgpars
 		if rangeVar.Schemaname != "" {
 			parts = []string{rangeVar.Schemaname, rangeVar.Relname}
 		}
-		parent, _, err := resolveNamespaceObject(ctx, snapshot, options.Bind.SearchPath, parts, []model.ObjectKind{model.ObjectTable}, "42P01", int(rangeVar.Location)+1)
+		pos := int(rangeVar.Location) + 1
+		parent, parentNamespace, err := resolveNamespaceObject(ctx, snapshot, options.Bind.SearchPath, parts, []model.ObjectKind{model.ObjectTable}, "42P01", pos)
 		if err != nil {
+			return nil, err
+		}
+		if err := b.checkSchemaUsage(parentNamespace, pos); err != nil {
+			return nil, err
+		}
+		if err := b.requireTableOwner(parent, pos); err != nil {
 			return nil, err
 		}
 		if seen[parent.ID()] {

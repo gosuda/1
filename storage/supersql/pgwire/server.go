@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -213,6 +214,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					s.logf("pgwire: recovered panic in connection goroutine pid=%d: %v\n%s", cc.pid, r, debug.Stack())
+					cc.safeSendFatalPanic()
+					cc.forceClose()
+				}
+			}()
 			cc.serve(serveCtx)
 		}()
 	}
@@ -307,15 +315,16 @@ func (s *Server) newClientConn(rawConn net.Conn) *clientConn {
 	pid := s.nextPID.Add(1)
 	secret := randomSecretKey()
 	return &clientConn{
-		server:    s,
-		rawConn:   rawConn,
-		br:        bufio.NewReaderSize(rawConn, 16*1024),
-		bw:        bufio.NewWriterSize(rawConn, 16*1024),
-		pid:       pid,
-		secretKey: secret,
-		txStatus:  txStatusIdle,
-		stmts:     make(map[string]*preparedStmt),
-		portals:   make(map[string]*portal),
+		server:      s,
+		rawConn:     rawConn,
+		br:          bufio.NewReaderSize(rawConn, 16*1024),
+		bw:          bufio.NewWriterSize(rawConn, 16*1024),
+		pid:         pid,
+		secretKey:   secret,
+		isSuperuser: false,
+		txStatus:    txStatusIdle,
+		stmts:       make(map[string]*preparedStmt),
+		portals:     make(map[string]*portal),
 	}
 }
 

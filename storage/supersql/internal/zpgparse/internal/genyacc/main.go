@@ -15,13 +15,27 @@ import (
 	"strings"
 )
 
-const maxParserBytes = 16 << 20
+const (
+	maxParserBytes = 16 << 20
+	yyMaxStackSize = 4096
+)
 
 // provenance is inserted after goyacc's own "// Code generated" line. Both
 // grammars are vendored from the pg18_query_go copy of libpg_query, so every
 // goyacc re-run keeps the attribution.
 const provenance = "// Source: internal/zpgparse/internal/neoparse/gram.y and internal/zpgparse/internal/plpgsql/gram.y, vendored from https://github.com/gosuda/pg18_query_go at 10d566809991b10ff1182369705c19743e16c155\n" +
 	"// License: BSD-3-Clause AND PostgreSQL (see internal/zpgparse/NOTICE)"
+
+const stackGrowReplacement = "if yyp >= len(yyS) {\n" +
+	"\tif yyp >= yyMaxStackSize {\n" +
+	"\t\tyylex.Error(\"parser stack overflow\")\n" +
+	"\t\tgoto ret1\n" +
+	"\t}\n" +
+	"\tnewcap := min(len(yyS)*2, yyMaxStackSize)\n" +
+	"\tnyys := make([]yySymType, newcap)\n" +
+	"\tcopy(nyys, yyS)\n" +
+	"\tyyS = nyys\n" +
+	"}"
 
 var (
 	errSkeleton    = errors.New("unrecognized pinned goyacc skeleton")
@@ -70,11 +84,33 @@ func normalize(source []byte) ([]byte, error) {
 		return nil, err
 	}
 	offset := func(position token.Pos) int { return files.File(position).Offset(position) }
+	var initialStack *ast.GenDecl
 	var fallback *ast.IfStmt
+	var stackGrow *ast.IfStmt
 	var recovery *ast.ForStmt
 	var resume *ast.BranchStmt
-	var fallbackCount, recoveryCount, resumeCount int
+	var initialStackCount, fallbackCount, stackGrowCount, recoveryCount, resumeCount int
 	for _, declaration := range file.Decls {
+		if decl, ok := declaration.(*ast.GenDecl); ok && decl.Tok == token.CONST {
+			for _, spec := range decl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, name := range valueSpec.Names {
+					switch name.Name {
+					case "yyMaxStackSize":
+						return nil, errSkeleton
+					case "yyInitialStackSize":
+						if len(decl.Specs) == 1 && len(valueSpec.Names) == 1 {
+							initialStack = decl
+							initialStackCount++
+						}
+					}
+				}
+			}
+			continue
+		}
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok {
 			continue
@@ -93,6 +129,11 @@ func normalize(source []byte) ([]byte, error) {
 			})
 		case "Parse":
 			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if branch, ok := node.(*ast.IfStmt); ok && isStackGrowCond(branch.Cond) {
+					stackGrow = branch
+					stackGrowCount++
+					return false
+				}
 				loop, ok := node.(*ast.ForStmt)
 				if !ok || !compareZero(loop.Cond, "yyp", token.GEQ) {
 					return true
@@ -111,11 +152,18 @@ func normalize(source []byte) ([]byte, error) {
 			})
 		}
 	}
-	if fallbackCount != 1 || recoveryCount != 1 || resumeCount != 1 {
+	if initialStackCount != 1 || fallbackCount != 1 || stackGrowCount != 1 || recoveryCount != 1 || resumeCount != 1 {
 		return nil, errSkeleton
 	}
 	fallbackSource := string(source[offset(fallback.Pos()):offset(fallback.End())])
 	if !strings.Contains(fallbackSource, "token = int(yyTok2[1])") || len(fallback.Body.List) != 1 || fallback.Else != nil {
+		return nil, errSkeleton
+	}
+	stackGrowSource := string(source[offset(stackGrow.Pos()):offset(stackGrow.End())])
+	if stackGrow.Init != nil || stackGrow.Else != nil || len(stackGrow.Body.List) != 3 ||
+		!strings.Contains(stackGrowSource, "make([]yySymType, len(yyS)*2)") ||
+		!strings.Contains(stackGrowSource, "copy(nyys, yyS)") ||
+		!strings.Contains(stackGrowSource, "yyS = nyys") {
 		return nil, errSkeleton
 	}
 	start, end := offset(recovery.Pos()), offset(recovery.End())
@@ -128,13 +176,15 @@ func normalize(source []byte) ([]byte, error) {
 	edits := []replacement{
 		{headerEnd, headerEnd, "\n" + provenance},
 		{offset(file.Name.End()), offset(file.Name.End()), "\nimport __yycmp__ \"cmp\"\n"},
+		{offset(initialStack.End()), offset(initialStack.End()), fmt.Sprintf("\nconst yyMaxStackSize = %d", yyMaxStackSize)},
 		{offset(fallback.Pos()), offset(fallback.End()), "token = __yycmp__.Or(token, int(yyTok2[1]))"},
+		{offset(stackGrow.Pos()), offset(stackGrow.End()), stackGrowReplacement},
 		{start, end, "yystate, yyp = yyErrorRecovery(yyS, yyp)\nif yyp >= 0 { goto yystack }"},
 		{len(source), len(source), helper},
 	}
 	slices.SortFunc(edits, func(a, b replacement) int { return a.start - b.start })
 	var output bytes.Buffer
-	output.Grow(len(source) + len(helper))
+	output.Grow(len(source) + len(helper) + len(stackGrowReplacement))
 	position := 0
 	for _, edit := range edits {
 		output.Write(source[position:edit.start])
@@ -159,6 +209,27 @@ func compareZero(expression ast.Expr, name string, operator token.Token) bool {
 	}
 	literal, ok := binary.Y.(*ast.BasicLit)
 	return ok && literal.Kind == token.INT && literal.Value == "0"
+}
+
+func isStackGrowCond(expression ast.Expr) bool {
+	binary, ok := expression.(*ast.BinaryExpr)
+	if !ok || binary.Op != token.GEQ {
+		return false
+	}
+	identifier, ok := binary.X.(*ast.Ident)
+	if !ok || identifier.Name != "yyp" {
+		return false
+	}
+	call, ok := binary.Y.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	callee, ok := call.Fun.(*ast.Ident)
+	if !ok || callee.Name != "len" {
+		return false
+	}
+	arg, ok := call.Args[0].(*ast.Ident)
+	return ok && arg.Name == "yyS"
 }
 
 func publish(path string, data []byte) (err error) {

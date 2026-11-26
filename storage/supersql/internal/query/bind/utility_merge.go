@@ -52,6 +52,9 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	if err != nil {
 		return relation{}, err
 	}
+	if err := b.checkViewMutationPrivileges(target, required, pos); err != nil {
+		return relation{}, err
+	}
 	previousProvenance := b.mutationProvenance
 	if target.automatic() {
 		b.mutationProvenance = target.executionDescriptor.ID()
