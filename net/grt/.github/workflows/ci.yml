@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, master]
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: 17 4 * * 1
+
+jobs:
+  lint:
+    name: Lint, Format & Cross-OS Build
+    runs-on: depot-ubuntu-24.04-4
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Verify Formatting (gofmt)
+        run: |
+          diffs=$(gofmt -l .)
+          if [ -n "$diffs" ]; then
+            echo "The following files are not formatted with gofmt:"
+            echo "$diffs"
+            exit 1
+          fi
+
+      - name: Verify Formal Codegen Up-To-Date
+        run: |
+          go run ./cmd/grtgen
+          git diff --exit-code
+
+      - name: Static Analysis (go vet)
+        run: go vet ./...
+
+      - name: Vulnerability Check (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Cross-OS Compile Check
+        run: |
+          for goos in linux darwin windows freebsd openbsd; do
+            GOOS=$goos GOARCH=amd64 go build ./...
+          done
+
+  unit-test:
+    name: Unit, fuzz and all simulation seeds (${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["depot-ubuntu-24.04-4","depot-macos-latest"]' || '["depot-ubuntu-24.04-4"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Unit Tests (with Race Detector)
+        run: go test -v -race -timeout 5m ./internal/formal/... ./internal/wire/... ./internal/crypto/... ./internal/engine/... .
+
+      - name: Run Wire Parser Fuzz Smoke Tests
+        run: |
+          go test -fuzz=^FuzzParseFrames$ -fuzztime=5s ./internal/wire
+          go test -fuzz=^FuzzParseFragment$ -fuzztime=5s ./internal/wire
+
+      - name: Run every deterministic simulation seed
+        shell: bash
+        run: |
+          for seed in 1 42 67 1982 1992 2002 2012 2022 2026; do
+            echo "::group::DST seed $seed"
+            DST_SEED="$seed" go test -v -race -count=1 -timeout 5m ./internal/sim/...
+            echo "::endgroup::"
+          done
+      - name: Run benchmarks
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: go test -v -bench=. -benchmem -benchtime=1x -run='^$' ./...
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}

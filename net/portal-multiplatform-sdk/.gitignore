@@ -1,0 +1,31 @@
+*.iml
+.gradle
+.idea
+.DS_Store
+build
+captures
+.externalNativeBuild
+.cxx
+local.properties
+xcuserdata
+.kotlin
+#So we do not accidentally commit our private keys
+*.gpg
+
+# iOS engine archives (rebuild via scripts/build-ios-engine.sh)
+native/ios/
+
+# Desktop engine shared libraries (rebuild via scripts/build-desktop-engine.sh)
+native/desktop/
+
+# Generated Xcode project (regenerate via xcodegen)
+samples/ios/PortalSample.xcodeproj/
+
+# Local go build output
+native/bridge/bridge
+
+# Packaged distribution artifacts (scripts/package-ios-xcframework.sh)
+dist/
+
+# SwiftPM scratch dir (verify-ios-maven-consumer.sh)
+.build/
