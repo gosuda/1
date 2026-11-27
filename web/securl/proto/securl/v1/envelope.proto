@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package securl.v1;
+
+option go_package = "securl.click/securl/gen/go/securl/v1;securlv1";
+
+enum PasswordProfile {
+  PASSWORD_PROFILE_UNSPECIFIED = 0;
+  PASSWORD_PROFILE_ARGON2D_V1 = 1;
+}
+
+enum FeatureFlag {
+  FEATURE_FLAG_UNSPECIFIED = 0;
+  FEATURE_FLAG_CAPTCHA = 1;
+  FEATURE_FLAG_PASSWORD = 2;
+  FEATURE_FLAG_BURN_AFTER_READ = 4;
+}
+
+// Zero keeps metadata of existing URL envelopes byte-identical, so their AAD is unchanged.
+enum PayloadKind {
+  PAYLOAD_KIND_URL = 0;
+  PAYLOAD_KIND_MARKDOWN = 1;
+}
+
+message PasswordLayer {
+  bytes salt = 1;
+  bytes nonce = 2;
+  PasswordProfile profile = 3;
+}
+
+message CaptchaLayer {
+  bytes nonce = 1;
+}
+
+message EnvelopeMetadata {
+  uint32 protocol_version = 1;
+  uint32 feature_flags = 2;
+  // Zero means the envelope does not expire.
+  uint32 ttl_seconds = 3;
+  bytes payload_nonce = 4;
+  PasswordLayer password = 5;
+  CaptchaLayer captcha = 6;
+  PayloadKind payload_kind = 7;
+}
+
+message Envelope {
+  EnvelopeMetadata metadata = 1;
+  bytes ciphertext = 2;
+}
+
+message Payload {
+  oneof content {
+    // NUL-padded destination URL.
+    string url = 1;
+    // Raw DEFLATE (RFC 1951) compressed UTF-8 Markdown.
+    bytes markdown_deflate = 2;
+  }
+  // Zero bytes that hide the exact compressed Markdown length.
+  bytes padding = 3;
+}
