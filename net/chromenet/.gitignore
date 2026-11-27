@@ -1,0 +1,4 @@
+# scripts/engine/build.sh output
+dist/
+go.work
+go.work.sum

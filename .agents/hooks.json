@@ -1,0 +1,16 @@
+{
+  "git-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/guard-git.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
