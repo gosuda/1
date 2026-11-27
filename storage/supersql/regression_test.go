@@ -32,6 +32,8 @@ import (
 // its 233 files are byte-identical to the reference, so it runs only when
 // SUPERSQL_REGRESS_CORPORA names it (comma-separated: postgres184,postgres).
 // SUPERSQL_REGRESS_FILES narrows a run to the named schedule files.
+// SUPERSQL_REGRESS_PREAMBLE names schedule files (such as test_setup) that are
+// always included in schedule order without duplication when narrowing a run.
 func TestPostgres18OfficialRegression(t *testing.T) {
 	if os.Getenv("NEOSEPIA_POSTGRES_REGRESS") != "1" {
 		t.Skip("set NEOSEPIA_POSTGRES_REGRESS=1 to run the vendored PostgreSQL regression schedule")
@@ -976,17 +978,33 @@ func isDollarTagByte(c byte) bool {
 
 // selectRegressionFiles narrows the schedule to the comma-separated file names
 // in SUPERSQL_REGRESS_FILES, keeping schedule order. Unset runs every file.
+// When SUPERSQL_REGRESS_PREAMBLE is set (for example, "test_setup"), those
+// schedule files are always included in schedule order without duplication so
+// sharded runs preserve shared setup fixtures.
 func selectRegressionFiles(t *testing.T, files []string) []string {
 	t.Helper()
+	preamble := parseRegressionFileList(os.Getenv("SUPERSQL_REGRESS_PREAMBLE"))
 	raw := os.Getenv("SUPERSQL_REGRESS_FILES")
 	if raw == "" {
+		if len(preamble) > 0 {
+			known := make(map[string]bool, len(files))
+			for _, name := range files {
+				known[name] = true
+			}
+			for _, name := range preamble {
+				if !known[name] {
+					t.Fatalf("SUPERSQL_REGRESS_PREAMBLE names %q, which the schedule does not list", name)
+				}
+			}
+		}
 		return files
 	}
 	wanted := make(map[string]bool)
-	for _, name := range strings.Split(raw, ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			wanted[name] = true
-		}
+	for _, name := range preamble {
+		wanted[name] = true
+	}
+	for _, name := range parseRegressionFileList(raw) {
+		wanted[name] = true
 	}
 	var selected []string
 	for _, name := range files {
@@ -996,7 +1014,60 @@ func selectRegressionFiles(t *testing.T, files []string) []string {
 		}
 	}
 	for name := range wanted {
-		t.Fatalf("SUPERSQL_REGRESS_FILES names %q, which the schedule does not list", name)
+		t.Fatalf("SUPERSQL_REGRESS_FILES/SUPERSQL_REGRESS_PREAMBLE names %q, which the schedule does not list", name)
 	}
 	return selected
+}
+
+func parseRegressionFileList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var names []string
+	for _, name := range strings.Split(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func TestSelectRegressionFilesPreamble(t *testing.T) {
+	schedule := []string{"test_setup", "boolean", "int4", "select", "join"}
+
+	t.Run("full_schedule_when_files_unset", func(t *testing.T) {
+		t.Setenv("SUPERSQL_REGRESS_FILES", "")
+		t.Setenv("SUPERSQL_REGRESS_PREAMBLE", "test_setup")
+		got := selectRegressionFiles(t, schedule)
+		if strings.Join(got, ",") != "test_setup,boolean,int4,select,join" {
+			t.Fatalf("got %v, want full schedule", got)
+		}
+	})
+
+	t.Run("prepends_preamble_in_schedule_order", func(t *testing.T) {
+		t.Setenv("SUPERSQL_REGRESS_FILES", "join,int4")
+		t.Setenv("SUPERSQL_REGRESS_PREAMBLE", "test_setup")
+		got := selectRegressionFiles(t, schedule)
+		if strings.Join(got, ",") != "test_setup,int4,join" {
+			t.Fatalf("got %v, want [test_setup int4 join]", got)
+		}
+	})
+
+	t.Run("deduplicates_when_preamble_already_in_shard", func(t *testing.T) {
+		t.Setenv("SUPERSQL_REGRESS_FILES", "test_setup,boolean")
+		t.Setenv("SUPERSQL_REGRESS_PREAMBLE", "test_setup")
+		got := selectRegressionFiles(t, schedule)
+		if strings.Join(got, ",") != "test_setup,boolean" {
+			t.Fatalf("got %v, want [test_setup boolean]", got)
+		}
+	})
+
+	t.Run("no_preamble_selects_only_requested_files", func(t *testing.T) {
+		t.Setenv("SUPERSQL_REGRESS_FILES", "select,boolean")
+		t.Setenv("SUPERSQL_REGRESS_PREAMBLE", "")
+		got := selectRegressionFiles(t, schedule)
+		if strings.Join(got, ",") != "boolean,select" {
+			t.Fatalf("got %v, want [boolean select]", got)
+		}
+	})
 }
