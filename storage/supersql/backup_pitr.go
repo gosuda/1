@@ -190,8 +190,18 @@ func (database *Catalog) CreateIncrementalBackup(ctx context.Context, baseBackup
 
 // EnableWALArchive enables atomic WAL segment archiving on an open database.
 // Every existing unretired WAL segment and every subsequent durable commit WAL
-// segment is atomically copied to archiveDir (encrypted with AES-256-GCM when
-// encryptionKey is non-empty) before WAL retirement can unlink it.
+// segment is atomically copied to archiveDir before WAL retirement can unlink
+// it. Already archived segments retain their stored bytes. Newly archived
+// segments, including older commits backfilled now, use AES-256-GCM when an
+// archive key is available. A non-empty encryptionKey selects that key;
+// otherwise the database's live encryption key is used, if configured. Without
+// either key, new segments remain plaintext. The PITR reader accepts mixed
+// plaintext and encrypted segments when supplied the archive key.
+//
+// Changing the key does not re-encrypt existing segments. A replacement key
+// is rejected if backfill encounters an encrypted segment it cannot decrypt;
+// the previous archiver remains active. A PITR replay accepts one archive
+// key, so all encrypted segments needed for that replay must use that key.
 func (database *Catalog) EnableWALArchive(ctx context.Context, archiveDir string, encryptionKey []byte) error {
 	if database == nil {
 		return ErrDatabaseClosed
