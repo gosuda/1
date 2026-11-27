@@ -497,6 +497,18 @@ func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physica
 			}
 			return
 		}
+		// A slot pair is a hash-join key only for a strict immutable
+		// error-free equality whose operator is hash- or merge-joinable.
+		// Non-strict or error-bearing key expressions must fall back to the
+		// nested loop (which evaluates them per pair) rather than hashing
+		// materialized inputs and failing with reserve query bytes.
+		if s.Kind != ir.Call || s.OperandCount() != 2 || !s.Strict || s.Effects.Volatility != ir.Immutable || s.Effects.MayError {
+			return
+		}
+		op, ok := builtin.LookupOperator(s.Operator)
+		if !ok || (!op.HashJoinable && !op.MergeJoinable) {
+			return
+		}
 		lhs, _ := o.graph.Operand(id, 0)
 		rhs, _ := o.graph.Operand(id, 1)
 		lo, _ := o.graph.Scalar(lhs)

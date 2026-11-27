@@ -1,0 +1,3850 @@
+{
+  "postgres_version": 180004,
+  "producer": "80e089e4fcdc71760b3435a4d0dceda72395d3c0",
+  "run": 45909237367,
+  "artifact": 15159885039,
+  "artifact_sha256": "025947534effa035ee52e027018047395ac29fa8347e773229aca79f8ebaf733",
+  "native_mode": "simple_protocol; no cross-TimeZone prepared-literal reuse",
+  "cases": [
+    {
+      "id": "UTC/ISO, MDY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T06:49:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 06:49:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/ISO, MDY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T06:49:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 06:49:56.1234 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.1234 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/SQL, DMY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "08-15-2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.1234 2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T06:49:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 06:49:56.1234 2023 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.1234 2023 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/Postgres, MDY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.123 2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T06:49:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 06:49:56.1234 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234+00:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.1234 UTC"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "UTC/German, DMY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T02:49:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 02:49:56.1234-04"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.1234-04"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/ISO, MDY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "2023-08-15 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T02:49:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 02:49:56.1234 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.1234 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/SQL, DMY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15/08/2023 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "08-15-2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.1234 2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T02:49:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 02:49:56.1234 2023 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.1234 2023 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/Postgres, MDY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "Tue Aug 15 12:34:56.123 2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/date/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/date/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15\"'::jsonb, '$.date()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/date/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/date/sql-text",
+      "sql": "SELECT ('2023-08-15'::date)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/time-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/time-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234\"'::jsonb, '$.time()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/time-fraction/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/time-fraction/sql-text",
+      "sql": "SELECT ('12:34:56.1234'::time)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-whole/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-whole/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+00\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+00:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-whole/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-whole/sql-text",
+      "sql": "SELECT ('12:34:56.1234+00'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+00"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"12:34:56.1234+05:45\"'::jsonb, '$.time_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"12:34:56.1234+05:45\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timetz-nonhour/sql-text",
+      "sql": "SELECT ('12:34:56.1234+05:45'::timetz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "12:34:56.1234+05:45"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-fraction/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-fraction/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-fraction/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-fraction/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamp)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.1234"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamptz-nonhour/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamptz-nonhour/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234+05:45\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234+05:45\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamptz-nonhour/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T02:49:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamptz-nonhour/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234+05:45'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 02:49:56.1234 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/local-timestamptz/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz().string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/local-timestamptz/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.1234\"'::jsonb, '$.timestamp_tz()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.1234-04:00\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/local-timestamptz/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.1234-04:00\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/local-timestamptz/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.1234'::timestamptz)::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.1234 EDT"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-precision/path-string",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3).string()')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-precision/path-temporal",
+      "sql": "SELECT jsonb_path_query_array_tz('\"2023-08-15 12:34:56.123456\"'::jsonb, '$.timestamp(3)')::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "[\"2023-08-15T12:34:56.123\"]"
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-precision/sql-json",
+      "sql": "SELECT to_jsonb('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "\"2023-08-15T12:34:56.123\""
+          ]
+        ],
+        "state": ""
+      }
+    },
+    {
+      "id": "America/New_York/German, DMY/timestamp-precision/sql-text",
+      "sql": "SELECT ('2023-08-15 12:34:56.123456'::timestamp(3))::text",
+      "native": {
+        "affected": 0,
+        "columns": 1,
+        "error": "",
+        "rows": [
+          [
+            "15.08.2023 12:34:56.123"
+          ]
+        ],
+        "state": ""
+      }
+    }
+  ]
+}

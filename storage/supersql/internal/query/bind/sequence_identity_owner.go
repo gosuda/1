@@ -19,7 +19,7 @@ func (b *binder) rejectIdentityOwnerChange(sequence, table model.ObjectID, colum
 	}
 	for _, declared := range spec.Table.Columns {
 		if declared.ID == column && declared.IdentitySequence == sequence {
-			return &SequenceOwnershipError{Cause: bindError("0A000", "cannot change ownership of identity sequence", 0)}
+			return &SequenceOwnershipError{Cause: &model.Error{Code: "0A000", Message: "cannot change ownership of identity sequence", FeatureID: string(IdentitySequenceOwnership)}}
 		}
 	}
 	return nil

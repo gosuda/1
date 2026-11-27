@@ -2,6 +2,8 @@ package supersql
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -44,9 +46,18 @@ func TestCIFixExpectedErrorTrailingComments(t *testing.T) {
 		"        3",
 		"(1 row)",
 	}, "\n")
-	stripped := collapseWhitespace(stripTrailingLineComments(out))
-	if !strings.Contains(stripped, "SELECT 2; ERROR:") {
-		t.Fatalf("stripTrailingLineComments did not place ERROR: after semicolon: %q", stripped)
+	corpus := t.TempDir()
+	if err := os.Mkdir(filepath.Join(corpus, "expected"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corpus, "expected", "trailing.out"), []byte(out), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got := expectedErrorSet(t, corpus, "trailing", stmts)
+	for i, want := range []bool{false, true, false} {
+		if got[i] != want {
+			t.Errorf("statement %d expected error = %v, want %v", i, got[i], want)
+		}
 	}
 }
 

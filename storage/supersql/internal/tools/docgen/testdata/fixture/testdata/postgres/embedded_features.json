@@ -263,6 +263,72 @@
       "ast_match": [],
       "resolved_objects": [],
       "regression_statements": []
+    },
+    {
+      "id": "updatable_view_columns",
+      "disposition": "unsupported",
+      "reason": "Writes to non-propagatable view columns.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "non-updatable view column"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "view_instead_of_mix",
+      "disposition": "unsupported",
+      "reason": "INSTEAD OF triggers mixed with automatic view updates.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "cannot mix INSTEAD OF triggers"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "list_partition_key_arity",
+      "disposition": "unsupported",
+      "reason": "Multi-key LIST partitioning.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "LIST partitioning requires exactly one key"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "identity_sequence_ownership",
+      "disposition": "unsupported",
+      "reason": "OWNED BY changes on identity backing sequences.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "cannot change ownership of identity sequence"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "multidim_array_remove",
+      "disposition": "unsupported",
+      "reason": "Element removal on multidimensional arrays.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "multidimensional arrays is not supported"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
+    },
+    {
+      "id": "partitioned_unique_key",
+      "disposition": "unsupported",
+      "reason": "Unique indexes missing partition key columns.",
+      "sqlstate": "0A000",
+      "ast_match": [
+        "must include every partition key column"
+      ],
+      "resolved_objects": [],
+      "regression_statements": []
     }
   ]
 }

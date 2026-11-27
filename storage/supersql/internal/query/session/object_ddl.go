@@ -916,7 +916,17 @@ func (transactions *Transactions) validateObjectConstraints(ctx context.Context,
 }
 
 func (transactions *Transactions) bindObjectCommand(ctx context.Context, node *zpgparse.Node, options ObjectCommandOptions) (*bind.BoundObjectCommand, error) {
-	view, err := transactions.transaction.ReadView(ctx, options.Dependencies)
+	dependencies := options.Dependencies
+	if node.GetDropRoleStmt() != nil {
+		// Role-name ACL references are discovered across object namespaces.
+		// Declare those reads under the existing catalog discovery budget.
+		var err error
+		dependencies, err = catalogDiscoveryDependencies(ctx, transactions.transaction, transactions.sequences.config.Catalog, catalogDiscovery{}, dependencies, options.Binding.Bind.Limits.MaxBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	view, err := transactions.transaction.ReadView(ctx, dependencies)
 	if err != nil {
 		return nil, err
 	}

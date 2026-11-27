@@ -59,7 +59,7 @@ const (
 	expectedProfile    = "embedded_pg18"
 	expectedVersionNum = 180004
 	// expectedFeatureCount is the fixed exclusion set of the embedded profile.
-	expectedFeatureCount = 25
+	expectedFeatureCount = 31
 	// unsupportedSQLState is the SQLSTATE of every profile exclusion.
 	unsupportedSQLState = "0A000"
 )

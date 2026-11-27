@@ -125,7 +125,7 @@ func generate(path, bindPath, builtinPath, catalogPath, opclassPath, rowComparis
 			signatures = append(signatures, obj)
 		}
 	}
-	if len(features) != 25 {
+	if len(features) != 31 {
 		return fmt.Errorf("%w: fixed profile feature set changed", errInvalidManifest)
 	}
 	if err := validateReference(profile, path); err != nil {

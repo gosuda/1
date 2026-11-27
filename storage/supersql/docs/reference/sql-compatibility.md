@@ -14,7 +14,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | catalog | ../postgres184/catalog |
 | regression | ../postgres184 |
 | auxiliary_regression_revision | 1f02a1e488f7b0f4c962a19d6b7b8e172f97d9c2 |
-| features | 25 |
+| features | 31 |
 
 ## Feature dispositions
 
@@ -45,6 +45,12 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | encoding_conversion | unsupported | 0A000 | 1 | 0 | Character-set conversion is limited to the encodings the embedded conversion kernels implement (UTF8, LATIN1, and WIN1252). |
 | required_sql | required |  | 1 | 2970 | All PostgreSQL 18.4 SQL outside the fixed exclusions is required, including missing implementations. |
 | psql_commands | client_command |  | 0 | 0 | psql backslash commands are test-client input, not executable SQL or compatibility passes. |
+| updatable_view_columns | unsupported | 0A000 | 2 | 0 | Writes that target view columns the view cannot propagate to its base tables are rejected. |
+| view_instead_of_mix | unsupported | 0A000 | 1 | 0 | Statements combining INSTEAD OF triggers with automatic view updates are rejected. |
+| list_partition_key_arity | unsupported | 0A000 | 1 | 0 | LIST partitioning on more than one key column is rejected. |
+| identity_sequence_ownership | unsupported | 0A000 | 1 | 0 | ALTER SEQUENCE ... OWNED BY on the backing sequence of an identity column is rejected. |
+| multidim_array_remove | unsupported | 0A000 | 1 | 0 | Removing elements from multidimensional arrays is rejected. |
+| partitioned_unique_key | unsupported | 0A000 | 1 | 0 | Unique indexes on partitioned tables that do not include every partition key column are rejected. |
 
 ## Feature details
 
@@ -663,9 +669,106 @@ psql backslash commands are test-client input, not executable SQL or compatibili
 
 No resolved catalog objects.
 
+### `updatable_view_columns`
+
+Writes that target view columns the view cannot propagate to its base tables are rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 2 |
+
+AST match strings:
+
+- `cannot insert into a non-updatable view column`
+- `cannot update a non-updatable view column`
+
+No resolved catalog objects.
+
+### `view_instead_of_mix`
+
+Statements combining INSTEAD OF triggers with automatic view updates are rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `cannot mix INSTEAD OF triggers and automatic view updates`
+
+No resolved catalog objects.
+
+### `list_partition_key_arity`
+
+LIST partitioning on more than one key column is rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `LIST partitioning requires exactly one key`
+
+No resolved catalog objects.
+
+### `identity_sequence_ownership`
+
+ALTER SEQUENCE ... OWNED BY on the backing sequence of an identity column is rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `cannot change ownership of identity sequence`
+
+No resolved catalog objects.
+
+### `multidim_array_remove`
+
+Removing elements from multidimensional arrays is rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `removing elements from multidimensional arrays is not supported`
+
+No resolved catalog objects.
+
+### `partitioned_unique_key`
+
+Unique indexes on partitioned tables that do not include every partition key column are rejected.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 1 |
+
+AST match strings:
+
+- `unique index on partitioned table must include every partition key column`
+
+No resolved catalog objects.
+
 ## Additional 0A000 rejections outside the profile table
 
-134 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+139 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
@@ -675,9 +778,10 @@ No resolved catalog objects.
 | internal/controlplane/catalog/type_service.go:1075 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |
 | internal/dataplane/txn/transaction_historical.go:12 | `model.Error{Code: "0A000"}` |
-| internal/query/bind/aggregate_invocation.go:205 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/aggregate_invocation.go:208 | `DISTINCT is not implemented for window functions` |
-| internal/query/bind/aggregate_invocation.go:211 | `aggregate ORDER BY is not implemented for window functions` |
+| internal/query/bind/aggregate_invocation.go:210 | `ordered-set aggregates cannot be used as window functions` |
+| internal/query/bind/aggregate_invocation.go:213 | `DISTINCT is not implemented for window functions` |
+| internal/query/bind/aggregate_invocation.go:216 | `aggregate ORDER BY is not implemented for window functions` |
+| internal/query/bind/aggregate_scope.go:157 | `outer-level aggregate cannot use a nested CTE` |
 | internal/query/bind/catalog_relation.go:17 | `cross-database reference is not supported` |
 | internal/query/bind/declaration.go:1013 | `cross-database reference is not supported` |
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
@@ -687,10 +791,10 @@ No resolved catalog objects.
 | internal/query/bind/declaration_constraint.go:394 | `only equality exclusion operators are supported` |
 | internal/query/bind/declaration_constraint.go:73 | `MATCH PARTIAL is not implemented` |
 | internal/query/bind/definition_declaration.go:321 | `support function arguments must be inferred from the declaration` |
-| internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/features.go:106 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/function.go:217 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/function.go:542 | `routine dependency is no longer available` |
-| internal/query/bind/function.go:547 | `routine semantic definition encoding is unavailable` |
+| internal/query/bind/function.go:546 | `routine dependency is no longer available` |
+| internal/query/bind/function.go:551 | `routine semantic definition encoding is unavailable` |
 | internal/query/bind/function_arguments.go:268 | `function defaults cannot contain subqueries` |
 | internal/query/bind/function_window.go:123 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/function_window.go:126 | `aggregate ORDER BY is not implemented for window functions` |
@@ -727,13 +831,13 @@ No resolved catalog objects.
 | internal/query/bind/partition_alter.go:680 | `CONCURRENTLY requires DETACH PARTITION` |
 | internal/query/bind/partition_declaration.go:115 | `HASH partitioning does not support a default partition` |
 | internal/query/bind/partition_declaration.go:361 | `unique constraint on partitioned table must include all partitioning columns` |
-| internal/query/bind/partition_declaration.go:38 | `LIST partitioning requires exactly one key` |
-| internal/query/bind/partition_index.go:454 | `unique index on partitioned table must include every partition key column` |
+| internal/query/bind/partition_declaration.go:38 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/partition_index.go:454 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/partition_reindex.go:87 | `concurrent partition reindex does not support exclusion indexes` |
 | internal/query/bind/project_set.go:40 | `aggregate function calls cannot contain set-returning function calls` |
 | internal/query/bind/project_set.go:43 | `window function calls cannot contain set-returning function calls` |
 | internal/query/bind/project_set.go:46 | `` |
-| internal/query/bind/project_set.go:49 | `set-returning functions are not allowed in this context` |
+| internal/query/bind/project_set.go:49 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/relation.go:165 | `` |
 | internal/query/bind/relation.go:198 | `view dependency is no longer available` |
 | internal/query/bind/routine.go:104 | `routine body dependency changed during binding` |
@@ -741,7 +845,7 @@ No resolved catalog objects.
 | internal/query/bind/routine_default_reference.go:122 | `routine default dependency is not public` |
 | internal/query/bind/routine_default_reference.go:130 | `routine default relation identity changed` |
 | internal/query/bind/routine_default_reference.go:133 | `routine default sequence identity changed` |
-| internal/query/bind/routine_default_reference.go:149 | `routine default dependency version changed` |
+| internal/query/bind/routine_default_reference.go:149 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/row_lock.go:215 | `row locking cannot be applied to the nullable side of an outer join` |
 | internal/query/bind/row_order.go:22 | `cannot compare rows of zero length` |
 | internal/query/bind/row_order.go:54 | `row comparison operators must belong to compatible btree families` |
@@ -756,8 +860,8 @@ No resolved catalog objects.
 | internal/query/bind/select.go:41 | `row locking is not allowed with this query form` |
 | internal/query/bind/select_recursive.go:32 | `with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT` |
 | internal/query/bind/select_set.go:127 | `WITH clause containing a data-modifying statement must be at the top level` |
-| internal/query/bind/sequence_identity_owner.go:22 | `cannot change ownership of identity sequence` |
-| internal/query/bind/sqljson.go:501 | `JSON FORMAT ENCODING requires bytea input` |
+| internal/query/bind/sequence_identity_owner.go:22 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/sqljson.go:500 | `JSON FORMAT ENCODING requires bytea input` |
 | internal/query/bind/statistics_declaration.go:258 | `unsupported statistics kind` |
 | internal/query/bind/statistics_declaration.go:559 | `DROP STATISTICS CONCURRENTLY is not supported` |
 | internal/query/bind/statistics_declaration.go:696 | `unsupported ANALYZE option` |
@@ -778,21 +882,25 @@ No resolved catalog objects.
 | internal/query/bind/type_declaration.go:265 | `only shell CREATE TYPE declarations are supported` |
 | internal/query/bind/type_declaration.go:375 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:580 | `domain constraints cannot be DEFERRABLE` |
-| internal/query/bind/utility.go:388 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/utility.go:710 | `cannot update a non-updatable view column` |
+| internal/query/bind/utility.go:388 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/utility.go:710 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:384 | `cannot insert into a non-updatable view column` |
-| internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
-| internal/query/builtin/context_only.go:21 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/utility_merge.go:384 | `model.Error{Code: "0A000"}` |
+| internal/query/bind/view_mutation.go:207 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/array_replace.go:32 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/context_only.go:29 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/date_fields.go:132 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:296 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:311 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/declared_type.go:321 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/interval_fields.go:106 | `model.Error{Code: "0A000"}` |
-| internal/query/builtin/key_opclass.go:153 | `model.Error{Code: "0A000"}` |
-| internal/query/builtin/key_opclass.go:159 | `model.Error{Code: "0A000"}` |
-| internal/query/builtin/key_opclass.go:162 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/json_record.go:88 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/json_record.go:91 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/jsonpath_execute.go:816 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:161 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:167 | `model.Error{Code: "0A000"}` |
+| internal/query/builtin/key_opclass.go:170 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/modify/options.go:173 | `model.Error{Code: "0A000"}` |

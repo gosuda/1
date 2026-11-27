@@ -1,0 +1,406 @@
+{
+  "postgres_version": 180004,
+  "setup": [
+    "CREATE TABLE tenk1(unique1 integer, unique2 integer)",
+    "INSERT INTO tenk1 VALUES (0, 7), (1, 9999), (2, 42)",
+    "CREATE TABLE review_keys(y integer NOT NULL)",
+    "INSERT INTO review_keys SELECT unique1 FROM tenk1",
+    "CREATE FUNCTION public.review_accumulate(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS 'SELECT $1 + $2'",
+    "CREATE AGGREGATE public.review_sum(integer) (SFUNC = public.review_accumulate, STYPE = integer, INITCOND = '0')"
+  ],
+  "cases": [
+    {
+      "id": "original-nested-correlated",
+      "sql": "SELECT\n  (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 = o.unique1)))\nFROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-outer",
+      "sql": "SELECT (SELECT max(o.unique2)) FROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "two-level-promotion",
+      "sql": "SELECT (SELECT (SELECT max(o.unique2))) FROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-aggregate",
+      "sql": "SELECT o.unique1, (SELECT max(i.v) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "6"
+        ],
+        [
+          "2",
+          "6"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "mixed-local-and-outer",
+      "sql": "SELECT o.unique1, (SELECT max(i.v + o.unique1) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "no-variable-local",
+      "sql": "SELECT o.unique1, (SELECT count(*)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "1"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "1"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "filter-only-owner",
+      "sql": "SELECT (SELECT count(*) FILTER (WHERE o.unique1 > 0)) FROM tenk1 o",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "outer-argument-and-filter",
+      "sql": "SELECT (SELECT sum(o.unique2) FILTER (WHERE o.unique1 < 2)) FROM tenk1 o",
+      "rows": [
+        [
+          "10006"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-filter-owner",
+      "sql": "SELECT o.unique1, (SELECT sum(o.unique2) FILTER (WHERE i.v > 4) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "7"
+        ],
+        [
+          "1",
+          "9999"
+        ],
+        [
+          "2",
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "aggregate-order",
+      "sql": "SELECT (SELECT array_agg(o.unique1 ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{0,2,1}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "order-only-owner",
+      "sql": "SELECT (SELECT array_agg(1 ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{1,1,1}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "ordered-set",
+      "sql": "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "lower-direct-argument",
+      "sql": "SELECT (SELECT percentile_cont(i.v) WITHIN GROUP (ORDER BY o.unique2) FROM (VALUES (0.5)) i(v)) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "nested-same-level",
+      "sql": "SELECT (SELECT max(sum(o.unique2))) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "nested-subquery-same-level",
+      "sql": "SELECT (SELECT max((SELECT sum(o.unique2)))) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "outer-where-rejection",
+      "sql": "SELECT unique1 FROM tenk1 o WHERE (SELECT max(o.unique2)) > 0",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "child-where-promotion",
+      "sql": "SELECT (SELECT 1 WHERE max(o.unique2) > 0) FROM tenk1 o",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouped-outer-input",
+      "sql": "SELECT o.unique1, (SELECT max(o.unique2)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "7"
+        ],
+        [
+          "1",
+          "9999"
+        ],
+        [
+          "2",
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouped-same-column",
+      "sql": "SELECT o.unique1, (SELECT max(o.unique1)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouping-sets-nullability",
+      "sql": "SELECT coalesce(y::text, 'NULL'), (SELECT max(y)) FROM review_keys GROUP BY GROUPING SETS ((y), ()) ORDER BY y NULLS LAST",
+      "rows": [
+        [
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "2"
+        ],
+        [
+          "NULL",
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "empty-outer-aggregate",
+      "sql": "SELECT coalesce((SELECT max(o.unique2))::text, 'NULL') FROM tenk1 o WHERE false",
+      "rows": [
+        [
+          "NULL"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "nested-cte-barrier",
+      "sql": "SELECT (WITH c AS (SELECT 1 v) SELECT sum((SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": null,
+      "state": "0A000"
+    },
+    {
+      "id": "argument-local-cte",
+      "sql": "SELECT (SELECT sum((WITH c AS (SELECT 1 v) SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "ancestor-cte",
+      "sql": "WITH c AS (SELECT 1 v) SELECT (SELECT sum((SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "declared-aggregate",
+      "sql": "SELECT (SELECT public.review_sum(o.unique2)) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "sqljson-array",
+      "sql": "SELECT (SELECT JSON_ARRAYAGG(o.unique1 ORDER BY o.unique1 RETURNING jsonb))::text FROM tenk1 o",
+      "rows": [
+        [
+          "[0, 1, 2]"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "sqljson-object",
+      "sql": "SELECT (SELECT JSON_OBJECTAGG((o.unique1::text) VALUE o.unique2 RETURNING jsonb))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{\"0\": 7, \"1\": 9999, \"2\": 42}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "scalar-cardinality-error",
+      "sql": "SELECT (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 >= o.unique1))) FROM tenk1 o",
+      "rows": null,
+      "state": "21000"
+    },
+    {
+      "id": "nearest-intermediate-owner",
+      "sql": "SELECT o.unique1, (SELECT (SELECT max(i.v + o.unique1)) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-aggregate-outer-group",
+      "sql": "SELECT o.unique1, (SELECT max(i.v + o.unique1) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "earlier-capture-prefix",
+      "sql": "SELECT (SELECT o.unique1 + max(o.unique2)) FROM tenk1 o GROUP BY o.unique1 ORDER BY o.unique1",
+      "rows": [
+        [
+          "7"
+        ],
+        [
+          "10000"
+        ],
+        [
+          "44"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "later-capture-reference",
+      "sql": "SELECT (SELECT max(o.unique2) + o.unique1) FROM tenk1 o GROUP BY o.unique1 ORDER BY o.unique1",
+      "rows": [
+        [
+          "7"
+        ],
+        [
+          "10000"
+        ],
+        [
+          "44"
+        ]
+      ],
+      "state": ""
+    }
+  ]
+}

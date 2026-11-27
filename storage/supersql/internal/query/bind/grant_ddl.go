@@ -130,6 +130,7 @@ func objectTypePrivilegeSet(objtype zpgparse.ObjectType) (model.PrivilegeMask, m
 			"truncate":   model.PrivilegeTruncate,
 			"references": model.PrivilegeReferences,
 			"trigger":    model.PrivilegeTrigger,
+			"maintain":   model.PrivilegeMaintain,
 		}, nil
 	case zpgparse.ObjectType_OBJECT_SEQUENCE:
 		return model.PrivilegeAllSequence, map[string]model.PrivilegeMask{

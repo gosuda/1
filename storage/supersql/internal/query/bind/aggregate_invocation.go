@@ -11,7 +11,7 @@ import (
 // Aggregates share PostgreSQL's pg_proc namespace with routines, so the routine
 // resolver skips them; this finds the descriptor whose Aggregate payload matches
 // the call and produces the same aggregate call shape the builtin path uses.
-func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call callArguments, s *scope, pos, directCount int) (expression, bool, error) {
+func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call callArguments, s *scope, pos, directCount int, mark *ir.ScopeMark) (expression, bool, error) {
 	if b.catalog == nil || n == nil {
 		return expression{}, false, nil
 	}
@@ -72,9 +72,6 @@ func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call c
 	if n.Over != nil {
 		expr, err := b.declaredWindowAggregate(n, s, name, selected, metadata, call, pos)
 		return expr, true, err
-	}
-	if !s.allowAggregate || s.inAggregate {
-		return expression{}, false, bindError("42803", "aggregate function is not allowed in this scope", pos)
 	}
 	inputs := make([]model.TypeLayout, len(metadata.Arguments))
 	copy(inputs, metadata.Arguments)
@@ -180,15 +177,23 @@ func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call c
 	}
 	aggregate.Order = order
 	aggregate.Effects = aggregate.Effects.Union(orderEffects)
-	slot, err := b.slot(s, result, true, 0, 0)
+	s.allowAggregate, s.allowWindow, s.inAggregate = previousAggregate, previousWindow, previousInput
+	owner, err := b.aggregateScope(s, aggregate, pos)
+	if err != nil {
+		return expression{}, false, err
+	}
+	if err := b.promoteAggregate(mark, s, owner, pos); err != nil {
+		return expression{}, false, err
+	}
+	slot, err := b.slot(owner, result, true, 0, 0)
 	if err != nil {
 		return expression{}, false, err
 	}
 	aggregate.Result = slot
 	c := column{ResultColumn: ResultColumn{Name: name, Layout: result, Nullable: true, Slot: slot}}
-	s.aggregates = append(s.aggregates, aggregate)
-	s.aggregateColumns = append(s.aggregateColumns, c)
-	s.aggregateSeen = true
+	owner.aggregates = append(owner.aggregates, aggregate)
+	owner.aggregateColumns = append(owner.aggregateColumns, c)
+	owner.aggregateSeen = true
 	expr, err := b.reference(s, c, pos)
 	expr.collation = resultState
 	return expr, true, err

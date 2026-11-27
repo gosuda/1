@@ -139,3 +139,38 @@ func TestBinaryRelabelJoinKeysPickHashJoin(t *testing.T) {
 	hashJoinSelected(t, result.Plan, options.Plan.MaxBytes)
 	lower(t, result.Plan)
 }
+
+// A non-strict equality key must fall back from the hash join rather than
+// hashing materialized inputs: NULL semantics are evaluated per pair by the
+// nested loop, and hashing them can fail with reserve query bytes.
+func TestNonStrictJoinKeyFallsBackFromHashJoin(t *testing.T) {
+	f := newFixture(t)
+	oidLayout, err := f.b.AddLayout(t.Context(), model.TypeLayout{Type: model.Type{ID: 26, Storage: model.TypeInt64}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, l := catalogLikeSource(f, 10, oidLayout, ir.Effects{Volatility: ir.Stable})
+	right, r := catalogLikeSource(f, 20, oidLayout, ir.Effects{Volatility: ir.Stable})
+	signature, err := f.b.AddSignature(t.Context(), ir.SignatureSpec{Signature: ir.Signature{Operator: 607, Result: f.boolean}, Parameters: []ir.LayoutID{oidLayout, oidLayout}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	predicate := f.scalar(ir.ScalarSpec{Scalar: ir.Scalar{Kind: ir.Call, Scope: f.scope, Layout: f.boolean, Signature: signature, Operator: 607}, Operands: []ir.ScalarID{slotScalar(f, oidLayout, l), slotScalar(f, oidLayout, r)}})
+	join := f.rel(ir.RelSpec{
+		Rel:     ir.Rel{Kind: ir.Join, Scope: f.scope, JoinKind: ir.InnerJoin, Predicate: predicate, Effects: ir.Effects{Volatility: ir.Stable}},
+		Inputs:  []ir.RelID{left, right},
+		Outputs: []model.SlotID{l, r},
+	})
+	options := testOptions()
+	options.Access = catalogAccessStub{layouts: map[model.ObjectID]model.TypeLayout{10: {Type: model.Type{ID: 26, Storage: model.TypeInt64}}, 20: {Type: model.Type{ID: 26, Storage: model.TypeInt64}}}}
+	result, err := Optimize(t.Context(), f.build(join), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, alg := range planAlgorithms(t, result.Plan, options.Plan.MaxBytes) {
+		if alg == physical.HashJoin || alg == physical.MergeJoin || alg == physical.LookupJoin {
+			t.Fatalf("expected nested-loop fallback for non-strict key, got keyed algorithm %v", alg)
+		}
+	}
+	lower(t, result.Plan)
+}

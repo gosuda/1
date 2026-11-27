@@ -272,8 +272,9 @@ const (
 	PrivilegeUsage
 	PrivilegeCreate
 	PrivilegeExecute
+	PrivilegeMaintain
 
-	PrivilegeAllTable    = PrivilegeSelect | PrivilegeInsert | PrivilegeUpdate | PrivilegeDelete | PrivilegeTruncate | PrivilegeReferences | PrivilegeTrigger
+	PrivilegeAllTable    = PrivilegeSelect | PrivilegeInsert | PrivilegeUpdate | PrivilegeDelete | PrivilegeTruncate | PrivilegeReferences | PrivilegeTrigger | PrivilegeMaintain
 	PrivilegeAllSequence = PrivilegeUsage | PrivilegeSelect | PrivilegeUpdate
 	PrivilegeAllSchema   = PrivilegeUsage | PrivilegeCreate
 	PrivilegeAllRoutine  = PrivilegeExecute

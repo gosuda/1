@@ -231,7 +231,6 @@ func (b *binder) sqlJSONDocumentOutput(target model.TypeLayout) bool {
 	return target.Type.ID == 17 || target.Type.ID == 114 || target.Type.ID == 3802 || b.typeCategory(target) == 'S'
 }
 
-
 func (b *binder) jsonParse(n *zpgparse.JsonParseExpr, s *scope) (expression, error) {
 	position := int(n.Location) + 1
 	input, format, encoding, err := b.jsonValueInput(n.Expr, s, position)
@@ -788,6 +787,10 @@ func (b *binder) jsonArrayAggregate(n *zpgparse.JsonArrayAgg, s *scope) (express
 		return expression{}, bindError("42601", "invalid JSON_ARRAYAGG", 0)
 	}
 	position := int(n.Constructor.Location) + 1
+	mark, err := b.markAggregateScope(s)
+	if err != nil {
+		return expression{}, err
+	}
 	argument, err := b.bindSQLJSONAggregateArgument(n.Arg, s, position)
 	if err != nil {
 		return expression{}, err
@@ -810,7 +813,7 @@ func (b *binder) jsonArrayAggregate(n *zpgparse.JsonArrayAgg, s *scope) (express
 			function = 6284
 		}
 	}
-	result, err := b.invokeSQLJSONAggregate(n.Constructor, s, function, []expression{argument})
+	result, err := b.invokeSQLJSONAggregate(n.Constructor, s, function, []expression{argument}, mark)
 	if err != nil {
 		return expression{}, err
 	}
@@ -824,6 +827,10 @@ func (b *binder) jsonObjectAggregate(n *zpgparse.JsonObjectAgg, s *scope) (expre
 	position := int(n.Constructor.Location) + 1
 	if s.inAggregate {
 		return expression{}, bindError("42803", "aggregate calls cannot be nested", position)
+	}
+	mark, err := b.markAggregateScope(s)
+	if err != nil {
+		return expression{}, err
 	}
 	previousAggregate, previousAllowWindow := s.inAggregate, s.allowWindow
 	s.inAggregate, s.allowWindow = true, false
@@ -864,7 +871,7 @@ func (b *binder) jsonObjectAggregate(n *zpgparse.JsonObjectAgg, s *scope) (expre
 	case n.AbsentOnNull:
 		function = 6280
 	}
-	result, err := b.invokeSQLJSONAggregate(n.Constructor, s, function, []expression{key, value})
+	result, err := b.invokeSQLJSONAggregate(n.Constructor, s, function, []expression{key, value}, mark)
 	if err != nil {
 		return expression{}, err
 	}
@@ -882,16 +889,21 @@ func (b *binder) bindSQLJSONAggregateArgument(value *zpgparse.JsonValueExpr, s *
 	return argument, err
 }
 
-func (b *binder) invokeSQLJSONAggregate(n *zpgparse.JsonAggConstructor, s *scope, function model.FunctionID, args []expression) (expression, error) {
+func (b *binder) invokeSQLJSONAggregate(n *zpgparse.JsonAggConstructor, s *scope, function model.FunctionID, args []expression, mark *ir.ScopeMark) (expression, error) {
 	sig, ok := builtin.LookupSignature(function)
 	if !ok {
 		return expression{}, bindError("XX000", "SQL/JSON aggregate signature is unavailable", int(n.Location)+1)
+	}
+	// Ordinary function calls specialize polymorphic inputs before binding.
+	sig, err := b.specialize(sig, args, int(n.Location)+1)
+	if err != nil {
+		return expression{}, err
 	}
 	call := &zpgparse.FuncCall{Location: n.Location, AggFilter: n.AggFilter, AggOrder: n.AggOrder, Over: n.Over}
 	if n.Over != nil {
 		return b.windowFunction(call, s, sig, args)
 	}
-	return b.aggregateFunction(call, s, sig, args, 0)
+	return b.aggregateFunction(call, s, sig, args, 0, mark)
 }
 
 func (b *binder) convertSQLJSONAggregate(input expression, target model.TypeLayout, format ir.SQLJSONFormat, encoding ir.SQLJSONEncoding, s *scope, position int) (expression, error) {

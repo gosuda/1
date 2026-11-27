@@ -14,7 +14,7 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | catalog | ../postgres184/catalog |
 | regression | ../postgres184 |
 | auxiliary_regression_revision | 1f02a1e488f7b0f4c962a19d6b7b8e172f97d9c2 |
-| features | 25 |
+| features | 31 |
 
 ## Feature dispositions
 
@@ -45,6 +45,12 @@ The embedded profile is `embedded_pg18` against PostgreSQL 18.4 (`postgres_versi
 | encoding_conversion | unsupported | 0A000 | 1 | 0 | Only the builtin encodings can be converted. |
 | required_sql | required |  | 1 | 0 | All SQL outside the fixed exclusions is required. |
 | psql_commands | client_command |  | 0 | 0 | psql backslash commands are test-client input. |
+| updatable_view_columns | unsupported | 0A000 | 1 | 0 | Writes to non-propagatable view columns. |
+| view_instead_of_mix | unsupported | 0A000 | 1 | 0 | INSTEAD OF triggers mixed with automatic view updates. |
+| list_partition_key_arity | unsupported | 0A000 | 1 | 0 | Multi-key LIST partitioning. |
+| identity_sequence_ownership | unsupported | 0A000 | 1 | 0 | OWNED BY changes on identity backing sequences. |
+| multidim_array_remove | unsupported | 0A000 | 1 | 0 | Element removal on multidimensional arrays. |
+| partitioned_unique_key | unsupported | 0A000 | 1 | 0 | Unique indexes missing partition key columns. |
 
 ## Feature details
 
@@ -451,6 +457,102 @@ psql backslash commands are test-client input.
 | disposition | client_command |
 | sqlstate |  |
 | regression_statements | 0 |
+
+No resolved catalog objects.
+
+### `updatable_view_columns`
+
+Writes to non-propagatable view columns.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `non-updatable view column`
+
+No resolved catalog objects.
+
+### `view_instead_of_mix`
+
+INSTEAD OF triggers mixed with automatic view updates.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `cannot mix INSTEAD OF triggers`
+
+No resolved catalog objects.
+
+### `list_partition_key_arity`
+
+Multi-key LIST partitioning.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `LIST partitioning requires exactly one key`
+
+No resolved catalog objects.
+
+### `identity_sequence_ownership`
+
+OWNED BY changes on identity backing sequences.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `cannot change ownership of identity sequence`
+
+No resolved catalog objects.
+
+### `multidim_array_remove`
+
+Element removal on multidimensional arrays.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `multidimensional arrays is not supported`
+
+No resolved catalog objects.
+
+### `partitioned_unique_key`
+
+Unique indexes missing partition key columns.
+
+| Field | Value |
+| --- | --- |
+| disposition | unsupported |
+| sqlstate | 0A000 |
+| regression_statements | 0 |
+
+AST match strings:
+
+- `must include every partition key column`
 
 No resolved catalog objects.
 

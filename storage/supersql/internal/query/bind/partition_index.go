@@ -451,7 +451,7 @@ func partitionIndexIncludesKeys(table model.TableMetadata, index *model.IndexMet
 		if partitionKey.Column == 0 || !slices.ContainsFunc(index.Keys, func(key model.KeyElement) bool {
 			return key.Column == partitionKey.Column
 		}) {
-			return bindError("0A000", "unique index on partitioned table must include every partition key column", 0)
+			return &model.Error{Code: "0A000", Message: "unique index on partitioned table must include every partition key column", FeatureID: string(PartitionedUniqueKey), Position: 0}
 		}
 	}
 	return nil

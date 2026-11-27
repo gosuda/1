@@ -204,7 +204,7 @@ func (b *binder) prepareMutationTarget(target mutationTarget, events []string) (
 			return target, nil
 		}
 		if triggered != 0 {
-			return mutationTarget{}, bindError("0A000", "cannot mix INSTEAD OF triggers and automatic view updates", 0)
+			return mutationTarget{}, &model.Error{Code: "0A000", Message: "cannot mix INSTEAD OF triggers and automatic view updates", FeatureID: string(ViewInsteadOfMix), Position: 0}
 		}
 		if view.Automatic == nil {
 			return mutationTarget{}, bindError("55000", "view is not automatically updatable and has no applicable INSTEAD OF trigger", 0)

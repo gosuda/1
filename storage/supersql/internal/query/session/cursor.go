@@ -50,6 +50,7 @@ type namedCursor struct {
 	batchBytes        uint64
 	metadataBytes     uint64
 	sealed            bool
+	failed            bool
 }
 
 func cursorMetadataBytes(name, statement string) uint64 {
@@ -362,7 +363,7 @@ func (transactions *Transactions) prepareCursorsForCommit(ctx context.Context) e
 			if cursor.transaction != transactions.transaction {
 				continue
 			}
-			if cursor.holdable {
+			if cursor.holdable && !cursor.failed {
 				if materializeErr := cursor.materialize(statementContext); materializeErr != nil {
 					delete(transactions.named.cursors, name)
 					transactions.named.release(cursor.metadataBytes)
@@ -404,6 +405,9 @@ func (cursor *namedCursor) executionContext(ctx context.Context) context.Context
 }
 
 func (cursor *namedCursor) materialize(ctx context.Context) (err error) {
+	if cursor.failed {
+		return &model.Error{Code: "55000", Message: fmt.Sprintf("portal %q cannot be run", cursor.name)}
+	}
 	if cursor.sealed {
 		return nil
 	}
@@ -489,6 +493,10 @@ func (transactions *Transactions) fetchCursor(ctx context.Context, command bind.
 			rows.mu.Unlock()
 			return consumerErr
 		})
+		if err != nil {
+			cursor.failed = true
+			err = errors.Join(err, cursor.closeSource())
+		}
 	}
 	err = errors.Join(err, transactions.markDataAccess())
 	moved := cursor.lastMoved
@@ -528,6 +536,9 @@ func fetchMagnitude(value int64) uint64 {
 // lastMoved is updated only after rows are published or deliberately moved.
 func (cursor *namedCursor) newFetchSource(ctx context.Context, command bind.FetchCursorCommand) (*cursorFetchSource, error) {
 	cursor.lastMoved = 0
+	if cursor.failed {
+		return nil, &model.Error{Code: "55000", Message: fmt.Sprintf("portal %q cannot be run", cursor.name)}
+	}
 	direction, count := command.Direction, command.Count
 	if direction == zpgparse.FetchDirection_FETCH_DIRECTION_UNDEFINED {
 		direction = zpgparse.FetchDirection_FETCH_FORWARD

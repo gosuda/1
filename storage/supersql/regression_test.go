@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,11 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
 )
+
+// regressUpdate rewrites the committed per-file regression baselines under
+// testdata/<corpus>/baseline. It is used exactly once to record the observed
+// buckets after a fix, then the ratchet enforces equality on every run.
+var regressUpdate = flag.Bool("update", false, "rewrite the regression baseline files under testdata/<corpus>/baseline")
 
 // TestPostgres18OfficialRegression executes the vendored PostgreSQL regression
 // schedules through the public Catalog API and reports each statement's
@@ -132,6 +138,7 @@ var dependentCodes = map[string]bool{
 	"42723": true, // duplicate_function
 	"42P06": true, // duplicate_schema
 	"42710": true, // duplicate_object
+	"25P02": true, // in_failed_sql_transaction: cascade after an abort in the same session
 }
 
 func unsupportedFeatureIDs(t *testing.T) map[string]bool {
@@ -211,6 +218,9 @@ func runRegressionSchedule(t *testing.T, corpus string, unsupported map[string]b
 			continue
 		}
 		expected := expectedErrorSet(t, corpus, name, statements)
+		if err := resolveRegressionFixtureCopies(corpus, statements); err != nil {
+			t.Fatalf("%s: resolve fixture COPY: %v", name, err)
+		}
 		// pg_regress runs every file in a fresh psql backend: transactions,
 		// prepared statements, cursors, settings and temporary objects end
 		// with the file instead of leaking into the rest of the schedule.
@@ -220,6 +230,7 @@ func runRegressionSchedule(t *testing.T, corpus string, unsupported map[string]b
 		}
 		var counts regressionCounts
 		broken := false
+		var observed []string
 		fileStart := time.Now()
 		for i, statement := range statements {
 			statementStart := time.Now()
@@ -245,15 +256,15 @@ func runRegressionSchedule(t *testing.T, corpus string, unsupported map[string]b
 				unsupportedLeaks++
 				dump.recordLeak(name, statement, err)
 			}
-			if outcome == regFailed && broken && dependentCodes[state] {
-				outcome = regDependent
-			}
+			outcome = mapCascadeToDependent(outcome, state, broken)
 			counts.add(outcome)
+			observed = append(observed, regressionBucketName(outcome))
 			if outcome == regFailed || outcome == regUnsupported || outcome == regExpectedError {
 				broken = true
 			}
 			dump.recordFailure(name, statement, outcome, state, err)
 		}
+		checkRegressionBaseline(t, corpus, name, statements, observed)
 		if scope.txns.Active() {
 			t.Logf("%s/%s: file ended inside a transaction; closing its session rolls it back", corpus, name)
 		}
@@ -313,7 +324,12 @@ const (
 var (
 	regCopyInPattern  = regexp.MustCompile(`(?is)\bfrom\s+stdin\b`)
 	regCopyOutPattern = regexp.MustCompile(`(?is)\bto\s+stdout\b`)
-	regVarPattern     = regexp.MustCompile(`:'[^']*'|:"[^"]*"|:[a-zA-Z_][a-zA-Z_0-9]*`)
+	regVarPattern     = regexp.MustCompile(`:'[^']*'|:"[^"]*"|:[a-zA-Z_][a-zA-Z_0-9]*|:\{\??[a-zA-Z_][a-zA-Z_0-9]*\}`)
+	// regStdStringsSet tracks SET standard_conforming_strings so the
+	// splitter honors backslash escapes in string literals after the
+	// application turns standard-conforming strings off (strings.sql).
+	regStdStringsSet   = regexp.MustCompile(`(?i)^\s*SET\s+standard_conforming_strings\s*(?:=|TO\b)\s*'?\s*(ON|TRUE|1|OFF|FALSE|0)\b`)
+	regStdStringsReset = regexp.MustCompile(`(?i)^\s*RESET\s+standard_conforming_strings\b`)
 )
 
 // regSlowStatement is the per-statement duration above which the schedule logs
@@ -367,6 +383,97 @@ func classifyRegressionError(err error, unsupported map[string]bool) regressionO
 		return regUnsupported
 	}
 	return regFailed
+}
+
+// mapCascadeToDependent is the schedule's session-aware dependent rule: after
+// one root failure in a file (broken), a later statement failing with a
+// dependent SQLSTATE counts as dependent, not as its own failure. Both
+// runRegressionSchedule and TestDependent25P02Cascade call it so the proof
+// pins the production mapping instead of repeating it.
+func mapCascadeToDependent(outcome regressionOutcome, state string, broken bool) regressionOutcome {
+	if outcome == regFailed && broken && dependentCodes[state] {
+		return regDependent
+	}
+	return outcome
+}
+
+// regressionBucketName names a final per-statement bucket for the baseline.
+func regressionBucketName(o regressionOutcome) string {
+	switch o {
+	case regPass:
+		return "pass"
+	case regExpectedError:
+		return "expected_error"
+	case regUnsupported:
+		return "unsupported"
+	case regDependent:
+		return "dependent"
+	case regClient:
+		return "client"
+	case regUnexpectedSuccess:
+		return "unexpected_success"
+	case regFailed:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// checkRegressionBaseline enforces the committed per-file ratchet: the
+// observed bucket sequence for one schedule file must equal its baseline
+// file under testdata/<corpus>/baseline/<name>.txt (<line> <bucket> per
+// statement). Files without a committed baseline are skipped so baselines
+// land incrementally per shard; shard 2's files are the first set. With
+// -update, the observed sequence rewrites the baseline file instead of
+// failing. A mismatch fails the test: a newly failing statement is a
+// regression, a newly passing one must update its baseline row.
+func checkRegressionBaseline(t *testing.T, corpus, name string, statements []regStatement, observed []string) {
+	t.Helper()
+	path := filepath.Join(corpus, "baseline", name+".txt")
+	var want []string
+	for i, statement := range statements {
+		want = append(want, fmt.Sprintf("%d %s", statement.line, observed[i]))
+	}
+	if *regressUpdate {
+		if err := os.MkdirAll(filepath.Join(corpus, "baseline"), 0o755); err != nil {
+			t.Fatalf("%s/%s: create baseline dir: %v", corpus, name, err)
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(want, "\n")+"\n"), 0o644); err != nil {
+			t.Fatalf("%s/%s: write baseline: %v", corpus, name, err)
+		}
+		t.Logf("%s/%s: baseline rewritten (%d statements)", corpus, name, len(want))
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Logf("%s/%s: no baseline, skipping ratchet (%d statements observed)", corpus, name, len(want))
+			return
+		}
+		t.Errorf("%s/%s: read baseline: %v", corpus, name, err)
+		return
+	}
+	var got []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			got = append(got, trimmed)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("%s/%s: baseline has %d rows, observed %d statements; run with -update to rewrite", corpus, name, len(got), len(want))
+		return
+	}
+	mismatches := 0
+	for i := range want {
+		if got[i] != want[i] {
+			if mismatches < 5 {
+				t.Errorf("%s/%s statement %d: baseline %q, observed %q", corpus, name, i, got[i], want[i])
+			}
+			mismatches++
+		}
+	}
+	if mismatches > 0 {
+		t.Errorf("%s/%s: %d baseline mismatches; run with -update to rewrite after triage", corpus, name, mismatches)
+	}
 }
 
 // regMaxClusterSamples caps the sample statements listed per cluster.
@@ -576,68 +683,223 @@ func expectedErrorSet(t *testing.T, corpus, name string, statements []regStateme
 	if err != nil {
 		return expected
 	}
-	// Matching runs in collapsed space so an echo whose line wrapping differs
-	// from the .sql source still locates; positions stay consistent because
-	// every index is taken against the same collapsed text. Trailing same-line
-	// SQL comments after ';' (e.g. "; -- should fail") are stripped from each
-	// line first so they do not sit between ';' and the following ERROR: line.
-	out := collapseWhitespace(stripTrailingLineComments(string(data)))
+	out := string(data)
+	resultRows := regressionAlignedResults(out)
 	pos := 0
 	for i, statement := range statements {
 		if statement.kind != regSQL {
 			continue
 		}
-		needle := collapseWhitespace(stripLeadingComments(statement.text))
-		if needle == "" {
+		source := strings.TrimSpace(stripLeadingComments(statement.text))
+		if source == "" {
 			continue
 		}
-		idx := strings.Index(out[pos:], needle)
-		if idx < 0 {
+		// Match the complete echoed statement and its outer terminator. SQL
+		// wrapping may differ, but literal and comment bytes stay exact,
+		// including the vendored non-UTF8 encoding fixtures.
+		end, found := findRegressionEcho(out, pos, regressionEchoParts(source), resultRows)
+		if !found {
 			continue
 		}
-		idx += pos
-		rest := strings.TrimLeft(out[idx+len(needle):], " ;")
-		expected[i] = strings.HasPrefix(rest, "ERROR:")
-		pos = idx + len(needle)
+		pos = end
+		// A trailing SQL comment may precede the diagnostic; comments inside
+		// the matched statement were never removed.
+		expected[i] = strings.HasPrefix(stripLeadingComments(out[pos:]), "ERROR:")
 	}
 	return expected
 }
 
-// stripTrailingLineComments removes same-line "-- ..." comments that follow a
-// semicolon outside single-quoted literals, preserving the semicolon and line
-// breaks so expectedErrorSet sees "ERROR:" immediately after the echoed query.
-func stripTrailingLineComments(text string) string {
-	lines := strings.Split(text, "\n")
-	for idx, line := range lines {
-		semi := strings.IndexByte(line, ';')
-		if semi < 0 || !strings.Contains(line[semi:], "--") {
-			continue
-		}
-		inQuote := false
-		for i := 0; i < len(line); i++ {
-			switch line[i] {
-			case '\'':
-				if inQuote && i+1 < len(line) && line[i+1] == '\'' {
+func regressionEchoSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'
+}
+
+// Empty parts denote whitespace outside SQL literals and comments. All other
+// parts borrow the exact source bytes; a regexp cannot distinguish invalid
+// UTF8 bytes in the encoding corpora.
+func regressionEchoParts(source string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(source); {
+		switch {
+		case regressionEchoSpace(source[i]):
+			if i > start {
+				parts = append(parts, source[start:i])
+			}
+			parts = append(parts, "")
+			for i < len(source) && regressionEchoSpace(source[i]) {
+				i++
+			}
+			start = i
+		case strings.HasPrefix(source[i:], "--"):
+			if end := strings.IndexByte(source[i:], '\n'); end >= 0 {
+				i += end + 1
+			} else {
+				i = len(source)
+			}
+		case strings.HasPrefix(source[i:], "/*"):
+			i += 2
+			for depth := 1; i < len(source) && depth > 0; {
+				switch {
+				case strings.HasPrefix(source[i:], "/*"):
+					depth++
+					i += 2
+				case strings.HasPrefix(source[i:], "*/"):
+					depth--
+					i += 2
+				default:
 					i++
-					continue
-				}
-				inQuote = !inQuote
-			case ';':
-				if inQuote {
-					continue
-				}
-				j := i + 1
-				for j < len(line) && (line[j] == ' ' || line[j] == '\t' || line[j] == '\r') {
-					j++
-				}
-				if j+1 < len(line) && line[j] == '-' && line[j+1] == '-' {
-					lines[idx] = line[:i+1]
-					i = len(line)
 				}
 			}
+		case source[i] == '\'' || source[i] == '"':
+			quote := source[i]
+			i++
+			for i < len(source) {
+				if source[i] == quote {
+					i++
+					if i < len(source) && source[i] == quote {
+						i++
+						continue
+					}
+					break
+				}
+				if quote == '\'' && source[i] == '\\' && i+1 < len(source) {
+					i += 2
+				} else {
+					i++
+				}
+			}
+		case source[i] == '$':
+			tagStart, tagEnd := i, i+1
+			for tagEnd < len(source) && isDollarTagByte(source[tagEnd]) {
+				tagEnd++
+			}
+			i++
+			if tagEnd < len(source) && source[tagEnd] == '$' {
+				tag := source[tagStart : tagEnd+1]
+				if end := strings.Index(source[tagEnd+1:], tag); end >= 0 {
+					i = tagEnd + 1 + end + len(tag)
+				}
+			}
+		default:
+			i++
 		}
 	}
-	return strings.Join(lines, "\n")
+	if start < len(source) {
+		parts = append(parts, source[start:])
+	}
+	return parts
+}
+
+type regressionResultRange struct {
+	start int
+	end   int
+}
+
+// Recognize only complete single-line aligned results: a padded header, a
+// column divider, padded rows and the matching row-count footer. Multiline
+// and other psql output formats are left to ordinary echo matching.
+func regressionAlignedResults(output string) []regressionResultRange {
+	var result []regressionResultRange
+	start, rows, previousStart := -1, 0, 0
+	previous := ""
+	for pos := 0; pos < len(output); {
+		end := strings.IndexByte(output[pos:], '\n')
+		next := len(output)
+		if end < 0 {
+			end = len(output)
+		} else {
+			end += pos
+			next = end + 1
+		}
+		line := strings.TrimSuffix(output[pos:end], "\r")
+		divider := len(line) >= 3
+		for _, column := range strings.Split(line, "+") {
+			if len(column) < 3 || strings.Trim(column, "-") != "" {
+				divider = false
+				break
+			}
+		}
+		switch {
+		case divider && strings.HasPrefix(previous, " "):
+			start, rows = previousStart, 0
+		case start >= 0 && strings.HasPrefix(line, "("):
+			footer := fmt.Sprintf("(%d rows)", rows)
+			if rows == 1 {
+				footer = "(1 row)"
+			}
+			if line == footer {
+				result = append(result, regressionResultRange{start: start, end: pos})
+			}
+			start = -1
+		case start >= 0 && strings.HasPrefix(line, " "):
+			rows++
+		default:
+			start = -1
+		}
+		previous, previousStart = line, pos
+		pos = next
+	}
+	return result
+}
+
+func findRegressionEcho(output string, from int, parts []string, resultRows []regressionResultRange) (int, bool) {
+	if len(parts) == 0 || parts[0] == "" {
+		return 0, false
+	}
+	for search := from; search < len(output); {
+		found := strings.Index(output[search:], parts[0])
+		if found < 0 {
+			break
+		}
+		start := search + found
+		search = start + 1
+		row := sort.Search(len(resultRows), func(i int) bool { return resultRows[i].end > start })
+		if row < len(resultRows) && start >= resultRows[row].start {
+			search = resultRows[row].end
+			continue
+		}
+		// psql repeats a failing query after "LINE n:". That diagnostic is
+		// not another execution, even when the next statement is identical.
+		line := strings.LastIndexByte(output[:start], '\n') + 1
+		prefix := strings.TrimSpace(output[line:start])
+		if strings.HasPrefix(prefix, "LINE ") {
+			i := len("LINE ")
+			for i < len(prefix) && prefix[i] >= '0' && prefix[i] <= '9' {
+				i++
+			}
+			if i > len("LINE ") && i < len(prefix) && prefix[i] == ':' {
+				continue
+			}
+		}
+		end, matched := start+len(parts[0]), true
+		for _, part := range parts[1:] {
+			if part == "" {
+				before := end
+				for end < len(output) && regressionEchoSpace(output[end]) {
+					end++
+				}
+				if before == end {
+					matched = false
+					break
+				}
+			} else if strings.HasPrefix(output[end:], part) {
+				end += len(part)
+			} else {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for end < len(output) && regressionEchoSpace(output[end]) {
+			end++
+		}
+		if end < len(output) && output[end] == ';' {
+			return end + 1, true
+		}
+	}
+	return 0, false
 }
 
 // stripLeadingComments drops leading whitespace and SQL comments from a
@@ -716,13 +978,40 @@ func firstSQLWord(s string) string {
 }
 
 // splitRegressionSQL splits a regression .sql file into statements, tracking
-// strings (including E” backslash escapes), quoted identifiers, dollar-quoted
-// bodies and comments. Lines whose first character is '\' are psql client
-// commands. After a COPY ... FROM stdin statement, raw lines up to a lone \.
-// are the caller-owned stream data.
+// strings (including E” backslash escapes and backslash escapes while
+// standard_conforming_strings is off), quoted identifiers, dollar-quoted
+// bodies, comments, and parenthesis depth (CREATE RULE bodies hold
+// semicolons). Lines whose first character is '\' are psql client commands,
+// as is any statement with a mid-line backslash command (\gset, \bind,
+// \sendpipeline and friends). Lines starting with '**' are psql
+// query-buffer notes the server never sees (rules.sql prints and discards
+// them with \p and \r). After a COPY ... FROM stdin statement, raw lines up
+// to a lone \. are the caller-owned stream data.
 func splitRegressionSQL(source string) ([]regStatement, error) {
 	var statements []regStatement
 	var buf strings.Builder
+	var bufQuoted bool
+	var bufClient bool
+	var bufGset bool
+	parenDepth := 0
+	stdStrings := true
+	// noteStringsSetting tracks SET/RESET standard_conforming_strings so a
+	// later string literal honors backslash escapes exactly when the session
+	// would: off means backslash escapes, on (or reset) means literal.
+	noteStringsSetting := func(text string) {
+		if regStdStringsReset.MatchString(text) {
+			stdStrings = true
+			return
+		}
+		if m := regStdStringsSet.FindStringSubmatch(text); m != nil {
+			switch strings.ToUpper(m[1]) {
+			case "ON", "TRUE", "1":
+				stdStrings = true
+			default:
+				stdStrings = false
+			}
+		}
+	}
 	line := 1
 	stmtLine := 0
 	mark := func() {
@@ -731,8 +1020,19 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 		}
 	}
 	emitSQL := func(text string, lineNo int) {
+		quoted := bufQuoted
+		bufQuoted = false
+		client := bufClient
+		bufClient = false
+		bufGset = false
+		parenDepth = 0
 		if trimmed := strings.TrimSpace(text); trimmed != "" && !commentOnly(trimmed) {
-			statements = append(statements, regStatement{text: trimmed, line: lineNo})
+			noteStringsSetting(trimmed)
+			stmt := regStatement{text: trimmed, line: lineNo}
+			if quoted || client {
+				stmt.kind = regClientCommand
+			}
+			statements = append(statements, stmt)
 		}
 	}
 	i := 0
@@ -740,13 +1040,21 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 	for i < len(source) {
 		c := source[i]
 		if c == '\n' {
+			// An inline \gset executes and clears the query buffer. Other
+			// psql commands can keep that buffer open across physical lines.
+			if bufGset {
+				emitSQL(buf.String(), stmtLine)
+				buf.Reset()
+				stmtLine = 0
+			} else {
+				buf.WriteByte(c)
+			}
 			line++
 			atLineStart = true
-			buf.WriteByte(c)
 			i++
 			continue
 		}
-		if atLineStart && c == '\\' {
+		if atLineStart && (c == '\\' || c == '*' && i+1 < len(source) && source[i+1] == '*') {
 			emitSQL(buf.String(), stmtLine)
 			buf.Reset()
 			stmtLine = 0
@@ -811,6 +1119,13 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 			mark()
 			escape := i > 0 && (source[i-1] == 'e' || source[i-1] == 'E') &&
 				(i < 2 || !isIdentByte(source[i-2]))
+			uquoted := i > 1 && source[i-1] == '&' && (source[i-2] == 'u' || source[i-2] == 'U') &&
+				(i < 3 || !isIdentByte(source[i-3]))
+			if uquoted {
+				escape = false
+			} else if !stdStrings {
+				escape = true
+			}
 			j := i + 1
 			for j < len(source) {
 				if escape && source[j] == '\\' {
@@ -874,12 +1189,37 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 				i++
 			}
 		case ';':
+			if parenDepth > 0 && !bufClient {
+				mark()
+				atLineStart = false
+				buf.WriteByte(';')
+				i++
+				break
+			}
+			if i > 0 && source[i-1] == '\\' {
+				mark()
+				atLineStart = false
+				buf.WriteByte(';')
+				bufQuoted = true
+				i++
+				break
+			}
+			quoted := bufQuoted
+			bufQuoted = false
+			client := bufClient
+			bufClient = false
+			bufGset = false
+			parenDepth = 0
 			text := strings.TrimSpace(buf.String())
 			buf.Reset()
 			i++
 			if len(text) != 0 && !commentOnly(text) {
+				noteStringsSetting(text)
 				stmt := regStatement{text: text, line: stmtLine}
-				if firstSQLWord(text) == "copy" {
+				if quoted || client {
+					stmt.kind = regClientCommand
+				}
+				if stmt.kind == regSQL && firstSQLWord(text) == "copy" {
 					if regCopyInPattern.MatchString(text) {
 						stmt.kind = regCopyIn
 					} else if regCopyOutPattern.MatchString(text) {
@@ -920,6 +1260,45 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 				statements = append(statements, stmt)
 			}
 			stmtLine = 0
+		case '(', ')':
+			// Semicolons inside rule bodies and other parenthesized
+			// fragments do not end the statement (CREATE RULE ... DO
+			// ALSO (stmt; stmt)). Comments and literals never reach
+			// here: their cases consume them whole. Parentheses inside
+			// client input (mid-line psql commands) do not count: the
+			// client blob ends at a \gset newline or its SQL semicolon.
+			mark()
+			atLineStart = false
+			if !bufClient {
+				if c == '(' {
+					parenDepth++
+				} else if parenDepth > 0 {
+					parenDepth--
+				}
+			}
+			buf.WriteByte(c)
+			i++
+		case '\\':
+			// A mid-line backslash command is psql behavior, not engine
+			// SQL: \gset, \bind, \sendpipeline and friends execute in
+			// the client. Line-leading backslashes never reach here.
+			mark()
+			atLineStart = false
+			if i+1 < len(source) {
+				next := source[i+1]
+				if next >= 'a' && next <= 'z' || next >= 'A' && next <= 'Z' {
+					bufClient = true
+					const command = "\\gset"
+					if strings.HasPrefix(source[i:], command) {
+						end := i + len(command)
+						if end == len(source) || source[end] == ' ' || source[end] == '\t' || source[end] == '\r' || source[end] == '\n' {
+							bufGset = true
+						}
+					}
+				}
+			}
+			buf.WriteByte(c)
+			i++
 		default:
 			mark()
 			atLineStart = false

@@ -1,0 +1,166 @@
+\set ON_ERROR_STOP on
+SELECT 'VERSION', current_setting('server_version_num');
+ ?column? | current_setting 
+----------+-----------------
+ VERSION  | 180004
+(1 row)
+
+CREATE TABLE test_01(a int, b int, c int);
+ALTER TABLE test_01 DROP COLUMN a;
+SET plpgsql.extra_errors TO 'strict_multi_assignment';
+\set ON_ERROR_STOP off
+DO $$
+DECLARE
+  t test_01;
+BEGIN
+  SELECT 1 INTO t; -- should fail;
+END;
+$$;
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function inline_code_block line 5 at SQL statement
+\echo PL_COMMENT :SQLSTATE
+PL_COMMENT 42804
+DO $$
+DECLARE
+  t test_01;
+BEGIN
+  SELECT 1 INTO t;
+END;
+$$;
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function inline_code_block line 5 at SQL statement
+\echo PL_NO_COMMENT :SQLSTATE
+PL_NO_COMMENT 42804
+DO $$
+DECLARE
+  t test_01;
+BEGIN
+  SELECT 1, 2 INTO t; -- should be valid;
+END;
+$$;
+\echo PL_VALID_ASSIGNMENT :SQLSTATE
+PL_VALID_ASSIGNMENT 00000
+DO $body$
+DECLARE
+  t test_01;
+BEGIN
+  PERFORM $literal$literal; -- not a comment$literal$;
+  SELECT 1 INTO t;
+END;
+$body$;
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function inline_code_block line 6 at SQL statement
+\echo PL_DOLLAR_LITERAL :SQLSTATE
+PL_DOLLAR_LITERAL 42804
+DO $body$
+DECLARE
+  t test_01;
+BEGIN
+  PERFORM 'literal; -- not a comment';
+  SELECT 1 INTO t;
+END;
+$body$;
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function inline_code_block line 6 at SQL statement
+\echo PL_QUOTED_LITERAL :SQLSTATE
+PL_QUOTED_LITERAL 42804
+SELECT 1; -- trailing top-level comment
+ ?column? 
+----------
+        1
+(1 row)
+
+\echo PL_VALID_TRAILING_COMMENT :SQLSTATE
+PL_VALID_TRAILING_COMMENT 00000
+SELECT 1/0; -- rejected trailing top-level comment
+ERROR:  division by zero
+\echo PL_REJECTED_TRAILING_COMMENT :SQLSTATE
+PL_REJECTED_TRAILING_COMMENT 22012
+SELECT 'semicolon; -- quoted literal';
+           ?column?           
+------------------------------
+ semicolon; -- quoted literal
+(1 row)
+
+\echo PL_QUOTED_TEXT_CONTROL :SQLSTATE
+PL_QUOTED_TEXT_CONTROL 00000
+SELECT $literal$semicolon; -- dollar literal$literal$;
+           ?column?           
+------------------------------
+ semicolon; -- dollar literal
+(1 row)
+
+\echo PL_DOLLAR_TEXT_CONTROL :SQLSTATE
+PL_DOLLAR_TEXT_CONTROL 00000
+SELECT 'first line
+semicolon; -- multiline literal
+last line';
+            ?column?             
+---------------------------------
+ first line                     +
+ semicolon; -- multiline literal+
+ last line
+(1 row)
+
+\echo PL_MULTILINE_TEXT_CONTROL :SQLSTATE
+PL_MULTILINE_TEXT_CONTROL 00000
+SELECT ('first line
+semicolon; -- multiline literal
+last line')::integer;
+ERROR:  invalid input syntax for type integer: "first line
+semicolon; -- multiline literal
+last line"
+LINE 1: SELECT ('first line
+                ^
+\echo PL_MULTILINE_REJECTION :SQLSTATE
+PL_MULTILINE_REJECTION 22P02
+DO $body$
+DECLARE
+  t test_01;
+BEGIN
+  /* outer comment ; -- data
+     /* inner comment ; -- data */
+  */
+  SELECT 1 INTO t;
+END;
+$body$;
+ERROR:  number of source and target fields in assignment does not match
+DETAIL:  strict_multi_assignment check of extra_errors is active.
+HINT:  Make sure the query returns the exact list of columns.
+CONTEXT:  PL/pgSQL function inline_code_block line 8 at SQL statement
+\echo PL_NESTED_COMMENT_REJECTION :SQLSTATE
+PL_NESTED_COMMENT_REJECTION 42804
+SELECT v FROM pr15_repeat_table;
+ERROR:  relation "pr15_repeat_table" does not exist
+LINE 1: SELECT v FROM pr15_repeat_table;
+                      ^
+\echo PL_REPEAT_MISSING_BEFORE :SQLSTATE
+PL_REPEAT_MISSING_BEFORE 42P01
+CREATE TABLE pr15_repeat_table(v integer);
+INSERT INTO pr15_repeat_table VALUES (7);
+SELECT v FROM pr15_repeat_table;
+ v 
+---
+ 7
+(1 row)
+
+\echo PL_REPEAT_PRESENT :SQLSTATE
+PL_REPEAT_PRESENT 00000
+DROP TABLE pr15_repeat_table;
+SELECT v FROM pr15_repeat_table;
+ERROR:  relation "pr15_repeat_table" does not exist
+LINE 1: SELECT v FROM pr15_repeat_table;
+                      ^
+\echo PL_REPEAT_MISSING_AFTER :SQLSTATE
+PL_REPEAT_MISSING_AFTER 42P01
+\set ON_ERROR_STOP on
+RESET plpgsql.extra_errors;
+DROP TABLE test_01;

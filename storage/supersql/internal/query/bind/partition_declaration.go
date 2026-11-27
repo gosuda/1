@@ -35,7 +35,7 @@ func (b *binder) bindPartitionKeys(ctx context.Context, specification *zpgparse.
 		return 0, nil, model.ErrDescriptorLimit
 	}
 	if strategy == 'l' && len(specification.PartParams) != 1 {
-		return 0, nil, bindError("0A000", "LIST partitioning requires exactly one key", int(specification.Location)+1)
+		return 0, nil, &model.Error{Code: "0A000", Message: "LIST partitioning requires exactly one key", FeatureID: string(ListPartitionKeyArity), Position: int(specification.Location) + 1}
 	}
 	keys := make([]model.KeyElement, 0, len(specification.PartParams))
 	remaining := options.Descriptors.MaxBytes
