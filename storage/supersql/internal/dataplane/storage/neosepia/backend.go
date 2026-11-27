@@ -46,6 +46,9 @@ type Backend struct {
 	maintenanceFault   func(context.Context, maintenancePoint) error
 	commitFault        commitFault
 	stateFault         stateFault
+	archiveFault       func(archiveFaultPoint) error
+	archiveSyncDir     func(*os.Root) error
+	archiveFileSync    func(*os.File) error
 	memtable           memtable
 	flushErr           error
 	groupMu            sync.Mutex
@@ -100,7 +103,7 @@ func openBackend(ctx context.Context, config Config, maxCommitTS model.Timestamp
 	if err != nil {
 		return nil, err
 	}
-	archiver, err := newWALArchiver(config.WALArchiveDir, dbCipher, archiveCipher, config.Limits.recovery().Batch, config.WALArchiveHook)
+	archiver, err := newWALArchiver(config.WALArchiveDir, dbCipher, archiveCipher, config.Limits.recovery().Batch, config.WALArchiveHook, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -395,11 +398,12 @@ func (backend *Backend) Close() error {
 	backend.persistedHorizon = 0
 	backend.recoveredHorizon = 0
 	backend.stateDirty = false
-	backend.encoder = nil
-	backend.verifier = nil
 	backend.commitFault = nil
 	backend.stateFault = nil
 	backend.maintenanceFault = nil
+	backend.archiveFault = nil
+	backend.archiveSyncDir = nil
+	backend.archiveFileSync = nil
 	backend.closeErr = errors.Join(flushErr, stateErr, runErr, backend.directory.Close())
 	err := backend.closeErr
 	backend.mu.Unlock()

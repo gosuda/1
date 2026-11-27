@@ -1169,9 +1169,12 @@ type walArchiver struct {
 	archiveCipher *storageCipher
 	hook          func(context.Context, WALArchiveEntry) error
 	limits        storage.BatchDecodeLimits
+	fault         func(archiveFaultPoint) error
+	syncDir       func(*os.Root) error
+	fileSync      func(*os.File) error
 }
 
-func newWALArchiver(dir string, dbCipher, archiveCipher *storageCipher, limits storage.BatchDecodeLimits, hook func(context.Context, WALArchiveEntry) error) (*walArchiver, error) {
+func newWALArchiver(dir string, dbCipher, archiveCipher *storageCipher, limits storage.BatchDecodeLimits, hook func(context.Context, WALArchiveEntry) error, fault func(archiveFaultPoint) error, syncDir func(*os.Root) error, fileSync func(*os.File) error) (*walArchiver, error) {
 	if dir == "" && hook == nil {
 		return nil, nil
 	}
@@ -1183,16 +1186,48 @@ func newWALArchiver(dir string, dbCipher, archiveCipher *storageCipher, limits s
 	if archiveCipher == nil && dbCipher != nil {
 		archiveCipher = dbCipher
 	}
+	if syncDir == nil {
+		syncDir = syncCommitDirectory
+	}
 	return &walArchiver{
 		dir:           dir,
 		dbCipher:      dbCipher,
 		archiveCipher: archiveCipher,
 		hook:          hook,
 		limits:        limits,
+		fault:         fault,
+		syncDir:       syncDir,
+		fileSync:      fileSync,
 	}, nil
 }
 
 func walMetaName(position uint64) string { return fmt.Sprintf("%020d.meta", position) }
+
+// archiveFaultPoint names the observable durability step of WAL archive
+// publication. Tests set Backend.archiveFault to observe it or inject a
+// failure; production code leaves it nil.
+type archiveFaultPoint uint8
+
+const (
+	archiveDirectorySynced archiveFaultPoint = iota
+)
+
+// syncArchiveDirectory fsyncs the archive directory and reports the step to
+// the archiver fault hook. Skipping this sync leaves a published segment
+// visible but not durable.
+func (a *walArchiver) syncArchiveDirectory(archiveRoot *os.Root) error {
+	syncDir := a.syncDir
+	if syncDir == nil {
+		syncDir = syncCommitDirectory
+	}
+	if err := syncDir(archiveRoot); err != nil {
+		return err
+	}
+	if a.fault != nil {
+		return a.fault(archiveDirectorySynced)
+	}
+	return nil
+}
 
 // archiveCommit atomically writes a copy of commits/<pos>.wal (plus <pos>.meta)
 // into the archive directory and invokes WALArchiveHook if configured.
@@ -1242,7 +1277,7 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 				return err
 			}
 			// A previous publication may have failed at the directory sync.
-			return syncCommitDirectory(archiveRoot)
+			return a.syncArchiveDirectory(archiveRoot)
 		} else if !errors.Is(walErr, os.ErrNotExist) {
 			return walErr
 		}
@@ -1250,7 +1285,7 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 			if err := a.healMissingArchivedWAL(ctx, commitsRoot, archiveRoot, position, walFile, metaFile, commitTS); err != nil {
 				return err
 			}
-			return syncCommitDirectory(archiveRoot)
+			return a.syncArchiveDirectory(archiveRoot)
 		} else if !errors.Is(metaErr, os.ErrNotExist) {
 			return metaErr
 		}
@@ -1276,7 +1311,7 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 		if err := writeArchivedMeta(archiveRoot, metaFile, meta); err != nil {
 			return err
 		}
-		if err := syncCommitDirectory(archiveRoot); err != nil {
+		if err := a.syncArchiveDirectory(archiveRoot); err != nil {
 			return err
 		}
 	}
@@ -1544,13 +1579,20 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 	if expected != nil && (expected.Size != cw.n || expected.SHA256 != hex.EncodeToString(sum[:])) {
 		return 0, sum, storage.ErrCorruptStorage
 	}
-	if err := dst.Sync(); err != nil {
+	fileSync := a.fileSync
+	if fileSync == nil {
+		fileSync = (*os.File).Sync
+	}
+	if err := fileSync(dst); err != nil {
 		return 0, sum, err
 	}
 	closeErr := dst.Close()
 	dst = nil
 	if closeErr != nil {
 		return 0, sum, closeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, sum, err
 	}
 	if err := publishArchivedFile(archiveRoot, pending, walFile); err != nil {
 		return 0, sum, err
@@ -1682,7 +1724,7 @@ func (backend *Backend) EnableWALArchive(ctx context.Context, archiveDir string,
 	if backend.archiver != nil {
 		existingHook = backend.archiver.hook
 	}
-	archiver, err := newWALArchiver(archiveDir, backend.cipher, archiveCipher, backend.limits.recovery().Batch, existingHook)
+	archiver, err := newWALArchiver(archiveDir, backend.cipher, archiveCipher, backend.limits.recovery().Batch, existingHook, backend.archiveFault, backend.archiveSyncDir, backend.archiveFileSync)
 	if err != nil {
 		backend.mu.Unlock()
 		return err

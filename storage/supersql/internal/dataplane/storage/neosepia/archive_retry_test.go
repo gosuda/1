@@ -245,6 +245,69 @@ func TestWALArchiveAcceptsPlaintextAfterKeyAdded(t *testing.T) {
 	}
 }
 
+func TestWALArchiveHealsMissingSegmentFromLocalWAL(t *testing.T) {
+	fixture := openBackendFixture(t)
+	archiveDir := t.TempDir()
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 1, 20, 100, 200)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(archiveDir, commitName(1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatalf("re-enable with orphaned sidecar error = %v, want nil", err)
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, commitName(1))); err != nil {
+		t.Fatalf("heal did not restore the archived WAL: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, walMetaName(1))); err != nil {
+		t.Fatalf("heal did not reconcile archive metadata: %v", err)
+	}
+	if err := fixture.backend.Collect(t.Context(), storage.GCRequest{Boundary: 20}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALArchiveKeepsOrphanedSidecarNamingAnotherDecision(t *testing.T) {
+	fixture := openBackendFixture(t)
+	archiveDir := t.TempDir()
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 1, 20, 100, 200)); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(archiveDir, walMetaName(1))
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta WALArchiveMetadata
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	meta.CommitTS++
+	raw, err = json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(archiveDir, commitName(1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); !errors.Is(err, storage.ErrCorruptStorage) {
+		t.Fatalf("re-enable with mismatched sidecar error = %v, want corrupt storage", err)
+	}
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Fatalf("heal removed a sidecar naming another decision: %v", err)
+	}
+}
+
 func TestWALArchiveRepairFailsClosedOnPlaintextSidecarAfterKeyAdded(t *testing.T) {
 	fixture := openBackendFixture(t)
 	archiveDir := t.TempDir()
