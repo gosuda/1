@@ -1,6 +1,6 @@
 # hqq-zstd (`gosuda.org/zstd`)
 
-`gosuda.org/zstd` is a **zero-`cgo` (`CGO_ENABLED=0`) Zstandard (`libzstd`) library for Go** powered by HQQ shared-memory IPC, designed as a drop-in replacement for [`github.com/DataDog/zstd`](https://pkg.go.dev/github.com/DataDog/zstd) plus low-level pipelined async RPC (`*zstd.Client`). Your Go binary compiles without linking C objects, while executing the official C `libzstd` (`1.5.7`) compressor and decompressor in an isolated shared-memory worker process (`zstd_server`).
+`gosuda.org/zstd` is a **zero-`cgo` (`CGO_ENABLED=0`) Zstandard (`libzstd`) library for Go** powered by HQQ shared-memory IPC, designed as a drop-in replacement for [`github.com/DataDog/zstd`](https://pkg.go.dev/github.com/DataDog/zstd) plus low-level pipelined async RPC (`*zstd.Client`). Your Go binary compiles without linking C objects, while executing the official C `libzstd` (`1.6.0`) compressor and decompressor in an isolated shared-memory worker process (`zstd_server`).
 
 SLSA-attested prebuilt `zstd_server` binaries are embedded per target platform (`//go:build` + `//go:embed`), extracted to the user cache on first use, verified against pinned SHA-256 digests via `gosuda.org/hqq/secureexec`, and bound to the Go parent process lifetime via `--parent-stdin`. No external binary download or C toolchain is required.
 
@@ -179,8 +179,8 @@ func (p *BulkProcessor) Decompress(dst, src []byte) ([]byte, error)
 
 ```go
 const (
-	Version           = "v0.3.10507"
-	ZstdVersionNumber = 10507
+	Version           = "v0.3.10600"
+	ZstdVersionNumber = 10600
 )
 
 func Open(ctx context.Context) (*Client, error)
@@ -253,7 +253,7 @@ func ErrorCodeOf(err error) (ErrorCode, bool)
 ## Documentation and License
 
 - [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md): Shared-memory ring geometry, credit flow control, exposed IDL surface, security policy, and `cgo` comparison benchmarks.
-- **License**: Wrapper code is licensed under the [MIT License](LICENSE); Zstandard (`1.5.7`) is used under the [BSD-3-Clause License](third_party/zstd/LICENSE).
+- **License**: Wrapper code is licensed under the [MIT License](LICENSE); Zstandard (`1.6.0`) is used under the [BSD-3-Clause License](third_party/zstd/LICENSE).
 
 ## CI coverage
 

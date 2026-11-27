@@ -21,7 +21,7 @@ flowchart LR
     subgraph CSrv["zstd_server Process (C11)"]
         DISP["zstd_server.c\n(Handle Table + Wire Codec)"]
         HOOK["zstd_hooks.c\n(@intercept Policy + Stream Shims)"]
-        ZSTD["Official libzstd 1.5.7\n(SIMD / BMI2 / NEON)"]
+        ZSTD["Official libzstd 1.6.0\n(SIMD / BMI2 / NEON)"]
         DISP --> HOOK --> ZSTD
     end
 
@@ -114,7 +114,7 @@ Decompression latency across the same sweep:
 
 ## 5. Build, Test, and Benchmark Commands
 
-Fetch the pinned Zstandard source (`v1.5.7`), compile `zstd_server`, and run the test and benchmark suites:
+Fetch the pinned Zstandard source (`v1.6.0`), compile `zstd_server`, and run the test and benchmark suites:
 
 ```bash
 eval "$(./build.sh)"

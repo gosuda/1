@@ -3,21 +3,21 @@ package zstd
 import "gosuda.org/hqq/secureexec"
 
 // Version follows the v<WrapperMajor>.<WrapperMinor>.<NormalizedCVersion> scheme,
-// where 10507 corresponds to ZSTD_VERSION_NUMBER (Zstandard 1.5.7).
+// where 10600 corresponds to ZSTD_VERSION_NUMBER (Zstandard 1.6.0).
 const (
-	Version           = "v0.3.10507"
-	ZstdVersionNumber = 10507
+	Version           = "v0.3.10600"
+	ZstdVersionNumber = 10600
 )
 
 // ReleaseHashes maps "<GOOS>/<GOARCH>" to the SHA-256 digest of the prebuilt
 // zstd_server binary published with this module version.
 var ReleaseHashes = map[string]secureexec.Hash{
-	"darwin/amd64":  mustHash("90eeb7cdbc08a2018722f4965cd9e3d9c387e97b9b4c7910f2d2e1bde24c6cdb"),
-	"darwin/arm64":  mustHash("7649b1b45dacd934cde8149f35f4fcc3937f6486fbac23ce976466719b3752bb"),
-	"linux/amd64":   mustHash("b9ed44f83b962ecc135ceb32139476597603f7e1eec09cf685c49fc2b4233834"),
-	"linux/arm64":   mustHash("14241982f6ee31d2b4a073425473c61726a85871347c996deecfa22a3bdcfda0"),
-	"windows/amd64": mustHash("a09cefb43ae4f7ad1d8c28084217afc593eaa4965f111eed70dc0aafd47ac9ac"),
-	"windows/arm64": mustHash("dd71d248658937d48a782bb42260f6f7f517215ff61b460403ddae923e0cff42"),
+	"darwin/amd64":  mustHash("cfe719aec9a2100a49eab43554f16b3dfc3292eed55c45c7eb5f13c9e098e91f"),
+	"darwin/arm64":  mustHash("1106e14a7f9063efa32640bb4b530f6e716fe96841f7aef06410c1f4fcaa17fd"),
+	"linux/amd64":   mustHash("129cb3d9b3b186d4d9bc3de8e96c8fbcbd21c57450b603342c79f0aad897d2d4"),
+	"linux/arm64":   mustHash("85261e1310fe21df96d87e169f64c305f4dab052deb2a27e7f9e9013ef974cc5"),
+	"windows/amd64": mustHash("30f3aaed2d6fd69eebd410829b44c6c80962b485ea13df8cd19666c4d2697c55"),
+	"windows/arm64": mustHash("6658dc1976a072de6d1ad1dfe53feaa671c9d66816217156410e1bd33c698181"),
 }
 
 // ExpectedHash returns the pinned SHA-256 digest of zstd_server for goos/goarch.
