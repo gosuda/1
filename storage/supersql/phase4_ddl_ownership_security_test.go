@@ -66,18 +66,29 @@ func TestPhase4DDLOwnershipRefreshMatViewReindexAndSetSchema(t *testing.T) {
 	mustExec(`GRANT ALL ON TABLE s1.t, s1.v, s1.mv TO bob`)
 	mustExec(`GRANT ALL ON SEQUENCE s1.seq TO bob`)
 
-	// Bob (non-owner) must be denied on REFRESH MATERIALIZED VIEW, REINDEX, and SET SCHEMA.
+	// ALL includes MAINTAIN, allowing reindex without ownership. Refresh
+	// delegation remains unavailable until stored-query identities are pinned;
+	// unrelated SET SCHEMA operations still require the owner.
 	mustExec(`RESET ROLE`)
 	mustExec(`SET ROLE bob`)
 	requireErrCode(`REFRESH MATERIALIZED VIEW s1.mv`, "42501")
 	requireErrCode(`REFRESH MATERIALIZED VIEW s1.mv WITH DATA`, "42501")
 	requireErrCode(`REFRESH MATERIALIZED VIEW s1.mv WITH NO DATA`, "42501")
-	requireErrCode(`REINDEX TABLE s1.t`, "42501")
-	requireErrCode(`REINDEX INDEX s1.idx_t_val`, "42501")
+	mustExec(`REINDEX TABLE s1.t`)
+	mustExec(`REINDEX INDEX s1.idx_t_val`)
 	requireErrCode(`ALTER TABLE s1.t SET SCHEMA s3`, "42501")
 	requireErrCode(`ALTER VIEW s1.v SET SCHEMA s3`, "42501")
 	requireErrCode(`ALTER MATERIALIZED VIEW s1.mv SET SCHEMA s3`, "42501")
 	requireErrCode(`ALTER SEQUENCE s1.seq SET SCHEMA s3`, "42501")
+
+	// Removing MAINTAIN restores reindex denial despite the remaining ACL.
+	mustExec(`RESET ROLE`)
+	mustExec(`SET ROLE alice`)
+	mustExec(`REVOKE MAINTAIN ON s1.t FROM bob`)
+	mustExec(`RESET ROLE`)
+	mustExec(`SET ROLE bob`)
+	requireErrCode(`REINDEX TABLE s1.t`, "42501")
+	requireErrCode(`REINDEX INDEX s1.idx_t_val`, "42501")
 
 	// Alice (owner) can refresh and reindex, is denied SET SCHEMA without destination CREATE (s2),
 	// and succeeds on SET SCHEMA with destination CREATE (s3).

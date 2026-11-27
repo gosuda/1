@@ -11,6 +11,13 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/columnar"
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
+// featureJsonpathTimezone names the embedded_pg18 profile exclusion the
+// jsonpath datetime kernel raises for conversions that require a time zone
+// context. The bind package owns the canonical FeatureID
+// (bind.JsonpathTimezone) but cannot be imported here: bind imports
+// builtin. gates_test.go's manifest-driven exclusion table fails if this id
+// drifts from testdata/postgres/embedded_features.json.
+const featureJsonpathTimezone = "jsonpath_timezone"
 
 var errJSONPathStop = errors.New("jsonpath evaluation stopped")
 
@@ -30,6 +37,8 @@ type jsonPathItem struct {
 	boolean  bool
 	temporal model.Value
 	typeID   model.TypeID
+	timeZoneOffset int32
+	hasTimeZone bool
 	baseID   int64
 	baseRoot int
 }
@@ -761,7 +770,12 @@ func (execution *jsonPathExecution) datetimeMethod(item jsonPathItem, method *js
 		value, err = call.Call(execution.ctx, []model.Value{value, model.Int64Val(precision)}, execution.budget)
 		if err != nil { return err }
 	}
-	return emit(jsonPathItem{kind: jsonTextString, temporal: value, typeID: targetID})
+	result := jsonPathItem{kind: jsonTextString, temporal: value, typeID: targetID}
+	if sourceID == 1184 && targetID == 1184 {
+		result.timeZoneOffset, result.hasTimeZone, err = execution.datetimeTimeZone(text)
+		if err != nil { return err }
+	}
+	return emit(result)
 }
 
 func jsonPathDatetimeType(name string) model.TypeID {
@@ -799,7 +813,7 @@ func (execution *jsonPathExecution) castDatetime(value model.Value, source, targ
 	case source == 1184 && target == 1114: cast, timezone = 2027, true
 	default: return model.Value{}, sqlError("22031", "incompatible jsonpath datetime types")
 	}
-	if timezone && !execution.useTZ { return model.Value{}, sqlError("0A000", "jsonpath datetime conversion requires time zone usage") }
+	if timezone && !execution.useTZ { return model.Value{}, &model.Error{Code: "0A000", Message: "jsonpath datetime conversion requires time zone usage", FeatureID: featureJsonpathTimezone} }
 	call, err := Resolve(cast, execution.options)
 	if err != nil { return model.Value{}, err }
 	return call.Call(execution.ctx, []model.Value{value}, execution.budget)
@@ -855,10 +869,15 @@ func parseJSONPathDatetimeTemplate(input, template string) (string, string, erro
 func (execution *jsonPathExecution) temporalOutput(item jsonPathItem) (string, error) {
 	id := model.FunctionID(0)
 	switch item.typeID { case 1082: id = 1085; case 1083: id = 1144; case 1266: id = 1351; case 1114: id = 1313; case 1184: id = 1151 }
-	call, err := Resolve(id, execution.options); if err != nil { return "", err }
+	options := execution.options
+	if item.typeID == 1082 || item.typeID == 1114 || item.typeID == 1184 { options.DateStyle = DateISO }
+	if item.typeID == 1184 && item.hasTimeZone {
+		options.TimeZone = TimeZoneContext{Name: "UTC", Fixed: true, OffsetSeconds: item.timeZoneOffset}
+	}
+	call, err := Resolve(id, options); if err != nil { return "", err }
 	value, err := call.Call(execution.ctx, []model.Value{item.temporal}, execution.budget)
 	if err != nil { return "", err }
-	return value.StrVal, nil
+	return jsonDatetimeText(item.typeID, value.StrVal)
 }
 
 func (execution *jsonPathExecution) keyValue(item jsonPathItem, emit func(jsonPathItem) error) error {

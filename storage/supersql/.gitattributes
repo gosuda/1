@@ -1,0 +1,6 @@
+# These exact native psql transcripts preserve aligned headers and query-buffer padding.
+# Keep all other whitespace checks; only end-of-line padding is data here.
+testdata/postgres184/review/expected/echo.out whitespace=-blank-at-eol
+testdata/postgres184/review/expected/header-echo.out whitespace=-blank-at-eol
+testdata/postgres184/review/expected/result-row-echo.out whitespace=-blank-at-eol
+testdata/postgres184/review/expected/psql-print-buffer.out whitespace=-blank-at-eol

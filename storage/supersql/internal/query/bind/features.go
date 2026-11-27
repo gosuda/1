@@ -46,6 +46,54 @@ const (
 	// EncodingConversion covers character-set conversion for encodings outside
 	// the builtin conversion kernels (UTF8, LATIN1, WIN1252).
 	EncodingConversion FeatureID = "encoding_conversion"
+	// AnonymousRecord covers JSON record functions whose row type cannot be
+	// determined from an anonymous record value without a registered
+	// composite type (for example row(...) literals).
+	AnonymousRecord FeatureID = "anonymous_record"
+	// CompositeRoutineDependency covers routine default expressions that
+	// reference a composite type whose dependency version changed (for
+	// example after ALTER TYPE ... ALTER ATTRIBUTE): cached defaults are
+	// not re-planned.
+	CompositeRoutineDependency FeatureID = "composite_routine_dependency"
+	// UpdatableViewColumns covers writes to view columns the view cannot
+	// propagate to its base tables.
+	UpdatableViewColumns FeatureID = "updatable_view_columns"
+	// ViewInsteadOfMix covers statements that combine INSTEAD OF triggers
+	// with automatic view updates.
+	ViewInsteadOfMix FeatureID = "view_instead_of_mix"
+	// TargetSRF covers set-returning functions in write-target contexts
+	// (for example VALUES lists) the executor does not expand.
+	TargetSRF FeatureID = "target_srf"
+	// ListPartitionKeyArity covers LIST partitioning on more than one key
+	// column.
+	ListPartitionKeyArity FeatureID = "list_partition_key_arity"
+	// IdentitySequenceOwnership covers ALTER SEQUENCE ... OWNED BY on the
+	// backing sequence of an identity column.
+	IdentitySequenceOwnership FeatureID = "identity_sequence_ownership"
+	// StatisticsCatalogMutation covers pg_clear_*_stats functions that need
+	// a mutable statistics catalog.
+	StatisticsCatalogMutation FeatureID = "statistics_catalog_mutation"
+	// IndexKeyOrdering covers index operator classes without an equivalent
+	// SQL key ordering, equality, or key representation.
+	IndexKeyOrdering FeatureID = "index_key_ordering"
+	// TextSearchParser covers text search parsers other than the native
+	// default parser.
+	TextSearchParser FeatureID = "text_search_parser"
+	// MultidimArrayRemove covers removing elements from multidimensional
+	// arrays.
+	MultidimArrayRemove FeatureID = "multidim_array_remove"
+	// PartitionedUniqueKey covers unique indexes on partitioned tables that
+	// do not include every partition key column.
+	PartitionedUniqueKey FeatureID = "partitioned_unique_key"
+	// InheritedConstraintRecursion covers constraint DDL with recursion or
+	// CASCADE that needs inherited constraint planning.
+	InheritedConstraintRecursion FeatureID = "inherited_constraint_recursion"
+	// GinIndexLimits covers GIN indexes on multiple columns or on
+	// expressions.
+	GinIndexLimits FeatureID = "gin_index_limits"
+	// JsonpathTimezone covers jsonpath datetime conversions that require a
+	// time zone context.
+	JsonpathTimezone FeatureID = "jsonpath_timezone"
 )
 
 // UnsupportedMessage names one profile exclusion in the diagnostic of every

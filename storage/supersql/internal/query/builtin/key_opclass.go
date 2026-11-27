@@ -8,6 +8,14 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+// featureIndexKeyOrdering names the embedded_pg18 profile exclusion the key
+// encoder raises for operator classes without an equivalent SQL key
+// ordering, equality, or key representation. The bind package owns the
+// canonical FeatureID (bind.IndexKeyOrdering) but cannot be imported here:
+// bind imports builtin. gates_test.go's manifest-driven exclusion table
+// fails if this id drifts from testdata/postgres/embedded_features.json.
+const featureIndexKeyOrdering = "index_key_ordering"
+
 var _ storage.IndexKeyEncoder = (*KeyEncoder)(nil)
 
 // ValidateOperatorClassInput checks B-tree input compatibility, not key codec

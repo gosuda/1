@@ -16,7 +16,7 @@ func bindOnlineConstraint(ctx context.Context, b *binder, snapshot CatalogSnapsh
 		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(WriteDescriptorExpansion)}
 	}
 	if command.Behavior == zpgparse.DropBehavior_DROP_CASCADE && command.Subtype != zpgparse.AlterTableType_AT_DropConstraint {
-		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(WriteDescriptorExpansion)}
+		return nil, &model.Error{Code: "0A000", Message: "constraint recursion or CASCADE requires inherited constraint planning", FeatureID: string(InheritedConstraintRecursion), Position: 0}
 	}
 	spec, err := table.SpecWithin(ctx, options.Descriptors)
 	if err != nil || spec.Table == nil {

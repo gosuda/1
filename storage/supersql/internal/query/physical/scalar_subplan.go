@@ -2,6 +2,7 @@ package physical
 
 import (
 	"context"
+	"unsafe"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
@@ -22,11 +23,74 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 	if err := b.charge(uint64(len(n.ScalarSubplans)), 1); err != nil {
 		return err
 	}
-	seen := make([]bool, len(n.ScalarSubplans))
+	// A dependency may occur in both argument phases. Validate its captures
+	// separately against each phase's inputs.
+	seen := make([]uint8, len(n.ScalarSubplans))
 	remaining := uint64(b.limits.MaxOperands)
 	defer func() { b.used -= uint64(len(n.ScalarSubplans)) }()
-	var visit func(ScalarRef, uint32) error
-	visit = func(ref ScalarRef, depth uint32) error {
+	// Classify only Direct roots, not their descendants. The two phase walks
+	// below still validate captures independently, including shared subqueries.
+	var directIDs []ir.ScalarID
+	if len(n.Expressions) != 0 {
+		var count uint64
+		for i := range logical.AggregateCount() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if remaining == 0 {
+				return ErrLimit
+			}
+			remaining--
+			call, _ := g.Aggregate(n.Logical.Rel, i)
+			count += uint64(call.DirectArgumentCount())
+			if count > remaining {
+				return ErrLimit
+			}
+		}
+		if count != 0 {
+			// Keep at least half the table empty, even when Direct IDs repeat.
+			// Charge its full capacity and initialization before allocating it.
+			capacity := uint64(2)
+			for capacity/2 < count {
+				if capacity > remaining/2 {
+					return ErrLimit
+				}
+				capacity *= 2
+			}
+			const scalarIDBytes = uint64(unsafe.Sizeof(ir.ScalarID(0)))
+			if capacity > remaining || capacity > uint64(^uint(0)>>1)/scalarIDBytes {
+				return ErrLimit
+			}
+			bytes := capacity * scalarIDBytes
+			if err := b.charge(capacity, scalarIDBytes); err != nil {
+				return err
+			}
+			defer func() { b.used -= bytes }()
+			remaining -= capacity
+			directIDs = make([]ir.ScalarID, int(capacity))
+		}
+	}
+	// Built graphs use positive scalar IDs. Zero marks an empty bucket.
+	// Every probe, including a collision, consumes the local work budget.
+	directBucket := func(id ir.ScalarID) (*ir.ScalarID, error) {
+		mask := uint64(len(directIDs) - 1)
+		i := uint64(id) * 0x9e3779b97f4a7c15 & mask
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if remaining == 0 {
+				return nil, ErrLimit
+			}
+			remaining--
+			if directIDs[i] == 0 || directIDs[i] == id {
+				return &directIDs[i], nil
+			}
+			i = (i + 1) & mask
+		}
+	}
+	var visit func(ScalarRef, uint32, bool) error
+	visit = func(ref ScalarRef, depth uint32, direct bool) error {
 		if ref.Scalar == 0 {
 			return nil
 		}
@@ -63,7 +127,11 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 			if found < 0 {
 				return invalid("missing scalar dependency")
 			}
-			if !seen[found] {
+			phase := uint8(1)
+			if direct {
+				phase = 2
+			}
+			if seen[found]&phase == 0 {
 				subplan := n.ScalarSubplans[found]
 				body := p.nodes[subplan.Root-1]
 				if !implementsLogical(graph, ref.Graph, scalar.Relation, body) {
@@ -114,7 +182,7 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 					}
 				}
 				for _, capture := range body.Delivered.Parameters {
-					available, err := p.scalarCaptureAvailable(n, capture, &remaining)
+					available, err := p.scalarCaptureAvailable(n, capture, direct, &remaining)
 					if err != nil {
 						return err
 					}
@@ -122,92 +190,107 @@ func (p *Plan) validateScalarSubplans(ctx context.Context, n NodeSpec, b *copier
 						return invalid("unavailable scalar capture")
 					}
 				}
-				seen[found] = true
+				seen[found] |= phase
 			}
 		}
 		for i := range scalar.OperandCount() {
 			child, _ := graph.Operand(ref.Scalar, i)
-			if err := visit(ScalarRef{Graph: ref.Graph, Scalar: child}, depth+1); err != nil {
+			if err := visit(ScalarRef{Graph: ref.Graph, Scalar: child}, depth+1, direct); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	var walkErr error
-	add := func(id ir.ScalarID) {
+	add := func(id ir.ScalarID, direct bool) {
 		if walkErr == nil {
-			walkErr = visit(ScalarRef{Graph: n.Logical.Graph, Scalar: id}, 0)
+			walkErr = visit(ScalarRef{Graph: n.Logical.Graph, Scalar: id}, 0, direct)
 		}
 	}
 	for _, id := range [...]ir.ScalarID{logical.Predicate, logical.Offset, logical.Count, logical.ConflictPredicate, logical.RLSInsertCheck, logical.RLSUpdateCheck, logical.RLSConflictCheck, logical.Frame.Start.Offset, logical.Frame.End.Offset, logical.Recursion.CycleValue, logical.Recursion.CycleDefault, logical.Recursion.CycleContinue} {
-		add(id)
+		add(id, false)
 	}
 	for i := range logical.ExpressionCount() {
 		id, _ := g.Expression(n.Logical.Rel, i)
-		add(id)
+		add(id, false)
 	}
 	for i := range logical.BindingCount() {
 		binding, _ := g.Binding(n.Logical.Rel, i)
-		add(binding.Expr)
+		add(binding.Expr, false)
 	}
 	for i := range logical.OrderCount() {
 		key, _ := g.Order(n.Logical.Rel, i)
-		add(key.Expr)
+		add(key.Expr, false)
 	}
 	for i := range logical.PartitionCount() {
 		id, _ := g.Partition(n.Logical.Rel, i)
-		add(id)
+		add(id, false)
 	}
 	for i := range logical.AggregateCount() {
 		call, _ := g.Aggregate(n.Logical.Rel, i)
-		add(call.Filter)
+		add(call.Filter, false)
 		for j := range call.DirectArgumentCount() {
 			id, _ := g.AggregateDirectArgument(n.Logical.Rel, i, j)
-			add(id)
+			add(id, true)
+			if walkErr == nil && len(directIDs) != 0 {
+				var bucket *ir.ScalarID
+				bucket, walkErr = directBucket(id)
+				if walkErr == nil {
+					*bucket = id
+				}
+			}
 		}
 		for j := range call.ArgumentCount() {
 			id, _ := g.AggregateArgument(n.Logical.Rel, i, j)
-			add(id)
+			add(id, false)
 		}
 		for j := range call.OrderCount() {
 			key, _ := g.AggregateOrder(n.Logical.Rel, i, j)
-			add(key.Expr)
+			add(key.Expr, false)
 		}
 	}
 	for i := range logical.WindowCount() {
 		call, _ := g.Window(n.Logical.Rel, i)
-		add(call.Filter)
+		add(call.Filter, false)
 		for j := range call.ArgumentCount() {
 			id, _ := g.WindowArgument(n.Logical.Rel, i, j)
-			add(id)
+			add(id, false)
 		}
 	}
 	for i := range logical.AssignmentCount() {
 		binding, _ := g.Assignment(n.Logical.Rel, i)
-		add(binding.Expr)
+		add(binding.Expr, false)
 	}
 	for i := range logical.ConflictAssignmentCount() {
 		binding, _ := g.ConflictAssignment(n.Logical.Rel, i)
-		add(binding.Expr)
+		add(binding.Expr, false)
 	}
 	for i := range logical.ActionCount() {
 		action, _ := g.MergeAction(n.Logical.Rel, i)
-		add(action.Condition)
+		add(action.Condition, false)
 		for j := range action.AssignmentCount() {
 			binding, _ := g.MergeAssignment(n.Logical.Rel, i, j)
-			add(binding.Expr)
+			add(binding.Expr, false)
 		}
 	}
 	if walkErr != nil {
 		return walkErr
 	}
 	for _, used := range seen {
-		if !used {
+		if used == 0 {
 			return invalid("scalar dependency outside logical expressions")
 		}
 	}
 	for _, ref := range n.Expressions {
-		if err := visit(ref, 0); err != nil {
+		direct := false
+		if ref.Graph == n.Logical.Graph && len(directIDs) != 0 {
+			bucket, err := directBucket(ref.Scalar)
+			if err != nil {
+				return err
+			}
+			direct = *bucket != 0
+		}
+		if err := visit(ref, 0, direct); err != nil {
 			return err
 		}
 	}
@@ -226,15 +309,37 @@ func (p *Plan) validateSubplanOutputLayout(ctx context.Context, graph *ir.Graph,
 	return nil
 }
 
-func (p *Plan) scalarCaptureAvailable(n NodeSpec, capture Slot, remaining *uint64) (bool, error) {
-	for _, child := range n.Children {
-		for _, slot := range p.nodes[child-1].Output {
+func (p *Plan) scalarCaptureAvailable(n NodeSpec, capture Slot, direct bool, remaining *uint64) (bool, error) {
+	g, logical, err := p.relation(n.Logical)
+	if err != nil {
+		return false, err
+	}
+	if direct {
+		// Direct arguments run once per group and see grouping outputs, not
+		// per-row input slots or aggregate result slots.
+		if logical.Kind != ir.Aggregate {
+			return false, nil
+		}
+		groups := int(logical.ExpressionCount())
+		for _, slot := range n.Output[:groups] {
 			if *remaining == 0 {
 				return false, ErrLimit
 			}
 			*remaining--
 			if slot == capture {
 				return true, nil
+			}
+		}
+	} else {
+		for _, child := range n.Children {
+			for _, slot := range p.nodes[child-1].Output {
+				if *remaining == 0 {
+					return false, ErrLimit
+				}
+				*remaining--
+				if slot == capture {
+					return true, nil
+				}
 			}
 		}
 	}
@@ -246,10 +351,6 @@ func (p *Plan) scalarCaptureAvailable(n NodeSpec, capture Slot, remaining *uint6
 		if slot == capture {
 			return true, nil
 		}
-	}
-	g, logical, err := p.relation(n.Logical)
-	if err != nil {
-		return false, err
 	}
 	if logical.Kind != ir.Modify || capture.Graph != n.Logical.Graph {
 		return false, nil

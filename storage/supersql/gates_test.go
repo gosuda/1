@@ -95,6 +95,23 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 		// expansion exclusion: direct writes to either are unsupported.
 		`CREATE TABLE part_root (a text, b int) PARTITION BY LIST (a)`,
 		`CREATE TABLE part_leaf PARTITION OF part_root FOR VALUES IN ('a')`,
+		// Fixtures for the pg184 regression leak exclusions: updatable
+		// views, partitioned targets, identity sequences, inheritance
+		// for constraint recursion, and triggers. Composite-type
+		// version drift gets an isolated database below: it poisons
+		// later binds in the same catalog (domain.sql).
+		`CREATE TABLE uv_base (a int, b text)`,
+		`CREATE VIEW uv_v AS SELECT a, upper(b) FROM uv_base`,
+		`CREATE TABLE pu_root (a int, b int) PARTITION BY RANGE (a)`,
+		`CREATE TABLE itab (a int GENERATED ALWAYS AS IDENTITY)`,
+		`CREATE TABLE srf_t (x int)`,
+		`CREATE TABLE bt_t (s name)`,
+		`CREATE TABLE inh_p (a int CONSTRAINT c CHECK (a > 0))`,
+		`CREATE TABLE inh_c (extra int)`,
+		`CREATE TABLE mbase (a int, b text)`,
+		`CREATE VIEW mv AS SELECT a, b FROM mbase`,
+		`CREATE FUNCTION mtrig() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$`,
+		`CREATE TRIGGER mtr INSTEAD OF UPDATE ON mv FOR EACH ROW EXECUTE FUNCTION mtrig()`,
 	} {
 		requireExec(statement)
 	}
@@ -171,6 +188,13 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 		{string(bind.DatetimeFields), `SELECT EXTRACT(MICROSECONDS FROM DATE '2020-08-11')`},
 		{string(bind.DatetimeFields), `SELECT EXTRACT(TIMEZONE FROM INTERVAL '2 days')`},
 		{string(bind.EncodingConversion), `SELECT convert_from('\xbcf6c7d0', 'EUC_KR')`},
+		{string(bind.UpdatableViewColumns), `UPDATE uv_v SET upper = 'x' WHERE a = 3`},
+		{string(bind.ViewInsteadOfMix), `MERGE INTO mv t USING (SELECT 1 AS a, 'x' AS b) AS s ON t.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)`},
+		{string(bind.UpdatableViewColumns), `INSERT INTO uv_v VALUES (3, 'ROW 3')`},
+		{string(bind.ListPartitionKeyArity), `CREATE TABLE lp_t (a int, b int) PARTITION BY LIST (a, b)`},
+		{string(bind.IdentitySequenceOwnership), `ALTER SEQUENCE itab_a_seq OWNED BY NONE`},
+		{string(bind.MultidimArrayRemove), `SELECT array_remove(ARRAY[[1,2],[3,4]], 1)`},
+		{string(bind.PartitionedUniqueKey), `CREATE UNIQUE INDEX pu_u ON pu_root (b)`},
 	}
 	covered := make(map[string]bool)
 	for _, excludedStatement := range excluded {
@@ -191,7 +215,6 @@ func TestEmbeddedUnsupportedProfile(t *testing.T) {
 		}
 		covered[excludedStatement.feature] = true
 	}
-
 	// The manifest is authoritative: every unsupported feature id must have a
 	// representative statement above. server_transport has none — wire
 	// negotiation and client commands never reach SQL.

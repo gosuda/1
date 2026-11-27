@@ -381,7 +381,7 @@ func (b *binder) mergeInsertAssignments(clause *zpgparse.MergeWhenClause, s *sco
 			executionColumn, writable := target.executionColumn(column.ID)
 			if !writable {
 				if slices.ContainsFunc(targets[:min(len(targets), len(clause.Values))], func(supplied model.ColumnDescriptor) bool { return supplied.ID == column.ID }) {
-					b.deferWriteError(bindError("0A000", "cannot insert into a non-updatable view column", 0))
+					b.deferWriteError(&model.Error{Code: "0A000", Message: "cannot insert into a non-updatable view column", FeatureID: string(UpdatableViewColumns), Position: 0})
 				}
 				continue
 			}

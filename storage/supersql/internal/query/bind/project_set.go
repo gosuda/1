@@ -46,7 +46,7 @@ func (b *binder) checkTargetSRF(s *scope, pos int) error {
 		return bindError("0A000", "set-returning functions are not allowed in "+b.srfRestriction, pos)
 	}
 	if !b.allowTargetSRF {
-		return bindError("0A000", "set-returning functions are not allowed in this context", pos)
+		return &model.Error{Code: "0A000", Message: "set-returning functions are not allowed in this context", FeatureID: string(TargetSRF), Position: pos}
 	}
 	return nil
 }

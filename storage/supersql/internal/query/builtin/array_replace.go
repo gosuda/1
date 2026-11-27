@@ -6,6 +6,14 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/model"
 )
 
+// featureMultidimArrayRemove names the embedded_pg18 profile exclusion the
+// array_replace kernel raises for element removal on multidimensional
+// arrays. The bind package owns the canonical FeatureID
+// (bind.MultidimArrayRemove) but cannot be imported here: bind imports
+// builtin. gates_test.go's manifest-driven exclusion table fails if this id
+// drifts from testdata/postgres/embedded_features.json.
+const featureMultidimArrayRemove = "multidim_array_remove"
+
 func compileArrayReplace(signature Signature, element Callable, lookupErr error) scalarKernel {
 	remove := signature.ID == 3167
 	return func(ctx context.Context, arguments []model.Value, callBudget CallBudget) (model.Value, error) {
@@ -21,7 +29,7 @@ func compileArrayReplace(signature Signature, element Callable, lookupErr error)
 			return model.Value{Type: model.TypeArray}, nil
 		}
 		if remove && len(input.Dimensions) > 1 {
-			return model.Value{}, sqlError("0A000", "removing elements from multidimensional arrays is not supported")
+		return model.Value{}, &model.Error{Code: "0A000", Message: "removing elements from multidimensional arrays is not supported", FeatureID: featureMultidimArrayRemove}
 		}
 		if lookupErr != nil {
 			return model.Value{}, lookupErr

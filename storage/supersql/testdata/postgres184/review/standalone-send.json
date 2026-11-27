@@ -1,0 +1,55 @@
+{
+  "postgres_version": 180004,
+  "source": "\\set VERBOSITY terse\nCREATE TABLE\n\\g\n\\echo SEND_STATE syntax-send :SQLSTATE\nSELECT 1 AS ok\n\\g\n\\echo SEND_STATE success-send :SQLSTATE\nSELECT 1 / 0\n\\g\n\\echo SEND_STATE divide-send :SQLSTATE\nSELECT '\\g' AS literal\n\\g\n\\echo SEND_STATE quoted-send :SQLSTATE\nSELECT $tag$x\n\\g\ny$tag$ AS literal\n\\g\n\\echo SEND_STATE dollar-send :SQLSTATE\nSELECT 2 -- \\g in a SQL comment\n\\g\n\\echo SEND_STATE comment-send :SQLSTATE\nSELECT missing_send_probe()\n\\g\n\\echo SEND_STATE missing-send :SQLSTATE\nSELECT 3;\n\\echo SEND_STATE ordinary-semicolon :SQLSTATE\n",
+  "cases": [
+    {
+      "id": "syntax-send",
+      "sql": "CREATE TABLE\n\\g\n",
+      "state": "42601"
+    },
+    {
+      "id": "success-send",
+      "sql": "SELECT 1 AS ok\n\\g\n",
+      "state": "00000"
+    },
+    {
+      "id": "divide-send",
+      "sql": "SELECT 1 / 0\n\\g\n",
+      "state": "22012"
+    },
+    {
+      "id": "quoted-send",
+      "sql": "SELECT '\\g' AS literal\n\\g\n",
+      "state": "00000"
+    },
+    {
+      "id": "dollar-send",
+      "sql": "SELECT $tag$x\n\\g\ny$tag$ AS literal\n\\g\n",
+      "state": "00000"
+    },
+    {
+      "id": "comment-send",
+      "sql": "SELECT 2 -- \\g in a SQL comment\n\\g\n",
+      "state": "00000"
+    },
+    {
+      "id": "missing-send",
+      "sql": "SELECT missing_send_probe()\n\\g\n",
+      "state": "42883"
+    },
+    {
+      "id": "ordinary-semicolon",
+      "sql": "SELECT 3;\n",
+      "state": "00000"
+    }
+  ],
+  "output": "\\set VERBOSITY terse\nCREATE TABLE\n\\g\nERROR:  syntax error at end of input at character 13\n\\echo SEND_STATE syntax-send :SQLSTATE\nSEND_STATE syntax-send 42601\nSELECT 1 AS ok\n\\g\n ok \n----\n  1\n(1 row)\n\n\\echo SEND_STATE success-send :SQLSTATE\nSEND_STATE success-send 00000\nSELECT 1 / 0\n\\g\nERROR:  division by zero\n\\echo SEND_STATE divide-send :SQLSTATE\nSEND_STATE divide-send 22012\nSELECT '\\g' AS literal\n\\g\n literal \n---------\n \\g\n(1 row)\n\n\\echo SEND_STATE quoted-send :SQLSTATE\nSEND_STATE quoted-send 00000\nSELECT $tag$x\n\\g\ny$tag$ AS literal\n\\g\n literal \n---------\n x      +\n \\g     +\n y\n(1 row)\n\n\\echo SEND_STATE dollar-send :SQLSTATE\nSEND_STATE dollar-send 00000\nSELECT 2 -- \\g in a SQL comment\n\\g\n ?column? \n----------\n        2\n(1 row)\n\n\\echo SEND_STATE comment-send :SQLSTATE\nSEND_STATE comment-send 00000\nSELECT missing_send_probe()\n\\g\nERROR:  function missing_send_probe() does not exist at character 8\n\\echo SEND_STATE missing-send :SQLSTATE\nSEND_STATE missing-send 42883\nSELECT 3;\n ?column? \n----------\n        3\n(1 row)\n\n\\echo SEND_STATE ordinary-semicolon :SQLSTATE\nSEND_STATE ordinary-semicolon 00000\n",
+  "output_sha256": "8e59f97bb47e58a2c477da7a425e7e66d1101c932145bf7bc5fef0f022125e66",
+  "evidence": {
+    "producer": "b2df3f3a0a95dc364ab0b6e9c83f45d1f16e1db7",
+    "run": 45927778068,
+    "job": 140273088335,
+    "artifact": 15167581116,
+    "artifact_sha256": "d92a7600c8fc21a07cbbe404e8c47c44f444cd15a96aac63906306ff278a29f7"
+  }
+}

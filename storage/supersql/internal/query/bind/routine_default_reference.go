@@ -134,20 +134,20 @@ func (b *binder) validateDefaultDependencies(dependencies []model.Dependency, id
 			}
 			matched++
 		} else if descriptor.Version() != dependency.Version {
-			allowedAdvance := false
-			if descriptor.Version() > dependency.Version && dependency.Column == 0 {
-				switch descriptor.Kind() {
-				case model.ObjectSchema:
+		allowedAdvance := false
+		if descriptor.Version() > dependency.Version && dependency.Column == 0 {
+			switch descriptor.Kind() {
+			case model.ObjectSchema:
+				allowedAdvance = true
+			case model.ObjectType:
+				if declared, ok := descriptor.DeclaredType(); ok && declared.DeclaredKind() == model.TypeKindDomain {
 					allowedAdvance = true
-				case model.ObjectType:
-					if declared, ok := descriptor.DeclaredType(); ok && declared.DeclaredKind() == model.TypeKindDomain {
-						allowedAdvance = true
-					}
 				}
 			}
-			if !allowedAdvance {
-				return bindError("0A000", "routine default dependency version changed", pos)
-			}
+		}
+		if !allowedAdvance {
+			return &model.Error{Code: "0A000", Message: "routine default dependency version changed", FeatureID: string(CompositeRoutineDependency), Position: pos}
+		}
 		}
 		b.dependency(descriptor, dependency.Column)
 	}

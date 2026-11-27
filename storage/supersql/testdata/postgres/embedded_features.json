@@ -74492,6 +74492,107 @@
       "resolved_objects": [],
       "sqlstate": "",
       "regression_statements": []
+    },
+    {
+      "id": "updatable_view_columns",
+      "disposition": "unsupported",
+      "reason": "Writes that target view columns the view cannot propagate to its base tables are rejected.",
+      "ast_match": [
+        "cannot insert into a non-updatable view column",
+        "cannot update a non-updatable view column"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/updatable_views.sql",
+          "line": 99
+        },
+        {
+          "file": "testdata/postgres184/sql/updatable_views.sql",
+          "line": 112
+        }
+      ]
+    },
+    {
+      "id": "view_instead_of_mix",
+      "disposition": "unsupported",
+      "reason": "Statements combining INSTEAD OF triggers with automatic view updates are rejected.",
+      "ast_match": [
+        "cannot mix INSTEAD OF triggers and automatic view updates"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/updatable_views.sql",
+          "line": 554
+        }
+      ]
+    },
+    {
+      "id": "list_partition_key_arity",
+      "disposition": "unsupported",
+      "reason": "LIST partitioning on more than one key column is rejected.",
+      "ast_match": [
+        "LIST partitioning requires exactly one key"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/create_table.sql",
+          "line": 125
+        }
+      ]
+    },
+    {
+      "id": "identity_sequence_ownership",
+      "disposition": "unsupported",
+      "reason": "ALTER SEQUENCE ... OWNED BY on the backing sequence of an identity column is rejected.",
+      "ast_match": [
+        "cannot change ownership of identity sequence"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/identity.sql",
+          "line": 260
+        }
+      ]
+    },
+    {
+      "id": "multidim_array_remove",
+      "disposition": "unsupported",
+      "reason": "Removing elements from multidimensional arrays is rejected.",
+      "ast_match": [
+        "removing elements from multidimensional arrays is not supported"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/arrays.sql",
+          "line": 707
+        }
+      ]
+    },
+    {
+      "id": "partitioned_unique_key",
+      "disposition": "unsupported",
+      "reason": "Unique indexes on partitioned tables that do not include every partition key column are rejected.",
+      "ast_match": [
+        "unique index on partitioned table must include every partition key column"
+      ],
+      "resolved_objects": [],
+      "sqlstate": "0A000",
+      "regression_statements": [
+        {
+          "file": "testdata/postgres184/sql/indexing.sql",
+          "line": 853
+        }
+      ]
     }
   ]
 }

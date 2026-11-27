@@ -225,6 +225,10 @@ func (b *binder) function(n *zpgparse.FuncCall, s *scope) (expression, error) {
 			return expression{}, bindError("42601", "WITHIN GROUP requires ORDER BY", pos)
 		}
 	}
+	mark, err := b.markAggregateScope(s)
+	if err != nil {
+		return expression{}, err
+	}
 	aggregateSyntax := n.AggStar || n.AggDistinct || n.AggFilter != nil || n.AggWithinGroup
 	for sig := range b.signaturesNamed(name) {
 		aggregateSyntax = aggregateSyntax || sig.Kind == 'a'
@@ -269,7 +273,7 @@ func (b *binder) function(n *zpgparse.FuncCall, s *scope) (expression, error) {
 			// consulted here too; a plain routine cannot, so userFunction is
 			// skipped rather than letting it match an ordinary function.
 			if n.AggWithinGroup {
-				e, found, err := b.userAggregate(schema, name, n, call, s, pos, directCount)
+				e, found, err := b.userAggregate(schema, name, n, call, s, pos, directCount, mark)
 				if err != nil || found {
 					return e, err
 				}
@@ -281,7 +285,7 @@ func (b *binder) function(n *zpgparse.FuncCall, s *scope) (expression, error) {
 			if err != nil || found {
 				return e, err
 			}
-			e, found, err = b.userAggregate(schema, name, n, call, s, pos, directCount)
+			e, found, err = b.userAggregate(schema, name, n, call, s, pos, directCount, mark)
 			if err != nil || found {
 				return e, err
 			}
@@ -339,7 +343,7 @@ func (b *binder) function(n *zpgparse.FuncCall, s *scope) (expression, error) {
 			if orderedSet && metadata.Kind == builtin.HypotheticalSetAggregate && directCount != len(n.AggOrder) {
 				return expression{}, bindError("42883", "hypothetical-set direct and ORDER BY argument counts must match", pos)
 			}
-			return b.aggregateFunction(n, s, selected, args, directCount)
+			return b.aggregateFunction(n, s, selected, args, directCount, mark)
 		}
 		if n.AggStar || n.AggDistinct || n.AggFilter != nil || len(n.AggOrder) > 0 || n.AggWithinGroup {
 			return expression{}, bindError("42809", "aggregate syntax used with non-aggregate function", pos)
@@ -769,12 +773,8 @@ func (b *binder) completeProcedureArguments(parameters []model.RoutineParameter,
 	return append(values, packed), nil
 }
 
-func (b *binder) aggregateFunction(n *zpgparse.FuncCall, s *scope, sig builtin.Signature, args []expression, directCount int) (expression, error) {
+func (b *binder) aggregateFunction(n *zpgparse.FuncCall, s *scope, sig builtin.Signature, args []expression, directCount int, mark *ir.ScopeMark) (expression, error) {
 	pos := int(n.Location) + 1
-	if !s.allowAggregate || s.inAggregate {
-		return expression{}, bindError("42803", "aggregate function is not allowed in this scope", pos)
-
-	}
 	metadata, orderedSet := builtin.LookupAggregateMetadata(sig.ID)
 	if n.AggWithinGroup != orderedSet {
 		if orderedSet {
@@ -856,13 +856,8 @@ func (b *binder) aggregateFunction(n *zpgparse.FuncCall, s *scope, sig builtin.S
 	if err != nil {
 		return expression{}, err
 	}
-	nullable := functionNullable(sig)
-	slot, err := b.slot(s, result, nullable, 0, 0)
-	if err != nil {
-		return expression{}, err
-	}
 	call := ir.AggregateSpec{
-		AggregateCall: ir.AggregateCall{Signature: signature, Function: sig.ID, Result: slot, Distinct: n.AggDistinct, Effects: effects},
+		AggregateCall: ir.AggregateCall{Signature: signature, Function: sig.ID, Distinct: n.AggDistinct, Effects: effects},
 		Direct:        ids[:directCount],
 		Args:          ids[directCount:],
 	}
@@ -895,10 +890,24 @@ func (b *binder) aggregateFunction(n *zpgparse.FuncCall, s *scope, sig builtin.S
 	}
 	call.Order = order
 	call.Effects = call.Effects.Union(orderEffects)
+	s.allowAggregate, s.allowWindow, s.inAggregate = previousAggregate, previousWindow, previousInput
+	owner, err := b.aggregateScope(s, call, pos)
+	if err != nil {
+		return expression{}, err
+	}
+	if err := b.promoteAggregate(mark, s, owner, call, pos); err != nil {
+		return expression{}, err
+	}
+	nullable := functionNullable(sig)
+	slot, err := b.slot(owner, result, nullable, 0, 0)
+	if err != nil {
+		return expression{}, err
+	}
+	call.Result = slot
 	c := column{ResultColumn: ResultColumn{Name: sig.Name, Layout: result, Nullable: nullable, Slot: slot}}
-	s.aggregates = append(s.aggregates, call)
-	s.aggregateColumns = append(s.aggregateColumns, c)
-	s.aggregateSeen = true
+	owner.aggregates = append(owner.aggregates, call)
+	owner.aggregateColumns = append(owner.aggregateColumns, c)
+	owner.aggregateSeen = true
 	expr, err := b.reference(s, c, pos)
 	expr.collation = resultState
 	return expr, err

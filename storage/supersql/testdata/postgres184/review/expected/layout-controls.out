@@ -1,0 +1,12 @@
+\set VERBOSITY terse
+    SELECT missing_indented_echo_probe();
+ERROR:  function missing_indented_echo_probe() does not exist at character 8
+\echo INDENTED_STATE :SQLSTATE
+INDENTED_STATE 42883
+------------------------------
+    SELECT missing_divider_echo_probe();
+ERROR:  function missing_divider_echo_probe() does not exist at character 8
+\echo (1 row)
+(1 row)
+\echo DIVIDER_STATE :SQLSTATE
+DIVIDER_STATE 42883

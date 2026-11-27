@@ -1,0 +1,13 @@
+\set VERBOSITY terse
+SELECT 1 AS "SELECT missing_echo_probe();";
+ SELECT missing_echo_probe(); 
+------------------------------
+                            1
+(1 row)
+
+\echo HEADER_LITERAL :SQLSTATE
+HEADER_LITERAL 00000
+SELECT missing_echo_probe();
+ERROR:  function missing_echo_probe() does not exist at character 8
+\echo HEADER_MISSING :SQLSTATE
+HEADER_MISSING 42883
