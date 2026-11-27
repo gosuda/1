@@ -1247,7 +1247,10 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 			return walErr
 		}
 		if _, metaErr := archiveRoot.Lstat(metaFile); metaErr == nil {
-			return storage.ErrCorruptStorage
+			if err := a.healMissingArchivedWAL(ctx, commitsRoot, archiveRoot, position, walFile, metaFile, commitTS); err != nil {
+				return err
+			}
+			return syncCommitDirectory(archiveRoot)
 		} else if !errors.Is(metaErr, os.ErrNotExist) {
 			return metaErr
 		}
@@ -1258,7 +1261,7 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 		}
 		defer func() { _ = src.Close() }()
 
-		size, checksum, err := a.writeArchivedSegment(ctx, archiveRoot, walFile, src)
+		size, checksum, err := a.writeArchivedSegment(ctx, archiveRoot, walFile, src, nil)
 		if err != nil {
 			return err
 		}
@@ -1278,6 +1281,67 @@ func (a *walArchiver) archiveCommit(ctx context.Context, commitsRoot *os.Root, p
 		}
 	}
 	return nil
+}
+
+// healMissingArchivedWAL preserves the original sidecar throughout repair.
+// Its byte checksum is the identity proof: only an exact reconstruction may
+// be published. A segment encrypted under an archive key distinct from the
+// live database encryption state uses a fresh random per-file salt and cannot
+// be recreated from the sidecar's ciphertext checksum alone; it fails closed
+// instead of replacing the original identity.
+func (a *walArchiver) healMissingArchivedWAL(ctx context.Context, commitsRoot, archiveRoot *os.Root, position uint64, walFile, metaFile string, commitTS model.Timestamp) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := archiveRoot.Lstat(metaFile)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 64<<10 {
+		return storage.ErrCorruptStorage
+	}
+	file, err := archiveRoot.Open(metaFile)
+	if err != nil {
+		return err
+	}
+	raw := make([]byte, int(info.Size()))
+	_, err = io.ReadFull(file, raw)
+	var trailing [1]byte
+	trailingN, trailingErr := file.Read(trailing[:])
+	closeErr := file.Close()
+	if err != nil {
+		return errors.Join(storage.ErrCorruptStorage, err)
+	}
+	if trailingN != 0 || !errors.Is(trailingErr, io.EOF) {
+		return storage.ErrCorruptStorage
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var stored WALArchiveMetadata
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return errors.Join(storage.ErrCorruptStorage, err)
+	}
+	if stored.LogPosition != position || stored.CommitTS != commitTS ||
+		stored.Encrypted != (a.archiveCipher != nil) || stored.KeyFingerprint != a.archiveCipher.fingerprintHex() {
+		return storage.ErrCorruptStorage
+	}
+	// A segment encrypted under an archive key distinct from the live database
+	// encryption state uses a fresh random per-file salt, so its bytes can
+	// never match the sidecar checksum. Fail closed before copying anything.
+	if a.archiveCipher != nil && !a.sameCipher() {
+		return storage.ErrCorruptStorage
+	}
+	src, err := commitsRoot.Open(walFile)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return storage.ErrCorruptStorage
+		}
+		return err
+	}
+	defer func() { err = errors.Join(err, src.Close()) }()
+	_, _, err = a.writeArchivedSegment(ctx, archiveRoot, walFile, src, &stored)
+	return err
 }
 
 // archivedCommitMetadata verifies that an existing archive is the same durable
@@ -1382,7 +1446,34 @@ func reconcileArchivedMeta(root *os.Root, name string, expected WALArchiveMetada
 	return nil
 }
 
-func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.Root, walFile string, src *os.File) (size uint64, sum [sha256.Size]byte, err error) {
+var archiveLink = func(root *os.Root, oldname, newname string) error {
+	return root.Link(oldname, newname)
+}
+
+func publishArchivedFile(archiveRoot *os.Root, pending, final string) error {
+	linkErr := archiveLink(archiveRoot, pending, final)
+	if linkErr == nil || errors.Is(linkErr, os.ErrExist) {
+		return linkErr
+	}
+	if err := renameArchivedFileNoReplace(archiveRoot, pending, final); err == nil || errors.Is(err, os.ErrExist) {
+		return err
+	} else if !errors.Is(err, errors.ErrUnsupported) {
+		return errors.Join(linkErr, err)
+	}
+	// No atomic no-replace operation is available: fail closed and retain the
+	// local WAL for a later retry. A check-then-rename here could replace a
+	// competing publisher's archived bytes after both passed the absence
+	// check, and a lost archived WAL is unrecoverable once the local WAL
+	// retires.
+	return errors.Join(linkErr, errors.ErrUnsupported)
+}
+
+func (a *walArchiver) sameCipher() bool {
+	return (a.dbCipher == nil && a.archiveCipher == nil) ||
+		(a.dbCipher != nil && a.archiveCipher != nil && a.dbCipher.matchesFingerprint(a.archiveCipher.fingerprint))
+}
+
+func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.Root, walFile string, src *os.File, expected *WALArchiveMetadata) (size uint64, sum [sha256.Size]byte, err error) {
 	pending := "." + walFile + "." + rand.Text() + ".pending"
 	dst, err := archiveRoot.OpenFile(pending, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -1399,8 +1490,7 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 
 	hash := sha256.New()
 	cw := &countingWriter{w: io.MultiWriter(dst, hash)}
-	sameCipher := (a.dbCipher == nil && a.archiveCipher == nil) ||
-		(a.dbCipher != nil && a.archiveCipher != nil && a.dbCipher.matchesFingerprint(a.archiveCipher.fingerprint))
+	sameCipher := a.sameCipher()
 
 	buf := make([]byte, 64<<10)
 	if sameCipher {
@@ -1450,7 +1540,10 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 			}
 		}
 	}
-
+	hash.Sum(sum[:0])
+	if expected != nil && (expected.Size != cw.n || expected.SHA256 != hex.EncodeToString(sum[:])) {
+		return 0, sum, storage.ErrCorruptStorage
+	}
 	if err := dst.Sync(); err != nil {
 		return 0, sum, err
 	}
@@ -1459,10 +1552,9 @@ func (a *walArchiver) writeArchivedSegment(ctx context.Context, archiveRoot *os.
 	if closeErr != nil {
 		return 0, sum, closeErr
 	}
-	if err := archiveRoot.Link(pending, walFile); err != nil {
+	if err := publishArchivedFile(archiveRoot, pending, walFile); err != nil {
 		return 0, sum, err
 	}
-	hash.Sum(sum[:0])
 	return cw.n, sum, nil
 }
 
@@ -1507,7 +1599,7 @@ func writeArchivedMeta(archiveRoot *os.Root, metaFile string, meta WALArchiveMet
 	if closeErr != nil {
 		return closeErr
 	}
-	if err := archiveRoot.Link(pending, metaFile); err != nil {
+	if err := publishArchivedFile(archiveRoot, pending, metaFile); err != nil {
 		return err
 	}
 	return nil
