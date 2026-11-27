@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Checkout HQQ core
+        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Install Ninja
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ninja-build
+          else
+            command -v ninja >/dev/null || brew install ninja
+          fi
+      - name: Build zstd_server and run Go tests
+        run: |
+          eval "$(./build.sh)"
+          go test -short -v -race -timeout 10m -tags zstdcgo ./...
