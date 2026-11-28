@@ -306,9 +306,7 @@ func TestNormalizeRelaysBoundariesAndDeduplication(t *testing.T) {
 
 func TestDefaultRelaysOrderAndDefensiveCopy(t *testing.T) {
 	want := []string{
-		"https://gosunuts.xyz",
 		"https://s-h.day",
-		"https://kakashit.org",
 		"https://portal.rabbitson87.dev",
 		"https://portal.dawnfullstack.com",
 	}

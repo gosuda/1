@@ -5,9 +5,7 @@ package portalite
 // against the tunnel protocol this SDK speaks. Relay availability is
 // operational state, not a static guarantee.
 var defaultRelays = [...]string{
-	"https://gosunuts.xyz",
 	"https://s-h.day",
-	"https://kakashit.org",
 	"https://portal.rabbitson87.dev",
 	"https://portal.dawnfullstack.com",
 }
