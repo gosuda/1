@@ -1,0 +1,231 @@
+[
+  {
+    "__doc": [
+      "Single source of truth for (tag, attr) URL-bearing DOM surfaces.",
+      "kind: rewrite=rewrite to proxy route / srcset=candidate list parsed separately / navigation=rewrite to ?via=",
+      "      / deliberate=intentionally unrewritten (requires why) / known-gap=unfixed (requires why)",
+      "case: hole-matrix case id that exercises this surface. When null, provide why.",
+      "Rust (zp-shared::surfaces), the page prelude (isURLBearing), and static-policy",
+      "all validate against this file."
+    ]
+  },
+  {
+    "pair": "link:href",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Static link href uses /style/a7.css without an id tag; arrival is verified by a7-netcss-url instead"
+  },
+  {
+    "pair": "script:src",
+    "kind": "rewrite",
+    "case": "a19-static-script"
+  },
+  {
+    "pair": "img:src",
+    "kind": "rewrite",
+    "case": "a1-static-img"
+  },
+  {
+    "pair": "source:src",
+    "kind": "rewrite",
+    "case": "a3-static-source"
+  },
+  {
+    "pair": "video:src",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same media loading path as source:src"
+  },
+  {
+    "pair": "audio:src",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same media loading path as source:src"
+  },
+  {
+    "pair": "track:src",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same media loading path as source:src"
+  },
+  {
+    "pair": "embed:src",
+    "kind": "rewrite",
+    "case": "b10-embed-src"
+  },
+  {
+    "pair": "input:src",
+    "kind": "rewrite",
+    "case": "a11-static-inputimage"
+  },
+  {
+    "pair": "image:src",
+    "kind": "rewrite",
+    "case": "a15-static-legacy-image"
+  },
+  {
+    "pair": "image:href",
+    "kind": "rewrite",
+    "case": "a13-static-svgimage"
+  },
+  {
+    "pair": "image:xlink:href",
+    "kind": "rewrite",
+    "case": "a14-static-svgxlink"
+  },
+  {
+    "pair": "use:href",
+    "kind": "rewrite",
+    "case": "a20-static-use"
+  },
+  {
+    "pair": "feimage:href",
+    "kind": "rewrite",
+    "case": "a21-static-feimage"
+  },
+  {
+    "pair": "feimage:xlink:href",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same rewrite path as feimage:href"
+  },
+  {
+    "pair": "video:poster",
+    "kind": "rewrite",
+    "case": "a12-static-poster-cross"
+  },
+  {
+    "pair": "body:background",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same legacy background attribute path as td:background"
+  },
+  {
+    "pair": "table:background",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same legacy background attribute path as td:background"
+  },
+  {
+    "pair": "td:background",
+    "kind": "rewrite",
+    "case": "a16-static-td-background"
+  },
+  {
+    "pair": "th:background",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same legacy background attribute path as td:background"
+  },
+  {
+    "pair": "tr:background",
+    "kind": "rewrite",
+    "case": null,
+    "why": "Covered by the same legacy background attribute path as td:background"
+  },
+  {
+    "pair": "img:srcset",
+    "kind": "srcset",
+    "case": "a2-static-srcset"
+  },
+  {
+    "pair": "source:srcset",
+    "kind": "srcset",
+    "case": "b6-picture-source"
+  },
+  {
+    "pair": "link:imagesrcset",
+    "kind": "srcset",
+    "case": null,
+    "why": "Preload links are blocked by policy so an arrival test case does not apply"
+  },
+  {
+    "pair": "a:href",
+    "kind": "navigation",
+    "case": null,
+    "why": "Covered by dedicated navigation escape vector tests"
+  },
+  {
+    "pair": "area:href",
+    "kind": "navigation",
+    "case": null,
+    "why": "Covered by the same navigation path as a:href"
+  },
+  {
+    "pair": "form:action",
+    "kind": "navigation",
+    "case": null,
+    "why": "Covered by dedicated form navigation escape vector tests"
+  },
+  {
+    "pair": "input:formaction",
+    "kind": "navigation",
+    "case": null,
+    "why": "Covered by the same navigation path as form:action"
+  },
+  {
+    "pair": "button:formaction",
+    "kind": "navigation",
+    "case": null,
+    "why": "Covered by the same navigation path as form:action"
+  },
+  {
+    "pair": "object:data",
+    "kind": "rewrite",
+    "case": "a23-static-object-cross"
+  },
+  {
+    "pair": "a:ping",
+    "kind": "deliberate",
+    "case": "c11-ping-attr",
+    "why": "Click-tracking beacon attribute containing a space-separated URL list; stripped intentionally"
+  },
+  {
+    "pair": "object:codebase",
+    "kind": "deliberate",
+    "case": null,
+    "why": "Blocked by object-src 'none' plugin surface restriction (same rationale as object:data)"
+  },
+  {
+    "pair": "iframe:src",
+    "kind": "special",
+    "case": "a10-static-iframe",
+    "why": "Server stashes the URL in data-zp-frame-src and the page realm activates it via a share route so the frame loads with the runtime prelude"
+  },
+  {
+    "pair": "frame:src",
+    "kind": "special",
+    "case": null,
+    "why": "Covered by the same frame activation path as iframe:src"
+  },
+  {
+    "pair": "iframe:srcdoc",
+    "kind": "special",
+    "case": "a17-static-srcdoc",
+    "why": "Server stashes markup in data-zp-srcdoc and the page realm injects the runtime prelude before restoring srcdoc"
+  },
+  {
+    "pair": "script:href",
+    "kind": "rewrite",
+    "case": null,
+    "why": "SVG script elements load via href rather than src; handled by subresource rewriting"
+  },
+  {
+    "pair": "script:xlink:href",
+    "kind": "rewrite",
+    "case": null,
+    "why": "SVG script xlink:href variant; handled by the same surface as script:href"
+  },
+  {
+    "pair": "use:xlink:href",
+    "kind": "rewrite",
+    "case": null,
+    "why": "SVG use xlink:href variant; handled by the same surface as use:href"
+  },
+  {
+    "pair": "a:xlink:href",
+    "kind": "navigation",
+    "case": null,
+    "why": "SVG anchor xlink:href variant; handled by the same navigation path as a:href"
+  }
+]

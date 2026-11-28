@@ -1,0 +1,12 @@
+lexical 7.0.5 (crates.io), replaced rather than forked.
+
+Why: `swc_css_parser` 27 calls `lexical::parse` and passes any `Err` to `unreachable!()`. On out-of-range `:nth-child(...)` offsets such as `:nth-child(99999999999n+99999999999)`, upstream `lexical` 7 returns `Overflow(...)` and panics the stylesheet rewrite (a WASM trap). Replacing `lexical` with a clamping stand-in also keeps the seven `lexical*` crates out of Cargo.lock and the WASM bundle.
+
+What: `swc_css_parser` calls only `lexical::parse` (the tokenizer's number and the `An+B` offsets in the selector parser), on text its tokenizer has already checked. This crate keeps that one function and its generic shape (`parse::<N, Bytes: AsRef<[u8]>>`), implemented with the standard library's `FromStr`. It is version 7.0.6 so the parser's `^7` requirement resolves here, and the workspace `[patch.crates-io]` points `lexical` here. `lexical`, `lexical-core`, `lexical-parse-float`, `lexical-parse-integer`, `lexical-write-float`, `lexical-write-integer`, and `lexical-util` are gone from Cargo.lock.
+
+Differences from upstream lexical:
+- `f64`: identical on CSS number shapes (`1.e3`, `-0`, `inf`, `nan`, empty, lone sign or dot, separators, hex, whitespace, non-ASCII digits).
+- `i32` within range: identical. Outside range, upstream returns an overflow error and `swc_css_parser` hits `unreachable!()`. The stand-in clamps to the type's range, matching CSS integer clamping.
+- Error values: one kind (`InvalidNumber`) instead of lexical's detailed ones; only `Debug` is used. Digit separators and non-decimal radixes are not accepted (the CSS tokenizer never produces them).
+
+Re-check when `swc_css_parser` handles integer overflow without panicking (or drops `lexical`): then this directory and the patch line can be deleted.
