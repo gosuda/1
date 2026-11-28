@@ -53,10 +53,11 @@ type namedCursor struct {
 	metadataBytes     uint64
 	sealed            bool
 	failed            bool
-	currentOfSimple   bool
-	currentOfTable    string
-	currentOfRow      []model.Value
-	currentOfOnRow    bool
+	currentOfSimple     bool
+	currentOfTable      string
+	currentOfOccurrence int
+	currentOfRow        []model.Value
+	currentOfOnRow      bool
 }
 
 func cursorMetadataBytes(name, statement string) uint64 {
@@ -296,19 +297,7 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 		}
 		transactions.named.cursorSerial++
 		flags := declaration.Options
-		currentOfSimple := false
-		currentOfTable := ""
-		if sel := declaration.Query.GetSelectStmt(); sel != nil &&
-			sel.Op == zpgparse.SetOperation_SETOP_NONE &&
-			len(sel.FromClause) == 1 &&
-			len(sel.GroupClause) == 0 &&
-			len(sel.DistinctClause) == 0 &&
-			sel.HavingClause == nil {
-			if rv := sel.FromClause[0].GetRangeVar(); rv != nil && rv.Relname != "" {
-				currentOfSimple = true
-				currentOfTable = rv.Relname
-			}
-		}
+		currentOfTable, currentOfOccurrence, currentOfSimple := cursorCurrentOfTarget(declaration.Query.GetSelectStmt())
 		cursor = &namedCursor{
 			name: declaration.Portalname, statement: statementSQL, createdAt: createdAt,
 			holdable: flags&cursorOptionHold != 0, binary: flags&cursorOptionBinary != 0,
@@ -317,7 +306,7 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 			prepared: compiled, layouts: layouts, portal: portal, closeCapabilities: closeCapabilities, scope: scope, spool: spool, spoolQuery: spoolQuery,
 			metadataBytes: metadataBytes, batchRows: options.Environment.Limits.BatchRows,
 			batchBytes: options.Environment.Limits.BatchBytes,
-			currentOfSimple: currentOfSimple, currentOfTable: currentOfTable,
+			currentOfSimple: currentOfSimple, currentOfTable: currentOfTable, currentOfOccurrence: currentOfOccurrence,
 		}
 		return nil
 	})
@@ -864,11 +853,14 @@ func (transactions *Transactions) ResolveCurrentOf(cursorName string, target *mo
 	if len(cursorCols) != len(cursor.currentOfRow) {
 		return bind.CurrentOfRow{}, &model.Error{Code: "55000", Message: fmt.Sprintf("cursor %q row layout mismatch", cursorName)}
 	}
+	colSeen := make(map[string]int, len(cursorCols))
 	colByName := make(map[string]int, len(cursorCols))
 	for i, c := range cursorCols {
-		if _, exists := colByName[c.Name]; !exists {
+		n := colSeen[c.Name]
+		if n == 0 || n == cursor.currentOfOccurrence {
 			colByName[c.Name] = i
 		}
+		colSeen[c.Name] = n + 1
 	}
 	// Prefer matching non-system primary key columns if all are projected by the cursor.
 	var pkCols []model.ColumnID
@@ -909,4 +901,90 @@ func (transactions *Transactions) ResolveCurrentOf(cursorName string, target *mo
 		return bind.CurrentOfRow{}, &model.Error{Code: "0A000", Message: fmt.Sprintf("cursor %q is not a simply updatable scan of table %q", cursorName, target.Name().Name)}
 	}
 	return res, nil
+}
+
+func cursorCurrentOfTarget(sel *zpgparse.SelectStmt) (string, int, bool) {
+	if sel == nil ||
+		sel.Op != zpgparse.SetOperation_SETOP_NONE ||
+		len(sel.FromClause) == 0 ||
+		len(sel.GroupClause) != 0 ||
+		len(sel.DistinctClause) != 0 ||
+		sel.HavingClause != nil {
+		return "", 0, false
+	}
+	if len(sel.FromClause) == 1 {
+		if rv := sel.FromClause[0].GetRangeVar(); rv != nil && rv.Relname != "" {
+			return rv.Relname, 0, true
+		}
+	}
+	if len(sel.LockingClause) == 0 {
+		return "", 0, false
+	}
+	var rangeVars []*zpgparse.RangeVar
+	var collect func(node *zpgparse.Node)
+	collect = func(node *zpgparse.Node) {
+		if node == nil {
+			return
+		}
+		if rv := node.GetRangeVar(); rv != nil && rv.Relname != "" {
+			rangeVars = append(rangeVars, rv)
+			return
+		}
+		if join := node.GetJoinExpr(); join != nil {
+			collect(join.Larg)
+			collect(join.Rarg)
+		}
+	}
+	for _, item := range sel.FromClause {
+		collect(item)
+	}
+	if len(rangeVars) == 0 {
+		return "", 0, false
+	}
+	matchedIdx := -1
+	for _, lockNode := range sel.LockingClause {
+		clause := lockNode.GetLockingClause()
+		if clause == nil || len(clause.LockedRels) == 0 {
+			return "", 0, false
+		}
+		for _, lockedNode := range clause.LockedRels {
+			locked := lockedNode.GetRangeVar()
+			if locked == nil || locked.Relname == "" || locked.Catalogname != "" {
+				return "", 0, false
+			}
+			found := -1
+			for i, rv := range rangeVars {
+				effective := rv.Relname
+				hasAlias := rv.Alias != nil && rv.Alias.Aliasname != ""
+				if hasAlias {
+					effective = rv.Alias.Aliasname
+				}
+				if !strings.EqualFold(effective, locked.Relname) {
+					continue
+				}
+				if locked.Schemaname != "" && (hasAlias || !strings.EqualFold(rv.Schemaname, locked.Schemaname)) {
+					continue
+				}
+				if found >= 0 {
+					return "", 0, false
+				}
+				found = i
+			}
+			if found < 0 || (matchedIdx >= 0 && matchedIdx != found) {
+				return "", 0, false
+			}
+			matchedIdx = found
+		}
+	}
+	if matchedIdx < 0 {
+		return "", 0, false
+	}
+	target := rangeVars[matchedIdx]
+	occurrence := 0
+	for i := 0; i < matchedIdx; i++ {
+		if strings.EqualFold(rangeVars[i].Relname, target.Relname) {
+			occurrence++
+		}
+	}
+	return target.Relname, occurrence, true
 }

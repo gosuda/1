@@ -219,23 +219,6 @@ func (b *binder) copyTo(statement *zpgparse.CopyStmt, s *scope) (relation, error
 		}
 		input, err = b.statement(statement.Query, s)
 	case statement.Relation != nil && statement.Query == nil:
-		if statement.Relation.Relname != "" && statement.Relation.Catalogname == "" {
-			parts := []string{statement.Relation.Relname}
-			if statement.Relation.Schemaname != "" {
-				parts = []string{statement.Relation.Schemaname, statement.Relation.Relname}
-			}
-			if desc, _, rErr := b.resolve(parts, []model.ObjectKind{model.ObjectTable}, "42P01", int(statement.Relation.Location)+1); rErr == nil && desc != nil {
-				if tbl, ok := desc.Table(); ok && tbl.RowSecurity {
-					roles, roleErr := b.cachedRoles()
-					if roleErr != nil {
-						return relation{}, roleErr
-					}
-					if rlsApplies(roles, b.options.CurrentRole, &tbl) {
-						return relation{}, bindError("0A000", "COPY TO not supported with row-level security", int(statement.Relation.Location)+1)
-					}
-				}
-			}
-		}
 		input, err = b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: statement.Relation}}, s)
 		if err == nil {
 			input, err = b.copyOutputColumns(input, statement.Attlist, s)

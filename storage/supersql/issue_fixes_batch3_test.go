@@ -283,4 +283,53 @@ func TestBatch3TypesParsingOperatorsTailIssueFixes(t *testing.T) {
 			t.Fatalf("partitioned MERGE = %+v", res.Rows)
 		}
 	})
+
+	// CI regression leak fixes: metadata-only ADD COLUMN CHECK, single-partition view WCO,
+	// multi-table self-join cursor FOR SHARE OF <alias> + WHERE CURRENT OF.
+	t.Run("CIFix_AddColumnCheckPartitionViewAndCursorLock", func(t *testing.T) {
+		t.Cleanup(func() { _, _ = execRaw("ROLLBACK") })
+
+		// 1. Metadata-only nullable ADD COLUMN with inline CHECK must preserve TableVersion.
+		mustExec(t, `CREATE TABLE ci_addchk (id int)`)
+		mustExec(t, `ALTER TABLE ci_addchk ADD COLUMN a1 int CHECK (a1 > 0)`)
+		mustExec(t, `INSERT INTO ci_addchk VALUES (1, 10)`)
+		mustFailState(t, `INSERT INTO ci_addchk VALUES (2, -1)`, "23514")
+
+		// 2. Single-partition partitioned table view with WITH CHECK OPTION.
+		mustExec(t, `CREATE TABLE ci_pt (a int, b int) PARTITION BY RANGE (a)`)
+		mustExec(t, `CREATE TABLE ci_pt1 PARTITION OF ci_pt FOR VALUES FROM (0) TO (10)`)
+		mustExec(t, `CREATE VIEW ci_ptv_wco AS SELECT * FROM ci_pt WHERE a = 0 WITH CHECK OPTION`)
+		mustExec(t, `INSERT INTO ci_ptv_wco VALUES (0, 2)`)
+		mustFailState(t, `INSERT INTO ci_ptv_wco VALUES (1, 2)`, "44000")
+
+		// 3. Self-join cursor updatable when FOR SHARE OF names a single alias.
+		mustExec(t, `CREATE TABLE ci_uctest (f1 int, f2 text)`)
+		mustExec(t, `INSERT INTO ci_uctest VALUES (1, 'one'), (6, 'six')`)
+		mustExec(t, `BEGIN`)
+		mustExec(t, `DECLARE ci_c1 CURSOR FOR SELECT * FROM ci_uctest a, ci_uctest b WHERE a.f1 = b.f1 + 5 FOR UPDATE`)
+		mustExec(t, `FETCH 1 FROM ci_c1`)
+		mustFailState(t, `UPDATE ci_uctest SET f1 = f1 + 10 WHERE CURRENT OF ci_c1`, "0A000")
+		mustExec(t, `ROLLBACK`)
+
+		mustExec(t, `BEGIN`)
+		mustExec(t, `DECLARE ci_c2 CURSOR FOR SELECT * FROM ci_uctest a, ci_uctest b WHERE a.f1 = b.f1 + 5 FOR SHARE OF a`)
+		mustExec(t, `FETCH 1 FROM ci_c2`)
+		mustExec(t, `UPDATE ci_uctest SET f1 = f1 + 10 WHERE CURRENT OF ci_c2`)
+		mustExec(t, `COMMIT`)
+		res := mustExec(t, `SELECT f1 FROM ci_uctest ORDER BY f1`)
+		if len(res.Rows) != 2 || res.Rows[0][0].IntVal != 1 || res.Rows[1][0].IntVal != 16 {
+			t.Fatalf("after FOR SHARE OF a WHERE CURRENT OF = %+v, want [1, 16]", res.Rows)
+		}
+
+		// 4. FOR SHARE OF b updates the second alias (b), not the first (a).
+		mustExec(t, `BEGIN`)
+		mustExec(t, `DECLARE ci_c3 CURSOR FOR SELECT * FROM ci_uctest a, ci_uctest b WHERE a.f1 = b.f1 + 15 FOR SHARE OF b`)
+		mustExec(t, `FETCH 1 FROM ci_c3`)
+		mustExec(t, `UPDATE ci_uctest SET f1 = f1 + 100 WHERE CURRENT OF ci_c3`)
+		mustExec(t, `COMMIT`)
+		res = mustExec(t, `SELECT f1 FROM ci_uctest ORDER BY f1`)
+		if len(res.Rows) != 2 || res.Rows[0][0].IntVal != 16 || res.Rows[1][0].IntVal != 101 {
+			t.Fatalf("after FOR SHARE OF b WHERE CURRENT OF = %+v, want [16, 101]", res.Rows)
+		}
+	})
 }

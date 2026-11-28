@@ -708,6 +708,9 @@ func bindOnlineAddColumn(ctx context.Context, b *binder, snapshot CatalogSnapsho
 		return nil, missing("ONLINE ADD COLUMN inline relational constraints", int(column.Location)+1)
 	}
 	metadataOnly := defaultNode == nil && declaration.Nullable
+	hasInlineIndex := slices.ContainsFunc(relationalConstraints, func(c *zpgparse.Constraint) bool {
+		return c != nil && (c.Contype == zpgparse.ConstrType_CONSTR_PRIMARY || c.Contype == zpgparse.ConstrType_CONSTR_UNIQUE || c.Contype == zpgparse.ConstrType_CONSTR_EXCLUSION)
+	})
 	if defaultNode != nil {
 		bound, err := defineDefault(ctx, defaultNode, layout, snapshot, options.Bind, true)
 		if err != nil {
@@ -732,7 +735,11 @@ func bindOnlineAddColumn(ctx context.Context, b *binder, snapshot CatalogSnapsho
 		pendingSpec.Table = &pendingTable
 		pendingSpec.Table.Columns = append(slices.Clone(spec.Table.Columns), declaration)
 		pendingSpec.Table.ColumnIDHighWatermark = declaration.ID
-		pendingSpec.Version = table.Version() + 3
+		if !stored && declaration.Nullable && !hasInlineIndex {
+			pendingSpec.Version = table.Version() + 1
+		} else {
+			pendingSpec.Version = table.Version() + 3
+		}
 		pending, pendingErr := model.NewDescriptor(ctx, pendingSpec, options.Descriptors)
 		if pendingErr != nil {
 			return nil, pendingErr
@@ -785,7 +792,11 @@ func bindOnlineAddColumn(ctx context.Context, b *binder, snapshot CatalogSnapsho
 	}
 	spec.Table.Columns = append(spec.Table.Columns, declaration)
 	spec.Table.ColumnIDHighWatermark = declaration.ID
-	spec.Version = table.Version() + 3
+	if metadataOnly && !hasInlineIndex {
+		spec.Version = table.Version() + 1
+	} else {
+		spec.Version = table.Version() + 3
+	}
 	creates, validations, err := bindAddedColumnConstraints(ctx, b, snapshot, options, table, &spec, declaration.ID, relationalConstraints)
 	if err != nil {
 		return nil, err

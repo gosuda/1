@@ -410,7 +410,7 @@ func (b *binder) insert(n *zpgparse.InsertStmt, s *scope) (relation, error) {
 			executionColumn, writable := target.executionColumn(c.ID)
 			if !writable {
 				if slices.ContainsFunc(targets, func(supplied model.ColumnDescriptor) bool { return supplied.ID == c.ID }) {
-					b.deferWriteError(bindError("0A000", "cannot insert into a non-updatable view column", 0))
+					b.deferWriteError(&model.Error{Code: "0A000", Message: "cannot insert into a non-updatable view column", FeatureID: string(RewriteHooks)})
 				}
 				continue
 			}

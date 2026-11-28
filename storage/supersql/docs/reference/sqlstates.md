@@ -10,7 +10,7 @@
 | 00000 | 00 | successful completion | 2 | internal/query/bind/object_declaration.go:301 | model.Error Code field |
 | 01000 | 01 | warning | 4 | internal/query/bind/definition_declaration.go:955 | model.Error Code field |
 | 09000 | 09 | triggered action exception | 2 | internal/query/builtin/fulltext_trigger.go:31 | sqlError call |
-| 0A000 | 0A | feature not supported | 196 | connector.go:1610 | bindError call, model.Error Code field, sqlError call, unsupported call |
+| 0A000 | 0A | feature not supported | 195 | connector.go:1610 | bindError call, model.Error Code field, sqlError call, unsupported call |
 | 0LP01 | 0L | invalid grantor | 5 | internal/query/bind/grant_ddl.go:116 | bindError call |
 | 0Z002 | 0Z | diagnostics exception | 2 | internal/query/procedural/execute.go:1207 | sqlError call |
 | 20000 | 20 | case not found | 1 | internal/query/procedural/execute.go:481 | sqlError call |
@@ -78,7 +78,7 @@
 | 42601 | 42 | syntax error or access rule violation | 636 | connector.go:285 | bindError call, model.Error Code field, sqlError call |
 | 42602 | 42 | syntax error or access rule violation | 5 | internal/query/bind/regclass.go:23 | bindError call, model.Error Code field |
 | 42622 | 42 | syntax error or access rule violation | 4 | internal/query/bind/declaration.go:103 | bindError call |
-| 42701 | 42 | syntax error or access rule violation | 37 | internal/query/bind/copy.go:285 | bindError call, model.Error Code field |
+| 42701 | 42 | syntax error or access rule violation | 37 | internal/query/bind/copy.go:268 | bindError call, model.Error Code field |
 | 42702 | 42 | syntax error or access rule violation | 5 | internal/query/bind/composite_field.go:38 | bindError call |
 | 42703 | 42 | syntax error or access rule violation | 70 | internal/dataplane/txn/row_normalizer.go:407 | bindError call, model.Error Code field, sqlError call |
 | 42704 | 42 | syntax error or access rule violation | 134 | internal/controlplane/catalog/store.go:26 | bindError call, model.Error Code field, sqlError call |
@@ -103,7 +103,7 @@
 | 42P08 | 42 | syntax error or access rule violation | 2 | internal/query/bind/bind.go:272 | bindError call |
 | 42P09 | 42 | syntax error or access rule violation | 3 | internal/query/bind/relation_qualifier.go:23 | bindError call |
 | 42P10 | 42 | syntax error or access rule violation | 17 | internal/query/bind/aggregate_order.go:98 | bindError call |
-| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:167 | model.Error Code field |
+| 42P11 | 42 | syntax error or access rule violation | 2 | internal/query/session/cursor.go:168 | model.Error Code field |
 | 42P13 | 42 | syntax error or access rule violation | 51 | internal/query/bind/definition_declaration.go:1004 | bindError call, model.Error Code field, sqlError call |
 | 42P16 | 42 | syntax error or access rule violation | 32 | internal/query/bind/constraint_rename.go:121 | bindError call, model.Error Code field |
 | 42P17 | 42 | syntax error or access rule violation | 42 | internal/query/bind/definition_declaration.go:809 | bindError call, model.Error Code field |

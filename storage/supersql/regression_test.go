@@ -690,7 +690,7 @@ func expectedErrorSet(t *testing.T, corpus, name string, statements []regStateme
 	resultRows := regressionAlignedResults(out)
 	pos := 0
 	for i, statement := range statements {
-		if statement.kind != regSQL {
+		if statement.kind == regClientCommand {
 			continue
 		}
 		source := strings.TrimSpace(stripLeadingComments(statement.text))

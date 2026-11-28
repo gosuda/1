@@ -221,7 +221,7 @@ func TestBatch2CatalogPartitionRLSCopyIssueFixes(t *testing.T) {
 		mustExec(t, `DROP POLICY p_dep ON rls_tbl`)
 		mustExec(t, `CREATE POLICY p_own ON rls_tbl FOR SELECT USING (owner_name = current_user)`)
 
-		// SET SESSION AUTHORIZATION switches user and enforces RLS + row_security=off + COPY TO 0A000.
+		// SET SESSION AUTHORIZATION switches user and enforces RLS + row_security=off + PG 18 COPY TO RLS.
 		mustExec(t, `SET SESSION AUTHORIZATION rls_u1`)
 		res := mustExec(t, `SELECT id FROM rls_tbl`)
 		if len(res.Rows) != 1 || res.Rows[0][0].IntVal != 1 {
@@ -229,12 +229,19 @@ func TestBatch2CatalogPartitionRLSCopyIssueFixes(t *testing.T) {
 		}
 		mustExec(t, `SET row_security = off`)
 		mustFailState(t, `SELECT id FROM rls_tbl`, "42501")
-		mustExec(t, `SET row_security = on`)
 		var copyBuf bytes.Buffer
 		_, copyErr := execCopy(`COPY rls_tbl TO STDOUT`, &qcopy.Streams{Writer: &copyBuf})
 		var sqlErr *model.Error
-		if !errors.As(copyErr, &sqlErr) || sqlErr.Code != "0A000" {
-			t.Fatalf("COPY TO under RLS err = %v, want 0A000", copyErr)
+		if !errors.As(copyErr, &sqlErr) || sqlErr.Code != "42501" {
+			t.Fatalf("COPY TO under RLS with row_security=off err = %v, want 42501", copyErr)
+		}
+		mustExec(t, `SET row_security = on`)
+		copyBuf.Reset()
+		if _, err := execCopy(`COPY rls_tbl TO STDOUT`, &qcopy.Streams{Writer: &copyBuf}); err != nil {
+			t.Fatalf("COPY TO under RLS with row_security=on failed: %v", err)
+		}
+		if strings.TrimSpace(copyBuf.String()) != "1\trls_u1" {
+			t.Fatalf("COPY TO under RLS output = %q, want %q", copyBuf.String(), "1\trls_u1")
 		}
 		// Switch directly to another role (authenticated user is superuser) and reset.
 		mustExec(t, `SET SESSION AUTHORIZATION rls_u2`)

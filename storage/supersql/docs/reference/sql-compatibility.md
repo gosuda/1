@@ -664,7 +664,7 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-149 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+148 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
@@ -683,7 +683,6 @@ No resolved catalog objects.
 | internal/query/bind/copy.go:209 | `COPY query must have a RETURNING clause` |
 | internal/query/bind/copy.go:213 | `COPY query must have a RETURNING clause` |
 | internal/query/bind/copy.go:217 | `COPY query must have a RETURNING clause` |
-| internal/query/bind/copy.go:234 | `COPY TO not supported with row-level security` |
 | internal/query/bind/declaration.go:1045 | `cross-database reference is not supported` |
 | internal/query/bind/declaration.go:1176 | `constraint enforceability is only supported for CHECK and FOREIGN KEY constraints` |
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
@@ -760,7 +759,7 @@ No resolved catalog objects.
 | internal/query/bind/schema_constraint_ddl.go:26 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/schema_constraint_ddl.go:693 | `constraint type is not deferrable` |
 | internal/query/bind/schema_constraint_ddl.go:702 | `constraint enforceability cannot be altered` |
-| internal/query/bind/schema_ddl.go:1907 | `cannot drop a partitioned index concurrently` |
+| internal/query/bind/schema_ddl.go:1918 | `cannot drop a partitioned index concurrently` |
 | internal/query/bind/select.go:252 | `row locking is not allowed with aggregate or window queries` |
 | internal/query/bind/select.go:361 | `row locking is not allowed with set-returning targets` |
 | internal/query/bind/select.go:41 | `row locking is not allowed with this query form` |
@@ -789,11 +788,11 @@ No resolved catalog objects.
 | internal/query/bind/type_declaration.go:266 | `only shell CREATE TYPE declarations are supported` |
 | internal/query/bind/type_declaration.go:376 | `serial is not valid for a composite attribute` |
 | internal/query/bind/type_declaration.go:584 | `domain constraints cannot be DEFERRABLE` |
-| internal/query/bind/utility.go:413 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility.go:413 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/utility.go:766 | `cannot update a non-updatable view column` |
 | internal/query/bind/utility.go:93 | `cross-database reference is not supported` |
 | internal/query/bind/utility_arguments.go:115 | `EXECUTE arguments cannot contain subqueries` |
-| internal/query/bind/utility_merge.go:412 | `cannot insert into a non-updatable view column` |
+| internal/query/bind/utility_merge.go:412 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/view_mutation.go:207 | `cannot mix INSTEAD OF triggers and automatic view updates` |
 | internal/query/builtin/context_only.go:21 | `model.Error{Code: "0A000"}` |
 | internal/query/builtin/date_fields.go:132 | `model.Error{Code: "0A000"}` |
@@ -807,9 +806,9 @@ No resolved catalog objects.
 | internal/query/builtin/native_scalar_basic.go:653 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/groupingset/partitioned.go:69 | `model.Error{Code: "0A000"}` |
 | internal/query/exec/modify/options.go:173 | `model.Error{Code: "0A000"}` |
-| internal/query/session/cursor.go:854 | `model.Error{Code: "0A000"}` |
-| internal/query/session/cursor.go:861 | `model.Error{Code: "0A000"}` |
-| internal/query/session/cursor.go:909 | `model.Error{Code: "0A000"}` |
+| internal/query/session/cursor.go:843 | `model.Error{Code: "0A000"}` |
+| internal/query/session/cursor.go:850 | `model.Error{Code: "0A000"}` |
+| internal/query/session/cursor.go:901 | `model.Error{Code: "0A000"}` |
 | internal/query/session/execute_prepared.go:31 | `model.Error{Code: "0A000"}` |
 | internal/query/session/named_execute.go:340 | `model.Error{Code: "0A000"}` |
 | internal/query/session/prepare.go:111 | `model.Error{Code: "0A000"}` |

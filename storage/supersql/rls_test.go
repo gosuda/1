@@ -410,14 +410,25 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 		t.Fatalf("LEFT JOIN rows = %+v, want [(1,'one'), (2,NULL), (3,NULL)]", out.Rows)
 	}
 
-	// S1(a): PostgreSQL 18 rejects direct COPY rel TO STDOUT under RLS (0A000),
-	// while COPY (SELECT * FROM rel) TO STDOUT exports only visible tenant rows.
+	// S1(a): PostgreSQL 18 supports direct COPY rel TO STDOUT under RLS,
+	// enforcing row_security = off (42501) and filtering visible rows when ON,
+	// matching COPY (SELECT * FROM rel) TO STDOUT.
 	var copyBuf bytes.Buffer
-	if _, err := db.CopyTo(ctx, `COPY rls_items TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20}); sqlStateOf(err) != "0A000" {
-		t.Fatalf("direct CopyTo under RLS: expected 0A000, got %v", err)
+	copyOut, err := db.CopyTo(ctx, `COPY rls_items TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("direct CopyTo under RLS: %v", err)
 	}
+	if copyOut.RowsAffected != 1 || strings.TrimSpace(copyBuf.String()) != "1\tt1\tone" {
+		t.Fatalf("direct CopyTo under RLS = %d rows %q, want 1 row '1\\tt1\\tone'", copyOut.RowsAffected, copyBuf.String())
+	}
+	mustExec(`SET row_security = off`)
 	copyBuf.Reset()
-	copyOut, err := db.CopyTo(ctx, `COPY (SELECT * FROM rls_items) TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20})
+	if _, err := db.CopyTo(ctx, `COPY rls_items TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20}); sqlStateOf(err) != "42501" {
+		t.Fatalf("direct CopyTo with row_security=off: expected 42501, got %v", err)
+	}
+	mustExec(`SET row_security = on`)
+	copyBuf.Reset()
+	copyOut, err = db.CopyTo(ctx, `COPY (SELECT * FROM rls_items) TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20})
 	if err != nil {
 		t.Fatalf("CopyTo query under RLS: %v", err)
 	}

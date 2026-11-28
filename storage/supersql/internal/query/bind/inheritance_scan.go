@@ -45,6 +45,38 @@ func (b *binder) inheritanceRelation(root *model.Descriptor, rootTable *model.Ta
 		return empty, err
 	}
 	combined := branches[0]
+	if len(branches) == 1 && rootTable.PartitionStrategy != 0 {
+		columns := slices.Clone(combined.columns)
+		bindings := make([]ir.Binding, len(columns))
+		for i := range columns {
+			reference, err := b.reference(scope, combined.columns[i], position)
+			if err != nil {
+				return relation{}, err
+			}
+			var object model.ObjectID
+			var columnID model.ColumnID
+			if i < len(logicalColumns) {
+				object = root.ID()
+				columnID = logicalColumns[i].ID
+			}
+			slot, err := b.slot(scope, columns[i].Layout, columns[i].Nullable, object, columnID)
+			if err != nil {
+				return relation{}, err
+			}
+			columns[i].Slot = slot
+			bindings[i] = ir.Binding{Slot: slot, Expr: reference.id}
+		}
+		id, err := b.builder.AddRel(b.ctx, ir.RelSpec{
+			Rel:      ir.Rel{Kind: ir.Project, Scope: scope.id, Effects: combined.effects},
+			Inputs:   []ir.RelID{combined.id},
+			Outputs:  outputSlots(columns),
+			Bindings: bindings,
+		})
+		if err != nil {
+			return relation{}, err
+		}
+		combined = relation{id: id, columns: columns, effects: combined.effects, occurrence: occurrence}
+	}
 	for _, branch := range branches[1:] {
 		if len(combined.columns) != len(branch.columns) {
 			return relation{}, bindError("XX000", "inheritance relation width changed", position)
