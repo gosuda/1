@@ -188,10 +188,12 @@ func (s *Store) CompositeTypeDependents(ctx context.Context, snapshot *CatalogSn
 	}
 	byObject := make(map[model.ObjectID]TypeUpdate)
 	byOID := make(map[model.TypeID]TypeUpdate)
+	updatedIDs := make(map[model.ObjectID]bool, len(updates))
 	for _, update := range updates {
 		if update.Base == nil || update.Next == nil {
 			continue
 		}
+		updatedIDs[update.Base.ID()] = true
 		before, beforeOK := update.Base.DeclaredType()
 		after, afterOK := update.Next.DeclaredType()
 		if !beforeOK || !afterOK || before.DeclaredKind() != model.TypeKindComposite || sameCompositeTypeDeclaration(before, after) {
@@ -209,7 +211,7 @@ func (s *Store) CompositeTypeDependents(ctx context.Context, snapshot *CatalogSn
 			return model.ErrInvalidDescriptor
 		}
 		if descriptor.Kind() == model.ObjectType {
-			if _, altering := byObject[descriptor.ID()]; altering {
+			if updatedIDs[descriptor.ID()] {
 				return nil
 			}
 			spec, err := descriptor.SpecWithin(ctx, s.limits.Descriptor)
@@ -1002,7 +1004,8 @@ func typeCascadeDropOrder(ctx context.Context, targets map[model.ObjectID]*model
 			return nil
 		}
 		if visiting[id] {
-			return &model.Error{Code: "2BP01", Message: "type dependency cycle prevents cascade"}
+			// Intra-target cycles are dropped atomically in the same transaction.
+			return nil
 		}
 		visiting[id] = true
 		for _, candidateID := range ids {

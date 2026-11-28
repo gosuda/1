@@ -88,15 +88,15 @@ func (b *binder) resolveOperator(name string, args []expression, pos int) (resol
 		return selected, b.castErr
 	}
 	switch {
-	case userBest > best:
-		// A strictly better user candidate: the operator is user-defined.
+	case userBest >= 0 && userBest >= best:
+		// Respect PostgreSQL search_path precedence: when a user operator matches
+		// at least as well as any builtin candidate, pick it unless ambiguous
+		// among user operators.
 		if userAmbiguous {
 			return selected, bindError("42725", "operator is ambiguous", pos)
 		}
 		chosen := userSelected
 		return resolvedOperator{operator: model.OperatorID(userSelected.descriptor.OID()), userOP: &chosen}, nil
-	case userBest >= 0 && userBest == best:
-		return selected, bindError("42725", "operator is ambiguous", pos)
 	}
 	if best < 0 {
 		return selected, bindError("42883", "operator does not exist for argument types", pos)

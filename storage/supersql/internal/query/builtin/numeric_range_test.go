@@ -130,8 +130,8 @@ func TestNumericRangeRejectsOffsetsWithoutLeakingAdmission(t *testing.T) {
 		{"wrong type", model.StringVal("1"), "42804"},
 		{"NULL", model.NullVal(model.TypeNumeric), "22004"},
 		{"excessive scale", numericDatum("1e-16384"), "22003"},
-		{"excessive expansion", numericDatum("1e100000"), "54000"},
-		{"excessive input", numericDatum(strings.Repeat("1", 65537)), "54000"},
+		{"excessive overflow", numericDatum("1e131072"), "22003"},
+		{"excessive input", numericDatum(strings.Repeat("0", 300000)), "54000"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			r, err := builtin.NewNumericRange(t.Context(), test.value, q.Allocator(runtime.WorkMemory))

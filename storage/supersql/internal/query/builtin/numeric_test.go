@@ -240,9 +240,9 @@ func TestNumericPrimitiveCastBoundaries(t *testing.T) {
 func TestNumericResourceAndFormatLimits(t *testing.T) {
 	input := callable(t, "numeric_in", 2275, 26, 23)
 	for _, test := range []struct{ text, state string }{
-		{"1e100000", "54000"}, {"1e131072", "22003"},
+		{"1e131072", "22003"},
 		{"1e-20000", "22003"}, {"1e99999999999999999", "22003"},
-		{strings.Repeat("1", 65537), "54000"},
+		{strings.Repeat("0", 300000), "54000"},
 	} {
 		_, err := input.Call(t.Context(), []model.Value{model.StringVal(test.text), model.Int64Val(0), model.Int64Val(-1)}, builtin.CallBudget{OutputBytes: 1 << 20, MemoryBytes: 64 << 20})
 		requireSQLState(t, err, test.state)

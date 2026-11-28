@@ -218,8 +218,7 @@ func TestNumericWidthBucketWorkLimits(t *testing.T) {
 		name, operand, bound1, bound2 string
 		count                         int64
 	}{
-		{"input byte limit", strings.Repeat("0", 65537), "0", "1", 1},
-		{"expanded coefficient limit", "1e32768", "0", "1", 1},
+		{"input byte limit", strings.Repeat("0", 300000), "0", "1", 1},
 		{"alignment limit", "1", "1e-16383", "1e20000", 1},
 		{"subtraction growth limit", "0", "-1e32767", "1e32767", 1},
 		{"multiplication growth limit", "1e32760", "0", "1e32761", math.MaxInt32},

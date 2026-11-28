@@ -151,8 +151,10 @@ func (b *binder) prepareTableInheritance(ctx context.Context, statement *zpgpars
 				child.ConstantDefault = nil
 				child.DefaultOID = 0
 				child.Generated = nil
-				child.IdentitySequence = 0
-				child.IdentityAlways = false
+				if !partition {
+					child.IdentitySequence = 0
+					child.IdentityAlways = false
+				}
 				metadata.Columns = append(metadata.Columns, child)
 				columnNames[child.Name] = childID
 			}

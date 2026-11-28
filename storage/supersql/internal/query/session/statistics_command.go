@@ -155,9 +155,13 @@ func ExecuteStatisticsCommand(ctx context.Context, transactions *Transactions, n
 					return nil
 				}
 			}
-			bound, err := transactions.bindAnalyze(ctx, vacuum, options, bindingDependencies)
+			bound, acquired, err := transactions.bindAnalyze(ctx, vacuum, options, bindingDependencies, skipLocked)
 			if err != nil {
 				return err
+			}
+			if !acquired {
+				result.Tag = "ANALYZE"
+				return nil
 			}
 			result.Tag = "ANALYZE"
 			result.Warnings, err = transactions.executeAnalyze(ctx, bound, options)
@@ -251,17 +255,27 @@ func (transactions *Transactions) stageStatisticsDDL(ctx context.Context, bound 
 	return errors.Join(err, snapshot.Close(), view.Close())
 }
 
-func (transactions *Transactions) bindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, options StatisticsCommandOptions, dependencies []txn.ReadDependency) (*bind.BoundAnalyze, error) {
-	view, err := transactions.transaction.ReadView(ctx, dependencies)
-	if err != nil {
-		return nil, err
+func (transactions *Transactions) bindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, options StatisticsCommandOptions, dependencies []txn.ReadDependency, skipLocked bool) (*bind.BoundAnalyze, bool, error) {
+	var view txn.ReadView
+	var err error
+	if skipLocked {
+		var acquired bool
+		view, acquired, err = transactions.transaction.ReadViewSkipLocked(ctx, dependencies)
+		if err != nil || !acquired {
+			return nil, acquired, err
+		}
+	} else {
+		view, err = transactions.transaction.ReadView(ctx, dependencies)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	snapshot, err := options.Catalog.TransactionSnapshot(view, catalog.BorrowReader)
 	if err != nil {
-		return nil, errors.Join(err, view.Close())
+		return nil, false, errors.Join(err, view.Close())
 	}
 	bound, bindErr := bind.BindAnalyze(ctx, statement, snapshot, options.Binding)
-	return bound, errors.Join(bindErr, snapshot.Close(), view.Close())
+	return bound, true, errors.Join(bindErr, snapshot.Close(), view.Close())
 }
 
 func (transactions *Transactions) admitAnalyzeRelations(ctx context.Context, statement *zpgparse.VacuumStmt, options StatisticsCommandOptions) (*zpgparse.VacuumStmt, []txn.ReadDependency, bool, error) {
@@ -333,11 +347,13 @@ func (transactions *Transactions) admitAnalyzeRelations(ctx context.Context, sta
 	for _, table := range tables {
 		tableByName[table.Name] = table
 	}
+	admittedSchemas := make(map[model.ObjectID]bool)
 	admit := func(schema catalog.NamespaceReference, table catalog.NamespaceReference) (bool, error) {
 		acquired, err := options.Catalog.LockDescriptorPairSkipLocked(ctx, transactions.transaction, schema.ID, table.ID)
 		if err != nil || !acquired {
 			return acquired, err
 		}
+		admittedSchemas[schema.ID] = true
 		dependencies = append(dependencies, options.Catalog.DescriptorDependency(schema.ID), options.Catalog.DescriptorDependency(table.ID))
 		return true, nil
 	}
@@ -399,6 +415,40 @@ func (transactions *Transactions) admitAnalyzeRelations(ctx context.Context, sta
 			}
 		}
 	}
+	if len(restricted.Rels) != 0 {
+		roleDep, err := options.Catalog.NamespaceScanDependency(ctx, 0, model.ObjectRole)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		roles, acquired, err := transactions.scanAnalyzeNamespaceReferences(ctx, options.Catalog, []txn.ReadDependency{roleDep}, 0, model.ObjectRole, maximum)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !acquired {
+			return restricted, dependencies, true, nil
+		}
+		dependencies = append(dependencies, roleDep)
+		for _, role := range roles {
+			dependencies = append(dependencies, options.Catalog.DescriptorDependency(role.ID))
+		}
+		for schemaID := range admittedSchemas {
+			indexDep, err := options.Catalog.NamespaceScanDependency(ctx, schemaID, model.ObjectIndex)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			indexes, acquired, err := transactions.scanAnalyzeNamespaceReferences(ctx, options.Catalog, []txn.ReadDependency{indexDep}, schemaID, model.ObjectIndex, maximum)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if !acquired {
+				return restricted, dependencies, true, nil
+			}
+			dependencies = append(dependencies, indexDep)
+			for _, index := range indexes {
+				dependencies = append(dependencies, options.Catalog.DescriptorDependency(index.ID))
+			}
+		}
+	}
 	return restricted, dependencies, len(restricted.Rels) == 0, ctx.Err()
 }
 
@@ -432,10 +482,7 @@ func (transactions *Transactions) executeAnalyze(ctx context.Context, bound *bin
 	}
 	targets := bound.Targets()
 	admitted := targets
-	var dependencies []txn.ReadDependency
-	if !bound.SkipLocked() {
-		dependencies = slicesCloneReadDependencies(options.Dependencies)
-	}
+	dependencies := slicesCloneReadDependencies(options.Dependencies)
 	for _, dependency := range bound.Dependencies() {
 		dependencies = append(dependencies, options.Catalog.DescriptorDependency(dependency.Object))
 	}
@@ -484,9 +531,22 @@ func (transactions *Transactions) executeAnalyze(ctx context.Context, bound *bin
 			dependencies = append(dependencies, publication)
 		}
 	}
-	view, err := transactions.transaction.ReadView(ctx, dependencies)
-	if err != nil {
-		return nil, err
+	var view txn.ReadView
+	var err error
+	if bound.SkipLocked() {
+		var acquired bool
+		view, acquired, err = transactions.transaction.ReadViewSkipLocked(ctx, dependencies)
+		if err != nil {
+			return nil, err
+		}
+		if !acquired {
+			return []model.Error{{Code: "55P03", Message: "skipping analyze because lock is not available"}}, nil
+		}
+	} else {
+		view, err = transactions.transaction.ReadView(ctx, dependencies)
+		if err != nil {
+			return nil, err
+		}
 	}
 	snapshot, err := options.Catalog.TransactionSnapshot(view, catalog.BorrowReader)
 	if err != nil {

@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"unsafe"
 
@@ -155,6 +156,19 @@ func (c *invocation) resolveRowSource(id model.FunctionID, arguments []model.Typ
 	case 3035:
 		return builtin.ResolveNotifyRows(c.portal.ctx, id, arguments, result, options, maximum)
 	}
+	if sig, ok := builtin.LookupSignature(id); ok && !sig.ReturnsSet {
+		callable, err := builtin.ResolveTyped(c.portal.ctx, id, arguments, result, options, maximum)
+		if err != nil {
+			return nil, err
+		}
+		return &scalarRowSourcePlan{
+			callable:  callable,
+			result:    result,
+			strict:    strict,
+			sequences: env.Sequences,
+			advisory:  env.Advisory,
+		}, nil
+	}
 	resolver, ok := env.Functions.(expr.RowSourceResolver)
 	if !ok {
 		return nil, &builtin.UnknownFunctionError{ID: id}
@@ -168,4 +182,89 @@ func (c *invocation) resolveRowSource(id model.FunctionID, arguments []model.Typ
 func catalogMetadataRuntime(source any) model.CatalogMetadataIntrospection {
 	runtime, _ := source.(model.CatalogMetadataIntrospection)
 	return runtime
+}
+
+type scalarRowSourcePlan struct {
+	callable  builtin.Callable
+	result    model.TypeLayout
+	strict    bool
+	sequences model.SequenceRuntime
+	advisory  model.AdvisoryLockRuntime
+}
+
+func (p *scalarRowSourcePlan) OwnedBytes() uint64 {
+	return uint64(unsafe.Sizeof(*p)) + p.callable.OwnedBytes()
+}
+
+func (p *scalarRowSourcePlan) Open(ctx context.Context, arguments []model.Value, options builtin.RowSourceOptions) (builtin.RowSourceIterator, error) {
+	expandComposite := p.result.Type.Storage == model.TypeComposite && len(p.result.Children) != 0
+	emitNullRow := func() []model.Value {
+		if expandComposite {
+			row := make([]model.Value, len(p.result.Children))
+			for i, child := range p.result.Children {
+				row[i] = model.NullVal(child.Type.Storage)
+			}
+			return row
+		}
+		return []model.Value{model.NullVal(p.result.Type.Storage)}
+	}
+	if p.strict {
+		for _, arg := range arguments {
+			if arg.IsNull {
+				return &scalarRowSourceIterator{row: emitNullRow()}, nil
+			}
+		}
+	}
+	outputLimit := int64(options.MaxRowBytes)
+	if outputLimit <= 0 {
+		outputLimit = 1 << 20
+	}
+	budget := builtin.CallBudget{
+		OutputBytes: outputLimit,
+		MemoryBytes: options.MaxMemoryBytes,
+		Temporal:    options.Temporal,
+		Relations:   options.Relations,
+		Settings:    options.Settings,
+		TextSearch:  options.TextSearch,
+		Sequences:   p.sequences,
+		Advisory:    p.advisory,
+		Native:      options.Native,
+	}
+	val, err := p.callable.Call(ctx, arguments, budget)
+	if err != nil {
+		return nil, err
+	}
+	var row []model.Value
+	if expandComposite {
+		if val.IsNull {
+			row = emitNullRow()
+		} else {
+			if len(val.ArrayVal) != len(p.result.Children) {
+				return nil, ErrInvalid
+			}
+			row = val.ArrayVal
+		}
+	} else {
+		row = []model.Value{val}
+	}
+	return &scalarRowSourceIterator{row: row}, nil
+}
+
+type scalarRowSourceIterator struct {
+	row     []model.Value
+	emitted bool
+}
+
+func (it *scalarRowSourceIterator) Next(_ context.Context) ([]model.Value, bool, error) {
+	if it.emitted {
+		return nil, false, nil
+	}
+	it.emitted = true
+	return it.row, true, nil
+}
+
+func (it *scalarRowSourceIterator) Close() error {
+	it.row = nil
+	it.emitted = true
+	return nil
 }

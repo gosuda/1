@@ -124,6 +124,9 @@ func (b *binder) compositeFields(descriptor *model.Descriptor, element model.Typ
 	if err != nil {
 		return nil, err
 	}
+	if spec.Type != nil && spec.Type.DeclaredKind() == model.TypeKindDomain {
+		return b.namedCompositeFields(spec.Type.BaseLayout, pos)
+	}
 	if spec.Type == nil || spec.Type.Layout.Type.ID != element.Type.ID || spec.Type.Layout.Type.Storage != model.TypeComposite {
 		return nil, bindError("XX000", "composite type descriptor has no matching layout", pos)
 	}

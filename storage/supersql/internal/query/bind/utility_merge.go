@@ -134,6 +134,13 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 	}
 	spec.MergeTargetPresent = columns[len(left.columns)-1].Slot
 	spec.MergeSourcePresent = columns[len(columns)-1].Slot
+	for i := len(left.columns) - 1; i >= 0; i-- {
+		col := left.columns[i]
+		if col.internal && col.Name == "" && col.Layout.Type.Storage == model.TypeInt64 {
+			spec.SourceObject = columns[i].Slot
+			break
+		}
+	}
 	if target.logicalTrigger {
 		for _, descriptor := range publicColumns(target.executionTable) {
 			for i, candidate := range left.columns {
@@ -145,11 +152,32 @@ func (b *binder) merge(n *zpgparse.MergeStmt, s *scope) (relation, error) {
 		}
 	} else {
 		for _, key := range target.executionTable.PrimaryKey {
+			matched := false
 			for i, candidate := range left.columns {
 				info, ok := b.builder.Slot(candidate.Slot)
 				if ok && info.Object == target.executionDescriptor.ID() && info.Column == key.Column {
 					spec.TargetKeys = append(spec.TargetKeys, columns[i].Slot)
+					matched = true
 					break
+				}
+			}
+			if !matched {
+				// Inherited/partitioned Append target slots may not preserve the base ObjectID;
+				// fall back to matching the PK column descriptor by name or system identity.
+				keyColIdx := slices.IndexFunc(target.executionTable.Columns, func(col model.ColumnDescriptor) bool { return col.ID == key.Column })
+				if keyColIdx >= 0 {
+					keyCol := target.executionTable.Columns[keyColIdx]
+					for i, candidate := range left.columns {
+						if keyCol.SystemIdentity {
+							if candidate.internal && candidate.Name == keyCol.Name && candidate.Layout.Type.Storage == keyCol.Layout.Type.Storage {
+								spec.TargetKeys = append(spec.TargetKeys, columns[i].Slot)
+								break
+							}
+						} else if candidate.Name == keyCol.Name && target.qualifier.matches(candidate) {
+							spec.TargetKeys = append(spec.TargetKeys, columns[i].Slot)
+							break
+						}
+					}
 				}
 			}
 		}

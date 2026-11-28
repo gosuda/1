@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -149,10 +150,21 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 		tag = "SET"
 	}
 	result := ExecutionResult{Tag: tag}
+	isSessionAuth := command.Action == bind.SetSessionAuthorization || command.Action == bind.ResetSessionAuthorization
 	if transactions.settings.InSecurityDefiner() {
-		return result, settingError("0A000", `cannot set parameter "role" within security-definer function`)
+		param := "role"
+		if isSessionAuth {
+			param = "session_authorization"
+		}
+		return result, settingError("0A000", fmt.Sprintf("cannot set parameter %q within security-definer function", param))
 	}
-	if command.Action == bind.ResetRole || strings.TrimSpace(command.Target) == "" {
+	if command.Action == bind.ResetSessionAuthorization {
+		if err := transactions.settings.SetSessionUser(ctx, "", command.Local); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	if command.Action == bind.ResetRole || (!isSessionAuth && strings.TrimSpace(command.Target) == "") {
 		if err := transactions.settings.ResetRole(ctx, command.Local); err != nil {
 			return result, err
 		}
@@ -172,7 +184,13 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 		if err != nil {
 			return errors.Join(err, view.Close())
 		}
-		target, authErr := bind.CheckSetRoleAuthorization(readCtx, snapshot, sessionUser, command.Target, 4096)
+		var target string
+		var authErr error
+		if isSessionAuth {
+			target, authErr = bind.CheckSetSessionAuthorization(readCtx, snapshot, command.Target, 4096)
+		} else {
+			target, authErr = bind.CheckSetRoleAuthorization(readCtx, snapshot, sessionUser, command.Target, 4096)
+		}
 		closeErr := errors.Join(snapshot.Close(), view.Close())
 		if authErr != nil {
 			return errors.Join(authErr, closeErr)
@@ -199,6 +217,12 @@ func (transactions *Transactions) executeRoleCommand(ctx context.Context, comman
 		if endErr != nil {
 			return result, endErr
 		}
+	}
+	if isSessionAuth {
+		if err := transactions.settings.SetSessionUser(ctx, authorizedTarget, command.Local); err != nil {
+			return result, err
+		}
+		return result, nil
 	}
 	if err := transactions.settings.SetRole(ctx, authorizedTarget, command.Local); err != nil {
 		return result, err

@@ -468,7 +468,8 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 	if operation == storage.MutationDelete {
 		previous := &model.Row{Key: oldKey, Values: old}
 		if o.Triggers != nil {
-			_, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerDelete, previous, nil, c.rowPayloadBytes())
+			trigPrev, _, _ := stripSystemIdentity(descriptor, previous)
+			_, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerDelete, trigPrev, nil, c.rowPayloadBytes())
 			if triggerErr != nil {
 				return triggerErr
 			}
@@ -486,15 +487,18 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 	if source != nil && o.Partitions.router != nil {
 		descriptor = c.descriptor
 	}
-	mappedColumns := columnIDs
+	mappedColumns, updateAssigned := columnIDs, assigned
 	if source != nil {
 		mappedColumns, err = o.Partitions.mapColumns(source, columnIDs)
 		if err != nil {
 			return err
 		}
+		mappedColumns, updateAssigned = filterNonGeneratedColumns(source.columns, mappedColumns, updateAssigned)
+	} else {
+		mappedColumns, updateAssigned = filterNonGeneratedMask(c.generatedColumns, mappedColumns, updateAssigned)
 	}
 	rowLimit := c.rowPayloadBytes()
-	candidate, err := o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: mappedColumns, Values: assigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
+	candidate, err := o.Transaction.PrepareUpdate(ctx, txn.UpdatePreparation{Target: target, Previous: &previous, ColumnIDs: mappedColumns, Values: updateAssigned, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 	if err != nil {
 		return err
 	}
@@ -517,13 +521,16 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		current = model.Row{}
 	}()
 	if o.Triggers != nil {
-		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerUpdate, &previous, &current, rowLimit)
+		trigPrev, _, _ := stripSystemIdentity(descriptor, &previous)
+		trigCur, sysIdx, sysVal := stripSystemIdentity(descriptor, &current)
+		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, descriptor, model.TriggerUpdate, trigPrev, trigCur, rowLimit)
 		if triggerErr != nil {
 			return triggerErr
 		}
 		if !proceed {
 			return errTriggerSkipped
 		}
+		replacement = restoreSystemIdentity(replacement, sysIdx, sysVal)
 		if replacement == nil || len(replacement.Values) != len(current.Values) {
 			return storage.ErrInvalidLayout
 		}
@@ -559,7 +566,12 @@ func (c *cursor) applyAssigned(ctx context.Context, frozen []model.Value, operat
 		}
 	}
 	if source != nil && o.Partitions.router != nil {
-		destination, routeErr := o.Partitions.Route(ctx, current.Values, partitionExpressions(*o))
+		rootRow := make([]model.Value, len(o.Partitions.rootColumns))
+		projected, projErr := o.Partitions.Project(source, current.Values, rootRow)
+		if projErr != nil {
+			return projErr
+		}
+		destination, routeErr := o.Partitions.Route(ctx, projected, partitionExpressions(*o))
 		if routeErr != nil {
 			return routeErr
 		}
@@ -625,11 +637,12 @@ func (c *cursor) checkRLS(ctx context.Context, state *expr.State, route *partiti
 }
 func (c *cursor) movePartitionRow(ctx context.Context, frozen []model.Value, source, destination *partitionChild, previous, proposed *model.Row) (err error) {
 	o := &c.options
-	columnIDs, err := o.Partitions.mapColumns(destination, c.columnIDs)
+	rootRow := make([]model.Value, len(o.Partitions.rootColumns))
+	projected, err := o.Partitions.Project(source, proposed.Values, rootRow)
 	if err != nil {
 		return err
 	}
-	insertColumns, insertValues := filterNonGeneratedColumns(destination.columns, columnIDs, proposed.Values)
+	insertColumns, insertValues := filterNonGeneratedColumns(destination.columns, destination.rootToChild, projected)
 	rowLimit := c.rowPayloadBytes()
 	candidate, err := o.Transaction.PrepareInsert(ctx, txn.InsertPreparation{Target: destination.target, ColumnIDs: insertColumns, Values: insertValues, Allocator: o.Query.Allocator(runtime.WorkMemory), MaxBytes: rowLimit, Expressions: partitionExpressions(*o)})
 	if err != nil {
@@ -777,7 +790,9 @@ func (c *cursor) finishMutationWithView(ctx context.Context, frozen []model.Valu
 		if operation != storage.MutationInsert {
 			previous = &model.Row{Key: oldKey, Values: old}
 		}
-		if err := o.Triggers.AfterRow(ctx, c.descriptor, triggerEvent(operation), previous, current, c.rowPayloadBytes()); err != nil {
+		trigPrev, _, _ := stripSystemIdentity(c.descriptor, previous)
+		trigCur, _, _ := stripSystemIdentity(c.descriptor, current)
+		if err := o.Triggers.AfterRow(ctx, c.descriptor, triggerEvent(operation), trigPrev, trigCur, c.rowPayloadBytes()); err != nil {
 			return err
 		}
 	}
@@ -1188,6 +1203,41 @@ func triggerEvent(operation storage.MutationOp) model.TriggerEvent {
 	default:
 		return 0
 	}
+}
+
+func stripSystemIdentity(descriptor *model.Descriptor, row *model.Row) (*model.Row, int, model.Value) {
+	if descriptor == nil || row == nil {
+		return row, -1, model.Value{}
+	}
+	table, ok := descriptor.Table()
+	if !ok || len(table.Columns) != len(row.Values) {
+		return row, -1, model.Value{}
+	}
+	sysIdx := -1
+	for i, col := range table.Columns {
+		if col.SystemIdentity {
+			sysIdx = i
+			break
+		}
+	}
+	if sysIdx < 0 {
+		return row, -1, model.Value{}
+	}
+	projected := make([]model.Value, 0, len(row.Values)-1)
+	projected = append(projected, row.Values[:sysIdx]...)
+	projected = append(projected, row.Values[sysIdx+1:]...)
+	return &model.Row{Key: row.Key, Values: projected}, sysIdx, row.Values[sysIdx]
+}
+
+func restoreSystemIdentity(row *model.Row, sysIdx int, sysVal model.Value) *model.Row {
+	if row == nil || sysIdx < 0 || sysIdx > len(row.Values) {
+		return row
+	}
+	restored := make([]model.Value, 0, len(row.Values)+1)
+	restored = append(restored, row.Values[:sysIdx]...)
+	restored = append(restored, sysVal)
+	restored = append(restored, row.Values[sysIdx:]...)
+	return &model.Row{Key: row.Key, Values: restored}
 }
 
 func modifyTriggerEvent(operation ir.ModifyKind) model.TriggerEvent {

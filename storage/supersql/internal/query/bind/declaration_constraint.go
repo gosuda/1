@@ -419,6 +419,11 @@ func (s *declarationState) bindExclusion(ctx context.Context, spec *model.Descri
 			if err != nil {
 				return constraint, nil, err
 			}
+		} else {
+			key.OperatorClass, err = s.b.defaultIndexOperatorClass("btree", layout)
+			if err != nil {
+				return constraint, nil, err
+			}
 		}
 		switch elem.Ordering {
 		case zpgparse.SortByDir_SORTBY_DEFAULT, zpgparse.SortByDir_SORTBY_ASC:

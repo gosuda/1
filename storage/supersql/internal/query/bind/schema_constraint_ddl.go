@@ -70,6 +70,7 @@ func bindOnlineAddConstraint(ctx context.Context, b *binder, snapshot CatalogSna
 	columns := publicConstraintColumns(spec.Table.Columns)
 	var constraint model.ConstraintDescriptor
 	var err error
+	var checkRawExpr *zpgparse.Node
 	switch raw.Contype {
 	case zpgparse.ConstrType_CONSTR_CHECK:
 		if raw.RawExpr == nil {
@@ -82,10 +83,7 @@ func bindOnlineAddConstraint(ctx context.Context, b *binder, snapshot CatalogSna
 		if err != nil {
 			return nil, err
 		}
-		constraint.Name, err = state.constraintName(raw.Conname, "", "check", false)
-		if err != nil {
-			return nil, err
-		}
+		constraint.Local = true
 		constraint.ID, constraint.OID, err = state.allocate()
 		if err != nil {
 			return nil, err
@@ -99,11 +97,20 @@ func bindOnlineAddConstraint(ctx context.Context, b *binder, snapshot CatalogSna
 		if err != nil {
 			return nil, err
 		}
+		checkCols := make([]model.ColumnID, 0, len(constraint.Expression.Dependencies))
 		for _, dependency := range constraint.Expression.Dependencies {
+			if dependency.Object == table.ID() && dependency.Column != 0 && !slices.Contains(checkCols, dependency.Column) {
+				checkCols = append(checkCols, dependency.Column)
+			}
 			if dependency.Object != table.ID() {
 				spec.Dependencies = appendIndexDependency(spec.Dependencies, dependency)
 			}
 		}
+		constraint.Name, err = state.constraintName(raw.Conname, declarationKeyName(spec.Table.Columns, checkCols), "check", false)
+		if err != nil {
+			return nil, err
+		}
+		checkRawExpr = raw.RawExpr
 	case zpgparse.ConstrType_CONSTR_FOREIGN:
 		if err := ordinaryConstraint(raw); err != nil {
 			return nil, err
@@ -145,6 +152,16 @@ func bindOnlineAddConstraint(ctx context.Context, b *binder, snapshot CatalogSna
 	result := &BoundSchemaDDL{source: table, mutation: constraint.ID, metadataOnly: target, dependencies: b.dependencies, warnings: b.warnings}
 	if constraint.Validated {
 		result.validation = constraint.ID
+		result.transactionalValidations = []model.ObjectID{constraint.ID}
+	}
+	if checkRawExpr != nil && !constraint.NoInherit && spec.Table.InheritanceChildren != 0 {
+		childUpdates, childValidations, propErr := propagateInheritedCheckAdd(ctx, b, snapshot, options, table.ID(), constraint, checkRawExpr)
+		if propErr != nil {
+			return nil, propErr
+		}
+		result.auxiliaryUpdates = append(result.auxiliaryUpdates, childUpdates...)
+		result.transactionalValidations = append(result.transactionalValidations, childValidations...)
+		result.dependencies = b.dependencies
 	}
 	return result, ctx.Err()
 }
@@ -353,7 +370,11 @@ func bindOnlineConstraintWithNewIndex(ctx context.Context, b *binder, options Cr
 		if !found {
 			return nil, model.ErrInvalidDescriptor
 		}
-		keys[i] = model.KeyElement{Column: columnID, Type: column.Layout.Type, Children: slices.Clone(column.Layout.Children), Collation: column.Layout.Type.Collation}
+		opClass, opErr := state.b.defaultIndexOperatorClass("btree", column.Layout)
+		if opErr != nil {
+			return nil, opErr
+		}
+		keys[i] = model.KeyElement{Column: columnID, Type: column.Layout.Type, Children: slices.Clone(column.Layout.Children), Collation: column.Layout.Type.Collation, OperatorClass: opClass}
 		if kind == model.ConstraintPrimaryKey {
 			column.Nullable = false
 		}
@@ -396,10 +417,20 @@ func bindOnlineDropConstraint(ctx context.Context, b *binder, snapshot CatalogSn
 		return nil, bindError("42704", "constraint does not exist", 0)
 	}
 	constraint := spec.Table.Constraints[position]
+	if !constraint.Local && constraint.InheritanceCount > 0 {
+		return nil, bindError("42P16", "cannot drop inherited constraint "+constraint.Name, 0)
+	}
 	if err := ensureConstraintUnreferenced(ctx, b, snapshot, table.ID(), constraint.ID); err != nil {
 		return nil, err
 	}
 	spec.Table.Constraints = slices.Delete(spec.Table.Constraints, position, position+1)
+	if constraint.Local && constraint.InheritanceCount > 0 {
+		// Dropping a locally-defined constraint that is also inherited keeps the
+		// inherited copy with Local = false (matching PostgreSQL).
+		kept := constraint
+		kept.Local = false
+		spec.Table.Constraints = slices.Insert(spec.Table.Constraints, position, kept)
+	}
 	if constraint.Kind == model.ConstraintNotNull && len(constraint.Columns) == 1 {
 		column, found := declarationColumn(spec.Table.Columns, constraint.Columns[0])
 		if !found {
@@ -435,7 +466,177 @@ func bindOnlineDropConstraint(ctx context.Context, b *binder, snapshot CatalogSn
 	if err != nil {
 		return nil, err
 	}
-	return &BoundSchemaDDL{source: table, mutation: constraint.ID, metadataOnly: target, dependencies: b.dependencies, warnings: b.warnings}, ctx.Err()
+	result := &BoundSchemaDDL{source: table, mutation: constraint.ID, metadataOnly: target, dependencies: b.dependencies, warnings: b.warnings}
+	if constraint.Kind == model.ConstraintCheck && !constraint.NoInherit && spec.Table.InheritanceChildren != 0 && constraint.InheritanceCount == 0 {
+		childUpdates, propErr := propagateInheritedCheckDrop(ctx, b, snapshot, options, table.ID(), constraint.Name)
+		if propErr != nil {
+			return nil, propErr
+		}
+		result.auxiliaryUpdates = append(result.auxiliaryUpdates, childUpdates...)
+		result.dependencies = b.dependencies
+	}
+	return result, ctx.Err()
+}
+
+func collectInheritanceDescendants(ctx context.Context, snapshot CatalogSnapshot, rootID model.ObjectID, limits model.DescriptorLimits) ([]*model.Descriptor, error) {
+	byParent := make(map[model.ObjectID][]*model.Descriptor)
+	err := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaDesc catalog.PublishedDescriptor) error {
+		if schemaDesc.Descriptor == nil || schemaDesc.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		return snapshot.ScanNamespace(ctx, schemaDesc.Descriptor.ID(), model.ObjectTable, func(tbl catalog.PublishedDescriptor) error {
+			if tbl.Descriptor == nil || tbl.Descriptor.State() != model.StatePublic {
+				return nil
+			}
+			meta, ok := tbl.Descriptor.Table()
+			if !ok || len(meta.Parents) == 0 {
+				return nil
+			}
+			for _, p := range meta.Parents {
+				byParent[p] = append(byParent[p], tbl.Descriptor)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	var result []*model.Descriptor
+	seen := map[model.ObjectID]bool{rootID: true}
+	queue := []model.ObjectID{rootID}
+	for len(queue) > 0 {
+		parentID := queue[0]
+		queue = queue[1:]
+		for _, child := range byParent[parentID] {
+			if seen[child.ID()] {
+				continue
+			}
+			seen[child.ID()] = true
+			result = append(result, child)
+			if len(result) > limits.MaxItems {
+				return nil, model.ErrDescriptorLimit
+			}
+			queue = append(queue, child.ID())
+		}
+	}
+	return result, nil
+}
+
+func propagateInheritedCheckAdd(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, parentID model.ObjectID, parentConstraint model.ConstraintDescriptor, rawExpr *zpgparse.Node) ([]ObjectMutation, []model.ObjectID, error) {
+	descendants, err := collectInheritanceDescendants(ctx, snapshot, parentID, options.Descriptors)
+	if err != nil {
+		return nil, nil, err
+	}
+	var updates []ObjectMutation
+	var validations []model.ObjectID
+	for _, child := range descendants {
+		b.dependency(child, 0)
+		childSpec, err := child.SpecWithin(ctx, options.Descriptors)
+		if err != nil || childSpec.Table == nil {
+			return nil, nil, errors.Join(model.ErrInvalidDescriptor, err)
+		}
+		childSpec.Table = cloneTableMetadata(childSpec.Table)
+		existingIdx := slices.IndexFunc(childSpec.Table.Constraints, func(c model.ConstraintDescriptor) bool {
+			return c.Kind == model.ConstraintCheck && c.Name == parentConstraint.Name
+		})
+		if existingIdx >= 0 {
+			childSpec.Table.Constraints[existingIdx].InheritanceCount++
+			if childSpec.Table.Constraints[existingIdx].ParentTable == 0 {
+				childSpec.Table.Constraints[existingIdx].ParentTable = parentID
+				childSpec.Table.Constraints[existingIdx].ParentConstraint = parentConstraint.ID
+			}
+		} else {
+			childID, childOID, allocErr := options.Identities.AllocateDeclarationIdentity(ctx)
+			if allocErr != nil {
+				return nil, nil, allocErr
+			}
+			pendingChild, err := model.NewDescriptor(ctx, childSpec, options.Descriptors)
+			if err != nil {
+				return nil, nil, err
+			}
+			exprDef, err := DefineCheck(ctx, rawExpr, pendingChild, childID, snapshot, options.Bind)
+			if err != nil {
+				return nil, nil, err
+			}
+			childConstraint := model.ConstraintDescriptor{
+				ID:               childID,
+				OID:              childOID,
+				Name:             parentConstraint.Name,
+				Kind:             model.ConstraintCheck,
+				Validated:        parentConstraint.Validated,
+				Enforced:         parentConstraint.Enforced,
+				Local:            false,
+				InheritanceCount: 1,
+				ParentTable:      parentID,
+				ParentConstraint: parentConstraint.ID,
+				Expression:       exprDef,
+			}
+			for _, dep := range exprDef.Dependencies {
+				if dep.Object != child.ID() {
+					childSpec.Dependencies = appendIndexDependency(childSpec.Dependencies, dep)
+				}
+			}
+			childSpec.Table.Constraints = append(childSpec.Table.Constraints, childConstraint)
+			if childConstraint.Validated {
+				validations = append(validations, childConstraint.ID)
+			}
+		}
+		if len(childSpec.Dependencies) != 0 {
+			slices.SortFunc(childSpec.Dependencies, compareDependency)
+			childSpec.Dependencies = slices.Compact(childSpec.Dependencies)
+		}
+		childSpec.Version = child.Version() + 1
+		nextChild, err := model.NewDescriptor(ctx, childSpec, options.Descriptors)
+		if err != nil {
+			return nil, nil, err
+		}
+		updates = append(updates, ObjectMutation{Base: child, Next: nextChild})
+	}
+	return updates, validations, nil
+}
+
+func propagateInheritedCheckDrop(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, parentID model.ObjectID, constraintName string) ([]ObjectMutation, error) {
+	descendants, err := collectInheritanceDescendants(ctx, snapshot, parentID, options.Descriptors)
+	if err != nil {
+		return nil, err
+	}
+	var updates []ObjectMutation
+	for _, child := range descendants {
+		b.dependency(child, 0)
+		childSpec, err := child.SpecWithin(ctx, options.Descriptors)
+		if err != nil || childSpec.Table == nil {
+			return nil, errors.Join(model.ErrInvalidDescriptor, err)
+		}
+		idx := slices.IndexFunc(childSpec.Table.Constraints, func(c model.ConstraintDescriptor) bool {
+			return c.Kind == model.ConstraintCheck && c.Name == constraintName
+		})
+		if idx < 0 {
+			continue
+		}
+		childSpec.Table = cloneTableMetadata(childSpec.Table)
+		if childSpec.Table.Constraints[idx].InheritanceCount > 0 {
+			childSpec.Table.Constraints[idx].InheritanceCount--
+		}
+		if childSpec.Table.Constraints[idx].InheritanceCount == 0 {
+			if !childSpec.Table.Constraints[idx].Local {
+				childSpec.Table.Constraints = slices.Delete(childSpec.Table.Constraints, idx, idx+1)
+			} else {
+				childSpec.Table.Constraints[idx].ParentTable = 0
+				childSpec.Table.Constraints[idx].ParentConstraint = 0
+			}
+		}
+		if len(childSpec.Dependencies) != 0 {
+			slices.SortFunc(childSpec.Dependencies, compareDependency)
+			childSpec.Dependencies = slices.Compact(childSpec.Dependencies)
+		}
+		childSpec.Version = child.Version() + 1
+		nextChild, err := model.NewDescriptor(ctx, childSpec, options.Descriptors)
+		if err != nil {
+			return nil, err
+		}
+		updates = append(updates, ObjectMutation{Base: child, Next: nextChild})
+	}
+	return updates, nil
 }
 
 func bindOnlineAlterConstraint(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, table *model.Descriptor, spec model.DescriptorSpec, command *zpgparse.AlterTableCmd) (*BoundSchemaDDL, error) {
@@ -495,13 +696,18 @@ func bindOnlineAlterConstraint(ctx context.Context, b *binder, snapshot CatalogS
 			return nil, bindError("42601", "INITIALLY DEFERRED requires DEFERRABLE", 0)
 		}
 	}
+	var validationID model.ObjectID
 	if alter.AlterEnforceability {
 		if constraint.Kind != model.ConstraintCheck && constraint.Kind != model.ConstraintForeignKey {
 			return nil, bindError("0A000", "constraint enforceability cannot be altered", 0)
 		}
+		wasEnforced := constraint.Enforced
 		constraint.Enforced = alter.IsEnforced
 		if !constraint.Enforced {
 			constraint.Validated = false
+		} else if !wasEnforced {
+			constraint.Validated = true
+			validationID = constraint.ID
 		}
 	}
 	if alter.AlterInheritability {
@@ -515,7 +721,7 @@ func bindOnlineAlterConstraint(ctx context.Context, b *binder, snapshot CatalogS
 	if err != nil {
 		return nil, err
 	}
-	return &BoundSchemaDDL{source: table, mutation: constraint.ID, metadataOnly: target, dependencies: b.dependencies, warnings: b.warnings}, ctx.Err()
+	return &BoundSchemaDDL{source: table, mutation: constraint.ID, metadataOnly: target, validation: validationID, dependencies: b.dependencies, warnings: b.warnings}, ctx.Err()
 }
 
 func bindOnlineValidateConstraint(ctx context.Context, b *binder, options CreateDeclarationOptions, table *model.Descriptor, spec model.DescriptorSpec, command *zpgparse.AlterTableCmd) (*BoundSchemaDDL, error) {
@@ -645,6 +851,9 @@ func bindAddedColumnConstraints(ctx context.Context, b *binder, snapshot Catalog
 					key, keyErr := declarationKey(spec.Table.Columns, nulls, constrained, kind == model.ConstraintPrimaryKey)
 					if keyErr != nil {
 						return nil, nil, keyErr
+					}
+					if col, ok := declarationColumn(spec.Table.Columns, constrained); ok {
+						key.OperatorClass = defaultBTreeOperatorClass(col.Layout)
 					}
 					index.Keys = append(index.Keys, key)
 					if kind == model.ConstraintPrimaryKey {

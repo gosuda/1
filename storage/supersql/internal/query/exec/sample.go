@@ -67,7 +67,7 @@ func (c *invocation) sample(id physical.NodeID, node physical.NodeSpec, children
 	seed := c.portal.env.SampleSeed
 	if relation.SampleRepeatable {
 		if repeatable.IsNull || repeatable.Type != model.TypeFloat64 {
-			return nil, &model.Error{Code: "2202H", Message: "TABLESAMPLE REPEATABLE seed must not be null"}
+			return nil, &model.Error{Code: "2202G", Message: "TABLESAMPLE REPEATABLE seed must not be null"}
 		}
 		seed = mixSample(math.Float64bits(repeatable.FloatVal))
 	}

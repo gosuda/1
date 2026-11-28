@@ -173,6 +173,88 @@ func fullTextArrayToVector(ctx context.Context,args []model.Value,budget CallBud
 func fullTextMatch(ctx context.Context,vectorValue,queryValue model.Value)(model.Value,error){vector,err:=decodeTSVector(ctx,vectorValue.BytesVal);if err!=nil{return model.Value{},err};query,_,err:=decodeTSQuery(ctx,queryValue.BytesVal);if err!=nil{return model.Value{},err};return model.BoolVal(matchTSQuery(vector,query)),nil}
 func fullTextQueryJoin(ctx context.Context,id model.FunctionID,args []model.Value,budget CallBudget)(model.Value,error){left,_,err:=decodeTSQuery(ctx,args[0].BytesVal);if err!=nil{return model.Value{},err};var root *tsQueryNode;switch id{case 3671:if left!=nil{root=&tsQueryNode{kind:tsQueryOp,op:tsQueryNot,right:left}};default:right,_,e:=decodeTSQuery(ctx,args[1].BytesVal);if e!=nil{return model.Value{},e};op,distance:=uint8(tsQueryAnd),uint16(0);if id==3670{op=tsQueryOr}else if id==5003||id==5004{op=tsQueryPhrase;distance=1;if id==5004{if args[2].IntVal<0||args[2].IntVal>tsMaxPosition+1{return model.Value{},sqlError("22023","distance in phrase operator is out of range")};distance=uint16(args[2].IntVal)}};root=joinTSQuery(op,distance,left,right)};data,err:=encodeTSQuery(ctx,root,budget.OutputBytes);if err!=nil{return model.Value{},err};return model.BytesVal(data),nil}
 func fullTextRewrite(ctx context.Context,args []model.Value,budget CallBudget)(model.Value,error){query,_,err:=decodeTSQuery(ctx,args[0].BytesVal);if err!=nil{return model.Value{},err};target,_,err:=decodeTSQuery(ctx,args[1].BytesVal);if err!=nil{return model.Value{},err};substitute,_,err:=decodeTSQuery(ctx,args[2].BytesVal);if err!=nil{return model.Value{},err};root:=rewriteTSQuery(query,target,substitute);data,err:=encodeTSQuery(ctx,root,budget.OutputBytes);if err!=nil{return model.Value{},err};return model.BytesVal(data),nil}
+
+// RewriteTSQueryBytes rewrites query by replacing every occurrence of target
+// with substitute, enforcing maxBytes on the encoded tsquery result.
+func RewriteTSQueryBytes(ctx context.Context, queryBytes, targetBytes, substituteBytes []byte, maxBytes uint64) ([]byte, error) {
+	query, _, err := decodeTSQuery(ctx, queryBytes)
+	if err != nil {
+		return nil, err
+	}
+	target, _, err := decodeTSQuery(ctx, targetBytes)
+	if err != nil {
+		return nil, err
+	}
+	substitute, _, err := decodeTSQuery(ctx, substituteBytes)
+	if err != nil {
+		return nil, err
+	}
+	limit := int64(tsMaxDataBytes)
+	if maxBytes > 0 && maxBytes < uint64(limit) {
+		limit = int64(maxBytes)
+	}
+	return encodeTSQuery(ctx, rewriteTSQuery(query, target, substitute), limit)
+}
+
+// CollectTSVectorStatistics aggregates per-lexeme document and entry counts
+// across encoded tsvector values filtered by optional weight letters (A..D).
+func CollectTSVectorStatistics(ctx context.Context, vectors [][]byte, weights string) ([]model.TextSearchStatistic, error) {
+	mask := uint8(0x0f)
+	if weights != "" {
+		mask = 0
+		for i := range len(weights) {
+			switch weights[i] {
+			case 'A', 'a':
+				mask |= 1 << 3
+			case 'B', 'b':
+				mask |= 1 << 2
+			case 'C', 'c':
+				mask |= 1 << 1
+			case 'D', 'd':
+				mask |= 1 << 0
+			case '*':
+				mask = 0x0f
+			default:
+				return nil, sqlError("22023", "unrecognized weight: "+weights[i:i+1])
+			}
+		}
+	}
+	type counts struct {
+		ndoc, nentry int64
+	}
+	totals := make(map[string]counts)
+	for _, raw := range vectors {
+		vec, err := decodeTSVector(ctx, raw)
+		if err != nil {
+			return nil, err
+		}
+		for _, lex := range vec {
+			var hits int64
+			if len(lex.positions) == 0 {
+				if mask&(1<<0) != 0 {
+					hits = 1
+				}
+			} else {
+				for _, pos := range lex.positions {
+					if mask&(1<<tsPositionWeight(pos)) != 0 {
+						hits++
+					}
+				}
+			}
+			if hits > 0 {
+				c := totals[lex.text]
+				c.ndoc++
+				c.nentry += hits
+				totals[lex.text] = c
+			}
+		}
+	}
+	out := make([]model.TextSearchStatistic, 0, len(totals))
+	for word, c := range totals {
+		out = append(out, model.TextSearchStatistic{Word: word, Documents: c.ndoc, Entries: c.nentry})
+	}
+	return out, nil
+}
 func fullTextQueryContains(ctx context.Context,id model.FunctionID,args []model.Value)(model.Value,error){left,_,err:=decodeTSQuery(ctx,args[0].BytesVal);if err!=nil{return model.Value{},err};right,_,err:=decodeTSQuery(ctx,args[1].BytesVal);if err!=nil{return model.Value{},err};if id==3692{left,right=right,left};have,want:=tsQueryValues(left),tsQueryValues(right);i:=0;for _,value:=range want{for i<len(have)&&have[i]<value{i++};if i==len(have)||have[i]!=value{return model.BoolVal(false),nil}};return model.BoolVal(true),nil}
 
 func cleanTSQueryTree(node *tsQueryNode)*tsQueryNode{if node==nil{return nil};if node.kind==tsQueryValue{return cloneTSQuery(node)};if node.op==tsQueryNot{return nil};left,right:=cleanTSQueryTree(node.left),cleanTSQueryTree(node.right);if node.op==tsQueryOr&&(left==nil||right==nil){return nil};if left==nil{return right};if right==nil{return left};return &tsQueryNode{kind:tsQueryOp,op:node.op,distance:node.distance,left:left,right:right}}

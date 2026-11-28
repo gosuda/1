@@ -473,32 +473,52 @@ func (b *binder) userRoutine(schema, name string, call callArguments, s *scope, 
 			}
 			candidate := &userPolymorphic{inferred: map[model.TypeID]model.TypeLayout{}}
 			score := 0
+			preferred := 0
+			unknownText := 0
 			for i, source := range order[:len(parameters)] {
 				if source < 0 || procedure && !routineParameterIsInput(parameters[i]) {
 					continue
 				}
 				arg := args[source]
+				paramType := parameters[i].Layout
 				argument := arg.typ
-				argument.Type.Collation = parameters[i].Layout.Type.Collation
-				argument.Type.Modifier = parameters[i].Layout.Type.Modifier
+				argument.Type.Collation = paramType.Type.Collation
+				argument.Type.Modifier = paramType.Type.Modifier
 				if arg.typ.Type.ID == 0 {
+					if paramType.Type.ID == 25 || paramType.Type.ID == 1043 || paramType.Type.ID == 1042 {
+						unknownText++
+					} else if !model.IsPseudoTypeID(paramType.Type.ID) {
+						if tInfo, ok := builtin.LookupType(paramType.Type.ID); ok && tInfo.Preferred && tInfo.Category == 'S' {
+							unknownText++
+						}
+					}
 					continue
 				}
 				switch {
-				case model.IsPseudoTypeID(parameters[i].Layout.Type.ID):
-					if !b.matchPolymorphicParameter(parameters[i].Layout.Type.ID, arg, candidate) {
+				case model.IsPseudoTypeID(paramType.Type.ID):
+					if !b.matchPolymorphicParameter(paramType.Type.ID, arg, candidate) {
 						return nil
 					}
-				case sameType(argument, parameters[i].Layout):
-					score += 10
-				case !b.implicitCastWithUser(arg.typ.Type.ID, parameters[i].Layout.Type.ID):
+					// Polymorphic match scores below exact concrete match but above implicit cast.
+					score += 2
+				case sameType(argument, paramType):
+					score += 100
+				case !b.implicitCastWithUser(arg.typ.Type.ID, paramType.Type.ID):
 					return nil
+				default:
+					if srcInfo, sOK := builtin.LookupType(arg.typ.Type.ID); sOK {
+						if dstInfo, dOK := builtin.LookupType(paramType.Type.ID); dOK && dstInfo.Preferred && dstInfo.Category == srcInfo.Category {
+							preferred++
+						}
+					}
 				}
 			}
+			// Combine primary score, preferred-type conversions, and unknown->string preference.
+			combined := score*100 + preferred*10 + unknownText
 			switch {
-			case score > bestScore:
-				bestScore, ambiguous = score, false
-			case score == bestScore:
+			case combined > bestScore:
+				bestScore, ambiguous = combined, false
+			case combined == bestScore:
 				ambiguous = true
 				return nil
 			default:
@@ -660,6 +680,28 @@ func (b *binder) userRoutine(schema, name string, call callArguments, s *scope, 
 			}
 		}
 		bound.routineOutputs = outputs
+	} else if resultType.Type.ID == 2249 && resultType.Type.Storage == model.TypeComposite {
+		outputs := routineOutputs(metadata.Parameters)
+		if len(outputs) > 0 {
+			fields := make([]column, len(outputs))
+			for i, output := range outputs {
+				layout := output.Layout
+				if containsPseudoMarker(layout) {
+					resolved, err := b.resolvePolymorphicLayout(layout, polymorphic, pos)
+					if err != nil {
+						return expression{}, false, err
+					}
+					layout = resolved
+				}
+				fieldName := output.Name
+				if fieldName == "" {
+					fieldName = fmt.Sprintf("column%d", i+1)
+				}
+				fields[i] = column{ResultColumn: ResultColumn{Name: fieldName, Layout: layout, Nullable: true}}
+			}
+			bound.record = recordDeclared
+			bound.recordFields = fields
+		}
 	}
 	expr, err := b.addScalar(s, bound, ir.Scalar{Kind: ir.Call, Function: function, Signature: signature, Strict: metadata.Strict}, args)
 	return expr, true, err

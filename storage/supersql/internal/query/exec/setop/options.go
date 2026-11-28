@@ -201,19 +201,24 @@ func (c *cursor) configure(ctx context.Context) error {
 		return resource("set operation group exceeds workspace", nil)
 	}
 	c.metadata = base + 4096
+	c.perGroup = perGroup
 	fixed := base + o.GroupBytes + o.MaxRecordBytes*32
 	spoolWork := c.metadata + o.MaxRecordBytes*9 + 8192
 	spoolPeak := spoolWork*2 + o.MaxRecordBytes*9 + 8192 + o.PartitionMemoryBytes*2
 	if fixed > o.WorkBytes || spoolPeak > o.WorkBytes-fixed {
 		return resource("set operation work limit cannot admit partitions", nil)
 	}
-	if err := claim.Resize(fixed); err != nil {
+	initial := min(fixed, base+o.MaxRecordBytes*2)
+	if o.Mode != DistinctOn && !c.unionAll() {
+		initial = min(fixed, base+o.MaxRecordBytes*4)
+		c.lookup = make(map[string]*group)
+	}
+	if err := claim.Resize(initial); err != nil {
 		return err
 	}
-	if o.Mode != DistinctOn && !c.unionAll() {
-		c.groups = make([]*group, 0, c.maxGroups)
-		c.lookup = make(map[string]*group, c.maxGroups)
-	}
+	c.baseClaim = initial
+	c.maxClaim = fixed
+	c.claimed = initial
 	c.row = make([]model.Value, len(c.layouts))
 	c.keyValues = make([]model.Value, max(len(c.keyLayout), len(c.orderLayout)))
 	c.builder, err = columnar.NewBuilder(o.Layouts, columnar.BuilderOptions{MaxRows: o.BatchRows, MaxBytes: o.BatchBytes, Allocator: o.Query.Allocator(runtime.OutputMemory)})

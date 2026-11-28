@@ -36,6 +36,9 @@ type cursor struct {
 	groupIndex    int
 	maxGroups     int
 	perGroup      uint64
+	baseClaim     uint64
+	maxClaim      uint64
+	claimed       uint64
 	metadata      uint64
 	sortWork       uint64
 	sortBatchBytes uint64
@@ -227,6 +230,23 @@ func (c *cursor) partitionRow(ctx context.Context, row []model.Value) error {
 		_, err := c.deferred.AppendRow(ctx, row)
 		return err
 	}
+	need := min(c.maxClaim, c.baseClaim+uint64(len(c.groups)+1)*c.perGroup)
+	if need > c.claimed {
+		if resizeErr := c.claim.Resize(need); resizeErr != nil {
+			if errors.Is(resizeErr, runtime.ErrBudget) && len(c.groups) > 0 {
+				if c.deferred == nil {
+					c.deferred, err = c.newSpool(ctx, c.layouts, false)
+					if err != nil {
+						return err
+					}
+				}
+				_, err := c.deferred.AppendRow(ctx, row)
+				return err
+			}
+			return resizeErr
+		}
+		c.claimed = need
+	}
 	g, err := c.newGroup(ctx, key, row)
 	if err != nil {
 		return err
@@ -255,6 +275,12 @@ func (c *cursor) loadPartition(ctx context.Context) error {
 	clear(c.groups)
 	c.groups = c.groups[:0]
 	c.groupIndex = 0
+	if c.claimed > c.baseClaim {
+		if err := c.claim.Resize(c.baseClaim); err != nil {
+			return err
+		}
+		c.claimed = c.baseClaim
+	}
 	if c.partition != nil {
 		var err error
 		c.reader, err = c.partition.Reader(ctx)

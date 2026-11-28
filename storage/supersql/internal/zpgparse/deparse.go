@@ -54,6 +54,21 @@ func DeparsePartitionBound(bound *PartitionBoundSpec) (string, error) {
 	return string(w.buf), nil
 }
 
+// DeparseFunctionSQLBody reconstructs a SQL-standard function body (RETURN or
+// BEGIN ATOMIC ... END) from its parse node.
+func DeparseFunctionSQLBody(node *Node) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("deparse: nil function SQL body")
+	}
+	var w deparseWriter
+	w.functionSQLBody(node)
+	w.trimSpace()
+	if w.err != nil {
+		return "", w.err
+	}
+	return string(w.buf), nil
+}
+
 type deparseWriter struct {
 	buf []byte
 	err error

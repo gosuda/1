@@ -174,13 +174,13 @@ func (transactions *Transactions) runTruncate(ctx context.Context, statement *zp
 					begun = append(begun, table)
 				}
 			}
-			for _, command := range bound.Commands() {
-				if err := transactions.stageAlterTableExpressionCommand(statementContext, command, options, true); err != nil {
+			for _, sequence := range bound.Sequences() {
+				if _, err := transactions.stageSequenceDDL(statementContext, sequence, nil); err != nil {
 					return err
 				}
 			}
-			for _, sequence := range bound.Sequences() {
-				if _, err := transactions.stageSequenceDDL(statementContext, sequence, nil); err != nil {
+			for _, command := range bound.Commands() {
+				if err := transactions.stageAlterTableExpressionCommand(statementContext, command, options, true); err != nil {
 					return err
 				}
 			}

@@ -48,6 +48,19 @@ func bindGrantStatement(ctx context.Context, statement *zpgparse.GrantStmt, snap
 	}
 
 	grantor := normalizeRoleName(options.Bind.CurrentRole)
+	if statement.Grantor != nil {
+		explicitGrantor, gErr := roleSpecName(&zpgparse.Node{Node: &zpgparse.Node_RoleSpec{RoleSpec: statement.Grantor}}, options.Bind.CurrentRole, options.Bind.SessionUser)
+		if gErr != nil {
+			return nil, gErr
+		}
+		if _, err := b.validateRoleExists(roles, explicitGrantor, 0); err != nil {
+			return nil, err
+		}
+		if !roleIsSuperuser(roles, options.Bind.CurrentRole) && !roleIsMemberOf(roles, options.Bind.CurrentRole, explicitGrantor) {
+			return nil, bindError("42501", fmt.Sprintf("role %q is not a member of role %q", options.Bind.CurrentRole, explicitGrantor), 0)
+		}
+		grantor = explicitGrantor
+	}
 	if isBuiltinSuperuserAlias(grantor) {
 		grantor = "supersql"
 	}
@@ -99,8 +112,8 @@ func resolveGrantPrivileges(objtype zpgparse.ObjectType, privNodes []*zpgparse.N
 		if priv == nil {
 			return 0, bindError("42601", "invalid privilege specification", 0)
 		}
-		if len(priv.Cols) != 0 {
-			return 0, unsupported(Authorization, 0)
+		if len(priv.Cols) != 0 && objtype != zpgparse.ObjectType_OBJECT_TABLE {
+			return 0, bindError("0LP01", "column privileges are only supported on tables and views", 0)
 		}
 		name := strings.ToLower(strings.TrimSpace(priv.PrivName))
 		if name == "" || name == "all" || name == "all privileges" {
@@ -146,6 +159,21 @@ func objectTypePrivilegeSet(objtype zpgparse.ObjectType) (model.PrivilegeMask, m
 	case zpgparse.ObjectType_OBJECT_FUNCTION, zpgparse.ObjectType_OBJECT_PROCEDURE, zpgparse.ObjectType_OBJECT_ROUTINE:
 		return model.PrivilegeAllRoutine, map[string]model.PrivilegeMask{
 			"execute": model.PrivilegeExecute,
+		}, nil
+	case zpgparse.ObjectType_OBJECT_TYPE, zpgparse.ObjectType_OBJECT_DOMAIN:
+		return model.PrivilegeUsage, map[string]model.PrivilegeMask{
+			"usage": model.PrivilegeUsage,
+		}, nil
+	case zpgparse.ObjectType_OBJECT_LANGUAGE:
+		return model.PrivilegeUsage, map[string]model.PrivilegeMask{
+			"usage": model.PrivilegeUsage,
+		}, nil
+	case zpgparse.ObjectType_OBJECT_DATABASE:
+		return model.PrivilegeCreate | model.PrivilegeUsage, map[string]model.PrivilegeMask{
+			"create":    model.PrivilegeCreate,
+			"connect":   model.PrivilegeUsage,
+			"temporary": model.PrivilegeUsage,
+			"temp":      model.PrivilegeUsage,
 		}, nil
 	default:
 		return 0, nil, unsupported(Authorization, 0)
@@ -237,6 +265,28 @@ func resolveSingleGrantTargets(ctx context.Context, b *binder, snapshot CatalogS
 				return nil, err
 			}
 			targets = append(targets, desc)
+		case zpgparse.ObjectType_OBJECT_TYPE, zpgparse.ObjectType_OBJECT_DOMAIN:
+			var parts []string
+			var nameErr error
+			if tn := obj.GetTypeName(); tn != nil {
+				parts, nameErr = names(tn.Names)
+			} else if lst := obj.GetList(); lst != nil {
+				parts, nameErr = names(lst.Items)
+			} else if s := obj.GetString_(); s != nil {
+				parts = []string{s.Sval}
+			}
+			if nameErr != nil || len(parts) == 0 {
+				return nil, bindError("42601", "invalid GRANT type target", 0)
+			}
+			desc, _, err := b.resolve(parts, []model.ObjectKind{model.ObjectType}, "42704", 0)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, desc)
+		case zpgparse.ObjectType_OBJECT_LANGUAGE, zpgparse.ObjectType_OBJECT_DATABASE:
+			if err := b.requireSuperuser("grant or revoke on language or database", 0); err != nil {
+				return nil, err
+			}
 		default:
 			return nil, unsupported(Authorization, 0)
 		}

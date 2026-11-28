@@ -187,6 +187,10 @@ func nativeFormatDatePicture(value int64, format string, zone namedTimeZone, zon
 type nativeParsedPicture struct { year, isoYear int64; month, day, hour, minute, second, micros, isoOrdinal int; pm, meridian, bc bool; zone string; julian int64; hasJulian bool }
 
 func nativeParseDatePicture(input, format string, locale model.FormatLocale) (nativeParsedPicture, error) {
+	return nativeParseDatePictureWithZone(input, format, locale, namedTimeZone{})
+}
+
+func nativeParseDatePictureWithZone(input, format string, locale model.FormatLocale, zone namedTimeZone) (nativeParsedPicture, error) {
 	result := nativeParsedPicture{month: 1, day: 1}
 	inputOffset := 0
 	exact := strings.HasPrefix(strings.ToUpper(format), "FX")
@@ -322,20 +326,68 @@ func nativeParseDatePicture(input, format string, locale model.FormatLocale) (na
 			}
 			if exact {
 				advanceInput()
-			} else if unicode.IsSpace(formatRune) {
-				skipSpaces()
-			} else if !unicode.IsLetter(formatRune) && !unicode.IsDigit(formatRune) {
-				skipSpaces()
-				if inputOffset < len(input) {
-					inputRune, _ := utf8.DecodeRuneInString(input[inputOffset:])
-					if !unicode.IsLetter(inputRune) && !unicode.IsDigit(inputRune) && !unicode.IsSpace(inputRune) {
-						advanceInput()
+				offset += size
+				continue
+			}
+			isSep := func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }
+			if isSep(formatRune) {
+				// Count contiguous format separators in this run and inspect the next field.
+				sepCount := 0
+				runEnd := offset
+				for runEnd < len(format) {
+					if format[runEnd] == '"' {
+						break
+					}
+					if nextField, _ := nativePictureToken(format, runEnd); nextField != "" {
+						break
+					}
+					r, sz := utf8.DecodeRuneInString(format[runEnd:])
+					if !isSep(r) {
+						break
+					}
+					sepCount++
+					runEnd += sz
+				}
+				nextField, _ := nativePictureToken(format, runEnd)
+				nextSigned := nextField == "TZ" || nextField == "TZH" || nextField == "OF" || nextField == "YYYY" || nextField == "YYY" || nextField == "YY" || nextField == "Y" || nextField == "Y,YYY" || nextField == "IYYY" || nextField == "IYY" || nextField == "IY" || nextField == "I"
+				// Look ahead past spaces in input to see if a sign for a signed field follows.
+				probe := inputOffset
+				for probe < len(input) {
+					r, sz := utf8.DecodeRuneInString(input[probe:])
+					if !unicode.IsSpace(r) {
+						break
+					}
+					probe += sz
+				}
+				preserveSign := nextSigned && probe < len(input) && (input[probe] == '-' || input[probe] == '+')
+				if !preserveSign {
+					skipSpaces()
+					for sepCount > 0 && inputOffset < len(input) {
+						r, sz := utf8.DecodeRuneInString(input[inputOffset:])
+						if !isSep(r) {
+							break
+						}
+						inputOffset += sz
+						sepCount--
+					}
+				} else {
+					for sepCount > 0 && inputOffset < len(input) {
+						r, sz := utf8.DecodeRuneInString(input[inputOffset:])
+						if !isSep(r) {
+							break
+						}
+						if unicode.IsSpace(r) {
+							skipSpaces()
+						} else {
+							inputOffset += sz
+						}
+						sepCount--
 					}
 				}
-				skipSpaces()
-			} else {
-				advanceInput()
+				offset = runEnd
+				continue
 			}
+			advanceInput()
 			offset += size
 			continue
 		}
@@ -425,17 +477,49 @@ func nativeParseDatePicture(input, format string, locale model.FormatLocale) (na
 			result.bc, eraSet = bc, true
 		case "TZ":
 			start := inputOffset
-			for inputOffset < len(input) {
-				current, size := utf8.DecodeRuneInString(input[inputOffset:])
-				if !unicode.IsLetter(current) {
-					break
+			if inputOffset < len(input) && (input[inputOffset] == '+' || input[inputOffset] == '-') {
+				inputOffset++
+				if _, _, ok := readDigits(1, 2); !ok {
+					return result, temporalBadFormat()
 				}
-				inputOffset += size
+				if inputOffset < len(input) && input[inputOffset] == ':' {
+					inputOffset++
+					if _, _, ok := readDigits(2, 2); !ok {
+						return result, temporalBadFormat()
+					}
+					if inputOffset < len(input) && input[inputOffset] == ':' {
+						inputOffset++
+						if _, _, ok := readDigits(2, 2); !ok {
+							return result, temporalBadFormat()
+						}
+					}
+				}
+				result.zone = input[start:inputOffset]
+			} else {
+				end := inputOffset
+				for end < len(input) && end-start < 16 {
+					current, size := utf8.DecodeRuneInString(input[end:])
+					if !unicode.IsLetter(current) {
+						break
+					}
+					end += size
+				}
+				if end == start {
+					return result, temporalBadFormat()
+				}
+				matched := 0
+				for k := end; k > start; k-- {
+					if _, _, ok := timezoneLookup(input[start:k], zone); ok {
+						matched = k
+						break
+					}
+				}
+				if matched == 0 {
+					return result, temporalBadFormat()
+				}
+				inputOffset = matched
+				result.zone = input[start:matched]
 			}
-			if inputOffset == start {
-				return result, temporalBadFormat()
-			}
-			result.zone = input[start:inputOffset]
 		case "TZH", "OF":
 			start := inputOffset
 			if inputOffset < len(input) && (input[inputOffset] == '+' || input[inputOffset] == '-') {
@@ -500,7 +584,15 @@ func nativeParseDatePicture(input, format string, locale model.FormatLocale) (na
 			if !exact {
 				minimum = 1
 			}
-			value, digits, ok := readDigits(minimum, maximum)
+			isFF := field == "FF1" || field == "FF2" || field == "FF3" || field == "FF4" || field == "FF5" || field == "FF6"
+			var value int64
+			var digits int
+			var ok bool
+			if isFF && !exact && inputOffset >= len(input) {
+				value, digits, ok = 0, 0, true
+			} else {
+				value, digits, ok = readDigits(minimum, maximum)
+			}
 			if !ok {
 				return result, temporalBadFormat()
 			}
@@ -614,10 +706,7 @@ func nativeParseDatePicture(input, format string, locale model.FormatLocale) (na
 			}
 		}
 	}
-	if !exact {
-		skipSpaces()
-	}
-	if inputOffset != len(input) {
+	if exact && inputOffset != len(input) {
 		return result, temporalBadFormat()
 	}
 	if gregorian && iso {
@@ -709,7 +798,7 @@ func nativeParseDatePicture(input, format string, locale model.FormatLocale) (na
 }
 
 func nativePictureTimestamp(ctx context.Context, input, format string, zone namedTimeZone, dateOnly bool, locale model.FormatLocale) (model.Value,error) {
-	parsed,err:=nativeParseDatePicture(input,format,locale);if err!=nil{return model.Value{},err}
+	parsed,err:=nativeParseDatePictureWithZone(input,format,locale,zone);if err!=nil{return model.Value{},err}
 	fields:=temporalInputFields{Year:parsed.year,Month:parsed.month,Day:parsed.day,TimeMicros:int64(parsed.hour)*intervalMicrosPerHour+int64(parsed.minute)*intervalMicrosPerMinute+int64(parsed.second)*intervalMicrosPerSecond+int64(parsed.micros),HasDate:true,HasTime:!dateOnly,Zone:parsed.zone,HasZone:parsed.zone!="",Kind:temporalInputCivil}
 	if dateOnly { days:=dateFieldJulianDay(fields.Year,int64(fields.Month),int64(fields.Day))-dateEpochJulian;if !validDate(days){return model.Value{},sqlError("22008","date out of range")};return dateValue(days),nil }
 	return temporalTimestampFields(ctx,fields,temporalInputCivil,true,zone)
@@ -1090,7 +1179,7 @@ func nativeParseNumberPicture(input, picture string, locale model.FormatLocale) 
 	upper:=strings.ToUpper(picture)
 	quoted:=false
 	decimalFields,virtualFields:=0,0
-	roman,romanOther:=false,false
+	romanCount,romanOther:=0,false
 	for offset:=0;offset<len(picture); {
 		if picture[offset]=='"' { quoted=!quoted;romanOther=true;offset++;continue }
 		if quoted { romanOther=true;_,size:=utf8.DecodeRuneInString(picture[offset:]);offset+=size;continue }
@@ -1098,7 +1187,7 @@ func nativeParseNumberPicture(input, picture string, locale model.FormatLocale) 
 			token:=upper[offset:offset+2]
 			switch token {
 			case "RN":
-				roman=true
+				romanCount++
 				offset+=2
 				continue
 			case "FM":
@@ -1111,15 +1200,26 @@ func nativeParseNumberPicture(input, picture string, locale model.FormatLocale) 
 			}
 		}
 		switch upper[offset] {
+		case ' ','\t','\n','\r':
+			offset++
+			continue
 		case '.','D': decimalFields++
 		case 'V': virtualFields++
 		}
 		romanOther=true
 		offset++
 	}
-	if quoted||decimalFields>1||virtualFields>1||decimalFields!=0&&virtualFields!=0||roman&&romanOther{return "",sqlError("22023","invalid numeric format")}
-	if roman {
-		value,ok:=nativeParseRoman(strings.TrimSpace(input));if !ok{return "",sqlError("22P02","invalid input syntax for type numeric")}
+	if quoted||decimalFields>1||virtualFields>1||decimalFields!=0&&virtualFields!=0||romanCount>1||romanCount==1&&romanOther{return "",sqlError("22023","invalid numeric format")}
+	if romanCount==1 {
+		trimmed := strings.TrimLeft(input, " \t\n\r")
+		if trimmed == "" {
+			return "", sqlError("22P02", "invalid input syntax for type numeric")
+		}
+		end := 0
+		for end < len(trimmed) && trimmed[end] != ' ' && trimmed[end] != '\t' && trimmed[end] != '\n' && trimmed[end] != '\r' {
+			end++
+		}
+		value,ok:=nativeParseRoman(trimmed[:end]);if !ok{return "",sqlError("22P02","invalid input syntax for type numeric")}
 		return strconv.FormatInt(value,10),nil
 	}
 

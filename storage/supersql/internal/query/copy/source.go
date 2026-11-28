@@ -186,14 +186,18 @@ func (iterator *sourceIterator) initialize(ctx context.Context) error {
 	}
 	iterator.rowNumber++
 	if !ok || end {
-		return sqlError("22P04", "COPY header is missing")
+		if iterator.plan.plan.options.Header == HeaderMatch {
+			return sqlError("22P04", "COPY header is missing")
+		}
+		return nil
 	}
 	if iterator.plan.plan.options.Header == HeaderMatch {
 		if len(fields) != len(iterator.plan.plan.columns) {
 			return sqlError("22P04", "COPY header does not match table columns")
 		}
+		nullStr := iterator.plan.plan.options.Null
 		for i, field := range fields {
-			if field.text != iterator.plan.plan.columns[i].Name {
+			if (!field.quoted && field.source == nullStr) || field.text != iterator.plan.plan.columns[i].Name {
 				return sqlError("22P04", "COPY header does not match table columns")
 			}
 		}
@@ -460,7 +464,6 @@ func (iterator *sourceIterator) readCSVRecord(ctx context.Context) ([]copyField,
 				return nil, true, false, nil
 			}
 			fields = append(fields, copyField{text: string(field), source: string(field), quoted: quoted})
-			if len(fields) == 1 && !fields[0].quoted && fields[0].text == `\.` { return nil, true, true, nil }
 			return fields, true, false, nil
 		}
 		field = append(field, value)

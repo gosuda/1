@@ -12,6 +12,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/query/exec"
 	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
 	"github.com/gosuda/supersql-alpha/internal/query/procedural"
+	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
 // RoutineTransactionCapabilities is the session-owned composition root for each
@@ -121,7 +122,15 @@ func (executor *routineExecutor) buildCapabilityFrame(ctx context.Context, view 
 	if executor.transactions.settings.TransactionPolicy().ReadOnly {
 		sequences = readOnlySequences{SequenceRuntime: sequences}
 	}
-	textSearch, err := NewTextSearchRuntimeWithCustom(snapshot, path, configured.PathBytes, configured.TextSearchRewrite, configured.TextSearchStatistics, configured.CustomTextSearch)
+	rewrite := configured.TextSearchRewrite
+	if rewrite == nil {
+		rewrite = executor.rewriteTextSearchQuery
+	}
+	statistics := configured.TextSearchStatistics
+	if statistics == nil {
+		statistics = executor.textSearchStatistics
+	}
+	textSearch, err := NewTextSearchRuntimeWithCustom(snapshot, path, configured.PathBytes, rewrite, statistics, configured.CustomTextSearch)
 	if err != nil {
 		return nil, err
 	}
@@ -240,6 +249,80 @@ func (executor *routineExecutor) closeCapabilities() error {
 	clear(executor.retiredFrames)
 	executor.retiredFrames = nil
 	return errors.Join(err, frame.close())
+}
+
+func (executor *routineExecutor) rewriteTextSearchQuery(ctx context.Context, query []byte, command string, maxBytes uint64) ([]byte, error) {
+	if executor == nil {
+		return nil, &model.Error{Code: "55000", Message: "text search rewrite query runtime is unavailable"}
+	}
+	parsed, err := zpgparse.Parse(command)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil || len(parsed.Stmts) != 1 || parsed.Stmts[0] == nil || parsed.Stmts[0].Stmt == nil || parsed.Stmts[0].Stmt.GetSelectStmt() == nil {
+		return nil, &model.Error{Code: "42601", Message: "ts_rewrite query must be a single SELECT statement"}
+	}
+	budget := maxBytes
+	if budget < 16<<20 {
+		budget = 16 << 20
+	}
+	res, err := executor.ExecuteSQL(ctx, procedural.SQLRequest{
+		Statement: parsed.Stmts[0],
+		MaxRows:   100000,
+		MaxBytes:  budget,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Columns) != 2 || res.Columns[0].Type.ID != 3615 || res.Columns[1].Type.ID != 3615 {
+		return nil, &model.Error{Code: "42804", Message: "ts_rewrite query must return two tsquery columns"}
+	}
+	current := query
+	for _, row := range res.Rows {
+		if len(row) != 2 || row[0].IsNull || row[1].IsNull {
+			continue
+		}
+		current, err = builtin.RewriteTSQueryBytes(ctx, current, row[0].BytesVal, row[1].BytesVal, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return current, nil
+}
+
+func (executor *routineExecutor) textSearchStatistics(ctx context.Context, command, weights string, maxBytes uint64) ([]model.TextSearchStatistic, error) {
+	if executor == nil {
+		return nil, &model.Error{Code: "55000", Message: "text search statistics runtime is unavailable"}
+	}
+	parsed, err := zpgparse.Parse(command)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil || len(parsed.Stmts) != 1 || parsed.Stmts[0] == nil || parsed.Stmts[0].Stmt == nil || parsed.Stmts[0].Stmt.GetSelectStmt() == nil {
+		return nil, &model.Error{Code: "42601", Message: "ts_stat query must be a single SELECT statement"}
+	}
+	budget := maxBytes
+	if budget < 16<<20 {
+		budget = 16 << 20
+	}
+	res, err := executor.ExecuteSQL(ctx, procedural.SQLRequest{
+		Statement: parsed.Stmts[0],
+		MaxRows:   100000,
+		MaxBytes:  budget,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Columns) != 1 || res.Columns[0].Type.ID != 3614 {
+		return nil, &model.Error{Code: "42804", Message: "ts_stat query must return one tsvector column"}
+	}
+	vectors := make([][]byte, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		if len(row) == 1 && !row[0].IsNull {
+			vectors = append(vectors, row[0].BytesVal)
+		}
+	}
+	return builtin.CollectTSVectorStatistics(ctx, vectors, weights)
 }
 
 // applyRoutineCapabilities transfers the frame's execution collaborators to the

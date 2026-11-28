@@ -176,6 +176,16 @@ func (s *Settings) currentRoleLocked() string {
 	return s.state.sessionUser
 }
 
+// RowSecurity reports whether the row_security GUC is enabled (default true).
+func (s *Settings) RowSecurity() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.current[rowSecurity].flag
+}
+
 // SessionUser returns the session's authenticated user role, or "" for the
 // default built-in superuser principal.
 func (s *Settings) SessionUser() string {

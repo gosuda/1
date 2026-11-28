@@ -159,31 +159,53 @@ func BindDefinitionCommand(ctx context.Context, node *zpgparse.Node, snapshot Ca
 // definitionSchema resolves the namespace that owns a declaration. Casts are
 // not schema-qualified in PostgreSQL and are recorded under pg_catalog.
 func definitionSchema(ctx context.Context, b *binder, snapshot CatalogSnapshot, parts []string, kind definitionKind) (*model.Descriptor, error) {
-	name := "pg_catalog"
-	if kind != definitionCast {
-		path := b.options.SearchPath
-		if len(parts) == 2 {
-			path = parts[:1]
-		}
-		if len(path) == 0 {
-			return nil, bindError("3F000", "no schema has been selected to create in", 0)
-		}
-		name = path[0]
-	}
-	schema, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: name})
-	if err != nil {
-		if isMissingObject(err) {
-			return nil, bindError("3F000", "schema does not exist", 0)
-		}
-		return nil, err
-	}
-	if kind != definitionCast {
-		if err := b.checkSchemaCreate(schema.Descriptor, 0); err != nil {
+	if kind == definitionCast {
+		schema, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: "pg_catalog"})
+		if err != nil {
+			if isMissingObject(err) {
+				return nil, bindError("3F000", "schema does not exist", 0)
+			}
 			return nil, err
 		}
+		b.dependency(schema.Descriptor, 0)
+		return schema.Descriptor, nil
 	}
-	b.dependency(schema.Descriptor, 0)
-	return schema.Descriptor, nil
+	path := b.options.SearchPath
+	explicit := len(parts) == 2
+	if explicit {
+		path = parts[:1]
+	}
+	if len(path) == 0 {
+		return nil, bindError("3F000", "no schema has been selected to create in", 0)
+	}
+	var resolved catalog.PublishedDescriptor
+	found := false
+	for _, candidate := range path {
+		if !explicit && candidate == "pg_temp" {
+			continue
+		}
+		schema, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: candidate})
+		if err != nil {
+			if isMissingObject(err) {
+				if explicit {
+					return nil, bindError("3F000", "schema does not exist", 0)
+				}
+				continue
+			}
+			return nil, err
+		}
+		resolved = schema
+		found = true
+		break
+	}
+	if !found {
+		return nil, bindError("3F000", "no schema has been selected to create in", 0)
+	}
+	if err := b.checkSchemaCreate(resolved.Descriptor, 0); err != nil {
+		return nil, err
+	}
+	b.dependency(resolved.Descriptor, 0)
+	return resolved.Descriptor, nil
 }
 
 func definitionName(parts []string) (string, error) {
@@ -310,6 +332,32 @@ type definitionFunction struct {
 // AGGREGATE support functions through the current search path, so a user
 // routine shadows an equally named builtin.
 func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot CatalogSnapshot, name string) (definitionFunction, bool, error) {
+	return resolveDefinitionFunctionPathForArgs(ctx, b, snapshot, name, nil)
+}
+
+func (b *binder) typesBinaryCoercible(source, target model.TypeLayout) bool {
+	if sameType(source, target) || source.Type.ID == target.Type.ID {
+		return true
+	}
+	if sBase, err := b.unwrapDomain(source); err == nil {
+		source = sBase
+	}
+	if tBase, err := b.unwrapDomain(target); err == nil {
+		target = tBase
+	}
+	if source.Type.ID == target.Type.ID {
+		return true
+	}
+	if cast, ok := builtin.LookupCast(source.Type.ID, target.Type.ID); ok && cast.Method == 'b' {
+		return true
+	}
+	if user := b.castLookup(source.Type.ID, target.Type.ID); user.err == nil && user.found && user.metadata.Method == 'b' {
+		return true
+	}
+	return false
+}
+
+func resolveDefinitionFunctionPathForArgs(ctx context.Context, b *binder, snapshot CatalogSnapshot, name string, expected []model.TypeLayout) (definitionFunction, bool, error) {
 	if name == "" {
 		return definitionFunction{}, false, nil
 	}
@@ -321,6 +369,24 @@ func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot Cata
 		return definitionFunction{}, false, bindError("0A000", "support function arguments must be inferred from the declaration", 0)
 	}
 	bare := parts[len(parts)-1]
+	matchesExpected := func(paramLayouts []model.TypeLayout) bool {
+		if len(expected) == 0 {
+			return true
+		}
+		if len(paramLayouts) != len(expected) {
+			return false
+		}
+		for i := range expected {
+			if sameType(paramLayouts[i], expected[i]) || paramLayouts[i].Type.ID == expected[i].Type.ID {
+				continue
+			}
+			if b.typesBinaryCoercible(expected[i], paramLayouts[i]) {
+				continue
+			}
+			return false
+		}
+		return true
+	}
 	for _, schemaName := range b.functionPath(parts) {
 		namespace, err := snapshot.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: schemaName})
 		if isMissingObject(err) {
@@ -330,6 +396,7 @@ func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot Cata
 			return definitionFunction{}, false, err
 		}
 		var selected *model.Descriptor
+		exact := false
 		scanErr := snapshot.ScanNamespace(ctx, namespace.Descriptor.ID(), model.ObjectRoutine, func(published catalog.PublishedDescriptor) error {
 			descriptor := published.Descriptor
 			if descriptor == nil || descriptor.State() != model.StatePublic || descriptor.Name().Name != bare {
@@ -342,10 +409,32 @@ func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot Cata
 			if spec.Routine == nil || spec.Routine.Procedure {
 				return nil
 			}
+			inputs := routineInputs(spec.Routine.Parameters)
+			layouts := make([]model.TypeLayout, len(inputs))
+			for i, in := range inputs {
+				layouts[i] = in.Layout
+			}
+			if !matchesExpected(layouts) {
+				return nil
+			}
+			isExact := len(expected) > 0
+			for i := range expected {
+				if layouts[i].Type.ID != expected[i].Type.ID {
+					isExact = false
+					break
+				}
+			}
 			if selected != nil {
+				if isExact && !exact {
+					selected, exact = descriptor, true
+					return nil
+				}
+				if !isExact && exact {
+					return nil
+				}
 				return bindError("42725", "support function reference is ambiguous", 0)
 			}
-			selected = descriptor
+			selected, exact = descriptor, isExact
 			return nil
 		})
 		if scanErr != nil {
@@ -370,12 +459,39 @@ func resolveDefinitionFunctionPath(ctx context.Context, b *binder, snapshot Cata
 			break
 		}
 	}
-	// No user routine: only a pinned builtin unambiguous by bare name qualifies.
+	// No user routine: match a pinned builtin (using expected argument types if provided).
 	var match builtin.Signature
 	count := 0
+	exactBuiltin := false
 	for signature := range builtin.SignaturesNamed(bare) {
 		if signature.Kind != 'f' || signature.ReturnsSet || signature.Variadic != 0 {
 			continue
+		}
+		if len(expected) > 0 {
+			if int(signature.ArgumentCount) != len(expected) {
+				continue
+			}
+			layouts := make([]model.TypeLayout, len(expected))
+			for i := range expected {
+				layouts[i] = b.primitive(signature.Arguments[i])
+			}
+			if !matchesExpected(layouts) {
+				continue
+			}
+			isExact := true
+			for i := range expected {
+				if signature.Arguments[i] != expected[i].Type.ID {
+					isExact = false
+					break
+				}
+			}
+			if isExact && !exactBuiltin {
+				match, count, exactBuiltin = signature, 1, true
+				continue
+			}
+			if !isExact && exactBuiltin {
+				continue
+			}
 		}
 		match = signature
 		count++
@@ -685,21 +801,21 @@ func bindCreateCast(ctx context.Context, statement *zpgparse.CreateCastStmt, sna
 		if err != nil {
 			return nil, err
 		}
-		function, found, resolveErr := resolveDefinitionFunctionPath(ctx, b, snapshot, strings.Join(parts, "."))
+		argument, err := b.typeName(statement.Func.Objargs[0].GetTypeName())
+		if err != nil {
+			return nil, err
+		}
+		if !b.typesBinaryCoercible(source, argument) {
+			return nil, bindError("42P17", "cast function argument type does not match the source type", 0)
+		}
+		function, found, resolveErr := resolveDefinitionFunctionPathForArgs(ctx, b, snapshot, strings.Join(parts, "."), []model.TypeLayout{argument})
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
 		if !found {
 			return nil, bindError("42883", "cast function does not exist", 0)
 		}
-		argument, err := b.typeName(statement.Func.Objargs[0].GetTypeName())
-		if err != nil {
-			return nil, err
-		}
-		if !sameType(argument, source) {
-			return nil, bindError("42P17", "cast function argument type does not match the source type", 0)
-		}
-		if !sameType(function.layout, target) {
+		if !b.typesBinaryCoercible(function.layout, target) {
 			return nil, bindError("42P17", "cast function result type does not match the target type", 0)
 		}
 		metadata.Method = 'f'
@@ -876,7 +992,7 @@ func bindCreateOperator(ctx context.Context, statement *zpgparse.DefineStmt, sna
 		return nil, bindError("42P13", "SETOF type not allowed for operator argument", 0)
 	}
 	expected = append(expected, metadata.Right)
-	function, found, resolveErr := resolveDefinitionFunctionPath(ctx, b, snapshot, options_.function)
+	function, found, resolveErr := resolveDefinitionFunctionPathForArgs(ctx, b, snapshot, options_.function, expected)
 	if resolveErr != nil {
 		return nil, resolveErr
 	}
@@ -1026,12 +1142,14 @@ func operatorOptionText(option *zpgparse.DefElem) string {
 	return ""
 }
 
-// operatorOptionBoolean reads a valued boolean operator option. PostgreSQL uses
-// defGetBoolean for ALTER OPERATOR HASHES/MERGES, so a missing or non-boolean
-// value is an error rather than an implicit false.
+// operatorOptionBoolean reads a boolean operator option. PostgreSQL's
+// defGetBoolean treats a bare flag (option.Arg == nil, e.g. SET (HASHES)) as true.
 func operatorOptionBoolean(option *zpgparse.DefElem) (bool, error) {
-	if option == nil || option.Arg == nil {
+	if option == nil {
 		return false, bindError("42601", "operator attribute requires a boolean value", 0)
+	}
+	if option.Arg == nil {
+		return true, nil
 	}
 	if value := option.Arg.GetBoolean(); value != nil {
 		return value.Boolval, nil
@@ -1161,6 +1279,7 @@ func bindAlterOperator(ctx context.Context, statement *zpgparse.AlterOperatorStm
 	if err := b.requireTableOwner(base, 0); err != nil {
 		return nil, err
 	}
+	var partnerUpdates []ObjectMutation
 	next, err := definitionMutation(ctx, b, base, options, nil, func(spec *model.DescriptorSpec) error {
 		if spec.Operator == nil {
 			return model.ErrInvalidDescriptor
@@ -1168,6 +1287,7 @@ func bindAlterOperator(ctx context.Context, statement *zpgparse.AlterOperatorStm
 		metadata := *spec.Operator
 		restrict, join := metadata.Restrict, metadata.Join
 		hashes, merges := metadata.CanHash, metadata.CanMerge
+		commutator, negator := metadata.Commutator, metadata.Negator
 		for _, node := range statement.Options {
 			option := node.GetDefElem()
 			if option == nil {
@@ -1196,9 +1316,83 @@ func bindAlterOperator(ctx context.Context, statement *zpgparse.AlterOperatorStm
 					return resolveErr
 				}
 				join = function
+			case "commutator":
+				if !set {
+					return bindError("42601", "operator commutator cannot be removed", 0)
+				}
+				if metadata.Left.Type.ID == 0 {
+					return bindError("42P13", "only binary operators can have commutators", 0)
+				}
+				refName := operatorOptionText(option)
+				refID, resolveErr := resolveOperatorReference(ctx, b, snapshot, refName, metadata.Right, metadata.Left)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				if commutator != 0 {
+					if commutator == refID {
+						continue
+					}
+					return bindError("42P13", "operator commutator is already set", 0)
+				}
+				if operatorPairClaimed(refID, true) {
+					return bindError("42P13", "commutator operator already has a commutator", 0)
+				}
+				commutator = refID
+				if refID != model.OperatorID(base.OID()) {
+					if partner, pErr := resolveOperatorDescriptorByOID(ctx, snapshot, model.OID(refID)); pErr == nil && partner != nil {
+						pSpec, sErr := partner.SpecWithin(ctx, options.Descriptors)
+						if sErr == nil && pSpec.Operator != nil && pSpec.Operator.Commutator == 0 {
+							pNext, mErr := definitionMutation(ctx, b, partner, options, nil, func(ps *model.DescriptorSpec) error {
+								pm := *ps.Operator
+								pm.Commutator = model.OperatorID(base.OID())
+								ps.Operator = &pm
+								return nil
+							})
+							if mErr != nil {
+								return mErr
+							}
+							partnerUpdates = append(partnerUpdates, ObjectMutation{Base: partner, Next: pNext})
+						}
+					}
+				}
+			case "negator":
+				if !set {
+					return bindError("42601", "operator negator cannot be removed", 0)
+				}
+				refName := operatorOptionText(option)
+				refID, resolveErr := resolveOperatorReference(ctx, b, snapshot, refName, metadata.Left, metadata.Right)
+				if resolveErr != nil {
+					return resolveErr
+				}
+				if refID == model.OperatorID(base.OID()) {
+					return bindError("42P13", "operator cannot be its own negator", 0)
+				}
+				if negator != 0 {
+					if negator == refID {
+						continue
+					}
+					return bindError("42P13", "operator negator is already set", 0)
+				}
+				if operatorPairClaimed(refID, false) {
+					return bindError("42P13", "negator operator already has a negator", 0)
+				}
+				negator = refID
+				if partner, pErr := resolveOperatorDescriptorByOID(ctx, snapshot, model.OID(refID)); pErr == nil && partner != nil {
+					pSpec, sErr := partner.SpecWithin(ctx, options.Descriptors)
+					if sErr == nil && pSpec.Operator != nil && pSpec.Operator.Negator == 0 {
+						pNext, mErr := definitionMutation(ctx, b, partner, options, nil, func(ps *model.DescriptorSpec) error {
+							pm := *ps.Operator
+							pm.Negator = model.OperatorID(base.OID())
+							ps.Operator = &pm
+							return nil
+						})
+						if mErr != nil {
+							return mErr
+						}
+						partnerUpdates = append(partnerUpdates, ObjectMutation{Base: partner, Next: pNext})
+					}
+				}
 			case "hashes":
-				// ALTER reads HASHES/MERGES with defGetBoolean, so a bare flag
-				// is an error rather than an implicit false.
 				value, boolErr := operatorOptionBoolean(option)
 				if boolErr != nil {
 					return boolErr
@@ -1216,13 +1410,31 @@ func bindAlterOperator(ctx context.Context, statement *zpgparse.AlterOperatorStm
 		}
 		metadata.Restrict, metadata.Join = restrict, join
 		metadata.CanHash, metadata.CanMerge = hashes, merges
+		metadata.Commutator, metadata.Negator = commutator, negator
 		spec.Operator = &metadata
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &BoundObjectCommand{tag: "ALTER OPERATOR", updates: []ObjectMutation{{Base: base, Next: next}}, dependencies: slices.Clone(b.dependencies), warnings: slices.Clone(b.warnings)}, ctx.Err()
+	updates := append([]ObjectMutation{{Base: base, Next: next}}, partnerUpdates...)
+	return &BoundObjectCommand{tag: "ALTER OPERATOR", updates: updates, dependencies: slices.Clone(b.dependencies), warnings: slices.Clone(b.warnings)}, ctx.Err()
+}
+
+func resolveOperatorDescriptorByOID(ctx context.Context, snapshot CatalogSnapshot, oid model.OID) (*model.Descriptor, error) {
+	var found *model.Descriptor
+	err := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaPub catalog.PublishedDescriptor) error {
+		if found != nil || schemaPub.Descriptor == nil || schemaPub.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		return snapshot.ScanNamespace(ctx, schemaPub.Descriptor.ID(), model.ObjectOperator, func(pub catalog.PublishedDescriptor) error {
+			if pub.Descriptor != nil && pub.Descriptor.State() == model.StatePublic && pub.Descriptor.OID() == oid {
+				found = pub.Descriptor
+			}
+			return nil
+		})
+	})
+	return found, err
 }
 
 // resolvePlannerFunction resolves a planner support function by name and checks

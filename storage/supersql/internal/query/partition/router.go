@@ -104,10 +104,25 @@ func NewRouter(ctx context.Context, options Options) (*Router, error) {
 	if used > limits.MaxBytes {
 		return nil, ErrLimit
 	}
+	var maxCol model.ColumnID
+	for _, col := range parent.Columns {
+		if col.ID > maxCol {
+			maxCol = col.ID
+		}
+	}
+	for _, key := range parent.PartitionKeys {
+		if key.Column > maxCol {
+			maxCol = key.Column
+		}
+	}
 	for i, key := range parent.PartitionKeys {
 		column := key.Column
 		if column == 0 {
-			column = model.ColumnID(i + 1)
+			if maxCol == ^model.ColumnID(0) {
+				return nil, ErrLimit
+			}
+			maxCol++
+			column = maxCol
 		}
 		layout, size, err := model.CopyPhysicalTypeLayout(ctx, model.TypeLayout{Type: key.Type, Children: key.Children}, limits.MaxBytes-used)
 		if err != nil {

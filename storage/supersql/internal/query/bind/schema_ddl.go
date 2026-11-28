@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
@@ -222,7 +223,22 @@ func BindAlterTableTransactional(ctx context.Context, statement *zpgparse.AlterT
 		if bound.indexAddition != nil {
 			return promoteTransactionalConstraintIndex(ctx, bound, snapshot, options)
 		}
-		target, err := addPersistentSchemaDependencies(ctx, bound.metadataOnly, bound.dependencies, snapshot, options)
+		persistentDeps := bound.dependencies
+		if len(bound.auxiliaryUpdates) != 0 {
+			auxIDs := make(map[model.ObjectID]bool, len(bound.auxiliaryUpdates))
+			for _, u := range bound.auxiliaryUpdates {
+				if u.Base != nil {
+					auxIDs[u.Base.ID()] = true
+				}
+			}
+			persistentDeps = make([]model.Dependency, 0, len(bound.dependencies))
+			for _, dep := range bound.dependencies {
+				if !auxIDs[dep.Object] {
+					persistentDeps = append(persistentDeps, dep)
+				}
+			}
+		}
+		target, err := addPersistentSchemaDependencies(ctx, bound.metadataOnly, persistentDeps, snapshot, options)
 		if err != nil {
 			return nil, err
 		}
@@ -524,7 +540,7 @@ func attachTransactionalRelationTypes(ctx context.Context, bound *BoundSchemaDDL
 	for _, update := range updates {
 		bound.dependencies = appendSchemaDependency(bound.dependencies, update.Base, 0)
 	}
-	bound.auxiliaryUpdates = updates
+	bound.auxiliaryUpdates = append(bound.auxiliaryUpdates, updates...)
 	return nil
 }
 
@@ -851,6 +867,106 @@ func bindOnlineDropColumn(ctx context.Context, b *binder, snapshot CatalogSnapsh
 		retained = append(retained, index)
 	}
 	indexes = retained
+	var auxiliaryUpdates []ObjectMutation
+	if column.IdentitySequence != 0 {
+		published, seqErr := snapshot.Descriptor(ctx, column.IdentitySequence)
+		if seqErr == nil && published.Descriptor != nil {
+			indexDrops = append(indexDrops, published.Descriptor)
+			b.dependency(published.Descriptor, 0)
+			spec.Dependencies = slices.DeleteFunc(spec.Dependencies, func(d model.Dependency) bool { return d.Object == column.IdentitySequence })
+		}
+	}
+	var externalErr error
+	scanErr := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaDesc catalog.PublishedDescriptor) error {
+		if schemaDesc.Descriptor == nil || schemaDesc.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		schemaID := schemaDesc.Descriptor.ID()
+		if err := snapshot.ScanNamespace(ctx, schemaID, model.ObjectSequence, func(pub catalog.PublishedDescriptor) error {
+			if pub.Descriptor == nil || pub.Descriptor.State() != model.StatePublic {
+				return nil
+			}
+			seqMeta, ok := pub.Descriptor.Sequence()
+			if ok && seqMeta.OwnerTable == table.ID() && seqMeta.OwnerColumn == column.ID {
+				if !slices.ContainsFunc(indexDrops, func(d *model.Descriptor) bool { return d.ID() == pub.Descriptor.ID() }) {
+					indexDrops = append(indexDrops, pub.Descriptor)
+					b.dependency(pub.Descriptor, 0)
+					spec.Dependencies = slices.DeleteFunc(spec.Dependencies, func(d model.Dependency) bool { return d.Object == pub.Descriptor.ID() })
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, kind := range []model.ObjectKind{model.ObjectView, model.ObjectMaterializedView} {
+			if err := snapshot.ScanNamespace(ctx, schemaID, kind, func(pub catalog.PublishedDescriptor) error {
+				if pub.Descriptor == nil || pub.Descriptor.State() != model.StatePublic {
+					return nil
+				}
+				depSpec, sErr := pub.Descriptor.SpecWithin(ctx, options.Descriptors)
+				if sErr != nil {
+					return sErr
+				}
+				usesCol := slices.ContainsFunc(depSpec.Dependencies, func(d model.Dependency) bool {
+					return d.Object == table.ID() && d.Column == column.ID
+				})
+				if !usesCol {
+					return nil
+				}
+				if !cascade {
+					externalErr = bindError("2BP01", "cannot drop column because another object depends on it", 0)
+					return externalErr
+				}
+				if !slices.ContainsFunc(indexDrops, func(d *model.Descriptor) bool { return d.ID() == pub.Descriptor.ID() }) {
+					indexDrops = append(indexDrops, pub.Descriptor)
+					b.dependency(pub.Descriptor, 0)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return snapshot.ScanNamespace(ctx, schemaID, model.ObjectTable, func(pub catalog.PublishedDescriptor) error {
+			if pub.Descriptor == nil || pub.Descriptor.State() != model.StatePublic || pub.Descriptor.ID() == table.ID() {
+				return nil
+			}
+			otherSpec, sErr := pub.Descriptor.SpecWithin(ctx, options.Descriptors)
+			if sErr != nil || otherSpec.Table == nil {
+				return sErr
+			}
+			hasRef := slices.ContainsFunc(otherSpec.Table.Constraints, func(c model.ConstraintDescriptor) bool {
+				return c.Kind == model.ConstraintForeignKey && c.ReferencedObject == table.ID() && slices.Contains(c.ReferencedColumns, column.ID)
+			})
+			if !hasRef {
+				return nil
+			}
+			if !cascade {
+				externalErr = bindError("2BP01", "cannot drop column because a foreign key constraint depends on it", 0)
+				return externalErr
+			}
+			otherSpec.Table = cloneTableMetadata(otherSpec.Table)
+			otherSpec.Table.Constraints = slices.DeleteFunc(otherSpec.Table.Constraints, func(c model.ConstraintDescriptor) bool {
+				return c.Kind == model.ConstraintForeignKey && c.ReferencedObject == table.ID() && slices.Contains(c.ReferencedColumns, column.ID)
+			})
+			otherSpec.Dependencies = slices.DeleteFunc(otherSpec.Dependencies, func(d model.Dependency) bool {
+				return d.Object == table.ID() && d.Column == column.ID
+			})
+			otherSpec.Version = pub.Descriptor.Version() + 1
+			nextOther, createErr := model.NewDescriptor(ctx, otherSpec, options.Descriptors)
+			if createErr != nil {
+				return createErr
+			}
+			b.dependency(pub.Descriptor, 0)
+			auxiliaryUpdates = append(auxiliaryUpdates, ObjectMutation{Base: pub.Descriptor, Next: nextOther})
+			return nil
+		})
+	})
+	if externalErr != nil {
+		return nil, externalErr
+	}
+	if scanErr != nil {
+		return nil, scanErr
+	}
 	spec.Table.Columns = slices.Delete(spec.Table.Columns, position, position+1)
 	spec.Version = table.Version() + 3
 	spec.Physical.Generation++
@@ -862,7 +978,7 @@ func bindOnlineDropColumn(ctx context.Context, b *binder, snapshot CatalogSnapsh
 	if err != nil {
 		return nil, err
 	}
-	return &BoundSchemaDDL{source: table, definition: schema.JobDefinition{Operation: schema.SchemaDropColumn, SourceTable: table, TargetTable: target, SourceIndexes: indexes, TargetIndexes: targetIndexes}, mutation: model.ObjectID(column.ID), indexDrops: indexDrops, dependencies: b.dependencies, warnings: b.warnings, cascade: cascade}, nil
+	return &BoundSchemaDDL{source: table, definition: schema.JobDefinition{Operation: schema.SchemaDropColumn, SourceTable: table, TargetTable: target, SourceIndexes: indexes, TargetIndexes: targetIndexes}, mutation: model.ObjectID(column.ID), indexDrops: indexDrops, auxiliaryUpdates: auxiliaryUpdates, dependencies: b.dependencies, warnings: b.warnings, cascade: cascade}, nil
 }
 
 func bindOnlineColumnType(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, table *model.Descriptor, command *zpgparse.AlterTableCmd) (*BoundSchemaDDL, error) {
@@ -1506,7 +1622,11 @@ func onlineTargetIndexes(ctx context.Context, snapshot CatalogSnapshot, options 
 				if column.ID == 0 {
 					return nil, bindError("2BP01", "cannot rewrite an index whose column was removed", 0)
 				}
-				key.Type, key.Children = column.Layout.Type, slices.Clone(column.Layout.Children)
+				colType := column.Layout.Type
+				if key.Collation != 0 {
+					colType.Collation = key.Collation
+				}
+				key.Type, key.Children = colType, slices.Clone(column.Layout.Children)
 				continue
 			}
 			definition, binding, err := redefineRowExpression(ctx, key.Expression, table, tableSpec.Table.Columns, snapshot, options.Bind, rowIndexKey, 0, nil, 0)

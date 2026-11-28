@@ -142,7 +142,8 @@ func (scope *sessionScope) builtins() builtin.ResolveOptions {
 // bindOptions returns the shared binding configuration for one statement.
 func (scope *sessionScope) bindOptions(builtins builtin.ResolveOptions) bind.Options {
 	options := bind.Options{
-		SearchPath: scope.settings.SearchPath(), CurrentRole: scope.settings.CurrentRole(), SessionUser: scope.settings.SessionUser(),
+		SearchPath: scope.settings.SearchPath(), CurrentRole: scope.settings.CurrentRole(), SessionUser: scope.settings.SessionUser(), RowSecurityOff: !scope.settings.RowSecurity(),
+		CurrentOf: scope.txns.ResolveCurrentOf,
 		Collation: defaultCollation, DefaultCollation: defaultCollation, Limits: scope.database.irLimits(), Builtin: builtins,
 		TextSearch: scope.database.customTextSearchRuntime(),
 	}

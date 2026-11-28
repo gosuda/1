@@ -266,18 +266,25 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		if route != nil {
 			triggerDescriptor = route.descriptor
 		}
-		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, triggerDescriptor, model.TriggerInsert, nil, &proposed, rowLimit)
+		trigProposed, sysIdx, sysVal := stripSystemIdentity(triggerDescriptor, &proposed)
+		replacement, proceed, triggerErr := o.Triggers.BeforeRow(ctx, triggerDescriptor, model.TriggerInsert, nil, trigProposed, rowLimit)
 		if triggerErr != nil {
 			return false, triggerErr
 		}
 		if !proceed {
 			return false, nil
 		}
+		replacement = restoreSystemIdentity(replacement, sysIdx, sysVal)
 		if replacement == nil || len(replacement.Values) != len(proposed.Values) {
 			return false, storage.ErrInvalidLayout
 		}
 		if route != nil {
-			selected, routeErr := o.Partitions.Route(ctx, replacement.Values, partitionExpressions(*o))
+			rootRow := make([]model.Value, len(o.Partitions.rootColumns))
+			projected, projErr := o.Partitions.Project(route, replacement.Values, rootRow)
+			if projErr != nil {
+				return false, projErr
+			}
+			selected, routeErr := o.Partitions.Route(ctx, projected, partitionExpressions(*o))
 			if routeErr != nil {
 				return false, routeErr
 			}
@@ -292,11 +299,7 @@ func (c *cursor) insert(ctx context.Context, frozen []model.Value, assignment *e
 		target, ids, vals := c.target, c.columnIDs, replacement.Values
 		if route != nil {
 			target = route.target
-			ids, err = o.Partitions.mapColumns(route, c.columnIDs)
-			if err != nil {
-				return false, err
-			}
-			ids, vals = filterNonGeneratedColumns(route.columns, ids, vals)
+			ids, vals = filterNonGeneratedColumns(route.columns, route.columnIDs, vals)
 		} else {
 			ids, vals = filterNonGeneratedMask(c.generatedColumns, ids, vals)
 		}

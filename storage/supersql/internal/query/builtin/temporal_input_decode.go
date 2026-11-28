@@ -38,6 +38,12 @@ func (p *temporalDecoder) acceptToken(ctx context.Context, tokens []temporalToke
 			return p.compact(text, force)
 		}
 		return p.number(text)
+	case 'd':
+		if *prefix == 't' {
+			*prefix = 0
+			return p.timeZoneToken(text)
+		}
+		return p.wordToken(ctx, tokens, index, prefix, options, timeOnly)
 	default:
 		return p.wordToken(ctx, tokens, index, prefix, options, timeOnly)
 	}

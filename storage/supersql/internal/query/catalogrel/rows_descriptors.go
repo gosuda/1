@@ -667,6 +667,62 @@ func catalogIndexDefinition(index objectDescriptor, table model.DescriptorSpec, 
 	keys := make([]string, len(metadata.Keys))
 	for i, key := range metadata.Keys {
 		operatorClass, ok := builtin.LookupOperatorClass(key.OperatorClass)
+		if !ok && key.OperatorClass == 0 {
+			if metadata.OpClass != "" {
+				operatorClass, ok = builtin.LookupOperatorClassName("gin", metadata.OpClass)
+			}
+			if !ok {
+				lookupID := key.Type.ID
+				if family, known := builtin.LookupRangeFamily(lookupID); known {
+					if lookupID == family.Range {
+						lookupID = 3831
+					} else {
+						lookupID = 4537
+					}
+				}
+				operatorClass, ok = builtin.LookupDefaultOperatorClass("btree", lookupID)
+			}
+			if !ok {
+				for candidate := range builtin.OperatorClasses() {
+					if candidate.Default && candidate.Method == "btree" && builtin.ValidateOperatorClassInput(key.Type, candidate.ID) == nil {
+						operatorClass, ok = candidate, true
+						break
+					}
+				}
+			}
+			if !ok {
+				var fallbackType model.TypeID
+				switch key.Type.Storage {
+				case model.TypeArray:
+					fallbackType = 2277
+				case model.TypeComposite:
+					fallbackType = 2249
+				case model.TypeInt64:
+					fallbackType = 20
+				case model.TypeFloat64:
+					fallbackType = 701
+				case model.TypeTimestamp:
+					fallbackType = 1114
+				case model.TypeString:
+					fallbackType = 25
+				case model.TypeBytes:
+					fallbackType = 17
+				case model.TypeBoolean:
+					fallbackType = 16
+				case model.TypeUUID:
+					fallbackType = 2950
+				case model.TypeNumeric:
+					fallbackType = 1700
+				case model.TypeJSONB:
+					fallbackType = 3802
+				case model.TypeInterval:
+					fallbackType = 1186
+				}
+				if fallbackType != 0 {
+					operatorClass, ok = builtin.LookupDefaultOperatorClass("btree", fallbackType)
+				}
+			}
+		}
 		if !ok {
 			return "", &model.Error{Code: "55000", Message: "index operator class metadata is unavailable"}
 		}

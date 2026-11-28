@@ -144,17 +144,28 @@ func TestMultiTenantGUCAndRowLevelSecurity(t *testing.T) {
 		t.Fatalf("bypass_admin count = %d, want 4", out.Rows[0][0].IntVal)
 	}
 
-	// 6. FORCE ROW LEVEL SECURITY applies RLS even to the table owner ('supersql').
+	// 6. FORCE ROW LEVEL SECURITY applies RLS to non-superuser table owners,
+	// while superusers always bypass RLS (PostgreSQL 18 semantics).
 	mustExec(`RESET ROLE`)
+	mustExec(`CREATE ROLE doc_owner`)
+	mustExec(`ALTER TABLE tenant_docs OWNER TO doc_owner`)
 	mustExec(`ALTER TABLE tenant_docs FORCE ROW LEVEL SECURITY`)
 	mustExec(`CREATE POLICY owner_tenant_policy ON tenant_docs
-		FOR ALL TO supersql
+		FOR ALL TO doc_owner
 		USING (tenant_id = current_setting('app.tenant_id', true))`)
 	mustExec(`SET app.tenant_id = 'tenant_b'`)
+	// Superuser still sees all 4 rows even under FORCE ROW LEVEL SECURITY.
+	out = mustExec(`SELECT count(*) FROM tenant_docs`)
+	if out.Rows[0][0].IntVal != 4 {
+		t.Fatalf("superuser under FORCE RLS count = %d, want 4", out.Rows[0][0].IntVal)
+	}
+	// Non-superuser table owner IS subject to FORCE ROW LEVEL SECURITY.
+	mustExec(`SET ROLE doc_owner`)
 	out = mustExec(`SELECT id FROM tenant_docs`)
 	if len(out.Rows) != 1 || out.Rows[0][0].IntVal != 3 {
 		t.Fatalf("forced owner rows = %+v, want [3]", out.Rows)
 	}
+	mustExec(`RESET ROLE`)
 
 	// 7. Reopen database and verify RLS policies and roles persist across restarts.
 	if err := db.Close(); err != nil {
@@ -399,14 +410,19 @@ func TestRLSSecurityBypassMatrix(t *testing.T) {
 		t.Fatalf("LEFT JOIN rows = %+v, want [(1,'one'), (2,NULL), (3,NULL)]", out.Rows)
 	}
 
-	// S1(a): COPY TO STDOUT only exports visible tenant rows.
+	// S1(a): PostgreSQL 18 rejects direct COPY rel TO STDOUT under RLS (0A000),
+	// while COPY (SELECT * FROM rel) TO STDOUT exports only visible tenant rows.
 	var copyBuf bytes.Buffer
-	copyOut, err := db.CopyTo(ctx, `COPY rls_items TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20})
+	if _, err := db.CopyTo(ctx, `COPY rls_items TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20}); sqlStateOf(err) != "0A000" {
+		t.Fatalf("direct CopyTo under RLS: expected 0A000, got %v", err)
+	}
+	copyBuf.Reset()
+	copyOut, err := db.CopyTo(ctx, `COPY (SELECT * FROM rls_items) TO STDOUT`, &copyBuf, CopyOptions{MaxRecordBytes: 1 << 20})
 	if err != nil {
-		t.Fatalf("CopyTo under RLS: %v", err)
+		t.Fatalf("CopyTo query under RLS: %v", err)
 	}
 	if copyOut.RowsAffected != 1 || strings.TrimSpace(copyBuf.String()) != "1\tt1\tone" {
-		t.Fatalf("CopyTo under RLS = %d rows %q, want 1 row '1\\tt1\\tone'", copyOut.RowsAffected, copyBuf.String())
+		t.Fatalf("CopyTo query under RLS = %d rows %q, want 1 row '1\\tt1\\tone'", copyOut.RowsAffected, copyBuf.String())
 	}
 
 	// S1(b): COPY FROM STDIN allows own tenant row and rejects cross-tenant row with 42501.

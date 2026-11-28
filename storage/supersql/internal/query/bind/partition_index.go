@@ -773,7 +773,7 @@ func (b *binder) bindAttachPartitionIndex(ctx context.Context, statement *zpgpar
 	parentMetadata, parentOK := parentIndex.Index()
 	childMetadata, childOK := childIndex.Index()
 	if !parentOK || !childOK || parentIndex.ID() == childIndex.ID() || childMetadata.ParentIndex != 0 ||
-		parentMetadata.Valid() || !parentMetadata.Ready() || !parentMetadata.Live() || !childMetadata.Valid() {
+		parentMetadata.Valid() || !parentMetadata.Ready() || !parentMetadata.Live() || !childMetadata.Ready() || !childMetadata.Live() {
 		return nil, bindError("42809", "index is not attachable to this partitioned index", 0)
 	}
 	parentPublished, err := snapshot.Descriptor(ctx, parentMetadata.Table)
@@ -790,6 +790,9 @@ func (b *binder) bindAttachPartitionIndex(ctx context.Context, statement *zpgpar
 	}
 	parentTable, parentTableOK := parentTableDescriptor.Table()
 	childTable, childTableOK := childTableDescriptor.Table()
+	if childTableOK && childTable.PartitionStrategy == 0 && !childMetadata.Valid() {
+		return nil, bindError("42809", "index is not attachable to this partitioned index", 0)
+	}
 	directChild := childTableOK && childTable.PartitionBound != nil && childTable.PartitionState == model.PartitionAttached && len(childTable.Parents) == 1 && childTable.Parents[0] == parentTableDescriptor.ID()
 	if !parentTableOK || parentTable.PartitionStrategy == 0 || !directChild ||
 		!slices.Contains(parentTable.Indexes, parentIndex.ID()) || !slices.Contains(childTable.Indexes, childIndex.ID()) {
@@ -799,7 +802,7 @@ func (b *binder) bindAttachPartitionIndex(ctx context.Context, statement *zpgpar
 	if err != nil {
 		return nil, err
 	}
-	expected.Table, expected.ParentIndex = childTableDescriptor.ID(), parentIndex.ID()
+	expected.Table, expected.ParentIndex = childTableDescriptor.ID(), 0
 	if !equivalentPartitionIndex(expected, childMetadata) {
 		return nil, bindError("42809", "partition index definition differs from parent index", 0)
 	}

@@ -741,7 +741,7 @@ func decodeNumericWire(ctx context.Context, data []byte, modifier int32, budget 
 	weight := int(int16(binary.BigEndian.Uint16(data[2:])))
 	sign := binary.BigEndian.Uint16(data[4:])
 	scale := int(binary.BigEndian.Uint16(data[6:]))
-	if ndigits < 0 || ndigits > numericWorkDigits || len(data) != 8+2*ndigits || scale > numericMaxScale {
+	if ndigits < 0 || ndigits > numericFullWorkDigits || len(data) != 8+2*ndigits || scale > numericMaxScale {
 		return model.Value{}, sqlError("22P03", "invalid binary numeric value")
 	}
 	special := numericFinite

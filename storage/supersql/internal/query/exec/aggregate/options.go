@@ -420,12 +420,18 @@ func (c *cursor) configure(ctx context.Context) error {
 	if fixed > o.WorkBytes || spoolPeak > o.WorkBytes-fixed || c.sortWork > o.WorkBytes-fixed-spoolPeak || ((c.hasDistinct || c.hasOrder) && c.sortWork == 0) {
 		return resource("aggregate work limit cannot admit partitions", nil)
 	}
-	if err := claim.Resize(fixed); err != nil {
+	initial := min(fixed, base+o.MaxRecordBytes*4)
+	if c.hasNumeric {
+		initial = min(fixed, initial+max(4<<20, builtin.NumericMomentsWorkBytes))
+	}
+	if err := claim.Resize(initial); err != nil {
 		return err
 	}
+	c.baseClaim = initial
+	c.maxClaim = fixed
+	c.claimed = initial
 	if !o.OrderedGroups {
-		c.groups = make([]*group, 0, c.maxGroups)
-		c.lookup = make(map[string]*group, c.maxGroups)
+		c.lookup = make(map[string]*group)
 	}
 	// Per-row scratch is allocated once for the widest call in the plan.
 	c.arguments = make([]model.Value, maxArity)

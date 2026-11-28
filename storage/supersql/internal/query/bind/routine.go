@@ -333,6 +333,9 @@ func bindRoutineOptions(ctx context.Context, b *binder, snapshot CatalogSnapshot
 			return bindError("42601", "unrecognized routine option", 0)
 		}
 	}
+	if metadata.Language == "" && metadata.Atomic {
+		metadata.Language = "sql"
+	}
 	if metadata.Language == "" {
 		return bindError("42P13", "routine language is missing", 0)
 	}

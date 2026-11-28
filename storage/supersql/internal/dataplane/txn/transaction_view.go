@@ -584,6 +584,20 @@ func (cursor *transactionCursor) Next(ctx context.Context, batch *columnar.Batch
 	return transactionError(cursor.cursor.Next(operation, batch))
 }
 
+func (cursor *transactionCursor) SampleUnit(lane uint32) (uint64, bool) {
+	cursor.mu.Lock()
+	defer cursor.mu.Unlock()
+	if cursor.closed.Load() || cursor.cursor == nil {
+		return 0, false
+	}
+	if sampler, ok := cursor.cursor.(storage.SamplingCursor); ok {
+		return sampler.SampleUnit(lane)
+	}
+	return 0, false
+}
+
+var _ storage.SamplingCursor = (*transactionCursor)(nil)
+
 func (cursor *transactionCursor) Close() error {
 	cursor.cancel(context.Canceled)
 	cursor.mu.Lock()

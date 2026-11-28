@@ -348,9 +348,11 @@ func (b *binder) userOperatorScore(operator userOperator, args []expression, pos
 			return -1
 		}
 	}
-	// The implementation must be a routine present in the pinned snapshot.
-	if _, err := resolveDefinitionFunctionDescriptor(b, operator.metadata.Function); err != nil {
-		return -1
+	// The implementation must be a routine present in the pinned snapshot or a builtin.
+	if _, builtinOK := builtin.LookupSignature(operator.metadata.Function); !builtinOK {
+		if _, err := resolveDefinitionFunctionDescriptor(b, operator.metadata.Function); err != nil {
+			return -1
+		}
 	}
 	return score
 }
@@ -363,6 +365,12 @@ func (b *binder) userOperator(s *scope, descriptor *model.Descriptor, metadata m
 	b.dependency(descriptor, 0)
 	if b.castErr != nil {
 		return expression{}, b.castErr
+	}
+	if sig, ok := builtin.LookupSignature(metadata.Function); ok {
+		if err := ValidateBuiltinFunction(sig.ID, pos); err != nil {
+			return expression{}, err
+		}
+		return b.invoke(s, sig, 0, args, ir.Call, 0, pos)
 	}
 	published, err := resolveDefinitionFunctionDescriptor(b, metadata.Function)
 	if err != nil {

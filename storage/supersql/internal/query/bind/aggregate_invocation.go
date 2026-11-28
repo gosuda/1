@@ -26,6 +26,8 @@ func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call c
 	// is equally true, so the call's shape decides which form is admissible.
 	var selected *model.Descriptor
 	var metadata *model.AggregateMetadata
+	var polymorphic *userPolymorphic
+	bestScore := -1
 	ambiguous := false
 	err = b.catalog.ScanNamespace(b.ctx, namespace.Descriptor.ID(), model.ObjectRoutine, func(p catalog.PublishedDescriptor) error {
 		if p.Descriptor.Name().Name != name {
@@ -38,13 +40,17 @@ func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call c
 		if spec.Aggregate == nil {
 			return nil
 		}
-		if !aggregateCallMatches(spec.Aggregate, n, call, directCount) {
+		score, candidate, ok := b.aggregateCallScore(spec.Aggregate, n, call, directCount)
+		if !ok {
 			return nil
 		}
-		if selected != nil {
+		switch {
+		case score > bestScore:
+			bestScore, ambiguous = score, false
+			selected, metadata, polymorphic = p.Descriptor, spec.Aggregate, candidate
+		case score == bestScore:
 			ambiguous = true
 		}
-		selected, metadata = p.Descriptor, spec.Aggregate
 		return nil
 	})
 	if err != nil {
@@ -66,6 +72,29 @@ func (b *binder) userAggregate(schema, name string, n *zpgparse.FuncCall, call c
 	// edge: they resolve from the pinned inventory.
 	recordAggregateSupportDependency(b, metadata.Transition)
 	recordAggregateSupportDependency(b, metadata.Final)
+	resolvedMeta := *metadata
+	if polymorphic != nil {
+		resolvedArgs := make([]model.TypeLayout, len(metadata.Arguments))
+		for i, layout := range metadata.Arguments {
+			if containsPseudoMarker(layout) {
+				resolved, rErr := b.resolvePolymorphicLayout(layout, polymorphic, pos)
+				if rErr != nil {
+					return expression{}, false, rErr
+				}
+				layout = resolved
+			}
+			resolvedArgs[i] = layout
+		}
+		resolvedMeta.Arguments = resolvedArgs
+		if containsPseudoMarker(resolvedMeta.Result) {
+			resolved, rErr := b.resolvePolymorphicLayout(resolvedMeta.Result, polymorphic, pos)
+			if rErr != nil {
+				return expression{}, false, rErr
+			}
+			resolvedMeta.Result = resolved
+		}
+	}
+	metadata = &resolvedMeta
 	// A window call uses the surrounding scope's frames, so it is bound through
 	// the window machinery rather than the grouping path. PostgreSQL replays the
 	// frame from its start, so a window aggregate needs no inverse transition.
@@ -284,36 +313,55 @@ func (b *binder) declaredAggregateStrictness(descriptor *model.Descriptor) (bool
 	return spec.Routine.Strict, true
 }
 
-// aggregateCallMatches reports whether a declared aggregate accepts this call.
-// A WITHIN GROUP call carries the direct arguments followed by the ORDER BY
-// arguments, which is exactly how the declaration stores them; an ordinary call
-// carries its arguments alone and may add ORDER BY as a sort specification over
-// those same arguments rather than as extra arguments.
-func aggregateCallMatches(metadata *model.AggregateMetadata, n *zpgparse.FuncCall, call callArguments, directCount int) bool {
+// aggregateCallScore reports whether a declared aggregate accepts this call and
+// returns its candidate score and any inferred polymorphic bindings.
+func (b *binder) aggregateCallScore(metadata *model.AggregateMetadata, n *zpgparse.FuncCall, call callArguments, directCount int) (int, *userPolymorphic, bool) {
 	if n.AggStar {
 		// A zero-argument aggregate is keyed by PostgreSQL's "*" spelling.
-		return len(metadata.Arguments) == 0 && directCount == 0
+		if len(metadata.Arguments) == 0 && directCount == 0 {
+			return 0, nil, true
+		}
+		return -1, nil, false
 	}
 	if len(call.values) != len(metadata.Arguments) {
-		return false
+		return -1, nil, false
 	}
 	if n.AggWithinGroup {
 		ordered := metadata.Kind == model.AggregateOrderedSet || metadata.Kind == model.AggregateHypotheticalSet
 		if !ordered || directCount != int(metadata.DirectArguments) {
-			return false
+			return -1, nil, false
 		}
 		if len(n.AggOrder) != len(metadata.Arguments)-int(metadata.DirectArguments) {
-			return false
+			return -1, nil, false
 		}
 	} else if metadata.Kind != model.AggregateOrdinary || directCount != 0 {
-		return false
+		return -1, nil, false
 	}
-	for i, value := range call.values {
-		if value.typ.Type.ID != 0 && !sameType(value.typ, metadata.Arguments[i]) {
-			return false
+	candidate := &userPolymorphic{inferred: map[model.TypeID]model.TypeLayout{}}
+	score := 0
+	for i, arg := range call.values {
+		paramType := metadata.Arguments[i]
+		if arg.typ.Type.ID == 0 {
+			if paramType.Type.ID == 25 {
+				score += 1
+			}
+			continue
+		}
+		switch {
+		case model.IsPseudoTypeID(paramType.Type.ID):
+			if !b.matchPolymorphicParameter(paramType.Type.ID, arg, candidate) {
+				return -1, nil, false
+			}
+			score += 2
+		case sameType(arg.typ, paramType) || arg.typ.Type.ID == paramType.Type.ID:
+			score += 100
+		case b.implicitCastWithUser(arg.typ.Type.ID, paramType.Type.ID):
+			score += 1
+		default:
+			return -1, nil, false
 		}
 	}
-	return true
+	return score, candidate, true
 }
 
 // aggregateVolatility maps the persisted volatility spelling to its IR effect.

@@ -90,11 +90,23 @@ func (a routineStatementCacheKey) equal(b routineStatementCacheKey) bool {
 		return false
 	}
 	for i := range a.parameterLayouts {
-		if !model.TypeLayoutsEqual(a.parameterLayouts[i], b.parameterLayouts[i]) {
+		if !typeLayoutsEqualWithFields(a.parameterLayouts[i], b.parameterLayouts[i]) {
 			return false
 		}
 	}
 	return bytes.Equal(a.astBytes, b.astBytes)
+}
+
+func typeLayoutsEqualWithFields(a, b model.TypeLayout) bool {
+	if a.Type != b.Type || len(a.Children) != len(b.Children) || !slices.Equal(a.FieldNames, b.FieldNames) {
+		return false
+	}
+	for i := range a.Children {
+		if !typeLayoutsEqualWithFields(a.Children[i], b.Children[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *routineStatementCache) load(key routineStatementCacheKey) (routineStatementCacheEntry, bool) {

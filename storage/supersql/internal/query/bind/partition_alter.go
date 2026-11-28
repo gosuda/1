@@ -604,7 +604,7 @@ func compatibleInheritedColumns(parent, child []model.ColumnDescriptor, exact bo
 			return nil, bindError("42804", "partition row identity differs from parent", 0)
 		}
 		if parentIdentity >= 0 {
-			if parentIdentity != childIdentity || !sameType(parent[parentIdentity].Layout, child[childIdentity].Layout) {
+			if !sameType(parent[parentIdentity].Layout, child[childIdentity].Layout) {
 				return nil, bindError("42804", "partition row identity differs from parent", 0)
 			}
 			mapping[child[childIdentity].ID] = parent[parentIdentity].ID
@@ -627,18 +627,13 @@ func compatibleInheritedColumns(parent, child []model.ColumnDescriptor, exact bo
 	}
 	if exact {
 		visible := 0
-		parentPosition := 0
 		for _, childColumn := range child {
 			if childColumn.State != model.StatePublic || childColumn.SystemIdentity {
 				continue
 			}
-			for parentPosition < len(parent) && (parent[parentPosition].State != model.StatePublic || parent[parentPosition].SystemIdentity) {
-				parentPosition++
-			}
-			if parentPosition >= len(parent) || mapping[childColumn.ID] != parent[parentPosition].ID {
+			if mapping[childColumn.ID] == 0 {
 				return nil, bindError("42804", "partition columns differ from parent", 0)
 			}
-			parentPosition++
 			visible++
 		}
 		if visible != matched {

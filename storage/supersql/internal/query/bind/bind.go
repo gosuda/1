@@ -24,11 +24,20 @@ type CatalogSnapshot interface {
 	ScanNamespace(context.Context, model.ObjectID, model.ObjectKind, func(catalog.PublishedDescriptor) error) error
 }
 
+type CurrentOfRow struct {
+	Columns []model.ColumnID
+	Values  []model.Value
+	Layouts []model.TypeLayout
+}
+
 type Options struct {
 	// SearchPath contains exact normalized namespace names, not SQL fragments.
 	SearchPath       []string
 	CurrentRole      string
 	SessionUser      string
+	RowSecurityOff   bool
+	// CurrentOf resolves WHERE CURRENT OF <cursor> against open session cursors.
+	CurrentOf        func(cursorName string, target *model.Descriptor) (CurrentOfRow, error)
 	Collation        model.CollationID
 	DefaultCollation model.CollationID
 	// Builtin captures input-codec settings while SQL literals are bound.
@@ -316,6 +325,7 @@ type binder struct {
 	nextScanOccurrence       model.ScanOccurrence
 	pushedRowLocks           map[*zpgparse.SelectStmt][]rowLockPolicy
 	rangeRowLocks            map[*zpgparse.RangeVar][]rowLockPolicy
+	currentOfTarget          *model.Descriptor
 	warnings                 []model.Error
 	writeError, arbiterError error
 	// casts caches user-defined cast probes for this binding pass; the value is

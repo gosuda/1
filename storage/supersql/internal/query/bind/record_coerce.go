@@ -53,6 +53,15 @@ func (b *binder) canCoerceRecordField(source, target model.TypeLayout, context i
 	if source.Type.ID == 0 || source.Type.ID == 705 || source.Type.ID == target.Type.ID {
 		return true
 	}
+	if unwrapped, err := b.unwrapDomain(source); err == nil {
+		source = unwrapped
+	}
+	if unwrapped, err := b.unwrapDomain(target); err == nil {
+		target = unwrapped
+	}
+	if source.Type.ID == target.Type.ID {
+		return true
+	}
 	compositePair := source.Type.Storage == model.TypeComposite && target.Type.Storage == model.TypeComposite
 	if compositePair && (source.Type.ID == 2249 || target.Type.ID == 2249) {
 		return true

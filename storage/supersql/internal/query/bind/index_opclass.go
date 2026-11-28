@@ -82,3 +82,58 @@ func (b *binder) indexOperatorClassType(layout model.TypeLayout) (model.Type, er
 	}
 	return model.Type{}, bindError("54000", "domain base chain exceeds limit", 0)
 }
+
+func (b *binder) defaultIndexOperatorClass(method string, layout model.TypeLayout) (model.OID, error) {
+	operatorType, err := b.indexOperatorClassType(layout)
+	if err != nil {
+		return 0, err
+	}
+	return resolveDefaultOperatorClass(method, operatorType), nil
+}
+
+func defaultBTreeOperatorClass(layout model.TypeLayout) model.OID {
+	return resolveDefaultOperatorClass("btree", layout.Type)
+}
+
+func resolveDefaultOperatorClass(method string, typ model.Type) model.OID {
+	if family, known := builtin.LookupRangeFamily(typ.ID); known {
+		if typ.ID == family.Range {
+			typ.ID = 3831
+		} else {
+			typ.ID = 4537
+		}
+	}
+	if class, ok := builtin.LookupDefaultOperatorClass(method, typ.ID); ok {
+		return class.ID
+	}
+	switch typ.Storage {
+	case model.TypeArray:
+		if class, ok := builtin.LookupDefaultOperatorClass(method, 2277); ok {
+			return class.ID
+		}
+	case model.TypeComposite:
+		if class, ok := builtin.LookupDefaultOperatorClass(method, 2249); ok {
+			return class.ID
+		}
+	}
+	var compatible model.OID
+	matches := 0
+	for class := range builtin.OperatorClasses() {
+		if !class.Default || class.Method != method {
+			continue
+		}
+		if method == "btree" {
+			if err := builtin.ValidateOperatorClassInput(typ, class.ID); err != nil {
+				continue
+			}
+		} else if class.InputType != typ.ID {
+			continue
+		}
+		compatible = class.ID
+		matches++
+	}
+	if matches == 1 {
+		return compatible
+	}
+	return 0
+}

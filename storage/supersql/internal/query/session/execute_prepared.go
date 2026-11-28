@@ -508,8 +508,37 @@ func invocationSampleSeed(id model.TxnID, serial uint64) uint64 {
 	return value
 }
 
+func (transactions *Transactions) recordUncommittedTargets(targets []exec.MutationTarget) {
+	if len(targets) != 0 {
+		transactions.uncommittedTargets = append(transactions.uncommittedTargets, targets...)
+	}
+}
+
+type uncommittedMutationTargets struct {
+	targets  []exec.MutationTarget
+	fallback exec.MutationTargets
+}
+
+func (u uncommittedMutationTargets) ResolveMutationTarget(ctx context.Context, ref storage.ObjectRef) (exec.MutationTarget, error) {
+	if err := ctx.Err(); err != nil {
+		return exec.MutationTarget{}, err
+	}
+	for i := len(u.targets) - 1; i >= 0; i-- {
+		if target, err := u.targets[i].ResolveMutationTarget(ctx, ref); err == nil {
+			return target, nil
+		}
+	}
+	if u.fallback == nil {
+		return exec.MutationTarget{}, storage.ErrInvalidTarget
+	}
+	return u.fallback.ResolveMutationTarget(ctx, ref)
+}
+
 func runPreparedStatement(ctx context.Context, owner *Transactions, transaction *txn.Transaction, execution statementExecution, options PreparedExecution, consume func(context.Context, *Prepared, *Rows) error, nonAtomic bool) (affected uint64, err error) {
 	environment := options.Environment
+	if len(owner.uncommittedTargets) != 0 {
+		environment.MutationTargets = uncommittedMutationTargets{targets: owner.uncommittedTargets, fallback: environment.MutationTargets}
+	}
 	if len(owner.named.temporary) != 0 {
 		environment.MutationTargets = temporaryMutationTargets{named: &owner.named, fallback: environment.MutationTargets}
 	}

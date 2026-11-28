@@ -82,10 +82,11 @@ func (transactions *Transactions) runCreateIndex(ctx context.Context, statement 
 			temporary := objectCommandTemporary(ctx, hierarchy, options.Binding.Descriptors)
 			if temporary {
 				transactions.named.temporaryOptions = &options
-				if err := transactions.named.applyTemporaryCommand(hierarchy); err != nil {
+				droppedTemp, err := transactions.named.applyTemporaryCommand(ctx, hierarchy, options.Binding.Descriptors)
+				if err != nil {
 					return err
 				}
-				if err := transactions.stageTemporaryObjectCommand(ctx, hierarchy, options); err != nil {
+				if err := transactions.stageTemporaryObjectCommand(ctx, hierarchy, droppedTemp, options); err != nil {
 					return err
 				}
 			} else {

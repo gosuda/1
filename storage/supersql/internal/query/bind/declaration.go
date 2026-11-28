@@ -179,9 +179,9 @@ func BindCreateSchema(ctx context.Context, statement *zpgparse.CreateSchemaStmt,
 type tableConstraint struct {
 	raw    *zpgparse.Constraint
 	column model.ColumnID
-	// deferrability and timing record which deferrability attributes have already
-	// been folded into raw, so a repeat of either axis is rejected.
-	deferrability, timing bool
+	// deferrability, timing and enforceability record which constraint
+	// attributes have already been folded into raw, so repeats are rejected.
+	deferrability, timing, enforceability bool
 }
 
 func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapshot CatalogSnapshot, options CreateDeclarationOptions) (*BoundDeclaration, error) {
@@ -314,6 +314,7 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 			columnNames[column.Name] = columnID
 		}
 	}
+	var partitionColumnOptions []*zpgparse.ColumnDef
 	for _, node := range statement.TableElts {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -339,7 +340,11 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 			return nil, bindError("42601", "invalid CREATE TABLE element", 0)
 		}
 		if statement.Partbound != nil {
-			return nil, bindError("42601", "PARTITION OF does not accept column definitions", int(c.Location)+1)
+			if c.TypeName != nil || c.CollClause != nil {
+				return nil, bindError("42601", "PARTITION OF does not accept column definitions", int(c.Location)+1)
+			}
+			partitionColumnOptions = append(partitionColumnOptions, c)
+			continue
 		}
 		if meta.TypedOf != 0 {
 			id, found := columnNames[c.Colname]
@@ -394,6 +399,26 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 	inheritance, err := b.prepareTableInheritance(ctx, statement, snapshot, options, meta, columnNames)
 	if err != nil {
 		return nil, err
+	}
+	if len(partitionColumnOptions) != 0 {
+		seenPartOpts := make(map[model.ColumnID]bool, len(partitionColumnOptions))
+		for _, c := range partitionColumnOptions {
+			id, found := columnNames[c.Colname]
+			if !found {
+				return nil, bindError("42703", "column does not exist in parent table", int(c.Location)+1)
+			}
+			if seenPartOpts[id] {
+				return nil, bindError("42701", "column specified more than once", int(c.Location)+1)
+			}
+			seenPartOpts[id] = true
+			if err := ordinaryColumn(c); err != nil {
+				return nil, err
+			}
+			constraints, err = appendColumnConstraints(constraints, c.Constraints, id, options.Descriptors.MaxItems)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	if inheritance != nil && meta.TypedOf != 0 {
 		return nil, bindError("42P16", "typed tables cannot participate in inheritance", 0)
@@ -600,6 +625,13 @@ func BindCreateTable(ctx context.Context, statement *zpgparse.CreateStmt, snapsh
 			if constraint.Kind == model.ConstraintPrimaryKey && !constraint.Deferrable {
 				meta.PrimaryKey = slices.Clone(index.Keys)
 			}
+			for i := range index.Keys {
+				if index.Keys[i].OperatorClass == 0 {
+					if col, ok := declarationColumn(meta.Columns, index.Keys[i].Column); ok {
+						index.Keys[i].OperatorClass = defaultBTreeOperatorClass(col.Layout)
+					}
+				}
+			}
 			descriptor, err := model.NewDescriptor(ctx, model.DescriptorSpec{ID: indexID, OID: indexOID, Name: model.NamespaceName{Parent: parent.ID(), Kind: model.ObjectIndex, Name: constraint.Name}, Version: 1, State: model.StatePublic, Physical: options.Physical, Dependencies: deps, Index: index}, options.Descriptors)
 			if err != nil {
 				return nil, err
@@ -798,9 +830,6 @@ func (d *pendingTableDeclaration) compile(ctx context.Context, snapshot CatalogS
 		return nil, err
 	}
 	indexes = append(indexes, likeIndexes...)
-	if err := validatePartitionUniqueIndexes(ctx, meta, indexes, options.Descriptors); err != nil {
-		return nil, err
-	}
 	if err := rebindInheritedExpressions(ctx, pending, meta, d.inheritance, snapshot, options); err != nil {
 		return nil, err
 	}
@@ -812,6 +841,9 @@ func (d *pendingTableDeclaration) compile(ctx context.Context, snapshot CatalogS
 		return nil, model.ErrInvalidDescriptor
 	}
 	indexes = append(indexes, partitionIndexes...)
+	if err := validatePartitionUniqueIndexes(ctx, meta, indexes, options.Descriptors); err != nil {
+		return nil, err
+	}
 	for i, item := range checks {
 		constraint := &meta.Constraints[checkIndexes[i]]
 		definition, err := DefineCheck(ctx, item.raw.RawExpr, pending, constraint.ID, snapshot, options.Bind)
@@ -1079,8 +1111,9 @@ func ordinaryConstraint(c *zpgparse.Constraint) error {
 // two axes are independent, so a constraint may carry one of each but repeats of
 // the same axis conflict.
 type constraintAttributeState struct {
-	deferrability, deferrable bool
-	timing, deferred          bool
+	deferrability, deferrable  bool
+	timing, deferred           bool
+	enforceability, enforced   bool
 }
 
 func constraintAttribute(c *zpgparse.Constraint) (constraintAttributeState, bool) {
@@ -1093,16 +1126,20 @@ func constraintAttribute(c *zpgparse.Constraint) (constraintAttributeState, bool
 		return constraintAttributeState{timing: true, deferred: true}, true
 	case zpgparse.ConstrType_CONSTR_ATTR_IMMEDIATE:
 		return constraintAttributeState{timing: true}, true
+	case zpgparse.ConstrType_CONSTR_ATTR_ENFORCED:
+		return constraintAttributeState{enforceability: true, enforced: true}, true
+	case zpgparse.ConstrType_CONSTR_ATTR_NOT_ENFORCED:
+		return constraintAttributeState{enforceability: true, enforced: false}, true
 	default:
 		return constraintAttributeState{}, false
 	}
 }
 
 // appendColumnConstraints appends one column's constraint items. DEFERRABLE, NOT
-// DEFERRABLE, INITIALLY DEFERRED and INITIALLY IMMEDIATE arrive as their own items
-// following the constraint they modify and carry no state of their own, so each is
-// folded into the constraint just appended, as PostgreSQL does. A column may not
-// state deferrability twice for the same constraint.
+// DEFERRABLE, INITIALLY DEFERRED, INITIALLY IMMEDIATE, ENFORCED and NOT ENFORCED
+// arrive as their own items following the constraint they modify and carry no
+// state of their own, so each is folded into the constraint just appended, as
+// PostgreSQL does.
 func appendColumnConstraints(constraints []tableConstraint, raw []*zpgparse.Node, column model.ColumnID, maximum int) ([]tableConstraint, error) {
 	for _, node := range raw {
 		constraint := node.GetConstraint()
@@ -1115,9 +1152,8 @@ func appendColumnConstraints(constraints []tableConstraint, raw []*zpgparse.Node
 				return nil, bindError("42601", "misplaced constraint attribute", int(constraint.Location)+1)
 			}
 			prior := &constraints[position]
-			// A constraint states deferrability at most once and its timing at most
-			// once, but the two are independent: UNIQUE DEFERRABLE INITIALLY DEFERRED
-			// is two attributes, and repeating either one is the error.
+			// A constraint states deferrability at most once, its timing at most
+			// once, and enforceability at most once.
 			if attribute.deferrability {
 				if prior.deferrability {
 					return nil, bindError("42601", "conflicting constraint attributes", int(constraint.Location)+1)
@@ -1131,6 +1167,20 @@ func appendColumnConstraints(constraints []tableConstraint, raw []*zpgparse.Node
 				}
 				prior.timing = true
 				prior.raw.Initdeferred = attribute.deferred
+			}
+			if attribute.enforceability {
+				if prior.enforceability {
+					return nil, bindError("42601", "conflicting constraint attributes", int(constraint.Location)+1)
+				}
+				if prior.raw.Contype != zpgparse.ConstrType_CONSTR_CHECK && prior.raw.Contype != zpgparse.ConstrType_CONSTR_FOREIGN {
+					return nil, bindError("0A000", "constraint enforceability is only supported for CHECK and FOREIGN KEY constraints", int(constraint.Location)+1)
+				}
+				prior.enforceability = true
+				prior.raw.IsEnforced = attribute.enforced
+				if !attribute.enforced {
+					prior.raw.InitiallyValid = false
+					prior.raw.SkipValidation = true
+				}
 			}
 			continue
 		}

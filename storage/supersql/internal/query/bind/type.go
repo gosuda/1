@@ -424,6 +424,24 @@ func (b *binder) coerce(s *scope, e expression, target model.TypeLayout, context
 	if sameType(e.typ, target) {
 		return e, nil
 	}
+	if domainTargetBase, targetIsDomain, err := b.domainBase(target); err != nil {
+		return e, err
+	} else if targetIsDomain {
+		if e.typ.Type.ID == 0 {
+			return b.resolveUnknown(s, e, target)
+		}
+		if e.typ.Type.ID == 705 {
+			return b.coerceViaIO(s, e, target)
+		}
+		converted := e
+		if !sameType(e.typ, domainTargetBase) {
+			converted, err = b.coerce(s, e, domainTargetBase, context)
+			if err != nil {
+				return e, err
+			}
+		}
+		return b.coerceViaIO(s, converted, target)
+	}
 	genericRecord := target.Type.ID == 2249 && (e.typ.Type.ID != 2249 || len(target.Children) == 0)
 	if genericRecord && e.typ.Type.Storage == model.TypeComposite {
 		if err := b.validateIOLayout(e.typ, e.position); err != nil {
@@ -589,6 +607,22 @@ func implicitCast(from, to model.TypeID) bool {
 	target, targetKnown := builtin.LookupType(to)
 	return sourceKnown && targetKnown && source.IsArray() && target.IsArray() && implicitCast(source.Element, target.Element)
 }
+func (b *binder) unwrapDomain(layout model.TypeLayout) (model.TypeLayout, error) {
+	remaining := b.options.Limits.MaxDepth
+	for remaining > 0 {
+		base, domain, err := b.domainBase(layout)
+		if err != nil {
+			return model.TypeLayout{}, err
+		}
+		if !domain {
+			return layout, nil
+		}
+		layout = base
+		remaining--
+	}
+	return layout, nil
+}
+
 func (b *binder) commonType(expressions []expression) (model.TypeLayout, error) {
 	var typ model.TypeLayout
 	var nullRecord model.TypeLayout
@@ -622,6 +656,26 @@ func (b *binder) commonType(expressions []expression) (model.TypeLayout, error) 
 				typ.Children = []model.TypeLayout{element}
 			}
 			continue
+		}
+		// Unwrap domains when branches have distinct types, matching PostgreSQL's
+		// select_common_type (e.g. coalesce(4::domainint4, 7) resolves to int4).
+		curBase, err := b.unwrapDomain(typ)
+		if err != nil {
+			return typ, err
+		}
+		candBase, err := b.unwrapDomain(e.typ)
+		if err != nil {
+			return typ, err
+		}
+		if curBase.Type.ID != typ.Type.ID || candBase.Type.ID != e.typ.Type.ID {
+			typ = curBase
+			e.typ = candBase
+			if sameType(typ, e.typ) {
+				continue
+			}
+			if typ.Type.ID == e.typ.Type.ID {
+				continue
+			}
 		}
 		toCurrent := implicitCast(e.typ.Type.ID, typ.Type.ID)
 		if !toCurrent && implicitCast(typ.Type.ID, e.typ.Type.ID) {

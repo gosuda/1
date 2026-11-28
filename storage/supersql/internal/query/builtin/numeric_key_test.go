@@ -210,8 +210,8 @@ func TestNumericKeyRejectsMalformedAndOverBudgetWork(t *testing.T) {
 	for _, test := range []struct{ text, state string }{
 		{"", "22P02"}, {"1.2.3", "22P02"}, {"1e+", "22P02"}, {"NaNgarbage", "22P02"},
 		{"1e-16384", "22003"}, {"0e-16384", "22003"},
-		{"1e32768", "54000"}, {strings.Repeat("1", 32769), "54000"},
-		{strings.Repeat("0", 65537), "54000"},
+		{"1e131072", "22003"}, {strings.Repeat("1", 131073), "22003"},
+		{strings.Repeat("0", 300000), "54000"},
 	} {
 		key, err := encoder.EncodePrefix(t.Context(), layout, []model.Value{numericDatum(test.text)}, 1<<20)
 		requireSQLState(t, err, test.state)

@@ -42,7 +42,7 @@ func ExecuteCreateTable(ctx context.Context, t *Transactions, statement *zpgpars
 	if statement == nil {
 		return TableCommandResult{}, settingError("42601", "missing CREATE TABLE statement")
 	}
-	temporary := statement.Relation != nil && statement.Relation.Relpersistence == "t"
+	temporary := statement.Relation != nil && (statement.Relation.Relpersistence == "t" || statement.Relation.Schemaname == temporarySchemaName)
 	if temporary {
 		node := proto.Clone(&zpgparse.Node{Node: &zpgparse.Node_CreateStmt{CreateStmt: statement}}).(*zpgparse.Node)
 		if err := qualifyTemporaryObject(node); err != nil {
@@ -237,6 +237,9 @@ func executeTableDeclaration(ctx context.Context, t *Transactions, options Table
 			t.named.temporaryOptions = &objectOptions
 		} else {
 			result.Mutations, err = StageDeclaration(ctx, t.transaction, bound, declarationOptions)
+			if err == nil && result.Mutations != nil {
+				t.recordUncommittedTargets(result.Mutations.targets)
+			}
 		}
 		err = errors.Join(err, snapshot.Close(), view.Close())
 		if err != nil {

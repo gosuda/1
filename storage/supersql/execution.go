@@ -612,7 +612,7 @@ func (database *Catalog) executionEnvironment(query *runtime.Query, builtins bui
 	env := exec.Environment{
 		Query: query, Keys: database.keys, Builtin: builtins, Catalog: database.source,
 		TextSearch:      database.customTextSearchRuntime(),
-		MutationTargets: newStackMutationTargets{descriptors: database.currentDescriptors(), policies: database.policies},
+		MutationTargets: newStackMutationTargets{database: database, descriptors: database.currentDescriptors(), policies: database.policies},
 		Limits: exec.Limits{
 			Expressions: exprLimits, BatchRows: columnar.DefaultBatchSize, BatchBytes: 32 << 20, ParameterBytes: 32 << 20, MetadataBytes: 8 << 20,
 		},
@@ -630,6 +630,7 @@ func (database *Catalog) executionEnvironment(query *runtime.Query, builtins bui
 			// MaxRecordBytes sizes the baseline per-row workspace and internal sort
 			// while MaxRowBytes admits multi-megabyte TOAST rows on demand under
 			// WorkMemory admission.
+			Query: query,
 			BatchRows: columnar.DefaultBatchSize, BatchBytes: 32 << 20, MaxRecordBytes: 64 << 10, MaxRowBytes: 32 << 20, MaxSpoolBytes: 256 << 20,
 			MaxRows: 1 << 30, WorkBytes: 128 << 20, SortRunBytes: 4 << 20, SortMaxRuns: 4, SortMergeFanIn: 2,
 		},

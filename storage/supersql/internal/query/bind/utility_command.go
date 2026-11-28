@@ -69,6 +69,8 @@ type RoleAction uint8
 const (
 	SetRole RoleAction = iota + 1
 	ResetRole
+	SetSessionAuthorization
+	ResetSessionAuthorization
 )
 
 type RoleCommand struct {
@@ -315,6 +317,40 @@ func (b *binder) command(node *zpgparse.Node) (Command, []ResultColumn, error) {
 				return roleCmd, nil, nil
 			default:
 				return nil, nil, bindError("42601", "invalid SET ROLE command", pos)
+			}
+		}
+		if strings.EqualFold(n.Name, "session_authorization") {
+			roleCmd := RoleCommand{Local: n.IsLocal, Tag: "SET"}
+			switch n.Kind {
+			case zpgparse.VariableSetKind_VAR_RESET, zpgparse.VariableSetKind_VAR_SET_DEFAULT:
+				roleCmd.Action = ResetSessionAuthorization
+				roleCmd.Tag = "RESET"
+				if n.Kind == zpgparse.VariableSetKind_VAR_SET_DEFAULT {
+					roleCmd.Tag = "SET"
+				}
+				return roleCmd, nil, nil
+			case zpgparse.VariableSetKind_VAR_SET_VALUE:
+				if len(n.Args) != 1 {
+					return nil, nil, bindError("42601", "SET SESSION AUTHORIZATION requires a single role name", pos)
+				}
+				arg := n.Args[0]
+				target := ""
+				if ac := arg.GetAConst(); ac != nil && ac.GetSval() != nil {
+					target = ac.GetSval().Sval
+				} else if s := arg.GetString_(); s != nil {
+					target = s.Sval
+				} else {
+					return nil, nil, bindError("42601", "SET SESSION AUTHORIZATION requires a role name", pos)
+				}
+				if strings.EqualFold(strings.TrimSpace(target), "default") {
+					roleCmd.Action = ResetSessionAuthorization
+					return roleCmd, nil, nil
+				}
+				roleCmd.Action = SetSessionAuthorization
+				roleCmd.Target = target
+				return roleCmd, nil, nil
+			default:
+				return nil, nil, bindError("42601", "invalid SET SESSION AUTHORIZATION command", pos)
 			}
 		}
 		if err := ValidateSetting(n.Name, pos); err != nil {

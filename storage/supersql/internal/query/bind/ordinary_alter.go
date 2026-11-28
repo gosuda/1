@@ -249,6 +249,9 @@ func BindAlterTableIdentity(ctx context.Context, statement *zpgparse.AlterTableS
 	if column.Default != nil || column.Generated != nil {
 		return nil, bindError("428C9", "identity column cannot have a default or generation expression", 0)
 	}
+	if column.Nullable {
+		return nil, bindError("55000", "column \""+column.Name+"\" of relation \""+base.Name().Name+"\" must be declared NOT NULL before identity can be added", 0)
+	}
 	wasNullable := column.Nullable
 	b.dependency(base, 0)
 	state := declarationState{

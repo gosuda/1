@@ -246,7 +246,7 @@ func (g *Graph) validateRel(ctx context.Context, n Rel, limits Limits) error {
 		return invalid("CTE payload on another relation")
 	}
 	generator := n.Kind == GenerateSeries || n.Kind == GenerateSubscripts || n.Kind == Unnest
-	expressionList := generator || n.Kind == Values || n.Kind == Aggregate || n.Kind == Distinct
+	expressionList := generator || n.Kind == Values || n.Kind == Aggregate || n.Kind == Distinct || n.Kind == Sample
 	if !expressionList && n.expressions.count != 0 {
 		return invalid("unexpected expression list")
 	}

@@ -42,6 +42,10 @@ type cursor struct {
 	groups      []*group
 	groupIndex  int
 	maxGroups   int
+	perGroup    uint64
+	baseClaim   uint64
+	maxClaim    uint64
+	claimed     uint64
 	repeats     uint64
 	metadata    uint64
 	spillBytes  uint64
@@ -183,6 +187,12 @@ func (c *cursor) loadPartition(ctx context.Context) error {
 	clear(c.groups)
 	c.groups = c.groups[:0]
 	c.groupIndex = 0
+	if c.claimed > c.baseClaim {
+		if err := c.claim.Resize(c.baseClaim); err != nil {
+			return err
+		}
+		c.claimed = c.baseClaim
+	}
 	if c.partition != nil {
 		var err error
 		c.reader, err = c.partition.Reader(ctx)
@@ -212,6 +222,19 @@ func (c *cursor) loadPartition(ctx context.Context) error {
 					return err
 				}
 				continue
+			}
+			need := min(c.maxClaim, c.baseClaim+uint64(len(c.groups)+1)*c.perGroup)
+			if need > c.claimed {
+				if resizeErr := c.claim.Resize(need); resizeErr != nil {
+					if errors.Is(resizeErr, runtime.ErrBudget) && len(c.groups) > 0 {
+						if err := c.deferRow(ctx, row); err != nil {
+							return err
+						}
+						continue
+					}
+					return resizeErr
+				}
+				c.claimed = need
 			}
 			g, err = c.newGroup(ctx, key, row)
 			if err != nil {

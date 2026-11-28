@@ -346,10 +346,11 @@ func addObjectCommandOverlay(snapshot *catalog.CatalogSnapshot, command *bind.Bo
 func (transactions *Transactions) stageAlterTableExpressionCommand(ctx context.Context, command *bind.BoundObjectCommand, options ObjectCommandOptions, locked bool) error {
 	if objectCommandTemporary(ctx, command, options.Binding.Descriptors) {
 		transactions.named.temporaryOptions = &options
-		if err := transactions.named.applyTemporaryCommand(command); err != nil {
+		droppedTemp, err := transactions.named.applyTemporaryCommand(ctx, command, options.Binding.Descriptors)
+		if err != nil {
 			return err
 		}
-		return transactions.stageTemporaryObjectCommand(ctx, command, options)
+		return transactions.stageTemporaryObjectCommand(ctx, command, droppedTemp, options)
 	}
 	if !locked {
 		for _, update := range command.Updates() {

@@ -67,6 +67,7 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 	}
 	var memberTargets []string
 	var addMembers []string
+	var adminMembers []string
 	for _, optNode := range statement.Options {
 		def := optNode.GetDefElem()
 		if def == nil {
@@ -86,6 +87,10 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 			meta.CanLogin = val
 		case "nologin":
 			meta.CanLogin = false
+		case "inherit":
+			meta.NoInherit = !val
+		case "noinherit":
+			meta.NoInherit = true
 		case "addroleto":
 			if list := def.Arg.GetList(); list != nil {
 				for _, item := range list.Items {
@@ -110,7 +115,23 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 					}
 				}
 			}
+		case "adminmembers":
+			if list := def.Arg.GetList(); list != nil {
+				for _, item := range list.Items {
+					member, err := roleSpecName(item, options.Bind.CurrentRole, options.Bind.SessionUser)
+					if err != nil {
+						return nil, err
+					}
+					if member != "" && member != "public" && !slices.Contains(adminMembers, member) {
+						adminMembers = append(adminMembers, member)
+					}
+				}
+			}
 		}
+	}
+	grantorName := normalizeRoleName(options.Bind.CurrentRole)
+	if isBuiltinSuperuserAlias(grantorName) {
+		grantorName = "supersql"
 	}
 	for _, target := range memberTargets {
 		if target == roleName {
@@ -120,13 +141,34 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 			b.dependency(published.Descriptor, 0)
 		} else if !isMissingObject(err) {
 			return nil, err
-		} else if !isBuiltinSuperuserAlias(target) {
+		} else if !isBuiltinSuperuserAlias(target) && !isPredefinedRole(target) {
 			return nil, bindError("42704", fmt.Sprintf("role %q does not exist", target), 0)
 		}
 		meta.MemberOf = append(meta.MemberOf, target)
+		meta.Memberships = append(meta.Memberships, model.RoleMembership{
+			Role:          target,
+			Grantor:       grantorName,
+			InheritOption: !meta.NoInherit,
+			SetOption:     true,
+		})
 	}
 	var updates []ObjectMutation
-	for _, member := range addMembers {
+	memberAdminMap := make(map[string]bool, len(addMembers)+len(adminMembers))
+	var orderedMembers []string
+	for _, m := range addMembers {
+		if _, ok := memberAdminMap[m]; !ok {
+			orderedMembers = append(orderedMembers, m)
+			memberAdminMap[m] = false
+		}
+	}
+	for _, m := range adminMembers {
+		if _, ok := memberAdminMap[m]; !ok {
+			orderedMembers = append(orderedMembers, m)
+		}
+		memberAdminMap[m] = true
+	}
+	for _, member := range orderedMembers {
+		isAdmin := memberAdminMap[member]
 		if member == roleName {
 			return nil, bindError("0LP01", fmt.Sprintf("role %q cannot be a member of itself", roleName), 0)
 		}
@@ -141,15 +183,24 @@ func bindCreateRole(ctx context.Context, statement *zpgparse.CreateRoleStmt, sna
 		if !ok {
 			return nil, model.ErrInvalidDescriptor
 		}
+		memberMeta.MemberOf = slices.Clone(memberMeta.MemberOf)
+		memberMeta.Memberships = slices.Clone(roleMemberships(memberMeta))
 		if !slices.Contains(memberMeta.MemberOf, roleName) {
-			memberMeta.MemberOf = append(slices.Clone(memberMeta.MemberOf), roleName)
-			next, err := published.Descriptor.WithRole(memberMeta)
-			if err != nil {
-				return nil, err
-			}
-			b.dependency(published.Descriptor, 0)
-			updates = append(updates, ObjectMutation{Base: published.Descriptor, Next: next})
+			memberMeta.MemberOf = append(memberMeta.MemberOf, roleName)
 		}
+		memberMeta.Memberships = upsertRoleMembership(memberMeta.Memberships, model.RoleMembership{
+			Role:          roleName,
+			Grantor:       grantorName,
+			AdminOption:   isAdmin,
+			InheritOption: !memberMeta.NoInherit,
+			SetOption:     true,
+		})
+		nextMember, err := published.Descriptor.WithRole(memberMeta)
+		if err != nil {
+			return nil, err
+		}
+		b.dependency(published.Descriptor, 0)
+		updates = append(updates, ObjectMutation{Base: published.Descriptor, Next: nextMember})
 	}
 	id, oid, err := options.Identities.AllocateDeclarationIdentity(ctx)
 	if err != nil {
@@ -294,7 +345,19 @@ func bindDropRole(ctx context.Context, statement *zpgparse.DropRoleStmt, snapsho
 			continue
 		}
 		meta, ok := d.Role()
-		if !ok || len(meta.MemberOf) == 0 {
+		if !ok {
+			continue
+		}
+		for _, m := range meta.Memberships {
+			if m.Grantor != "" {
+				if _, droppingGrantor := droppedNames[strings.ToLower(m.Grantor)]; droppingGrantor {
+					if _, droppingRole := droppedNames[strings.ToLower(m.Role)]; !droppingRole {
+						return nil, bindError("2BP01", fmt.Sprintf("role %q cannot be dropped because some objects depend on it", m.Grantor), 0)
+					}
+				}
+			}
+		}
+		if len(meta.MemberOf) == 0 && len(meta.Memberships) == 0 {
 			continue
 		}
 		changed := false
@@ -306,10 +369,19 @@ func bindDropRole(ctx context.Context, statement *zpgparse.DropRoleStmt, snapsho
 			}
 			filtered = append(filtered, member)
 		}
+		filteredEdges := make([]model.RoleMembership, 0, len(meta.Memberships))
+		for _, edge := range meta.Memberships {
+			if _, removed := droppedNames[strings.ToLower(edge.Role)]; removed {
+				changed = true
+				continue
+			}
+			filteredEdges = append(filteredEdges, edge)
+		}
 		if !changed {
 			continue
 		}
 		meta.MemberOf = filtered
+		meta.Memberships = filteredEdges
 		next, err := d.WithRole(meta)
 		if err != nil {
 			return nil, err
@@ -330,9 +402,6 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 	if err != nil {
 		return nil, err
 	}
-	if err := b.requireSuperuser("grant or revoke role", 0); err != nil {
-		return nil, err
-	}
 	roles, roleDescs, err := loadCatalogRoles(ctx, snapshot, uint64(options.Bind.Limits.MaxOperands))
 	if err != nil {
 		return nil, err
@@ -341,6 +410,39 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 	for _, d := range roleDescs {
 		descByName[strings.ToLower(d.Name().Name)] = d
 		b.dependency(d, 0)
+	}
+	grantor := normalizeRoleName(options.Bind.CurrentRole)
+	if statement.Grantor != nil {
+		explicitGrantor, gErr := roleSpecName(&zpgparse.Node{Node: &zpgparse.Node_RoleSpec{RoleSpec: statement.Grantor}}, options.Bind.CurrentRole, options.Bind.SessionUser)
+		if gErr != nil {
+			return nil, gErr
+		}
+		if _, ok := roles[explicitGrantor]; !ok && !isBuiltinSuperuserAlias(explicitGrantor) {
+			return nil, bindError("42704", fmt.Sprintf("role %q does not exist", explicitGrantor), 0)
+		}
+		if !roleIsSuperuser(roles, options.Bind.CurrentRole) && !roleIsMemberOf(roles, options.Bind.CurrentRole, explicitGrantor) {
+			return nil, bindError("42501", fmt.Sprintf("role %q is not a member of role %q", options.Bind.CurrentRole, explicitGrantor), 0)
+		}
+		grantor = explicitGrantor
+	}
+	if isBuiltinSuperuserAlias(grantor) {
+		grantor = "supersql"
+	}
+	var adminOpt, inheritOpt, setOpt *bool
+	for _, optNode := range statement.Opt {
+		def := optNode.GetDefElem()
+		if def == nil {
+			continue
+		}
+		val := roleBoolOption(def)
+		switch strings.ToLower(def.Defname) {
+		case "admin":
+			adminOpt = &val
+		case "inherit":
+			inheritOpt = &val
+		case "set":
+			setOpt = &val
+		}
 	}
 	grantedRoles := make([]string, 0, len(statement.GrantedRoles))
 	for _, rNode := range statement.GrantedRoles {
@@ -356,8 +458,11 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 		if name == "" {
 			continue
 		}
-		if _, ok := roles[name]; !ok && !isBuiltinSuperuserAlias(name) {
+		if _, ok := roles[name]; !ok && !isBuiltinSuperuserAlias(name) && !isPredefinedRole(name) {
 			return nil, bindError("42704", fmt.Sprintf("role %q does not exist", name), 0)
+		}
+		if !roleHasAdminOption(roles, options.Bind.CurrentRole, name) {
+			return nil, bindError("42501", fmt.Sprintf("must have admin option on role %q", name), 0)
 		}
 		if !slices.Contains(grantedRoles, name) {
 			grantedRoles = append(grantedRoles, name)
@@ -368,6 +473,16 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 		tag = "GRANT ROLE"
 	}
 	updatedMeta := make(map[string]model.RoleMetadata)
+	stageRole := func(name string) model.RoleMetadata {
+		if staged, exists := updatedMeta[name]; exists {
+			return staged
+		}
+		m := roles[name]
+		m.MemberOf = slices.Clone(m.MemberOf)
+		m.Memberships = slices.Clone(roleMemberships(m))
+		return m
+	}
+	cascade := statement.Behavior == zpgparse.DropBehavior_DROP_CASCADE
 	for _, gNode := range statement.GranteeRoles {
 		grantee, err := roleSpecName(gNode, options.Bind.CurrentRole, options.Bind.SessionUser)
 		if err != nil {
@@ -376,31 +491,109 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 		if grantee == "" {
 			continue
 		}
-		meta, ok := roles[grantee]
-		if !ok {
+		if _, ok := roles[grantee]; !ok {
 			return nil, bindError("42704", fmt.Sprintf("role %q does not exist", grantee), 0)
 		}
-		if staged, exists := updatedMeta[grantee]; exists {
-			meta = staged
-		} else {
-			meta.MemberOf = slices.Clone(meta.MemberOf)
-		}
+		meta := stageRole(grantee)
 		for _, granted := range grantedRoles {
 			if statement.IsGrant {
-				if grantee == granted || roleIsMemberOf(roles, granted, grantee) {
+				if grantee == granted || roleIsAnyMemberOf(roles, granted, grantee) {
 					return nil, bindError("0LP01", fmt.Sprintf("role %q is already a member of role %q", granted, grantee), 0)
 				}
+				edge := model.RoleMembership{
+					Role:          granted,
+					Grantor:       grantor,
+					InheritOption: !meta.NoInherit,
+					SetOption:     true,
+				}
+				if idx := slices.IndexFunc(meta.Memberships, func(m model.RoleMembership) bool { return m.Role == granted && m.Grantor == grantor }); idx >= 0 {
+					edge = meta.Memberships[idx]
+				}
+				if adminOpt != nil {
+					edge.AdminOption = *adminOpt
+				}
+				if inheritOpt != nil {
+					edge.InheritOption = *inheritOpt
+				}
+				if setOpt != nil {
+					edge.SetOption = *setOpt
+				}
+				meta.Memberships = upsertRoleMembership(meta.Memberships, edge)
 				if !slices.Contains(meta.MemberOf, granted) {
 					meta.MemberOf = append(meta.MemberOf, granted)
-					roles[grantee] = meta
-					updatedMeta[grantee] = meta
 				}
+				roles[grantee] = meta
+				updatedMeta[grantee] = meta
 			} else {
-				idx := slices.Index(meta.MemberOf, granted)
-				if idx >= 0 {
-					meta.MemberOf = slices.Delete(meta.MemberOf, idx, idx+1)
+				optionOnly := adminOpt != nil || inheritOpt != nil || setOpt != nil
+				changed := false
+				if optionOnly {
+					for i := range meta.Memberships {
+						if meta.Memberships[i].Role != granted {
+							continue
+						}
+						if statement.Grantor != nil && meta.Memberships[i].Grantor != grantor {
+							continue
+						}
+						if adminOpt != nil && *adminOpt && meta.Memberships[i].AdminOption {
+							meta.Memberships[i].AdminOption = false
+							changed = true
+						}
+						if inheritOpt != nil && *inheritOpt && meta.Memberships[i].InheritOption {
+							meta.Memberships[i].InheritOption = false
+							changed = true
+						}
+						if setOpt != nil && *setOpt && meta.Memberships[i].SetOption {
+							meta.Memberships[i].SetOption = false
+							changed = true
+						}
+					}
+				} else {
+					kept := make([]model.RoleMembership, 0, len(meta.Memberships))
+					for _, m := range meta.Memberships {
+						if m.Role == granted && (statement.Grantor == nil || m.Grantor == grantor || roleIsSuperuser(roles, options.Bind.CurrentRole)) {
+							changed = true
+							continue
+						}
+						kept = append(kept, m)
+					}
+					meta.Memberships = kept
+					if !slices.ContainsFunc(meta.Memberships, func(m model.RoleMembership) bool { return m.Role == granted }) {
+						if idx := slices.Index(meta.MemberOf, granted); idx >= 0 {
+							meta.MemberOf = slices.Delete(meta.MemberOf, idx, idx+1)
+							changed = true
+						}
+					}
+				}
+				if changed {
 					roles[grantee] = meta
 					updatedMeta[grantee] = meta
+					// Check downstream memberships granted by grantee on granted role if grantee lost admin option.
+					if !roleHasAdminOption(roles, grantee, granted) {
+						for otherName := range roles {
+							if otherName == grantee {
+								continue
+							}
+							otherMeta := stageRole(otherName)
+							hasDep := slices.ContainsFunc(otherMeta.Memberships, func(m model.RoleMembership) bool {
+								return m.Role == granted && m.Grantor == grantee
+							})
+							if !hasDep {
+								continue
+							}
+							if !cascade {
+								return nil, bindError("2BP01", fmt.Sprintf("dependent privileges exist for role %q", grantee), 0)
+							}
+							otherMeta.Memberships = slices.DeleteFunc(otherMeta.Memberships, func(m model.RoleMembership) bool {
+								return m.Role == granted && m.Grantor == grantee
+							})
+							if !slices.ContainsFunc(otherMeta.Memberships, func(m model.RoleMembership) bool { return m.Role == granted }) {
+								otherMeta.MemberOf = slices.DeleteFunc(otherMeta.MemberOf, func(r string) bool { return r == granted })
+							}
+							roles[otherName] = otherMeta
+							updatedMeta[otherName] = otherMeta
+						}
+					}
 				}
 			}
 		}
@@ -418,6 +611,16 @@ func bindGrantRole(ctx context.Context, statement *zpgparse.GrantRoleStmt, snaps
 		command.noop = true
 	}
 	return command, ctx.Err()
+}
+
+func upsertRoleMembership(edges []model.RoleMembership, edge model.RoleMembership) []model.RoleMembership {
+	for i := range edges {
+		if edges[i].Role == edge.Role && edges[i].Grantor == edge.Grantor {
+			edges[i] = edge
+			return edges
+		}
+	}
+	return append(edges, edge)
 }
 
 func bindCreatePolicy(ctx context.Context, statement *zpgparse.CreatePolicyStmt, snapshot CatalogSnapshot, options CreateDeclarationOptions) (*BoundObjectCommand, error) {
@@ -459,11 +662,21 @@ func bindCreatePolicy(ctx context.Context, statement *zpgparse.CreatePolicyStmt,
 		if err != nil {
 			return nil, err
 		}
+		for _, dep := range usingDef.Dependencies {
+			if dep.Object != table.ID() {
+				spec.Dependencies = appendIndexDependency(spec.Dependencies, dep)
+			}
+		}
 	}
 	if statement.WithCheck != nil {
 		checkDef, err = bindPolicyExpressionDef(ctx, snapshot, options, table, schemaName, spec.Table, statement.WithCheck)
 		if err != nil {
 			return nil, err
+		}
+		for _, dep := range checkDef.Dependencies {
+			if dep.Object != table.ID() {
+				spec.Dependencies = appendIndexDependency(spec.Dependencies, dep)
+			}
 		}
 	}
 	id, oid, err := options.Identities.AllocateDeclarationIdentity(ctx)
@@ -525,6 +738,11 @@ func bindAlterPolicy(ctx context.Context, statement *zpgparse.AlterPolicyStmt, s
 			return nil, err
 		}
 		policy.Using = usingDef
+		for _, dep := range usingDef.Dependencies {
+			if dep.Object != table.ID() {
+				spec.Dependencies = appendIndexDependency(spec.Dependencies, dep)
+			}
+		}
 	}
 	if statement.WithCheck != nil {
 		checkDef, err := bindPolicyExpressionDef(ctx, snapshot, options, table, schemaName, spec.Table, statement.WithCheck)
@@ -532,6 +750,11 @@ func bindAlterPolicy(ctx context.Context, statement *zpgparse.AlterPolicyStmt, s
 			return nil, err
 		}
 		policy.WithCheck = checkDef
+		for _, dep := range checkDef.Dependencies {
+			if dep.Object != table.ID() {
+				spec.Dependencies = appendIndexDependency(spec.Dependencies, dep)
+			}
+		}
 	}
 	policies[idx] = policy
 	spec.Table.Policies = policies
@@ -750,8 +973,19 @@ func bindPolicyExpressionDef(ctx context.Context, snapshot CatalogSnapshot, opti
 	if err != nil {
 		return nil, err
 	}
+	var deps []model.Dependency
+	for _, dep := range eb.dependencies {
+		if dep.Object != 0 && dep.Object != table.ID() {
+			deps = appendIndexDependency(deps, dep)
+		}
+	}
+	if len(deps) != 0 {
+		slices.SortFunc(deps, compareDependency)
+		deps = slices.Compact(deps)
+	}
 	return &model.ExpressionDefinition{
 		SQL:             sqlText,
+		Dependencies:    deps,
 		SemanticVersion: 1,
 		Encoding:        encoding,
 	}, nil
@@ -760,6 +994,10 @@ func bindPolicyExpressionDef(ctx context.Context, snapshot CatalogSnapshot, opti
 func finishPolicyTableMutation(ctx context.Context, b *binder, table *model.Descriptor, spec model.DescriptorSpec, options CreateDeclarationOptions, tag string) (*BoundObjectCommand, error) {
 	if table.Version() == math.MaxUint64 {
 		return nil, model.ErrDescriptorLimit
+	}
+	if len(spec.Dependencies) != 0 {
+		slices.SortFunc(spec.Dependencies, compareDependency)
+		spec.Dependencies = slices.Compact(spec.Dependencies)
 	}
 	spec.Version = table.Version() + 1
 	next, err := model.NewDescriptor(ctx, spec, options.Descriptors)

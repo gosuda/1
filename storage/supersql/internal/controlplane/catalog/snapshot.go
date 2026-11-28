@@ -418,6 +418,9 @@ func (s *CatalogSnapshot) ScanNamespaceReferences(ctx context.Context, parent mo
 			if err != nil {
 				return err
 			}
+			if s.overlayByID[id] != nil {
+				continue
+			}
 			s.store.reads.Add(1)
 			if err := visit(NamespaceReference{Name: name, ID: id, Version: version}); err != nil {
 				return err

@@ -30,6 +30,18 @@ func DefineDomainCheck(ctx context.Context, ast *zpgparse.Node, domain *model.De
 	return definition, bound.Dependencies, nil
 }
 
+func RedefineDomainCheck(ctx context.Context, definition *model.ExpressionDefinition, domain *model.Descriptor, constraint model.ObjectID, base model.TypeLayout, snapshot CatalogSnapshot, options Options) (*model.ExpressionDefinition, []model.Dependency, error) {
+	if domain == nil || domain.Kind() != model.ObjectType || constraint == 0 {
+		return nil, nil, bindError("22023", "domain CHECK requires a type and constraint identity", 0)
+	}
+	columns := []model.ColumnDescriptor{{ID: 1, Name: "value", State: model.StatePublic, Layout: base, Nullable: true}}
+	redefined, bound, err := redefineRowExpression(ctx, definition, domain, columns, snapshot, options, rowDomainCheck, 0, nil, constraint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return redefined, bound.Dependencies, nil
+}
+
 func BindDomainCheck(ctx context.Context, definition *model.ExpressionDefinition, domain model.ObjectID, constraint model.ObjectID, base model.TypeLayout, snapshot CatalogSnapshot, limits ir.Limits) (*BoundColumnExpression, error) {
 	if domain == 0 || constraint == 0 {
 		return nil, bindError("22023", "domain CHECK identities are required", 0)

@@ -165,16 +165,28 @@ func (s *Spool) appendRow(ctx context.Context, row []model.Value) (Position, err
 	}
 	position := Position(s.bytes)
 	if s.spill == nil && s.bytes+uint64(len(frame)) <= s.limits.MemoryBytes {
+		needed := s.bytes + uint64(len(frame))
 		if s.memoryClaim == nil {
-			claim, err := s.query.TryReserve(runtime.WorkMemory, int64(s.limits.MemoryBytes))
+			initial := min(s.limits.MemoryBytes, max(uint64(64<<10), needed))
+			claim, err := s.query.TryReserve(runtime.WorkMemory, int64(initial))
 			if err == nil {
 				s.memoryClaim = claim
-				s.memory = make([]byte, 0, int(s.limits.MemoryBytes))
+				s.memory = make([]byte, 0, int(initial))
 			} else if !errors.Is(err, runtime.ErrBudget) {
 				return 0, err
 			}
+		} else if needed > uint64(s.memoryClaim.Bytes()) {
+			target := min(s.limits.MemoryBytes, max(needed, uint64(s.memoryClaim.Bytes())*2))
+			if err := s.memoryClaim.Resize(int64(target)); err != nil {
+				if !errors.Is(err, runtime.ErrBudget) {
+					return 0, err
+				}
+				if err := s.migrate(ctx); err != nil {
+					return 0, err
+				}
+			}
 		}
-		if s.memoryClaim != nil {
+		if s.spill == nil && s.memoryClaim != nil {
 			s.memory = append(s.memory, frame...)
 			s.bytes += uint64(len(frame))
 			s.rows++

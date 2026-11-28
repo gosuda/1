@@ -199,8 +199,43 @@ func (b *binder) copyTo(statement *zpgparse.CopyStmt, s *scope) (relation, error
 	var err error
 	switch {
 	case statement.Query != nil && statement.Relation == nil && len(statement.Attlist) == 0:
+		switch q := statement.Query.Node.(type) {
+		case *zpgparse.Node_InsertStmt:
+			if q.InsertStmt != nil && q.InsertStmt.ReturningClause == nil {
+				return relation{}, bindError("0A000", "COPY query must have a RETURNING clause", 0)
+			}
+		case *zpgparse.Node_UpdateStmt:
+			if q.UpdateStmt != nil && q.UpdateStmt.ReturningClause == nil {
+				return relation{}, bindError("0A000", "COPY query must have a RETURNING clause", 0)
+			}
+		case *zpgparse.Node_DeleteStmt:
+			if q.DeleteStmt != nil && q.DeleteStmt.ReturningClause == nil {
+				return relation{}, bindError("0A000", "COPY query must have a RETURNING clause", 0)
+			}
+		case *zpgparse.Node_MergeStmt:
+			if q.MergeStmt != nil && q.MergeStmt.ReturningClause == nil {
+				return relation{}, bindError("0A000", "COPY query must have a RETURNING clause", 0)
+			}
+		}
 		input, err = b.statement(statement.Query, s)
 	case statement.Relation != nil && statement.Query == nil:
+		if statement.Relation.Relname != "" && statement.Relation.Catalogname == "" {
+			parts := []string{statement.Relation.Relname}
+			if statement.Relation.Schemaname != "" {
+				parts = []string{statement.Relation.Schemaname, statement.Relation.Relname}
+			}
+			if desc, _, rErr := b.resolve(parts, []model.ObjectKind{model.ObjectTable}, "42P01", int(statement.Relation.Location)+1); rErr == nil && desc != nil {
+				if tbl, ok := desc.Table(); ok && tbl.RowSecurity {
+					roles, roleErr := b.cachedRoles()
+					if roleErr != nil {
+						return relation{}, roleErr
+					}
+					if rlsApplies(roles, b.options.CurrentRole, &tbl) {
+						return relation{}, bindError("0A000", "COPY TO not supported with row-level security", int(statement.Relation.Location)+1)
+					}
+				}
+			}
+		}
 		input, err = b.from(&zpgparse.Node{Node: &zpgparse.Node_RangeVar{RangeVar: statement.Relation}}, s)
 		if err == nil {
 			input, err = b.copyOutputColumns(input, statement.Attlist, s)
@@ -367,7 +402,7 @@ func (b *binder) copyOptions(statement *zpgparse.CopyStmt, columns []model.Colum
 			value, err := copyStringOption(option)
 			if err != nil { return state, err }
 			value = strings.ReplaceAll(strings.ToUpper(value), "-", "")
-			if value != "UTF8" && value != "UTF_8" { return state, unsupported(LocaleProviders, position) }
+			if value != "UTF8" && value != "UTF_8" && value != "SQL_ASCII" && value != "SQLASCII" { return state, unsupported(LocaleProviders, position) }
 		case "on_error":
 			value, err := copyStringOption(option)
 			if err != nil { return state, err }

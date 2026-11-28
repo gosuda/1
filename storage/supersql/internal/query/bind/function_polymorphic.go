@@ -17,8 +17,12 @@ func (b *binder) exactPolymorphicElement(signature builtin.Signature, args []exp
 			continue
 		}
 		switch declared {
-		case 2277, 2283, 2776, 3500, 3831, 4537:
+		case 2277, 3500, 3831, 4537:
 			requiresKnown = true
+		case 2283, 2776:
+			if polymorphic(signature.Result) {
+				requiresKnown = true
+			}
 		}
 		actual := b.argumentID(arg)
 		if actual == 0 {

@@ -282,6 +282,12 @@ func (target mutationTarget) assignmentColumn(viewColumn model.ColumnDescriptor)
 			if column.ID == id && (column.Default != nil || column.ConstantDefault != nil) {
 				viewColumn.Default = column.Default
 				viewColumn.ConstantDefault = column.ConstantDefault
+				if phys, ok := target.physicalColumn(viewColumn.ID); ok {
+					viewColumn.IdentitySequence = phys.IdentitySequence
+					viewColumn.IdentityAlways = phys.IdentityAlways
+					viewColumn.Generated = phys.Generated
+					viewColumn.GeneratedStored = phys.GeneratedStored
+				}
 				return viewColumn
 			}
 		}

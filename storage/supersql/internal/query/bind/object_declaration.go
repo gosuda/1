@@ -3,11 +3,13 @@ package bind
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
@@ -257,6 +259,7 @@ func bindCreateView(ctx context.Context, statement *zpgparse.ViewStmt, snapshot 
 		metadata.Persistence = "p"
 	}
 	metadata.Recursive = recursiveViewQuery(statement.Query)
+	promotedTemporary := false
 	for _, dependency := range query.Dependencies() {
 		published, resolveErr := snapshot.Descriptor(ctx, dependency.Object)
 		if resolveErr != nil {
@@ -268,10 +271,34 @@ func bindCreateView(ctx context.Context, statement *zpgparse.ViewStmt, snapshot 
 				return nil, err
 			}
 			if temporary {
-				return nil, bindError("42P16", "permanent view cannot reference a temporary relation", int(statement.View.Location)+1)
+				if statement.View.Schemaname != "" {
+					return nil, bindError("42P16", "permanent view cannot reference a temporary relation", int(statement.View.Location)+1)
+				}
+				tempParent, tempErr := b.catalog.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: "pg_temp"})
+				if tempErr != nil {
+					return nil, tempErr
+				}
+				parent = tempParent.Descriptor
+				metadata.Persistence = "t"
+				promotedTemporary = true
 			}
 		}
 		b.dependency(published.Descriptor, dependency.Column)
+	}
+	if promotedTemporary {
+		existing, err = relationNameConflict(ctx, snapshot, parent.ID(), name)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil && (!statement.Replace || existing.Kind() != model.ObjectView) {
+			return nil, bindError("42P07", "relation already exists", int(statement.View.Location)+1)
+		}
+		if existing == nil {
+			if err := implicitRelationTypeNamesAvailable(ctx, snapshot, parent.ID(), name); err != nil {
+				return nil, err
+			}
+		}
+		b.warnings = append(b.warnings, model.Error{Code: "00000", Message: fmt.Sprintf("view %q will be a temporary view", name)})
 	}
 	b.dependency(parent, 0)
 	command := &BoundObjectCommand{tag: "CREATE VIEW", query: query}
@@ -724,6 +751,9 @@ func declarationParent(ctx context.Context, b *binder, relation *zpgparse.RangeV
 		path = []string{relation.Schemaname}
 	}
 	for _, schemaName := range path {
+		if relation.Schemaname == "" && relation.Relpersistence != "t" && schemaName == "pg_temp" {
+			continue
+		}
 		published, err := b.catalog.Resolve(ctx, model.NamespaceName{Kind: model.ObjectSchema, Name: schemaName})
 		if isMissingObject(err) {
 			continue
@@ -910,6 +940,18 @@ func ownedRelationObjects(ctx context.Context, snapshot CatalogSnapshot, descrip
 		if column.IdentitySequence != 0 {
 			ids = append(ids, column.IdentitySequence)
 		}
+	}
+	if err := snapshot.ScanNamespace(ctx, descriptor.Name().Parent, model.ObjectSequence, func(published catalog.PublishedDescriptor) error {
+		if published.Descriptor == nil || published.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		seqMeta, ok := published.Descriptor.Sequence()
+		if ok && seqMeta.OwnerTable == descriptor.ID() {
+			ids = append(ids, published.Descriptor.ID())
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	slices.Sort(ids)
 	ids = slices.Compact(ids)

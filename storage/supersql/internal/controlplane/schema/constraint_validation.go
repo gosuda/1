@@ -110,12 +110,17 @@ func (p *IndexPolicyProvider) ValidateConstraintWithIndexes(ctx context.Context,
 		}
 		policySpec := planningSpec
 		policyTable := *planningSpec.Table
+		policyTable.Columns = slices.Clone(planningSpec.Table.Columns)
 		policyTable.Constraints = []model.ConstraintDescriptor{constraint}
 		policyTable.Triggers = nil
 		for i := range policyTable.Columns {
-			policyTable.Columns[i].Nullable = true
-			if constraint.Kind == model.ConstraintNotNull && slices.Contains(constraint.Columns, policyTable.Columns[i].ID) {
-				policyTable.Columns[i].Nullable = false
+			col := &policyTable.Columns[i]
+			preserveNotNull := col.SystemIdentity || col.IdentitySequence != 0 || slices.ContainsFunc(policyTable.PrimaryKey, func(k model.KeyElement) bool { return k.Column == col.ID })
+			if !preserveNotNull {
+				col.Nullable = true
+			}
+			if constraint.Kind == model.ConstraintNotNull && slices.Contains(constraint.Columns, col.ID) {
+				col.Nullable = false
 			}
 		}
 		policySpec.Table = &policyTable

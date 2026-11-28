@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -51,6 +53,10 @@ type namedCursor struct {
 	metadataBytes     uint64
 	sealed            bool
 	failed            bool
+	currentOfSimple   bool
+	currentOfTable    string
+	currentOfRow      []model.Value
+	currentOfOnRow    bool
 }
 
 func cursorMetadataBytes(name, statement string) uint64 {
@@ -290,6 +296,19 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 		}
 		transactions.named.cursorSerial++
 		flags := declaration.Options
+		currentOfSimple := false
+		currentOfTable := ""
+		if sel := declaration.Query.GetSelectStmt(); sel != nil &&
+			sel.Op == zpgparse.SetOperation_SETOP_NONE &&
+			len(sel.FromClause) == 1 &&
+			len(sel.GroupClause) == 0 &&
+			len(sel.DistinctClause) == 0 &&
+			sel.HavingClause == nil {
+			if rv := sel.FromClause[0].GetRangeVar(); rv != nil && rv.Relname != "" {
+				currentOfSimple = true
+				currentOfTable = rv.Relname
+			}
+		}
 		cursor = &namedCursor{
 			name: declaration.Portalname, statement: statementSQL, createdAt: createdAt,
 			holdable: flags&cursorOptionHold != 0, binary: flags&cursorOptionBinary != 0,
@@ -298,6 +317,7 @@ func (transactions *Transactions) declareCursor(ctx context.Context, command bin
 			prepared: compiled, layouts: layouts, portal: portal, closeCapabilities: closeCapabilities, scope: scope, spool: spool, spoolQuery: spoolQuery,
 			metadataBytes: metadataBytes, batchRows: options.Environment.Limits.BatchRows,
 			batchBytes: options.Environment.Limits.BatchBytes,
+			currentOfSimple: currentOfSimple, currentOfTable: currentOfTable,
 		}
 		return nil
 	})
@@ -666,6 +686,11 @@ func (source *cursorFetchSource) Next(ctx context.Context, out *columnar.Batch) 
 	if source.remaining == 0 {
 		if !source.live {
 			source.cursor.position = source.boundary
+			total := int64(source.cursor.spool.Rows())
+			if source.boundary < 1 || source.boundary > total {
+				source.cursor.currentOfOnRow = false
+				source.cursor.currentOfRow = nil
+			}
 		}
 		return io.EOF
 	}
@@ -700,6 +725,11 @@ func (source *cursorFetchSource) Next(ctx context.Context, out *columnar.Batch) 
 	} else {
 		source.cursor.position = source.next - source.step
 	}
+	total := int64(source.cursor.spool.Rows())
+	source.cursor.currentOfOnRow = source.cursor.position >= 1 && source.cursor.position <= total && len(source.cursor.currentOfRow) > 0
+	if !source.cursor.currentOfOnRow {
+		source.cursor.currentOfRow = nil
+	}
 	return nil
 }
 
@@ -714,6 +744,8 @@ func (source *cursorFetchSource) nextLive(ctx context.Context, out *columnar.Bat
 		sealErr := source.cursor.spool.Seal(call)
 		source.cursor.sealed = sealErr == nil
 		source.cursor.position = int64(source.cursor.spool.Rows()) + 1
+		source.cursor.currentOfOnRow = false
+		source.cursor.currentOfRow = nil
 		source.remaining = 0
 		// Callers compare the end sentinel by identity; a joined io.EOF would
 		// surface as an error. Close and seal failures replace it.
@@ -730,6 +762,23 @@ func (source *cursorFetchSource) nextLive(ctx context.Context, out *columnar.Bat
 		return errors.Join(err, errPreparedInvocation)
 	}
 	rows := uint64(batch.Rows())
+	if rows > 0 {
+		lastLane := batch.Lane(batch.Rows() - 1)
+		rowCopy := make([]model.Value, len(batch.Columns))
+		copyOK := true
+		for i := range batch.Columns {
+			v, _, copyErr := columnar.CopyValue(call, &batch.Columns[i], lastLane, source.cursor.batchBytes)
+			if copyErr != nil {
+				copyOK = false
+				break
+			}
+			rowCopy[i] = v
+		}
+		if copyOK {
+			source.cursor.currentOfRow = rowCopy
+			source.cursor.currentOfOnRow = true
+		}
+	}
 	source.remaining -= rows
 	source.cursor.position += int64(rows)
 	source.cursor.lastMoved += rows
@@ -769,14 +818,95 @@ func (cursor *namedCursor) readRange(ctx context.Context, first, step int64, cou
 		}
 		positions[index] = position
 	}
-	for _, position := range positions {
+	for idx, position := range positions {
 		row, readErr := reader.Read(ctx, position)
 		if readErr != nil {
 			return readErr
+		}
+		if idx == len(positions)-1 {
+			cursor.currentOfRow = slices.Clone(row)
 		}
 		if appendErr := builder.Append(ctx, row); appendErr != nil {
 			return appendErr
 		}
 	}
 	return nil
+}
+
+// ResolveCurrentOf resolves WHERE CURRENT OF <cursor> for UPDATE/DELETE against
+// the session's open named cursors.
+func (transactions *Transactions) ResolveCurrentOf(cursorName string, target *model.Descriptor) (bind.CurrentOfRow, error) {
+	if transactions == nil {
+		return bind.CurrentOfRow{}, &model.Error{Code: "34000", Message: fmt.Sprintf("cursor %q does not exist", cursorName)}
+	}
+	cursor := transactions.named.cursors[cursorName]
+	if cursor == nil {
+		return bind.CurrentOfRow{}, &model.Error{Code: "34000", Message: fmt.Sprintf("cursor %q does not exist", cursorName)}
+	}
+	if cursor.transaction != nil && cursor.transaction != transactions.transaction {
+		return bind.CurrentOfRow{}, &model.Error{Code: "34000", Message: fmt.Sprintf("cursor %q does not exist", cursorName)}
+	}
+	if !cursor.currentOfSimple || target == nil || !strings.EqualFold(target.Name().Name, cursor.currentOfTable) {
+		tableName := ""
+		if target != nil {
+			tableName = target.Name().Name
+		}
+		return bind.CurrentOfRow{}, &model.Error{Code: "0A000", Message: fmt.Sprintf("cursor %q is not a simply updatable scan of table %q", cursorName, tableName)}
+	}
+	if !cursor.currentOfOnRow || len(cursor.currentOfRow) == 0 {
+		return bind.CurrentOfRow{}, &model.Error{Code: "55000", Message: fmt.Sprintf("cursor %q is not positioned on a row", cursorName)}
+	}
+	table, ok := target.Table()
+	if !ok {
+		return bind.CurrentOfRow{}, &model.Error{Code: "0A000", Message: fmt.Sprintf("cursor %q is not a simply updatable scan of table %q", cursorName, target.Name().Name)}
+	}
+	cursorCols := cursor.prepared.Columns()
+	if len(cursorCols) != len(cursor.currentOfRow) {
+		return bind.CurrentOfRow{}, &model.Error{Code: "55000", Message: fmt.Sprintf("cursor %q row layout mismatch", cursorName)}
+	}
+	colByName := make(map[string]int, len(cursorCols))
+	for i, c := range cursorCols {
+		if _, exists := colByName[c.Name]; !exists {
+			colByName[c.Name] = i
+		}
+	}
+	// Prefer matching non-system primary key columns if all are projected by the cursor.
+	var pkCols []model.ColumnID
+	var pkVals []model.Value
+	var pkLayouts []model.TypeLayout
+	allPKFound := len(table.PrimaryKey) > 0
+	for _, key := range table.PrimaryKey {
+		colIdx := slices.IndexFunc(table.Columns, func(c model.ColumnDescriptor) bool { return c.ID == key.Column })
+		if colIdx < 0 || table.Columns[colIdx].SystemIdentity {
+			allPKFound = false
+			break
+		}
+		col := table.Columns[colIdx]
+		pos, found := colByName[col.Name]
+		if !found {
+			allPKFound = false
+			break
+		}
+		pkCols = append(pkCols, col.ID)
+		pkVals = append(pkVals, cursor.currentOfRow[pos])
+		pkLayouts = append(pkLayouts, col.Layout)
+	}
+	if allPKFound && len(pkCols) > 0 {
+		return bind.CurrentOfRow{Columns: pkCols, Values: pkVals, Layouts: pkLayouts}, nil
+	}
+	var res bind.CurrentOfRow
+	for _, col := range table.Columns {
+		if col.State != model.StatePublic || col.SystemIdentity {
+			continue
+		}
+		if pos, found := colByName[col.Name]; found {
+			res.Columns = append(res.Columns, col.ID)
+			res.Values = append(res.Values, cursor.currentOfRow[pos])
+			res.Layouts = append(res.Layouts, col.Layout)
+		}
+	}
+	if len(res.Columns) == 0 {
+		return bind.CurrentOfRow{}, &model.Error{Code: "0A000", Message: fmt.Sprintf("cursor %q is not a simply updatable scan of table %q", cursorName, target.Name().Name)}
+	}
+	return res, nil
 }

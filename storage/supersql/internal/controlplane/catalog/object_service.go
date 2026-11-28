@@ -51,7 +51,103 @@ func (s *Store) ApplyObjectChanges(ctx context.Context, snapshot *CatalogSnapsho
 		changes = append(changes, change)
 		dependencies = append(dependencies, reads...)
 	}
+	ordered, err := s.objectDropOrder(ctx, snapshot, set.Drops, set.Cascade, set.MaxDescriptors)
+	if err != nil {
+		return nil, nil, err
+	}
+	dropped := make(map[model.ObjectID]bool, len(ordered))
+	for _, descriptor := range ordered {
+		dropped[descriptor.ID()] = true
+	}
+	requestedDrops := make(map[model.ObjectID]bool, len(set.Drops))
+	for _, descriptor := range set.Drops {
+		if descriptor != nil {
+			requestedDrops[descriptor.ID()] = true
+		}
+	}
+	effectiveUpdates := make([]ObjectUpdate, 0, len(set.Updates))
+	updateIndex := make(map[model.ObjectID]int, len(set.Updates))
 	for _, update := range set.Updates {
+		if update.Base != nil && dropped[update.Base.ID()] {
+			continue
+		}
+		if update.Base != nil {
+			updateIndex[update.Base.ID()] = len(effectiveUpdates)
+		}
+		effectiveUpdates = append(effectiveUpdates, update)
+	}
+	if set.Cascade && len(ordered) > len(set.Drops) {
+		type cascadedParent struct {
+			children map[model.ObjectID]bool
+		}
+		parentDrops := make(map[model.ObjectID]*cascadedParent)
+		for _, descriptor := range ordered {
+			if requestedDrops[descriptor.ID()] {
+				continue
+			}
+			table, ok := descriptor.Table()
+			if !ok || len(table.Parents) == 0 || table.PartitionState == model.PartitionDetachPending {
+				continue
+			}
+			for _, parentID := range table.Parents {
+				if dropped[parentID] {
+					continue
+				}
+				entry := parentDrops[parentID]
+				if entry == nil {
+					entry = &cascadedParent{children: make(map[model.ObjectID]bool)}
+					parentDrops[parentID] = entry
+				}
+				entry.children[descriptor.ID()] = true
+			}
+		}
+		if len(parentDrops) != 0 {
+			parentIDs := make([]model.ObjectID, 0, len(parentDrops))
+			for id := range parentDrops {
+				parentIDs = append(parentIDs, id)
+			}
+			slices.Sort(parentIDs)
+			for _, parentID := range parentIDs {
+				entry := parentDrops[parentID]
+				idx, hasExisting := updateIndex[parentID]
+				var base, current *model.Descriptor
+				if hasExisting {
+					base, current = effectiveUpdates[idx].Base, effectiveUpdates[idx].Next
+				} else {
+					published, resolveErr := snapshot.Descriptor(ctx, parentID)
+					if resolveErr != nil {
+						return nil, nil, resolveErr
+					}
+					base, current = published.Descriptor, published.Descriptor
+				}
+				spec, specErr := current.SpecWithin(ctx, s.limits.Descriptor)
+				if specErr != nil || spec.Table == nil || uint32(len(entry.children)) > spec.Table.InheritanceChildren {
+					if specErr != nil {
+						return nil, nil, specErr
+					}
+					return nil, nil, model.ErrInvalidDescriptor
+				}
+				nextTable := *spec.Table
+				nextTable.InheritanceChildren -= uint32(len(entry.children))
+				if nextTable.PartitionDefault != 0 && entry.children[nextTable.PartitionDefault] {
+					nextTable.PartitionDefault = 0
+				}
+				spec.Table = &nextTable
+				spec.Version = base.Version() + 1
+				nextDesc, descErr := model.NewDescriptor(ctx, spec, s.limits.Descriptor)
+				if descErr != nil {
+					return nil, nil, descErr
+				}
+				if hasExisting {
+					effectiveUpdates[idx].Next = nextDesc
+				} else {
+					updateIndex[parentID] = len(effectiveUpdates)
+					effectiveUpdates = append(effectiveUpdates, ObjectUpdate{Base: base, Next: nextDesc})
+				}
+			}
+		}
+	}
+	for _, update := range effectiveUpdates {
 		if update.Base == nil || update.Next == nil || !ordinaryObjectKind(update.Base.Kind()) || update.Base.Kind() != update.Next.Kind() || update.Base.ID() != update.Next.ID() || update.Next.Version() != update.Base.Version()+1 {
 			return nil, nil, model.ErrInvalidDescriptor
 		}
@@ -61,10 +157,6 @@ func (s *Store) ApplyObjectChanges(ctx context.Context, snapshot *CatalogSnapsho
 		}
 		changes = append(changes, change)
 		dependencies = append(dependencies, s.DescriptorDependency(update.Base.ID()))
-	}
-	ordered, err := s.objectDropOrder(ctx, snapshot, set.Drops, set.Cascade, set.MaxDescriptors)
-	if err != nil {
-		return nil, nil, err
 	}
 	for _, descriptor := range ordered {
 		change, err := s.Drop(ctx, snapshot, descriptor.ID(), descriptor.Version())
@@ -233,7 +325,9 @@ func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, reques
 			return nil
 		}
 		if visiting[id] {
-			return &model.Error{Code: "2BP01", Message: cycleMsg}
+			// Intra-target cycles (e.g. table <-> serial sequence or mutual FKs)
+			// are dropped atomically in the same MVCC transaction.
+			return nil
 		}
 		visiting[id] = true
 		for _, dependentID := range targetDependents[id] {
@@ -259,7 +353,7 @@ func (s *Store) dropOrder(ctx context.Context, snapshot *CatalogSnapshot, reques
 // neither is scanned: a nested trigger's routine dependency is recorded on its
 // parent descriptor, which is scanned here, so CASCADE closure still reaches
 // every dependent.
-var objectScanKinds = []model.ObjectKind{model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectRoutine, model.ObjectType, model.ObjectCompositeRelation, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectTextSearchTemplate, model.ObjectCast, model.ObjectOperator}
+var objectScanKinds = []model.ObjectKind{model.ObjectTable, model.ObjectIndex, model.ObjectSequence, model.ObjectView, model.ObjectMaterializedView, model.ObjectRoutine, model.ObjectType, model.ObjectCompositeRelation, model.ObjectTextSearchDictionary, model.ObjectTextSearchConfiguration, model.ObjectTextSearchTemplate, model.ObjectCast, model.ObjectOperator, model.ObjectCollation}
 
 // scanDescriptors walks the requested standalone descriptor kinds under every
 // published schema, enforcing the shared scan budget and reporting limitMsg on

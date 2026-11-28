@@ -90,7 +90,8 @@ func bindCreateCollation(ctx context.Context, statement *zpgparse.DefineStmt, sn
 		return nil, err
 	}
 
-	provider := "icu"
+	provider := "libc"
+	providerSet := false
 	locale := ""
 	deterministic := true
 	hasFrom := false
@@ -116,6 +117,7 @@ func bindCreateCollation(ctx context.Context, statement *zpgparse.DefineStmt, sn
 			}
 			provider, locale, deterministic = srcProvider, srcLocale, srcDet
 		case "provider":
+			providerSet = true
 			p := strings.ToLower(strings.TrimSpace(defElemString(def.Arg)))
 			if p != "icu" && p != "builtin" && p != "libc" {
 				return nil, bindError("22023", fmt.Sprintf("unrecognized collation provider %q", p), 0)
@@ -135,6 +137,10 @@ func bindCreateCollation(ctx context.Context, statement *zpgparse.DefineStmt, sn
 		default:
 			return nil, bindError("42601", fmt.Sprintf("collation option %q not recognized", def.Defname), int(def.Location)+1)
 		}
+	}
+
+	if !hasFrom && !providerSet {
+		return nil, unsupported(LocaleProviders, 0)
 	}
 
 	if !hasFrom && locale == "" {

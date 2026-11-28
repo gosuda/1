@@ -195,11 +195,18 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 			}
 			metadata.OpClass = resolvedOpClass
 			dependencies = appendIndexDependency(dependencies, model.Dependency{Object: table.ID(), Version: table.Version(), Column: col.ID})
+			var ginOpClassOID model.OID
+			if class, ok := builtin.LookupOperatorClassName("gin", resolvedOpClass); ok {
+				ginOpClassOID = class.ID
+			} else if defOID, defErr := b.defaultIndexOperatorClass("gin", col.Layout); defErr == nil {
+				ginOpClassOID = defOID
+			}
 			key := model.KeyElement{
-				Column:    col.ID,
-				Type:      col.Layout.Type,
-				Children:  col.Layout.Children,
-				Collation: col.Layout.Type.Collation,
+				Column:        col.ID,
+				Type:          col.Layout.Type,
+				Children:      col.Layout.Children,
+				Collation:     col.Layout.Type.Collation,
+				OperatorClass: ginOpClassOID,
 			}
 			metadata.Keys = append(metadata.Keys, key)
 			continue
@@ -270,6 +277,11 @@ func BindCreateIndex(ctx context.Context, statement *zpgparse.IndexStmt, snapsho
 				return nil, typeErr
 			}
 			key.OperatorClass, err = indexOperatorClass(operatorType, elem.Opclass)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			key.OperatorClass, err = b.defaultIndexOperatorClass("btree", layout)
 			if err != nil {
 				return nil, err
 			}

@@ -60,6 +60,7 @@ type PartitionPlan struct {
 	byObject     map[model.ObjectID]int
 	rootColumns  []model.ColumnDescriptor
 	inputColumns []model.ColumnDescriptor
+	inputToRoot  []int
 	keyColumns   []int
 	expressions  []txn.ValueExpression
 	keyValues    []model.Value
@@ -83,14 +84,22 @@ func NewPartitionPlan(ctx context.Context, options PartitionPlanOptions) (*Parti
 	if !ok || len(inputTable.Columns) != len(root.Columns) {
 		return nil, storage.ErrInvalidLayout
 	}
-	for i := range root.Columns {
-		left, right := root.Columns[i], inputTable.Columns[i]
-		if left.SystemIdentity != right.SystemIdentity || !model.TypeLayoutsEqual(left.Layout, right.Layout) ||
-			!left.SystemIdentity && left.Name != right.Name {
+	inputToRoot := make([]int, len(inputTable.Columns))
+	matchedRoot := make([]bool, len(root.Columns))
+	for i, right := range inputTable.Columns {
+		rootIndex := slices.IndexFunc(root.Columns, func(left model.ColumnDescriptor) bool {
+			if left.SystemIdentity || right.SystemIdentity {
+				return left.SystemIdentity && right.SystemIdentity && model.TypeLayoutsEqual(left.Layout, right.Layout)
+			}
+			return left.Name == right.Name && model.TypeLayoutsEqual(left.Layout, right.Layout)
+		})
+		if rootIndex < 0 || matchedRoot[rootIndex] {
 			return nil, storage.ErrInvalidLayout
 		}
+		matchedRoot[rootIndex] = true
+		inputToRoot[i] = rootIndex
 	}
-	plan := &PartitionPlan{root: options.Root, rootColumns: slices.Clone(root.Columns), inputColumns: slices.Clone(inputTable.Columns), byObject: make(map[model.ObjectID]int)}
+	plan := &PartitionPlan{root: options.Root, rootColumns: slices.Clone(root.Columns), inputColumns: slices.Clone(inputTable.Columns), inputToRoot: inputToRoot, byObject: make(map[model.ObjectID]int)}
 	inputPhysical := input.Physical()
 	plan.inputTarget = storage.ObjectRef{ObjectID: input.ID(), DescriptorVersion: input.Version(), Generation: inputPhysical.Generation, EncodingVersion: inputPhysical.EncodingVersion}
 	if err := plan.inputTarget.Validate(); err != nil {
@@ -273,8 +282,11 @@ func (p *PartitionPlan) addLevel(ctx context.Context, parent *model.Descriptor, 
 				}
 				return candidate.Name == column.Name && model.TypeLayoutsEqual(candidate.Layout, column.Layout)
 			})
-			if rootIndex < 0 || rootIndex != j {
+			if rootIndex < 0 {
 				return nil, storage.ErrInvalidLayout
+			}
+			if rootIndex != j {
+				p.sourceImage = true
 			}
 			child.childToRoot[j], child.rootToChild[rootIndex] = rootIndex, column.ID
 		}
@@ -419,7 +431,14 @@ func (p *PartitionPlan) WorkspaceBytes() uint64 {
 func (p *PartitionPlan) mapColumns(child *partitionChild, columns []model.ColumnID) ([]model.ColumnID, error) {
 	mapped := make([]model.ColumnID, len(columns))
 	for i, id := range columns {
-		root := slices.IndexFunc(p.inputColumns, func(column model.ColumnDescriptor) bool { return column.ID == id })
+		inputPos := slices.IndexFunc(p.inputColumns, func(column model.ColumnDescriptor) bool { return column.ID == id })
+		if inputPos < 0 {
+			return nil, storage.ErrInvalidLayout
+		}
+		root := inputPos
+		if len(p.inputToRoot) == len(p.inputColumns) {
+			root = p.inputToRoot[inputPos]
+		}
 		if root < 0 || root >= len(child.rootToChild) {
 			return nil, storage.ErrInvalidLayout
 		}
@@ -558,6 +577,20 @@ func (p *PartitionPlan) PrepareInsert(ctx context.Context, transaction Transacti
 		_ = normalized.Close()
 		return nil, nil, model.Row{}, err
 	}
+	reordered := false
+	for i, rootIdx := range p.inputToRoot {
+		if i != rootIdx {
+			reordered = true
+			break
+		}
+	}
+	if reordered {
+		rootVals := make([]model.Value, len(p.rootColumns))
+		for i, rootIdx := range p.inputToRoot {
+			rootVals[rootIdx] = logical.Values[i]
+		}
+		logical.Values = rootVals
+	}
 	selected, err := p.Route(ctx, logical.Values, expressions)
 	if err != nil {
 		clear(logical.Values)
@@ -596,9 +629,8 @@ func (p *PartitionPlan) PrepareInsert(ctx context.Context, transaction Transacti
 		}
 		return nil, nil, model.Row{}, logicalpartition.ErrNoPartition
 	}
-	logical.Key, physical.Key = physical.Key, nil
-	clear(physical.Values)
-	return candidate, selected, logical, nil
+	clear(logical.Values)
+	return candidate, selected, physical, nil
 }
 
 func partitionExpressions(options Options) model.ExpressionRuntime {

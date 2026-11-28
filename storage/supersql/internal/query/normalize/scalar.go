@@ -399,7 +399,9 @@ func (n *normalizer) foldError(err error) {
 	}
 	var missing *builtin.MissingImplementationError
 	var unknown *builtin.UnknownFunctionError
-	if errors.As(err, &missing) || errors.As(err, &unknown) || errors.Is(err, builtin.ErrTypeBindingRequired) {
+	var sqlErr *model.Error
+	if errors.As(err, &missing) || errors.As(err, &unknown) || errors.Is(err, builtin.ErrTypeBindingRequired) ||
+		(errors.As(err, &sqlErr) && sqlErr.Code == "55000") {
 		return
 	}
 	n.err = err

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
+	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
 )
 
@@ -157,7 +158,23 @@ func (b *binder) declarationColumnType(raw *zpgparse.TypeName) (model.TypeLayout
 		}
 	}
 	layout, err := b.typeName(raw)
-	return layout, false, err
+	if err != nil {
+		return model.TypeLayout{}, false, err
+	}
+	if err := rejectPseudoColumnType(layout.Type.ID, int(raw.Location)+1); err != nil {
+		return model.TypeLayout{}, false, err
+	}
+	return layout, false, nil
+}
+
+func rejectPseudoColumnType(id model.TypeID, pos int) error {
+	if model.IsPseudoTypeID(id) {
+		return bindError("42P16", "column has pseudo-type", pos)
+	}
+	if info, ok := builtin.LookupType(id); ok && info.Kind == 'p' {
+		return bindError("42P16", "column has pseudo-type "+info.Name, pos)
+	}
+	return nil
 }
 
 func (s *declarationState) ownedSequences(spec model.DescriptorSpec, serials map[model.ColumnID]bool, constraints []tableConstraint, defaults map[model.ColumnID]*zpgparse.Node) ([]*BoundSequenceDefinition, []tableConstraint, error) {

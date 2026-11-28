@@ -314,7 +314,7 @@ func (e *expressionCursor) SampleUnit(lane uint32) (uint64, bool) {
 	if !ok || e.gather != nil {
 		return 0, false
 	}
-	if e.state != nil && !e.filter && e.projection == nil {
+	if !e.filter && e.projection == nil {
 		if uint64(lane) >= uint64(e.source.Rows()) {
 			return 0, false
 		}

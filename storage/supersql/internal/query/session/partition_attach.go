@@ -968,6 +968,9 @@ func (transactions *Transactions) scanPartitionAttachment(ctx context.Context, r
 	parentTable, parentOK := parent.Table()
 	childTable, childOK := child.Table()
 	options := invocation.Execution.Environment.Modify
+	if options.Query == nil {
+		options.Query = invocation.Execution.Environment.Query
+	}
 	if !parentOK || !childOK || reader == nil || compiler == nil || normalizer == nil || options.Query == nil || options.BatchRows <= 0 || options.MaxRows == 0 || options.MaxRecordBytes == 0 ||
 		(router != nil) != (expectedTarget != 0) {
 		return 0, errPreparedInvocation

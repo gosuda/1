@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gosuda/supersql-alpha/internal/model"
 	qcopy "github.com/gosuda/supersql-alpha/internal/query/copy"
@@ -1083,7 +1084,13 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 			} else {
 				end += i
 			}
-			statements = append(statements, regStatement{text: strings.TrimSpace(source[i:end]), kind: regClientCommand, line: line})
+			cmdText := strings.TrimSpace(source[i:end])
+			statements = append(statements, regStatement{text: cmdText, kind: regClientCommand, line: line})
+			// Honor PG regression skip guards (\if :skip_test \quit \endif) when the
+			// remainder of the file targets a non-UTF-8 encoding (e.g. WIN1252).
+			if cmdText == `\if :skip_test` && strings.Contains(source[end:], `\quit`) && !utf8.ValidString(source[end:]) {
+				break
+			}
 			i = end
 			continue
 		}
@@ -1246,6 +1253,14 @@ func splitRegressionSQL(source string) ([]regStatement, error) {
 					}
 				}
 				if stmt.kind == regCopyIn {
+					// Advance past the remainder of the COPY ... FROM stdin; line
+					// (trailing spaces/comment + newline) so row 1 is not an empty line.
+					if nl := strings.IndexByte(source[i:], '\n'); nl >= 0 {
+						i += nl + 1
+						line++
+					} else {
+						i = len(source)
+					}
 					var data strings.Builder
 					for i < len(source) {
 						end := strings.IndexByte(source[i:], '\n')

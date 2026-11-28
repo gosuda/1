@@ -65,6 +65,9 @@ func (transaction *Transaction) AdmitCreatedTarget(ctx context.Context, normaliz
 			// the identical target again is a no-op.
 			return nil
 		}
+		if normalizer.target.DescriptorVersion > cached.layout.Target.DescriptorVersion {
+			continue
+		}
 		return storage.ErrInvalidTarget
 	}
 	if err := transaction.lockWriteIntent(operation, normalizer.target); err != nil {

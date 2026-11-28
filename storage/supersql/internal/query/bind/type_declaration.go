@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/zpgparse"
@@ -424,6 +425,9 @@ func bindCreateDomain(ctx context.Context, statement *zpgparse.CreateDomainStmt,
 	}
 	baseLayout, err := state.b.typeName(statement.TypeName)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectPseudoColumnType(baseLayout.Type.ID, int(statement.TypeName.Location)+1); err != nil {
 		return nil, err
 	}
 	if statement.CollClause != nil {
@@ -1189,8 +1193,8 @@ func bindAlterDomain(ctx context.Context, statement *zpgparse.AlterDomainStmt, s
 		}
 	case "C":
 		raw := statement.Def.GetConstraint()
-		if raw == nil || raw.Contype != zpgparse.ConstrType_CONSTR_CHECK || raw.RawExpr == nil {
-			return nil, bindError("42601", "ALTER DOMAIN ADD requires CHECK", 0)
+		if raw == nil || (raw.Contype != zpgparse.ConstrType_CONSTR_CHECK && raw.Contype != zpgparse.ConstrType_CONSTR_NOTNULL) {
+			return nil, bindError("42601", "ALTER DOMAIN ADD requires CHECK or NOT NULL", 0)
 		}
 		if err := ordinaryDomainConstraint(raw); err != nil {
 			return nil, err
@@ -1199,6 +1203,32 @@ func bindAlterDomain(ctx context.Context, statement *zpgparse.AlterDomainStmt, s
 			if existing.Name == raw.Conname && raw.Conname != "" {
 				return nil, bindError("42710", "domain constraint already exists", 0)
 			}
+		}
+		if raw.Contype == zpgparse.ConstrType_CONSTR_NOTNULL {
+			if raw.SkipValidation {
+				return nil, bindError("0A000", "NOT VALID NOT NULL domain constraints are not supported", 0)
+			}
+			if !metadata.NotNull || !slices.ContainsFunc(metadata.Constraints, func(constraint model.ConstraintDescriptor) bool { return constraint.Kind == model.ConstraintNotNull }) {
+				id, oid, allocateErr := state.allocate()
+				if allocateErr != nil {
+					return nil, allocateErr
+				}
+				name := raw.Conname
+				if name == "" {
+					reserved := make(map[string]bool, len(metadata.Constraints))
+					for _, existing := range metadata.Constraints {
+						reserved[existing.Name] = true
+					}
+					name = domainNotNullConstraintName(base.Name().Name, reserved)
+				}
+				metadata.Constraints = append(metadata.Constraints, model.ConstraintDescriptor{ID: id, OID: oid, Name: name, Kind: model.ConstraintNotNull, Enforced: true, Validated: true})
+				metadata.NotNull = true
+				domainValidation = id
+			}
+			break
+		}
+		if raw.RawExpr == nil {
+			return nil, bindError("42601", "ALTER DOMAIN ADD CHECK requires an expression", 0)
 		}
 		id, oid, allocateErr := state.allocate()
 		if allocateErr != nil {
@@ -1420,8 +1450,216 @@ func bindAlterComposite(ctx context.Context, statement *zpgparse.AlterTableStmt,
 	if relation != nil {
 		updates = append(updates, *relation)
 	}
+	domainUpdates, err := cascadeCompositeAlterToDomains(ctx, b, snapshot, options, base, repaired)
+	if err != nil {
+		return nil, err
+	}
+	updates = append(updates, domainUpdates...)
 
 	return &BoundTypeCommand{updates: updates, dependencies: b.dependencies, warnings: b.warnings, tag: "ALTER TYPE", cascade: cascade}, nil
+}
+
+type descriptorOverlaySnapshot struct {
+	base    CatalogSnapshot
+	byID    map[model.ObjectID]catalog.PublishedDescriptor
+	byName  map[model.NamespaceName]catalog.PublishedDescriptor
+}
+
+func (o *descriptorOverlaySnapshot) Timestamp() model.Timestamp { return o.base.Timestamp() }
+
+func (o *descriptorOverlaySnapshot) Descriptor(ctx context.Context, id model.ObjectID) (catalog.PublishedDescriptor, error) {
+	if pub, ok := o.byID[id]; ok {
+		return pub, nil
+	}
+	return o.base.Descriptor(ctx, id)
+}
+
+func (o *descriptorOverlaySnapshot) Resolve(ctx context.Context, name model.NamespaceName) (catalog.PublishedDescriptor, error) {
+	if pub, ok := o.byName[name]; ok {
+		return pub, nil
+	}
+	return o.base.Resolve(ctx, name)
+}
+
+func (o *descriptorOverlaySnapshot) ScanNamespace(ctx context.Context, parent model.ObjectID, kind model.ObjectKind, visit func(catalog.PublishedDescriptor) error) error {
+	return o.base.ScanNamespace(ctx, parent, kind, func(pub catalog.PublishedDescriptor) error {
+		if pub.Descriptor != nil {
+			if replacement, ok := o.byID[pub.Descriptor.ID()]; ok {
+				return visit(replacement)
+			}
+		}
+		return visit(pub)
+	})
+}
+
+func replaceCompositeLayout(layout model.TypeLayout, targetOID model.TypeID, replacement model.TypeLayout) (model.TypeLayout, bool) {
+	if layout.Type.ID == targetOID {
+		next := replacement
+		next.Type.Modifier = layout.Type.Modifier
+		next.Type.Collation = layout.Type.Collation
+		return next, true
+	}
+	changed := false
+	var children []model.TypeLayout
+	for i, child := range layout.Children {
+		updated, childChanged := replaceCompositeLayout(child, targetOID, replacement)
+		if childChanged {
+			if children == nil {
+				children = slices.Clone(layout.Children)
+			}
+			children[i] = updated
+			changed = true
+		}
+	}
+	if !changed {
+		return layout, false
+	}
+	layout.Children = children
+	return layout, true
+}
+
+func cascadeCompositeAlterToDomains(ctx context.Context, b *binder, snapshot CatalogSnapshot, options CreateDeclarationOptions, base, nextComposite *model.Descriptor) ([]TypeMutation, error) {
+	nextSpec, err := nextComposite.SpecWithin(ctx, options.Descriptors)
+	if err != nil || nextSpec.Type == nil {
+		return nil, err
+	}
+	targetOID := model.TypeID(base.OID())
+	replacementLayout := nextSpec.Type.Layout
+	var allDomains []*model.Descriptor
+	err = snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaPub catalog.PublishedDescriptor) error {
+		if schemaPub.Descriptor == nil || schemaPub.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		return snapshot.ScanNamespace(ctx, schemaPub.Descriptor.ID(), model.ObjectType, func(pub catalog.PublishedDescriptor) error {
+			d := pub.Descriptor
+			if d == nil || d.State() != model.StatePublic || d.ID() == base.ID() {
+				return nil
+			}
+			t, ok := d.DeclaredType()
+			if ok && t.DeclaredKind() == model.TypeKindDomain {
+				allDomains = append(allDomains, d)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	overlay := &descriptorOverlaySnapshot{
+		base:   snapshot,
+		byID:   map[model.ObjectID]catalog.PublishedDescriptor{base.ID(): {Descriptor: nextComposite}},
+		byName: map[model.NamespaceName]catalog.PublishedDescriptor{nextComposite.Name(): {Descriptor: nextComposite}},
+	}
+	// Fixed-point loop to handle domains over domains over composites.
+	updatedByOID := map[model.TypeID]model.TypeLayout{targetOID: replacementLayout}
+	updatedVersions := map[model.ObjectID]uint64{base.ID(): nextComposite.Version()}
+	updatedSet := map[model.ObjectID]bool{}
+	var mutations []TypeMutation
+	for progress := true; progress; {
+		progress = false
+		for _, domainDesc := range allDomains {
+			if updatedSet[domainDesc.ID()] {
+				continue
+			}
+			spec, specErr := domainDesc.SpecWithin(ctx, options.Descriptors)
+			if specErr != nil || spec.Type == nil {
+				return nil, specErr
+			}
+			newBase := spec.Type.BaseLayout
+			newLayout := spec.Type.Layout
+			changed := false
+			for oid, repl := range updatedByOID {
+				if nb, ok := replaceCompositeLayout(newBase, oid, repl); ok {
+					newBase = nb
+					changed = true
+				}
+				if nl, ok := replaceCompositeLayout(newLayout, oid, repl); ok {
+					newLayout = nl
+					changed = true
+				}
+			}
+			if !changed {
+				continue
+			}
+			// Mirror updated base composite children onto direct composite domains.
+			if newBase.Type.Storage == model.TypeComposite && newLayout.Type.Storage == model.TypeComposite {
+				newLayout.Children = slices.Clone(newBase.Children)
+			}
+			b.dependency(domainDesc, 0)
+			// Build provisional domain descriptor carrying the updated composite layout
+			// so RedefineDomainCheck validates against newBase and nextDomain.Version().
+			provisional, mutErr := nextTypeDescriptor(ctx, domainDesc, options, func(s *model.DescriptorSpec) error {
+				meta := *s.Type
+				meta.BaseLayout = newBase
+				meta.Layout = newLayout
+				s.Type = &meta
+				for objID, version := range updatedVersions {
+					if slices.ContainsFunc(s.Dependencies, func(dep model.Dependency) bool { return dep.Object == objID }) {
+						s.Dependencies = replaceTypeDependency(s.Dependencies, objID, version)
+					}
+				}
+				return nil
+			})
+			if mutErr != nil {
+				return nil, mutErr
+			}
+			// Re-validate and re-bind every CHECK constraint against the updated composite layout.
+			updatedConstraints := slices.Clone(spec.Type.Constraints)
+			var extraDeps []model.Dependency
+			for i := range updatedConstraints {
+				c := &updatedConstraints[i]
+				if c.Kind != model.ConstraintCheck || c.Expression == nil {
+					continue
+				}
+				def, deps, checkErr := RedefineDomainCheck(ctx, c.Expression, provisional, c.ID, newBase, overlay, options.Bind)
+				if checkErr != nil {
+					return nil, bindError("2BP01", "cannot alter type because a domain constraint depends on it", 0)
+				}
+				c.Expression = def
+				extraDeps = append(extraDeps, externalTypeDependencies(deps, domainDesc.ID())...)
+			}
+			nextDomain := provisional
+			if len(updatedConstraints) != 0 {
+				nextDomain, mutErr = nextTypeDescriptor(ctx, domainDesc, options, func(s *model.DescriptorSpec) error {
+					meta := *s.Type
+					meta.BaseLayout = newBase
+					meta.Layout = newLayout
+					meta.Constraints = updatedConstraints
+					s.Type = &meta
+					for objID, version := range updatedVersions {
+						if slices.ContainsFunc(s.Dependencies, func(dep model.Dependency) bool { return dep.Object == objID }) {
+							s.Dependencies = replaceTypeDependency(s.Dependencies, objID, version)
+						}
+					}
+					if len(extraDeps) != 0 {
+						s.Dependencies = typeDependencies(s.Dependencies, extraDeps...)
+					}
+					return nil
+				})
+				if mutErr != nil {
+					return nil, mutErr
+				}
+			}
+			mutations = append(mutations, TypeMutation{Base: domainDesc, Next: nextDomain})
+			overlay.byID[domainDesc.ID()] = catalog.PublishedDescriptor{Descriptor: nextDomain}
+			overlay.byName[nextDomain.Name()] = catalog.PublishedDescriptor{Descriptor: nextDomain}
+			updatedByOID[model.TypeID(domainDesc.OID())] = newLayout
+			updatedVersions[domainDesc.ID()] = nextDomain.Version()
+			updatedSet[domainDesc.ID()] = true
+			progress = true
+			arrayMut, arrErr := companionArrayMutation(ctx, b, snapshot, options, nextDomain)
+			if arrErr != nil {
+				return nil, arrErr
+			}
+			if arrayMut != nil {
+				mutations = append(mutations, *arrayMut)
+				overlay.byID[arrayMut.Base.ID()] = catalog.PublishedDescriptor{Descriptor: arrayMut.Next}
+				overlay.byName[arrayMut.Next.Name()] = catalog.PublishedDescriptor{Descriptor: arrayMut.Next}
+				updatedVersions[arrayMut.Base.ID()] = arrayMut.Next.Version()
+			}
+		}
+	}
+	return mutations, nil
 }
 
 func bindDropTypes(ctx context.Context, statement *zpgparse.DropStmt, snapshot CatalogSnapshot, options CreateDeclarationOptions) (*BoundTypeCommand, error) {

@@ -49,6 +49,49 @@ func (b *binder) nativeRangeFunction(item rangeFunctionCall, alias *zpgparse.Ali
 	return b.rowSourceRelation(value, item.definitions, alias, item.parts[len(item.parts)-1], ordinality, s, position, true)
 }
 
+func (b *binder) scalarRangeFunction(item rangeFunctionCall, alias *zpgparse.Alias, ordinality bool, s *scope, signature builtin.Signature, args []expression, expandVariadic bool) (relation, error) {
+	position := int(item.call.Location) + 1
+	var value expression
+	var err error
+	if signature.Variadic == 2276 {
+		value, err = b.invokeVariadic(s, signature, args, item.call.FuncVariadic, position)
+	} else if signature.Variadic != 0 {
+		value, err = b.invokeTypedVariadic(s, signature, args, expandVariadic, position)
+	} else {
+		value, err = b.invoke(s, signature, 0, args, ir.Call, 0, position)
+	}
+	if err != nil {
+		return relation{}, err
+	}
+	name := item.parts[len(item.parts)-1]
+	expandComposite := true
+	if parameters, ok := builtin.LookupFunctionParameters(signature.ID); ok && parameters.HasAllArgumentTypes() && parameters.HasAllArgumentModes() {
+		var outNames []string
+		var outChildren []model.TypeLayout
+		for i := range parameters.AllArgumentCount() {
+			typeID, mode, paramName, valid := parameters.AllArgument(i)
+			if !valid || (mode != 'o' && mode != 'b' && mode != 't') {
+				continue
+			}
+			if paramName == "" {
+				paramName = name
+			}
+			outNames = append(outNames, paramName)
+			outChildren = append(outChildren, b.primitive(typeID))
+		}
+		if len(outChildren) == 1 {
+			if alias == nil && outNames[0] != "" {
+				name = outNames[0]
+			}
+			expandComposite = false
+		} else if len(outChildren) > 1 && value.typ.Type.ID == 2249 && len(value.typ.Children) == 0 {
+			value.typ.FieldNames = outNames
+			value.typ.Children = outChildren
+		}
+	}
+	return b.rowSourceRelation(value, item.definitions, alias, name, ordinality, s, position, expandComposite)
+}
+
 // rowSourceRelation builds the generic row-source relation a FROM-clause call
 // becomes: each emitted value is one scalar column unless expandComposite says
 // a composite result spreads its fields across output columns. PostgreSQL lets

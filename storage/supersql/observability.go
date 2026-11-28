@@ -371,7 +371,7 @@ func (database *Catalog) runAutoAnalyze(ctx context.Context) (int, error) {
 	if len(due) == 0 {
 		return 0, nil
 	}
-	ctx = withInternalQuery(ctx)
+	ctx = txn.WithNonWounding(withInternalQuery(ctx))
 	scope, err := database.newSession(ctx)
 	if err != nil {
 		return 0, err
@@ -383,7 +383,7 @@ func (database *Catalog) runAutoAnalyze(ctx context.Context) (int, error) {
 		if err := ctx.Err(); err != nil {
 			return analyzed, err
 		}
-		stmtSQL := fmt.Sprintf("ANALYZE %s.%s", quoteIdent(target.schema), quoteIdent(target.table))
+		stmtSQL := fmt.Sprintf("ANALYZE (SKIP_LOCKED) %s.%s", quoteIdent(target.schema), quoteIdent(target.table))
 		parsed, err := scope.txns.Parse(ctx, stmtSQL, zpgparse.ParseOptions{AllowSystemTime: true, AllowOnlineDDL: true})
 		if err != nil {
 			return analyzed, err

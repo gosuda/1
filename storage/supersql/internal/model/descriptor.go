@@ -297,11 +297,21 @@ type CollationMetadata struct {
 	Deterministic bool
 }
 
+type RoleMembership struct {
+	Role          string `json:"role"`
+	Grantor       string `json:"grantor,omitempty"`
+	AdminOption   bool   `json:"admin,omitempty"`
+	InheritOption bool   `json:"inherit,omitempty"`
+	SetOption     bool   `json:"set,omitempty"`
+}
+
 type RoleMetadata struct {
-	Superuser bool
-	BypassRLS bool
-	CanLogin  bool     `json:",omitempty"`
-	MemberOf  []string `json:",omitempty"` // normalized lower-case role names
+	Superuser   bool
+	BypassRLS   bool
+	CanLogin    bool             `json:",omitempty"`
+	NoInherit   bool             `json:",omitempty"`
+	MemberOf    []string         `json:",omitempty"` // normalized lower-case role names
+	Memberships []RoleMembership `json:",omitempty"`
 }
 
 type PolicyDescriptor struct {

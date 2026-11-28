@@ -243,27 +243,108 @@ func (named *sessionNamedObjects) finishTemporary(committed bool) {
 	named.temporaryMarks = named.temporaryMarks[:0]
 }
 
-func (named *sessionNamedObjects) applyTemporaryCommand(bound *bind.BoundObjectCommand) error {
+func (named *sessionNamedObjects) applyTemporaryCommand(ctx context.Context, bound *bind.BoundObjectCommand, limits model.DescriptorLimits) ([]*model.Descriptor, error) {
 	mark := len(named.temporaryChanges)
-	for _, descriptor := range bound.Drops() {
+	drops := bound.Drops()
+	if len(drops) != 0 {
+		expanded, err := named.planTemporaryDrops(ctx, drops, bound.Cascade(), limits)
+		if err != nil {
+			named.rollbackTemporary(mark)
+			return nil, err
+		}
+		drops = expanded
+	}
+	for _, descriptor := range drops {
 		if err := named.dropTemporary(descriptor); err != nil {
 			named.rollbackTemporary(mark)
-			return err
+			return nil, err
 		}
 	}
 	for _, update := range bound.Updates() {
 		if err := named.setTemporary(update.Next); err != nil {
 			named.rollbackTemporary(mark)
-			return err
+			return nil, err
 		}
 	}
 	for _, descriptor := range bound.Creates() {
 		if err := named.setTemporary(descriptor); err != nil {
 			named.rollbackTemporary(mark)
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return drops, nil
+}
+
+func (named *sessionNamedObjects) planTemporaryDrops(ctx context.Context, requested []*model.Descriptor, cascade bool, limits model.DescriptorLimits) ([]*model.Descriptor, error) {
+	targets := make(map[model.ObjectID]*model.Descriptor, len(requested))
+	for _, d := range requested {
+		if d != nil {
+			targets[d.ID()] = d
+		}
+	}
+	dependents := make(map[model.ObjectID][]*model.Descriptor)
+	for _, d := range named.temporaryDescriptors() {
+		id := d.ID()
+		inTargets := targets[id] != nil
+		spec, err := d.SpecWithin(ctx, limits)
+		if err != nil {
+			return nil, err
+		}
+		checkDep := func(depID model.ObjectID) error {
+			if depID == 0 || depID == id {
+				return nil
+			}
+			if !inTargets && !cascade && targets[depID] != nil {
+				return &model.Error{Code: "2BP01", Message: "cannot drop object because other objects depend on it"}
+			}
+			dependents[depID] = append(dependents[depID], d)
+			return nil
+		}
+		if d.Name().Parent != 0 {
+			if err := checkDep(d.Name().Parent); err != nil {
+				return nil, err
+			}
+		}
+		if dt, ok := d.DeclaredType(); ok && dt.Relation != 0 {
+			if err := checkDep(dt.Relation); err != nil {
+				return nil, err
+			}
+		}
+		for _, dep := range spec.Dependencies {
+			if err := checkDep(dep.Object); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if cascade {
+		queue := make([]model.ObjectID, 0, len(targets))
+		for id := range targets {
+			queue = append(queue, id)
+		}
+		slices.Sort(queue)
+		for head := 0; head < len(queue); head++ {
+			for _, child := range dependents[queue[head]] {
+				if targets[child.ID()] == nil {
+					targets[child.ID()] = child
+					queue = append(queue, child.ID())
+				}
+			}
+		}
+	}
+	result := make([]*model.Descriptor, 0, len(targets))
+	for _, d := range targets {
+		result = append(result, d)
+	}
+	slices.SortFunc(result, func(a, b *model.Descriptor) int {
+		if a.ID() < b.ID() {
+			return -1
+		}
+		if a.ID() > b.ID() {
+			return 1
+		}
+		return 0
+	})
+	return result, nil
 }
 
 func (named *sessionNamedObjects) applyTemporaryDeclaration(bound *bind.BoundDeclaration) error {
@@ -356,16 +437,16 @@ func temporaryObjectNode(node *zpgparse.Node) bool {
 		return false
 	}
 	if create := node.GetCreateStmt(); create != nil && create.Relation != nil {
-		return create.Relation.Relpersistence == "t"
+		return create.Relation.Relpersistence == "t" || create.Relation.Schemaname == temporarySchemaName
 	}
 	if create := node.GetCreateTableAsStmt(); create != nil && create.Into != nil && create.Into.Rel != nil {
-		return create.Into.Rel.Relpersistence == "t"
+		return create.Into.Rel.Relpersistence == "t" || create.Into.Rel.Schemaname == temporarySchemaName
 	}
 	if create := node.GetViewStmt(); create != nil && create.View != nil {
-		return create.View.Relpersistence == "t"
+		return create.View.Relpersistence == "t" || create.View.Schemaname == temporarySchemaName
 	}
 	if create := node.GetCreateSeqStmt(); create != nil && create.Sequence != nil {
-		return create.Sequence.Relpersistence == "t"
+		return create.Sequence.Relpersistence == "t" || create.Sequence.Schemaname == temporarySchemaName
 	}
 	return false
 }
@@ -375,6 +456,7 @@ func qualifyTemporaryObject(node *zpgparse.Node) error {
 		if create.Relation.Schemaname != "" && create.Relation.Schemaname != temporarySchemaName {
 			return &model.Error{Code: "42P16", Message: "temporary relation cannot be created in a permanent schema"}
 		}
+		create.Relation.Relpersistence = "t"
 		create.Relation.Schemaname = temporarySchemaName
 		return nil
 	}
@@ -382,6 +464,7 @@ func qualifyTemporaryObject(node *zpgparse.Node) error {
 		if create.Into.Rel.Schemaname != "" && create.Into.Rel.Schemaname != temporarySchemaName {
 			return &model.Error{Code: "42P16", Message: "temporary relation cannot be created in a permanent schema"}
 		}
+		create.Into.Rel.Relpersistence = "t"
 		create.Into.Rel.Schemaname = temporarySchemaName
 		return nil
 	}
@@ -389,6 +472,7 @@ func qualifyTemporaryObject(node *zpgparse.Node) error {
 		if create.View.Schemaname != "" && create.View.Schemaname != temporarySchemaName {
 			return &model.Error{Code: "42P16", Message: "temporary relation cannot be created in a permanent schema"}
 		}
+		create.View.Relpersistence = "t"
 		create.View.Schemaname = temporarySchemaName
 		return nil
 	}
@@ -396,6 +480,7 @@ func qualifyTemporaryObject(node *zpgparse.Node) error {
 		if create.Sequence.Schemaname != "" && create.Sequence.Schemaname != temporarySchemaName {
 			return &model.Error{Code: "42P16", Message: "temporary sequence cannot be created in a permanent schema"}
 		}
+		create.Sequence.Relpersistence = "t"
 		create.Sequence.Schemaname = temporarySchemaName
 		return nil
 	}

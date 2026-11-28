@@ -101,10 +101,25 @@ type lockObjectGen struct {
 	generation uint64
 }
 
+type nonWoundingContextKey struct{}
+
+// WithNonWounding marks background maintenance transactions (such as
+// auto-ANALYZE) so wound-wait conflict checks never abort active foreground
+// user transactions on their behalf.
+func WithNonWounding(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nonWoundingContextKey{}, true)
+}
+
+func isNonWounding(ctx context.Context) bool {
+	enabled, _ := ctx.Value(nonWoundingContextKey{}).(bool)
+	return enabled
+}
+
 type lockOwner struct {
 	registry    *lockRegistry
 	id          model.TxnID
 	age         uint64
+	nonWounding bool
 	ctx         context.Context
 	waitOwner   locks.WaitOwner
 	cancel      context.CancelCauseFunc
@@ -204,7 +219,7 @@ func (r *lockRegistry) register(ctx context.Context, id model.TxnID, waitOwners 
 	if len(waitOwners) == 1 {
 		waitOwner = waitOwners[0]
 	}
-	owner := &lockOwner{registry: r, id: id, age: r.age, waitOwner: waitOwner}
+	owner := &lockOwner{registry: r, id: id, age: r.age, nonWounding: isNonWounding(ctx), waitOwner: waitOwner}
 	owner.ctx, owner.cancel = context.WithCancelCause(ctx)
 	r.owners[id] = owner
 	return owner, nil
@@ -840,7 +855,7 @@ func (r *lockRegistry) conflicts(owner *lockOwner, request lockRequest, mode loc
 			if !wound {
 				return true, blockers
 			}
-			if owner.age < holder.age && holder.state == lockOwnerActive {
+			if !owner.nonWounding && owner.age < holder.age && holder.state == lockOwnerActive {
 				holder.state = lockOwnerAborting
 				holder.cancel(errLockWounded)
 			} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {
@@ -861,7 +876,7 @@ func (r *lockRegistry) conflicts(owner *lockOwner, request lockRequest, mode loc
 		if !wound {
 			return true
 		}
-		if owner.age < holder.age && holder.state == lockOwnerActive {
+		if !owner.nonWounding && owner.age < holder.age && holder.state == lockOwnerActive {
 			holder.state = lockOwnerAborting
 			holder.cancel(errLockWounded)
 		} else if holder.waitOwner != 0 && holder.state == lockOwnerActive {

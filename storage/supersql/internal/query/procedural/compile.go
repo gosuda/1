@@ -118,7 +118,7 @@ func CompileRoutine(ctx context.Context, statement *zpgparse.CreateFunctionStmt,
 		return model.RoutineMetadata{}, err
 	}
 	if metadata.Atomic && statement.SqlBody != nil {
-		sql, deparseErr := zpgparse.Deparse(&zpgparse.ParseResult{Stmts: []*zpgparse.RawStmt{{Stmt: statement.SqlBody}}})
+		sql, deparseErr := zpgparse.DeparseFunctionSQLBody(statement.SqlBody)
 		if deparseErr != nil {
 			return model.RoutineMetadata{}, deparseErr
 		}

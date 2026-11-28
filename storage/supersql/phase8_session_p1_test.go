@@ -152,11 +152,13 @@ func TestPhase8AutocommitSelectMisclassificationP1M1(t *testing.T) {
 
 	// 8. Row-level security USING policy invoking a writing routine on a plain
 	//    SELECT whose unexpanded AST has no user function calls at all.
+	phase8Exec(t, ctx, conn, `CREATE ROLE p8_rls_user`)
 	phase8Exec(t, ctx, conn, `CREATE TABLE t_rls (id int PRIMARY KEY)`)
+	phase8Exec(t, ctx, conn, `GRANT SELECT ON t_rls TO p8_rls_user`)
 	phase8Exec(t, ctx, conn, `INSERT INTO t_rls VALUES (10)`)
 	phase8Exec(t, ctx, conn, `
 		CREATE FUNCTION p8_rls_check(v int) RETURNS boolean
-		LANGUAGE sql AS $$
+		LANGUAGE sql SECURITY DEFINER AS $$
 			INSERT INTO write_log VALUES ('rls_using', v);
 			SELECT true;
 		$$
@@ -164,9 +166,11 @@ func TestPhase8AutocommitSelectMisclassificationP1M1(t *testing.T) {
 	phase8Exec(t, ctx, conn, `CREATE POLICY p8_pol ON t_rls FOR SELECT USING (p8_rls_check(id))`)
 	phase8Exec(t, ctx, conn, `ALTER TABLE t_rls ENABLE ROW LEVEL SECURITY`)
 	phase8Exec(t, ctx, conn, `ALTER TABLE t_rls FORCE ROW LEVEL SECURITY`)
+	phase8Exec(t, ctx, conn, `SET ROLE p8_rls_user`)
 	if got := queryInt(t, ctx, conn, `SELECT id FROM t_rls`); got != 10 {
 		t.Fatalf("SELECT id FROM t_rls = %d, want 10", got)
 	}
+	phase8Exec(t, ctx, conn, `RESET ROLE`)
 	if got := queryInt(t, ctx, conn, `SELECT count(*) FROM write_log WHERE tag = 'rls_using' AND val = 10`); got != 1 {
 		t.Fatalf("write_log count for rls_using = %d, want 1", got)
 	}
@@ -186,23 +190,29 @@ func TestPhase8AutocommitSelectMisclassificationP1M1(t *testing.T) {
 	// 10. Explicit BEGIN READ ONLY MUST STILL REJECT writes/locks with SQLSTATE 25006.
 	readOnlyCases := []struct {
 		name  string
+		role  string
 		query string
 	}{
-		{"view_fn", `SELECT x FROM v_write`},
-		{"view_lock", `SELECT id FROM v_lock`},
-		{"view_seq", `SELECT n FROM v_seq`},
-		{"shadow_lower", `SELECT lower(7)`},
-		{"shadow_round", `SELECT round(7)`},
-		{"user_agg", `SELECT sum(name) FROM items`},
-		{"user_cast", `SELECT (ROW(9)::p8_box)::int`},
-		{"domain_check", `SELECT 11::p8_logged_int`},
-		{"rls_using", `SELECT id FROM t_rls`},
+		{"view_fn", "", `SELECT x FROM v_write`},
+		{"view_lock", "", `SELECT id FROM v_lock`},
+		{"view_seq", "", `SELECT n FROM v_seq`},
+		{"shadow_lower", "", `SELECT lower(7)`},
+		{"shadow_round", "", `SELECT round(7)`},
+		{"user_agg", "", `SELECT sum(name) FROM items`},
+		{"user_cast", "", `SELECT (ROW(9)::p8_box)::int`},
+		{"domain_check", "", `SELECT 11::p8_logged_int`},
+		{"rls_using", "p8_rls_user", `SELECT id FROM t_rls`},
 	}
 	for _, tc := range readOnlyCases {
 		t.Run("BeginReadOnly/"+tc.name, func(t *testing.T) {
 			tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 			if err != nil {
 				t.Fatalf("BeginTx ReadOnly: %v", err)
+			}
+			if tc.role != "" {
+				if _, err := tx.ExecContext(ctx, "SET LOCAL ROLE "+tc.role); err != nil {
+					t.Fatalf("SET LOCAL ROLE %s: %v", tc.role, err)
+				}
 			}
 			var discard any
 			err = tx.QueryRowContext(ctx, tc.query).Scan(&discard)
@@ -219,6 +229,10 @@ func TestPhase8AutocommitSelectMisclassificationP1M1(t *testing.T) {
 	phase8Exec(t, ctx, conn, `SET default_transaction_read_only = on`)
 	for _, tc := range readOnlyCases {
 		t.Run("DefaultTxReadOnly/"+tc.name, func(t *testing.T) {
+			if tc.role != "" {
+				phase8Exec(t, ctx, conn, "SET ROLE "+tc.role)
+				defer phase8Exec(t, ctx, conn, "RESET ROLE")
+			}
 			var discard any
 			err := conn.QueryRowContext(ctx, tc.query).Scan(&discard)
 			if got := SQLState(err); got != "25006" {

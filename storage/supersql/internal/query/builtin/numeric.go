@@ -13,9 +13,10 @@ import (
 
 // Decimal work bounds are independent of the caller's output quota.
 const numericWorkDigits = 32768
-const numericInputBytes = 2 * numericWorkDigits
 const numericMaxScale = 16383
 const numericMaxIntegerDigits = 131072
+const numericFullWorkDigits = numericMaxIntegerDigits + numericMaxScale + 1
+const numericInputBytes = 2 * numericFullWorkDigits
 
 type numericSpecial int8
 
@@ -46,8 +47,18 @@ func numericWork(ctx context.Context, digits int) error {
 	return nil
 }
 
+func numericWorkFull(ctx context.Context, digits int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if digits < 0 || digits > numericFullWorkDigits {
+		return numericResourceError()
+	}
+	return nil
+}
+
 func numericPower(ctx context.Context, work *decimalint.Workspace, exponent int) (*decimalint.Int, error) {
-	if err := numericWork(ctx, exponent+1); err != nil {
+	if err := numericWorkFull(ctx, exponent+1); err != nil {
 		return nil, err
 	}
 	index := 0
@@ -115,7 +126,7 @@ func parseNumeric(ctx context.Context, work *decimalint.Workspace, input string)
 		}
 		c := input[i]
 		if c >= '0' && c <= '9' {
-			if count == numericWorkDigits {
+			if count == numericFullWorkDigits {
 				return decimal{}, numericResourceError()
 			}
 			count++
@@ -190,14 +201,14 @@ func parseNumeric(ctx context.Context, work *decimalint.Workspace, input string)
 	if significant != 0 && significant-scale > numericMaxIntegerDigits {
 		return decimal{}, numericOverflow()
 	}
-	if err := numericWork(ctx, max(significant, scale)); err != nil {
+	if err := numericWorkFull(ctx, max(significant, scale)); err != nil {
 		return decimal{}, err
 	}
 	if significant == 0 {
 		coefficient, err := work.FromInt64(ctx, 0)
 		return decimal{coefficient: coefficient, scale: max(scale, 0)}, err
 	}
-	if err := numericWork(ctx, significant+max(-scale, 0)); err != nil {
+	if err := numericWorkFull(ctx, significant+max(-scale, 0)); err != nil {
 		return decimal{}, err
 	}
 	cursor, remaining := first, significant
@@ -347,7 +358,7 @@ func numericRescale(ctx context.Context, work *decimalint.Workspace, value decim
 		if value.coefficient.Sign() == 0 {
 			coefficient, err = work.FromInt64(ctx, 0)
 		} else {
-			if err = numericWork(ctx, numericDigits(value.coefficient)+scale-value.scale); err != nil {
+			if err = numericWorkFull(ctx, numericDigits(value.coefficient)+scale-value.scale); err != nil {
 				return decimal{}, err
 			}
 			power, err = numericPower(ctx, work, scale-value.scale)
@@ -384,23 +395,30 @@ func numericRescale(ctx context.Context, work *decimalint.Workspace, value decim
 		return decimal{}, err
 	}
 	if scale < 0 {
-		if err = numericWork(ctx, numericDigits(coefficient)-scale); err != nil {
-			return decimal{}, err
+		if coefficient.Sign() == 0 {
+			scale = 0
+		} else {
+			if numericDigits(coefficient)-scale > numericMaxIntegerDigits {
+				return decimal{}, numericOverflow()
+			}
+			if err = numericWorkFull(ctx, numericDigits(coefficient)-scale); err != nil {
+				return decimal{}, err
+			}
+			if err = power.Close(); err != nil {
+				return decimal{}, err
+			}
+			power, err = numericPower(ctx, work, -scale)
+			if err != nil {
+				return decimal{}, err
+			}
+			next, mulErr := work.Mul(ctx, coefficient, power)
+			err = errors.Join(mulErr, coefficient.Close())
+			coefficient = next
+			if err != nil {
+				return decimal{}, err
+			}
+			scale = 0
 		}
-		if err = power.Close(); err != nil {
-			return decimal{}, err
-		}
-		power, err = numericPower(ctx, work, -scale)
-		if err != nil {
-			return decimal{}, err
-		}
-		next, mulErr := work.Mul(ctx, coefficient, power)
-		err = errors.Join(mulErr, coefficient.Close())
-		coefficient = next
-		if err != nil {
-			return decimal{}, err
-		}
-		scale = 0
 	}
 	result = decimal{coefficient: coefficient, scale: scale}
 	coefficient = nil

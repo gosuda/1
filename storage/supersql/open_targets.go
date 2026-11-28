@@ -2,13 +2,19 @@ package supersql
 
 import (
 	"context"
+	"errors"
+	"slices"
 
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/controlplane/schema"
 	"github.com/gosuda/supersql-alpha/internal/dataplane/storage"
+	"github.com/gosuda/supersql-alpha/internal/dataplane/txn"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/catalogrel"
 	"github.com/gosuda/supersql-alpha/internal/query/exec"
+	"github.com/gosuda/supersql-alpha/internal/query/exec/expr"
+	exmodify "github.com/gosuda/supersql-alpha/internal/query/exec/modify"
+	"github.com/gosuda/supersql-alpha/internal/query/session"
 )
 
 // newStackMutationTargets resolves one physical mutation target from the current
@@ -16,6 +22,7 @@ import (
 // the descriptor comes from a certified current read and the expansion from the
 // same index policy provider that owns every published index.
 type newStackMutationTargets struct {
+	database    *Catalog
 	descriptors *catalog.CurrentDescriptors
 	policies    *schema.IndexPolicyProvider
 }
@@ -38,7 +45,162 @@ func (targets newStackMutationTargets) ResolveMutationTarget(ctx context.Context
 	if err != nil {
 		return exec.MutationTarget{}, err
 	}
-	return exec.MutationTarget{Descriptor: descriptor, Expansion: policy.Indexes}, nil
+	table, hasTable := descriptor.Table()
+	needsHierarchy := hasTable && targets.database != nil && (table.PartitionStrategy != 0 || table.InheritanceChildren != 0 || len(table.Parents) != 0)
+	if !needsHierarchy {
+		return exec.MutationTarget{Descriptor: descriptor, Expansion: policy.Indexes}, nil
+	}
+	return targets.resolveHierarchyTarget(ctx, descriptor, policy.Indexes)
+}
+
+func (targets newStackMutationTargets) resolveHierarchyTarget(ctx context.Context, requested *model.Descriptor, requestedExpansion exmodify.Expansion) (target exec.MutationTarget, err error) {
+	view, err := targets.database.manager.CurrentReadView(ctx)
+	if err != nil {
+		return exec.MutationTarget{}, err
+	}
+	snapshot, err := targets.database.catalog.TransactionSnapshot(view, catalog.BorrowReader)
+	if err != nil {
+		return exec.MutationTarget{}, errors.Join(err, view.Close())
+	}
+	defer func() { err = errors.Join(err, snapshot.Close(), view.Close()) }()
+
+	allTables := make(map[model.ObjectID]*model.Descriptor)
+	childrenByParent := make(map[model.ObjectID][]*model.Descriptor)
+	scanErr := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaPub catalog.PublishedDescriptor) error {
+		if schemaPub.Descriptor == nil || schemaPub.Descriptor.State() != model.StatePublic {
+			return nil
+		}
+		return snapshot.ScanNamespace(ctx, schemaPub.Descriptor.ID(), model.ObjectTable, func(pub catalog.PublishedDescriptor) error {
+			d := pub.Descriptor
+			if d == nil || d.State() != model.StatePublic {
+				return nil
+			}
+			allTables[d.ID()] = d
+			if tbl, ok := d.Table(); ok && (tbl.PartitionBound == nil || tbl.PartitionState == model.PartitionAttached) {
+				for _, p := range tbl.Parents {
+					childrenByParent[p] = append(childrenByParent[p], d)
+				}
+			}
+			return nil
+		})
+	})
+	if scanErr != nil {
+		return exec.MutationTarget{}, scanErr
+	}
+	for parentID := range childrenByParent {
+		slices.SortFunc(childrenByParent[parentID], func(a, b *model.Descriptor) int {
+			if a.ID() < b.ID() {
+				return -1
+			}
+			if a.ID() > b.ID() {
+				return 1
+			}
+			return 0
+		})
+	}
+
+	// Find partition root if requested is an attached partition.
+	rootDesc := requested
+	seenUp := map[model.ObjectID]bool{rootDesc.ID(): true}
+	for {
+		tbl, ok := rootDesc.Table()
+		if !ok || tbl.PartitionBound == nil || tbl.PartitionState != model.PartitionAttached || len(tbl.Parents) != 1 {
+			break
+		}
+		parentDesc := allTables[tbl.Parents[0]]
+		if parentDesc == nil || seenUp[parentDesc.ID()] {
+			break
+		}
+		seenUp[parentDesc.ID()] = true
+		rootDesc = parentDesc
+	}
+
+	compiler, err := session.NewIndexExpressionCompiler(snapshot, session.IndexExpressionOptions{
+		Binding:     targets.database.irLimits(),
+		Evaluation:  expr.DefaultLimits(),
+		InputBytes:  1 << 20,
+		ResultBytes: 1 << 20,
+	})
+	if err != nil {
+		return exec.MutationTarget{}, err
+	}
+
+	var build func(*model.Descriptor) (exec.MutationTarget, error)
+	visiting := make(map[model.ObjectID]bool)
+	build = func(d *model.Descriptor) (exec.MutationTarget, error) {
+		if visiting[d.ID()] {
+			return exec.MutationTarget{}, model.ErrInvalidDescriptor
+		}
+		visiting[d.ID()] = true
+		defer delete(visiting, d.ID())
+
+		var exp exmodify.Expansion
+		if d.ID() == requested.ID() {
+			exp = requestedExpansion
+		} else {
+			phys := d.Physical()
+			dRef := storage.ObjectRef{ObjectID: d.ID(), DescriptorVersion: d.Version(), Generation: phys.Generation, EncodingVersion: phys.EncodingVersion}
+			pol, pErr := targets.policies.TablePolicy(ctx, dRef)
+			if pErr != nil {
+				return exec.MutationTarget{}, pErr
+			}
+			exp = pol.Indexes
+		}
+		var partExprs []txn.ValueExpression
+		if tbl, ok := d.Table(); ok && tbl.PartitionStrategy != 0 {
+			var cErr error
+			partExprs, cErr = compiler.CompilePartitionExpressions(ctx, d)
+			if cErr != nil {
+				return exec.MutationTarget{}, cErr
+			}
+		}
+		kids := childrenByParent[d.ID()]
+		childTargets := make([]exec.MutationTarget, 0, len(kids))
+		for _, kid := range kids {
+			ct, cErr := build(kid)
+			if cErr != nil {
+				return exec.MutationTarget{}, cErr
+			}
+			childTargets = append(childTargets, ct)
+		}
+		return exec.MutationTarget{
+			Descriptor:           d,
+			Expansion:            exp,
+			PartitionExpressions: partExprs,
+			PartitionChildren:    childTargets,
+		}, nil
+	}
+
+	rootTarget, err := build(rootDesc)
+	if err != nil {
+		return exec.MutationTarget{}, err
+	}
+	if rootDesc.ID() == requested.ID() {
+		return rootTarget, nil
+	}
+	// Locate requested inside rootTarget's subtree and attach PartitionRouting = &rootTarget.
+	var find func(exec.MutationTarget) (exec.MutationTarget, bool)
+	find = func(node exec.MutationTarget) (exec.MutationTarget, bool) {
+		if node.Descriptor != nil && node.Descriptor.ID() == requested.ID() {
+			node.PartitionRouting = &rootTarget
+			return node, true
+		}
+		for _, child := range node.PartitionChildren {
+			if found, ok := find(child); ok {
+				return found, true
+			}
+		}
+		return exec.MutationTarget{}, false
+	}
+	if found, ok := find(rootTarget); ok {
+		return found, nil
+	}
+	reqTarget, err := build(requested)
+	if err != nil {
+		return exec.MutationTarget{}, err
+	}
+	reqTarget.PartitionRouting = &rootTarget
+	return reqTarget, nil
 }
 
 // newStackSQLMetadata reports the SQL feature/standards inventory of the

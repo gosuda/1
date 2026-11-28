@@ -53,7 +53,35 @@ func (c *ColumnExpressionCompiler) CompileIdentityDefault(ctx context.Context, s
 		return nil, &model.Error{Code: "55000", Message: "identity sequence is unavailable"}
 	}
 	if sequence.OwnerTable != spec.Table || sequence.OwnerColumn != spec.Column {
-		return nil, &model.Error{Code: "55000", Message: "identity sequence ownership differs from column"}
+		// Partition children inherit their partitioned parent's identity sequence.
+		ownedByAncestor := false
+		if tablePub, tErr := c.snapshot.Descriptor(ctx, spec.Table); tErr == nil && tablePub.Descriptor != nil {
+			visited := map[model.ObjectID]bool{spec.Table: true}
+			cur := tablePub.Descriptor
+			for cur != nil {
+				tbl, hasTbl := cur.Table()
+				if !hasTbl || tbl.PartitionBound == nil || len(tbl.Parents) == 0 {
+					break
+				}
+				parentID := tbl.Parents[0]
+				if visited[parentID] {
+					break
+				}
+				visited[parentID] = true
+				if parentID == sequence.OwnerTable {
+					ownedByAncestor = true
+					break
+				}
+				pPub, pErr := c.snapshot.Descriptor(ctx, parentID)
+				if pErr != nil || pPub.Descriptor == nil {
+					break
+				}
+				cur = pPub.Descriptor
+			}
+		}
+		if !ownedByAncestor {
+			return nil, &model.Error{Code: "55000", Message: "identity sequence ownership differs from column"}
+		}
 	}
 	program := &identityValueExpression{oid: descriptor.OID(), narrow: spec.Result.Type.ID != 20, resultBytes: c.options.ResultBytes}
 	if program.narrow {

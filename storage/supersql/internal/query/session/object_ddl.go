@@ -36,6 +36,97 @@ type ObjectCommandResult struct {
 	RowsAffected uint64
 }
 
+func isAtomicPrimaryKeySwap(statement *zpgparse.AlterTableStmt) bool {
+	if statement == nil || len(statement.Cmds) != 2 {
+		return false
+	}
+	var drop, add bool
+	for _, item := range statement.Cmds {
+		cmd := item.GetAlterTableCmd()
+		if cmd == nil {
+			return false
+		}
+		switch cmd.Subtype {
+		case zpgparse.AlterTableType_AT_DropConstraint:
+			drop = !drop
+			if !drop {
+				return false
+			}
+		case zpgparse.AlterTableType_AT_AddConstraint:
+			c := cmd.Def.GetConstraint()
+			if c == nil || c.Contype != zpgparse.ConstrType_CONSTR_PRIMARY || add {
+				return false
+			}
+			add = true
+		default:
+			return false
+		}
+	}
+	return drop && add
+}
+
+func (transactions *Transactions) runMultiActionAlterTable(ctx context.Context, statement *zpgparse.RawStmt, alter *zpgparse.AlterTableStmt, invocation StatementExecution) (ExecutionResult, error) {
+	automatic := !transactions.Active()
+	var savepointName string
+	if automatic {
+		if err := transactions.Begin(ctx, TransactionStart{}); err != nil {
+			return ExecutionResult{}, errors.Join(err, rejectPreparedEnvironment(invocation.Execution.Environment, nil))
+		}
+	} else {
+		savepointName = "__supersql_multi_alter"
+		if err := transactions.Savepoint(ctx, savepointName); err != nil {
+			return ExecutionResult{}, errors.Join(err, rejectPreparedEnvironment(invocation.Execution.Environment, nil))
+		}
+	}
+	var combined ExecutionResult
+	combined.Tag = "ALTER TABLE"
+	envConsumed := false
+	for i, cmd := range alter.Cmds {
+		single := proto.Clone(alter).(*zpgparse.AlterTableStmt)
+		single.Cmds = []*zpgparse.Node{cmd}
+		singleRaw := &zpgparse.RawStmt{
+			Stmt:         &zpgparse.Node{Node: &zpgparse.Node_AlterTableStmt{AlterTableStmt: single}},
+			StmtLocation: statement.StmtLocation,
+			StmtLen:      statement.StmtLen,
+		}
+		subInvocation := invocation
+		if i > 0 {
+			subInvocation.Execution.Environment.Query = nil
+			subInvocation.Execution.Environment.Modify.Query = nil
+		}
+		envConsumed = true
+		subRes, handled, err := transactions.runObjectCommand(ctx, singleRaw, subInvocation)
+		if !handled && err == nil {
+			err = settingError("0A000", "unsupported ALTER TABLE action")
+		}
+		if err != nil {
+			if automatic {
+				err = errors.Join(err, transactions.Rollback(context.WithoutCancel(ctx), false))
+			} else if savepointName != "" {
+				err = errors.Join(err, transactions.RollbackTo(context.WithoutCancel(ctx), savepointName))
+			}
+			return combined, err
+		}
+		combined.Warnings = append(combined.Warnings, subRes.Warnings...)
+	}
+	if !envConsumed {
+		if err := rejectPreparedEnvironment(invocation.Execution.Environment, nil); err != nil {
+			return combined, err
+		}
+	}
+	if automatic {
+		commit, err := transactions.Commit(ctx, false)
+		combined.Commit = commit
+		return combined, err
+	}
+	if savepointName != "" {
+		if err := transactions.Release(ctx, savepointName); err != nil {
+			return combined, err
+		}
+	}
+	return combined, nil
+}
+
 func (transactions *Transactions) runObjectCommand(ctx context.Context, statement *zpgparse.RawStmt, invocation StatementExecution) (ExecutionResult, bool, error) {
 	if statement == nil || statement.Stmt == nil || !isObjectCommand(statement.Stmt) {
 		return ExecutionResult{}, false, nil
@@ -86,6 +177,10 @@ func (transactions *Transactions) runObjectCommand(ctx context.Context, statemen
 			cascade = &configured
 		}
 		result, err := transactions.runReindex(ctx, reindex, options, cascade)
+		return result, true, err
+	}
+	if alter := node.GetAlterTableStmt(); alter != nil && len(alter.Cmds) > 1 && !isAtomicPrimaryKeySwap(alter) {
+		result, err := transactions.runMultiActionAlterTable(ctx, statement, alter, invocation)
 		return result, true, err
 	}
 	if alter := node.GetAlterTableStmt(); bind.ExpressionAlter(alter) || bind.TransactionalGenerationAlter(alter) || bind.SchemaJobAlter(alter) {
@@ -791,10 +886,11 @@ func ExecuteObjectCommand(ctx context.Context, transactions *Transactions, node 
 		var stageErr error
 		if temporaryCommand {
 			transactions.named.temporaryOptions = &options
-			if err := transactions.named.applyTemporaryCommand(bound); err != nil {
+			droppedTemp, err := transactions.named.applyTemporaryCommand(ctx, bound, options.Binding.Descriptors)
+			if err != nil {
 				return err
 			}
-			stageErr = transactions.stageTemporaryObjectCommand(ctx, bound, options)
+			stageErr = transactions.stageTemporaryObjectCommand(ctx, bound, droppedTemp, options)
 		} else {
 			if !lockedForValidation {
 				if err := transactions.lockObjectCommandDescriptors(ctx, bound); err != nil {
@@ -975,9 +1071,12 @@ func objectCommandTemporary(ctx context.Context, bound *bind.BoundObjectCommand,
 	}
 	return false
 }
-func (transactions *Transactions) stageTemporaryObjectCommand(ctx context.Context, bound *bind.BoundObjectCommand, options ObjectCommandOptions) error {
+func (transactions *Transactions) stageTemporaryObjectCommand(ctx context.Context, bound *bind.BoundObjectCommand, drops []*model.Descriptor, options ObjectCommandOptions) error {
 	if bound == nil {
 		return errPreparedInvocation
+	}
+	if drops == nil {
+		drops = bound.Drops()
 	}
 	store := transactions.sequences.config.Catalog
 	dependencies := slicesCloneReadDependencies(options.Dependencies)
@@ -986,10 +1085,10 @@ func (transactions *Transactions) stageTemporaryObjectCommand(ctx context.Contex
 			dependencies = append(dependencies, store.DescriptorDependency(dependency.Object))
 		}
 	}
-	if err := transactions.stageTemporarySequenceDrops(ctx, bound.Drops()); err != nil {
+	if err := transactions.stageTemporarySequenceDrops(ctx, drops); err != nil {
 		return err
 	}
-	retired := append(objectUpdateRetirements(bound.Updates()), objectDescriptorRetirements(bound.Drops())...)
+	retired := append(objectUpdateRetirements(bound.Updates()), objectDescriptorRetirements(drops)...)
 	retirementID, err := transactions.prepareObjectRetirement(ctx, retired)
 	if err != nil {
 		return err
@@ -1070,7 +1169,11 @@ func (transactions *Transactions) stageObjectCommandAdmission(ctx context.Contex
 		columns := options.Columns
 		columns.Builtin = transactions.settings.BuiltinOptions(options.Binding.Bind.Collation, options.Binding.Bind.DefaultCollation)
 		columns.Temporal = transactions.temporal
-		return StageDeclaration(ctx, transactions.transaction, declaration, DeclarationOptions{Catalog: store, Encoder: transactions.options.KeyEncoder, Columns: columns, Indexes: options.Indexes, Limits: options.Limits, PolicyBytes: options.PolicyBytes})
+		admitted, err := StageDeclaration(ctx, transactions.transaction, declaration, DeclarationOptions{Catalog: store, Encoder: transactions.options.KeyEncoder, Columns: columns, Indexes: options.Indexes, Limits: options.Limits, PolicyBytes: options.PolicyBytes})
+		if err == nil && admitted != nil {
+			transactions.recordUncommittedTargets(admitted.targets)
+		}
+		return admitted, err
 	}
 	dependencies := slicesCloneReadDependencies(options.Dependencies)
 	for _, dependency := range bound.Dependencies() {
@@ -1107,6 +1210,11 @@ func (transactions *Transactions) stageObjectCommandAdmission(ctx context.Contex
 	}
 	for _, descriptor := range plannedDrops {
 		dependencies = append(dependencies, store.DescriptorDependency(descriptor.ID()))
+		if table, ok := descriptor.Table(); ok {
+			for _, parentID := range table.Parents {
+				dependencies = append(dependencies, store.DescriptorDependency(parentID))
+			}
+		}
 	}
 	view, err := transactions.transaction.ReadView(ctx, dependencies)
 	if err != nil {
@@ -1160,6 +1268,7 @@ func (transactions *Transactions) stageObjectCommandAdmission(ctx context.Contex
 			if err != nil {
 				return err
 			}
+			transactions.recordUncommittedTargets(admitted.targets)
 			admission = admitted
 		}
 		if retirementID != 0 {
@@ -1177,7 +1286,8 @@ func objectDeclarationNeedsAdmission(bound *bind.BoundObjectCommand) bool {
 		}
 	}
 	for _, update := range bound.Updates() {
-		if update.Base != nil && update.Next != nil && update.Base.Physical().Generation != update.Next.Physical().Generation {
+		if update.Base != nil && update.Next != nil && (update.Next.Kind() == model.ObjectTable || update.Next.Kind() == model.ObjectMaterializedView) &&
+			(update.Base.Physical().Generation != update.Next.Physical().Generation || update.Base.Version() != update.Next.Version()) {
 			return true
 		}
 	}

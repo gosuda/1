@@ -176,7 +176,7 @@ func (runtime *TriggerRuntime) AfterRow(ctx context.Context, table *model.Descri
 			}
 			continue
 		}
-		index := runtime.statementIndex(table.ID(), event)
+		index := runtime.statementIndexForTable(table, event)
 		if index < 0 || len(runtime.stack[index].pending) >= runtime.limits.MaxDeferredEvents {
 			return ErrLimit
 		}
@@ -204,6 +204,26 @@ func (runtime *TriggerRuntime) statementIndex(table model.ObjectID, event model.
 	for i := len(runtime.stack) - 1; i >= 0; i-- {
 		if runtime.stack[i].table == table && runtime.stack[i].event == event {
 			return i
+		}
+	}
+	return -1
+}
+
+// statementIndexForTable resolves the active statement frame for a row-level
+// trigger call, falling back to the active parent statement when a statement
+// targeting a partitioned or inherited parent routes rows to a child relation.
+func (runtime *TriggerRuntime) statementIndexForTable(table *model.Descriptor, event model.TriggerEvent) int {
+	if table == nil {
+		return -1
+	}
+	if index := runtime.statementIndex(table.ID(), event); index >= 0 {
+		return index
+	}
+	if tbl, ok := table.Table(); ok && len(tbl.Parents) != 0 {
+		for i := len(runtime.stack) - 1; i >= 0; i-- {
+			if runtime.stack[i].event == event {
+				return i
+			}
 		}
 	}
 	return -1
@@ -286,7 +306,7 @@ func (runtime *TriggerRuntime) triggers(ctx context.Context, table *model.Descri
 			continue
 		}
 		if event == model.TriggerUpdate && len(trigger.Columns) != 0 {
-			index := runtime.statementIndex(table.ID(), event)
+			index := runtime.statementIndexForTable(table, event)
 			if index < 0 || !slices.ContainsFunc(trigger.Columns, func(column model.ColumnID) bool {
 				return slices.Contains(runtime.stack[index].updated, column)
 			}) {
@@ -311,10 +331,7 @@ func relationTriggers(spec model.DescriptorSpec) ([]model.ColumnDescriptor, []mo
 }
 
 func (runtime *TriggerRuntime) captureTransitions(ctx context.Context, table *model.Descriptor, event model.TriggerEvent, old, new *model.Row, maxBytes uint64) error {
-	index := -1
-	if table != nil {
-		index = runtime.statementIndex(table.ID(), event)
-	}
+	index := runtime.statementIndexForTable(table, event)
 	if index < 0 {
 		return ErrInvalidProgram
 	}
@@ -395,7 +412,7 @@ func (runtime *TriggerRuntime) context(table *model.Descriptor, trigger model.Tr
 		level = "row"
 	}
 	invocation := TriggerContext{Name: trigger.Name, Timing: trigger.Timing, Event: triggerOperationName(event), Level: level, TableName: table.Name().Name, SchemaName: trigger.SchemaName, Relation: table.OID(), ConstraintTable: trigger.ConstraintTable, ConstraintID: trigger.ConstraintID, Arguments: slices.Clone(trigger.Arguments), Layout: layout, Old: old, New: new, OldTransitionName: trigger.OldTransitionTable, NewTransitionName: trigger.NewTransitionTable}
-	if index := runtime.statementIndex(table.ID(), event); index >= 0 {
+	if index := runtime.statementIndexForTable(table, event); index >= 0 {
 		statement := &runtime.stack[index]
 		invocation.OldTransition = statement.oldTransition
 		invocation.NewTransition = statement.newTransition

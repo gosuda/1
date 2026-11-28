@@ -199,6 +199,12 @@ func (b *binder) rangeFunctionCall(item rangeFunctionCall, alias *zpgparse.Alias
 		if b.nativeRowsFunction(signature.ID) {
 			return b.nativeRangeFunction(item, alias, ordinality, s, signature, args, resolved.expandVariadic)
 		}
+		if err := ValidateBuiltinFunction(signature.ID, pos); err != nil {
+			return relation{}, err
+		}
+		if !signature.ReturnsSet {
+			return b.scalarRangeFunction(item, alias, ordinality, s, signature, args, resolved.expandVariadic)
+		}
 		return relation{}, missing("table function implementation", pos)
 	}
 	return relation{}, bindError("42883", "function does not exist", pos)

@@ -65,6 +65,10 @@ type cursor struct {
 	builder      *columnar.Builder
 	claim        columnar.Allocation
 	metadata     uint64
+	baseClaim    uint64
+	maxClaim     uint64
+	claimed      uint64
+	maxEntries   int
 	entries      []entry
 	keys         []byte
 	row          []model.Value
@@ -127,7 +131,8 @@ func (c *cursor) configure(ctx context.Context) error {
 	if initial > o.WorkBytes {
 		return resource("admit sort workspace", nil)
 	}
-	claim, err := o.Query.Allocator(runtime.WorkMemory).Reserve(initial)
+	startClaim := min(initial, base+schemaBytes+o.MaxRecordBytes*4)
+	claim, err := o.Query.Allocator(runtime.WorkMemory).Reserve(startClaim)
 	if err != nil {
 		return err
 	}
@@ -176,15 +181,20 @@ func (c *cursor) configure(ctx context.Context) error {
 	if spoolWork > o.WorkBytes/uint64(o.MaxRuns+o.MergeFanIn+3) || fixed > o.WorkBytes || o.RunBytes > o.WorkBytes-fixed || uint64(o.MaxRuns+o.MergeFanIn+3)*spoolWork > o.WorkBytes-fixed-o.RunBytes {
 		return resource("sort work limit cannot admit runs and merge readers", nil)
 	}
-	if err := claim.Resize(fixed); err != nil {
+	baseClaim := min(fixed, base+o.MaxRecordBytes*4)
+	if err := claim.Resize(baseClaim); err != nil {
 		return err
 	}
 	capacity := o.RunBytes / uint64(unsafe.Sizeof(entry{}))
 	if capacity == 0 {
 		return resource("sort run cannot admit an index entry", nil)
 	}
-	c.entries = make([]entry, 0, int(capacity))
-	c.keys = make([]byte, 0, int(o.RunBytes))
+	c.baseClaim = baseClaim
+	c.maxClaim = fixed
+	c.claimed = baseClaim
+	c.maxEntries = int(capacity)
+	c.entries = make([]entry, 0, min(int(capacity), 64))
+	c.keys = make([]byte, 0, min(int(o.RunBytes), 4096))
 	c.row = make([]model.Value, len(c.layouts))
 	c.keyValues = make([]model.Value, len(o.Keys))
 	c.runs = make([]run, 0, o.MaxRuns)
@@ -333,9 +343,30 @@ func (c *cursor) initialize(ctx context.Context) error {
 }
 
 func (c *cursor) append(ctx context.Context, key []byte, ordinal int64) error {
-	if len(c.entries) == cap(c.entries) || len(key) > cap(c.keys)-len(c.keys) {
+	if len(c.entries) == c.maxEntries || uint64(len(key)) > c.options.RunBytes-uint64(len(c.keys)) {
 		if err := c.flush(ctx); err != nil {
 			return err
+		}
+	}
+	need := min(c.maxClaim, c.baseClaim+uint64(len(c.entries)+1)*uint64(unsafe.Sizeof(entry{}))*2+uint64(len(c.keys)+len(key))*2)
+	if need > c.claimed {
+		if err := c.claim.Resize(need); err != nil {
+			if errors.Is(err, runtime.ErrBudget) && len(c.entries) > 0 {
+				if flushErr := c.flush(ctx); flushErr != nil {
+					return flushErr
+				}
+				need = min(c.maxClaim, c.baseClaim+uint64(unsafe.Sizeof(entry{}))*2+uint64(len(key))*2)
+				if need > c.claimed {
+					if retryErr := c.claim.Resize(need); retryErr != nil {
+						return retryErr
+					}
+					c.claimed = need
+				}
+			} else {
+				return err
+			}
+		} else {
+			c.claimed = need
 		}
 	}
 	if c.raw == nil {
@@ -425,6 +456,12 @@ func (c *cursor) flush(ctx context.Context) (err error) {
 	clear(c.entries)
 	c.entries = c.entries[:0]
 	c.keys = c.keys[:0]
+	if c.claimed > c.baseClaim {
+		if resizeErr := c.claim.Resize(c.baseClaim); resizeErr != nil {
+			return resizeErr
+		}
+		c.claimed = c.baseClaim
+	}
 	c.runCount++
 	return nil
 }
@@ -483,11 +520,12 @@ func (c *cursor) Next(ctx context.Context, out *columnar.Batch) (err error) {
 			for i := range c.entries {
 				c.entries[i].key = nil
 			}
-			work += c.options.RunBytes
+			work += min(c.options.RunBytes, uint64(len(c.entries))*uint64(unsafe.Sizeof(entry{})))
 		}
 		if err := c.claim.Resize(work); err != nil {
 			return err
 		}
+		c.claimed = work
 		c.initialized = true
 	}
 	c.builder.Reset()

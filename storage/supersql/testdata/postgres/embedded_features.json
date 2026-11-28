@@ -204,25 +204,19 @@
     {
       "id": "authorization",
       "disposition": "unsupported",
-      "reason": "Native MVCC roles, object-level GRANT/REVOKE (including WITH GRANT OPTION and ALL IN SCHEMA), ALTER ... OWNER TO, CREATE SCHEMA AUTHORIZATION, SECURITY DEFINER, and Row-Level Security (RLS) are supported; ALTER DEFAULT PRIVILEGES, DROP/REASSIGN OWNED, ALTER ROLE SET, SECURITY LABEL, and SET SESSION AUTHORIZATION remain excluded.",
+      "reason": "Native MVCC roles, SET ROLE, SET SESSION AUTHORIZATION, object-level GRANT/REVOKE (including WITH GRANT OPTION and ALL IN SCHEMA), ALTER ... OWNER TO, CREATE SCHEMA AUTHORIZATION, SECURITY DEFINER, and Row-Level Security (RLS) are supported; ALTER DEFAULT PRIVILEGES, DROP/REASSIGN OWNED, ALTER ROLE SET, and SECURITY LABEL remain excluded.",
       "ast_match": [
         "AlterRoleSetStmt",
         "AlterDefaultPrivilegesStmt",
         "DropOwnedStmt",
         "ReassignOwnedStmt",
         "SecLabelStmt",
-        "VariableSetStmt.name = session_authorization",
         "object kind ROLE (unsupported operations), DEFACL, PARAMETER_ACL"
       ],
       "resolved_objects": [
         {
           "kind": "setting",
           "name": "is_superuser",
-          "mutable": false
-        },
-        {
-          "kind": "setting",
-          "name": "session_authorization",
           "mutable": false
         }
       ],
@@ -15479,11 +15473,6 @@
         {
           "kind": "setting",
           "name": "restrict_nonsystem_relation_kind",
-          "mutable": false
-        },
-        {
-          "kind": "setting",
-          "name": "row_security",
           "mutable": false
         },
         {

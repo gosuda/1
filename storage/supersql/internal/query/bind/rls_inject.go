@@ -23,6 +23,9 @@ func (b *binder) applyScanRLS(scan relation, descriptor, namespace *model.Descri
 	if !rlsApplies(roles, b.options.CurrentRole, table) {
 		return scan, nil
 	}
+	if b.options.RowSecurityOff {
+		return relation{}, bindError("42501", `query would be affected by row-level security policy for table "`+descriptor.Name().Name+`"`, position)
+	}
 	if b.rlsStack == nil {
 		b.rlsStack = make(map[model.ObjectID]bool)
 	}
@@ -177,6 +180,9 @@ func (b *binder) bindMergeActionRLSUsing(s *scope, target mutationTarget, leftCo
 	if !rlsApplies(roles, b.options.CurrentRole, table) {
 		return expression{}, false, nil
 	}
+	if b.options.RowSecurityOff {
+		return expression{}, false, bindError("42501", `query would be affected by row-level security policy for table "`+d.Name().Name+`"`, position)
+	}
 	if b.rlsStack == nil {
 		b.rlsStack = make(map[model.ObjectID]bool)
 	}
@@ -266,6 +272,9 @@ func (b *binder) applyModifyRLS(s *scope, target mutationTarget, kind ir.ModifyK
 	}
 	if !rlsApplies(roles, b.options.CurrentRole, table) {
 		return nil
+	}
+	if b.options.RowSecurityOff {
+		return bindError("42501", `query would be affected by row-level security policy for table "`+d.Name().Name+`"`, 0)
 	}
 	if b.rlsStack == nil {
 		b.rlsStack = make(map[model.ObjectID]bool)

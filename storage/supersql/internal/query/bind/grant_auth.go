@@ -73,6 +73,28 @@ func hasObjectPrivilege(roles map[string]model.RoleMetadata, currentRole string,
 			effective |= grant.Privileges
 		}
 	}
+	if roleIsMemberOf(roles, r, "pg_read_all_data") {
+		switch descriptor.Kind() {
+		case model.ObjectTable, model.ObjectView, model.ObjectMaterializedView, model.ObjectSequence:
+			effective |= model.PrivilegeSelect
+		case model.ObjectSchema:
+			effective |= model.PrivilegeUsage
+		}
+	}
+	if roleIsMemberOf(roles, r, "pg_write_all_data") {
+		switch descriptor.Kind() {
+		case model.ObjectTable, model.ObjectView:
+			effective |= model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete
+		case model.ObjectSchema:
+			effective |= model.PrivilegeUsage
+		}
+	}
+	if roleIsMemberOf(roles, r, "pg_maintain") {
+		switch descriptor.Kind() {
+		case model.ObjectTable, model.ObjectMaterializedView:
+			effective |= model.PrivilegeMaintain
+		}
+	}
 	if anyBit {
 		return (effective & required) != 0
 	}
@@ -201,7 +223,7 @@ func (b *binder) validateRoleExists(roles map[string]model.RoleMetadata, roleNam
 	} else if !isMissingObject(err) {
 		return 0, err
 	}
-	if isBuiltinSuperuserAlias(target) {
+	if isBuiltinSuperuserAlias(target) || isPredefinedRole(target) {
 		return 0, nil
 	}
 	return 0, bindError("42704", fmt.Sprintf("role %q does not exist", roleName), pos)

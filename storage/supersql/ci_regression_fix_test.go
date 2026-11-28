@@ -163,7 +163,7 @@ func TestCIFixSQLCompatAndFeatureIDTags(t *testing.T) {
 	}
 
 	// 5. Intentional 0A000 rejections must carry their manifest FeatureID.
-	if _, err := db.exec(ctx, `CREATE TABLE gin_t (a int[], b int[], j jsonb, n name, r record)`, 0); err != nil {
+	if _, err := db.exec(ctx, `CREATE TABLE gin_t (a int[], b int[], j jsonb, n name)`, 0); err != nil {
 		t.Fatalf("CREATE TABLE gin_t: %v", err)
 	}
 	for _, tc := range []struct {

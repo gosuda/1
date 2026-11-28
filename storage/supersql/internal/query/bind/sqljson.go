@@ -332,6 +332,17 @@ func (b *binder) jsonArrayConstructor(n *zpgparse.JsonArrayConstructor, s *scope
 	return b.addSQLJSON(s, target, false, position, payload, args)
 }
 
+func (b *binder) validateSQLJSONKey(key expression, position int) error {
+	typ := key.typ
+	if unwrapped, err := b.unwrapDomain(typ); err == nil {
+		typ = unwrapped
+	}
+	if typ.Type.ID == 114 || typ.Type.ID == 3802 || typ.Type.Storage == model.TypeArray || typ.Type.Storage == model.TypeComposite {
+		return bindError("22023", "key value must be scalar, not array, composite, or json", position)
+	}
+	return nil
+}
+
 func (b *binder) jsonObjectConstructor(n *zpgparse.JsonObjectConstructor, s *scope) (expression, error) {
 	position := int(n.Location) + 1
 	args := make([]expression, 0, len(n.Exprs)*2)
@@ -342,6 +353,9 @@ func (b *binder) jsonObjectConstructor(n *zpgparse.JsonObjectConstructor, s *sco
 		}
 		key, err := b.scalar(pair.Key, s)
 		if err != nil {
+			return expression{}, err
+		}
+		if err := b.validateSQLJSONKey(key, position); err != nil {
 			return expression{}, err
 		}
 		key, err = b.coerce(s, key, b.primitive(25), ir.AssignmentCast)
@@ -427,6 +441,10 @@ func (b *binder) jsonArrayQueryConstructor(n *zpgparse.JsonArrayQueryConstructor
 	signature, ok := builtin.LookupSignature(function)
 	if !ok {
 		return expression{}, bindError("XX000", "SQL/JSON aggregate signature is unavailable", position)
+	}
+	signature, err = b.specialize(signature, []expression{value}, position)
+	if err != nil {
+		return expression{}, err
 	}
 	result, err := b.functionResult(signature, []expression{value})
 	if err != nil {
@@ -835,6 +853,9 @@ func (b *binder) jsonObjectAggregate(n *zpgparse.JsonObjectAgg, s *scope) (expre
 	previousAggregate, previousAllowWindow := s.inAggregate, s.allowWindow
 	s.inAggregate, s.allowWindow = true, false
 	key, err := b.scalar(n.Arg.Key, s)
+	if err == nil {
+		err = b.validateSQLJSONKey(key, position)
+	}
 	if err == nil {
 		key, err = b.coerce(s, key, b.primitive(25), ir.AssignmentCast)
 	}

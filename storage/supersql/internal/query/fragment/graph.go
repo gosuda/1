@@ -478,7 +478,7 @@ func shape(meta physical.Metadata, children uint32) error {
 		}
 		want = children
 	}
-	if meta.Algorithm < physical.TableScan || meta.Algorithm > physical.CatalogScan || children != want {
+	if meta.Algorithm < physical.TableScan || meta.Algorithm > physical.Sample || children != want {
 		return invalid("source/transform arity")
 	}
 	wantBreak := physical.ExpectedBreak(meta.Algorithm)

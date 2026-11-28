@@ -83,7 +83,7 @@ func IsCustomSettingName(name string) bool {
 // unknown names and custom qualified GUC names. Value and transaction-state
 // checks belong to the session.
 func ValidateSetting(name string, position int) error {
-	if strings.EqualFold(name, "role") {
+	if strings.EqualFold(name, "role") || strings.EqualFold(name, "session_authorization") || strings.EqualFold(name, "row_security") {
 		return nil
 	}
 	feature, known := builtinSettingFeature(strings.ToLower(name))

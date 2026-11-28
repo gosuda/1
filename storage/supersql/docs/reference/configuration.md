@@ -92,8 +92,8 @@ The root package fixes its own envelope when it opens a database; the table list
 | --- | --- |
 | catalog.go:168 | MaxBytes=8 << 20 MaxDepth=64 MaxItems=65536 |
 | internal/controlplane/schema/column_policy.go:67 | MaxBytes=options.MetadataBytes MaxDepth=64 MaxItems=int(options.MetadataBytes) |
-| internal/controlplane/schema/constraint_validation.go:122 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
-| internal/controlplane/schema/constraint_validation.go:163 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
+| internal/controlplane/schema/constraint_validation.go:127 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
+| internal/controlplane/schema/constraint_validation.go:168 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:32 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:43 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
 | internal/controlplane/schema/constraint_validation.go:75 | MaxBytes=p.limits.MetadataBytes MaxDepth=64 MaxItems=int(p.limits.MetadataBytes) |
@@ -114,8 +114,8 @@ The root package fixes its own envelope when it opens a database; the table list
 | internal/query/exec/modify/options.go:302 | MaxBytes=c.metadata / 2 MaxDepth=64 MaxItems=int(c.metadata / 64) |
 | internal/query/exec/modify_compile.go:53 | MaxBytes=c.portal.env.Limits.MetadataBytes MaxDepth=64 MaxItems=c.portal.env.Limits.Expressions.MaxRegisters |
 | internal/query/procedural/compile.go:439 | MaxBytes=c.options.Bind.Limits.MaxBytes MaxDepth=int(min(c.options.Bind.Limits.MaxDepth, 64)) MaxItems=int(c.options.Bind.Limits.MaxOperands) |
-| internal/query/procedural/trigger.go:267 | MaxBytes=maxBytes MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
-| internal/query/procedural/trigger.go:322 | MaxBytes=max(maxBytes, runtime.limits.MaxResultBytes) MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
+| internal/query/procedural/trigger.go:287 | MaxBytes=maxBytes MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
+| internal/query/procedural/trigger.go:339 | MaxBytes=max(maxBytes, runtime.limits.MaxResultBytes) MaxDepth=64 MaxItems=runtime.limits.MaxStatements |
 | internal/query/session/catalog_access.go:124 | MaxBytes=budget.remaining MaxDepth=64 MaxItems=int(budget.remaining) |
 | internal/query/session/declaration.go:981 | MaxBytes=options.Limits.MetadataBytes MaxDepth=64 MaxItems=options.Limits.MaxColumns |
 | internal/query/session/native_catalog.go:452 | MaxBytes=1 << 16 MaxDepth=8 MaxItems=8 |
@@ -139,7 +139,7 @@ The root package's `Catalog.irLimits` supplies the default envelope for statemen
 | --- | --- |
 | internal/query/exec/aggregate_project.go:69 | MaxBytes=p.env.Limits.MetadataBytes MaxDepth=512 MaxNodes=handles MaxOperands=handles MaxSlots=handles SourceBytes=math.MaxUint32 |
 | internal/query/exec/residual.go:111 | MaxBytes=limits.MaxBytes MaxDepth=uint32(limits.MaxDepth) MaxNodes=uint32(limits.MaxInstructions) MaxOperands=uint32(limits.MaxInstructions) MaxSlots=uint32(limits.MaxInstructions) SourceBytes=1 |
-| internal/query/session/setting_command.go:20 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
+| internal/query/session/setting_command.go:21 | MaxBytes=bytes MaxDepth=64 MaxNodes=4096 MaxOperands=4096 MaxSlots=4096 |
 | session_scope.go:127 | MaxBytes=16 << 20 MaxDepth=100 MaxNodes=10000 MaxOperands=20000 MaxSlots=10000 SourceBytes=1 << 20 |
 
 ## `supersql.CopyOptions`

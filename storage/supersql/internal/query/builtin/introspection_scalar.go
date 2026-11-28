@@ -664,7 +664,7 @@ func regInput(ctx context.Context, text, kind string, missingOK bool, budget Cal
 	}
 	if err != nil && missingOK {
 		var sql *model.Error
-		if errors.As(err, &sql) && (sql.Code == "42704" || sql.Code == "42883" || sql.Code == "3F000") {
+		if errors.As(err, &sql) && (sql.Code == "42704" || sql.Code == "42883" || sql.Code == "3F000" || ((kind == "namespace" || kind == "role") && sql.Code == "22P02")) {
 			return model.NullVal(model.TypeInt64), nil
 		}
 	}
@@ -833,7 +833,7 @@ func partitionRoot(ctx context.Context, oid model.OID, budget CallBudget) (model
 		var parentID model.ObjectID
 		found, err := runtime.VisitCatalogObject(ctx, current, func(summary model.CatalogObjectSummary) error {
 			table, ok := summary.Descriptor.Table()
-			if ok && table.Partition != nil && len(table.Parents) != 0 {
+			if ok && (table.Partition != nil || table.PartitionBound != nil) && len(table.Parents) != 0 {
 				parentID = table.Parents[0]
 			}
 			return nil

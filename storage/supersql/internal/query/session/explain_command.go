@@ -63,6 +63,8 @@ func (transactions *Transactions) runExplainStatement(ctx context.Context, state
 	if !command.Options.Analyze {
 		if create := nestedStatement.Stmt.GetCreateTableAsStmt(); create != nil && create.Query != nil {
 			nestedStatement = &zpgparse.RawStmt{Stmt: proto.Clone(create.Query).(*zpgparse.Node), StmtLocation: statement.StmtLocation, StmtLen: statement.StmtLen}
+		} else if cursor := nestedStatement.Stmt.GetDeclareCursorStmt(); cursor != nil && cursor.Query != nil {
+			nestedStatement = &zpgparse.RawStmt{Stmt: proto.Clone(cursor.Query).(*zpgparse.Node), StmtLocation: statement.StmtLocation, StmtLen: statement.StmtLen}
 		}
 	}
 	result, err := transactions.RunStatement(ctx, nestedStatement, nested, nil)

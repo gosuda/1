@@ -121,9 +121,23 @@ func (b *binder) tableSample(sample *zpgparse.RangeTableSample, s *scope) (relat
 	if len(sample.Args) != 1 {
 		return relation{}, bindError("42601", "TABLESAMPLE requires one percentage argument", position)
 	}
+	rv := sample.Relation.GetRangeVar()
+	if rv.Schemaname == "" {
+		for current := s; current != nil; current = current.parent {
+			if _, ok := current.ctes[rv.Relname]; ok {
+				return relation{}, bindError("42809", "TABLESAMPLE clause can only be applied to tables and materialized views", position)
+			}
+		}
+	}
 	input, err := b.from(sample.Relation, s)
 	if err != nil {
 		return input, err
+	}
+	if rel, ok := b.builder.Rel(input.id); ok && rel.Kind == ir.CatalogScan {
+		return relation{}, bindError("42809", "TABLESAMPLE clause can only be applied to tables and materialized views", position)
+	}
+	if len(input.namespaces) > 0 && input.namespaces[0].subquery {
+		return relation{}, bindError("42809", "TABLESAMPLE clause can only be applied to tables and materialized views", position)
 	}
 	local := *s
 	local.columns, local.namespaces = nil, nil

@@ -35,6 +35,37 @@ func isBuiltinSuperuserAlias(role string) bool {
 	return role == "" || role == "embedded" || role == "supersql" || role == "postgres"
 }
 
+func isPredefinedRole(role string) bool {
+	switch normalizeRoleName(role) {
+	case "pg_read_all_data", "pg_write_all_data", "pg_read_all_settings", "pg_read_all_stats",
+		"pg_stat_scan_tables", "pg_monitor", "pg_database_owner", "pg_signal_backend",
+		"pg_checkpoint", "pg_maintain", "pg_create_subscription",
+		"pg_read_server_files", "pg_write_server_files", "pg_execute_server_program",
+		"pg_use_reserved_connections":
+		return true
+	default:
+		return false
+	}
+}
+
+func roleMemberships(meta model.RoleMetadata) []model.RoleMembership {
+	if len(meta.Memberships) != 0 {
+		return meta.Memberships
+	}
+	if len(meta.MemberOf) == 0 {
+		return nil
+	}
+	out := make([]model.RoleMembership, len(meta.MemberOf))
+	for i, parent := range meta.MemberOf {
+		out[i] = model.RoleMembership{
+			Role:          strings.ToLower(parent),
+			InheritOption: !meta.NoInherit,
+			SetOption:     true,
+		}
+	}
+	return out
+}
+
 func loadCatalogRoles(ctx context.Context, snapshot CatalogSnapshot, limit uint64) (map[string]model.RoleMetadata, []*model.Descriptor, error) {
 	roles := make(map[string]model.RoleMetadata)
 	if snapshot == nil {
@@ -91,9 +122,61 @@ func roleHasBypassRLS(roles map[string]model.RoleMetadata, role string) bool {
 	return false
 }
 
-// roleIsMemberOf reports whether role is equal to target or transitively a
-// member of target via MemberOf links.
+// roleIsMemberOf reports whether role is equal to target or transitively
+// inherits privileges from target via INHERIT-enabled membership links.
 func roleIsMemberOf(roles map[string]model.RoleMetadata, role, target string) bool {
+	return roleWalkMembership(roles, role, target, func(m model.RoleMembership) bool { return m.InheritOption })
+}
+
+// roleCanSetRole reports whether role may SET ROLE to target (traversing
+// SET-enabled membership edges).
+func roleCanSetRole(roles map[string]model.RoleMetadata, role, target string) bool {
+	return roleWalkMembership(roles, role, target, func(m model.RoleMembership) bool { return m.SetOption })
+}
+
+// roleIsAnyMemberOf reports whether role is equal to target or transitively a
+// member of target via any membership edge (for cycle detection).
+func roleIsAnyMemberOf(roles map[string]model.RoleMetadata, role, target string) bool {
+	return roleWalkMembership(roles, role, target, func(model.RoleMembership) bool { return true })
+}
+
+// roleHasAdminOption reports whether role holds ADMIN OPTION on target (either
+// directly, via an inherited role holding ADMIN OPTION, or as superuser).
+func roleHasAdminOption(roles map[string]model.RoleMetadata, role, target string) bool {
+	if roleIsSuperuser(roles, role) {
+		return true
+	}
+	r := normalizeRoleName(role)
+	t := normalizeRoleName(target)
+	if r == "" || t == "" {
+		return false
+	}
+	visited := map[string]struct{}{r: {}}
+	queue := []string{r}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		meta, ok := roles[current]
+		if !ok {
+			continue
+		}
+		for _, m := range roleMemberships(meta) {
+			p := strings.ToLower(m.Role)
+			if p == t && m.AdminOption {
+				return true
+			}
+			if m.InheritOption {
+				if _, seen := visited[p]; !seen {
+					visited[p] = struct{}{}
+					queue = append(queue, p)
+				}
+			}
+		}
+	}
+	return false
+}
+
+func roleWalkMembership(roles map[string]model.RoleMetadata, role, target string, allow func(model.RoleMembership) bool) bool {
 	r := normalizeRoleName(role)
 	t := normalizeRoleName(target)
 	if r == "" || t == "" {
@@ -111,8 +194,11 @@ func roleIsMemberOf(roles map[string]model.RoleMetadata, role, target string) bo
 		if !ok {
 			continue
 		}
-		for _, parent := range meta.MemberOf {
-			p := strings.ToLower(parent)
+		for _, m := range roleMemberships(meta) {
+			if !allow(m) {
+				continue
+			}
+			p := strings.ToLower(m.Role)
 			if p == t {
 				return true
 			}
@@ -139,10 +225,14 @@ func roleIsOwner(roles map[string]model.RoleMetadata, currentRole, ownerName str
 }
 
 // rlsApplies reports whether Row-Level Security policies must be enforced for
-// (currentRole, table). FORCE ROW LEVEL SECURITY enforces policies even for
-// superusers and table owners unless the role has explicit BYPASSRLS.
+// (currentRole, table). In PostgreSQL 18, superusers and roles with BYPASSRLS
+// always bypass RLS even under FORCE ROW LEVEL SECURITY, while non-superuser
+// table owners are subject to RLS when FORCE ROW LEVEL SECURITY is enabled.
 func rlsApplies(roles map[string]model.RoleMetadata, currentRole string, table *model.TableMetadata) bool {
 	if table == nil || !table.RowSecurity {
+		return false
+	}
+	if roleIsSuperuser(roles, currentRole) {
 		return false
 	}
 	if roleHasBypassRLS(roles, currentRole) {
@@ -150,9 +240,6 @@ func rlsApplies(roles map[string]model.RoleMetadata, currentRole string, table *
 	}
 	if table.ForceRowSecurity {
 		return true
-	}
-	if roleIsSuperuser(roles, currentRole) {
-		return false
 	}
 	if roleIsOwner(roles, currentRole, table.OwnerName) {
 		return false
@@ -198,11 +285,28 @@ func CheckSetRoleAuthorization(ctx context.Context, snapshot CatalogSnapshot, cu
 		return "", err
 	}
 	_, exists := roles[target]
-	if !exists && !isBuiltinSuperuserAlias(target) {
+	if !exists && !isBuiltinSuperuserAlias(target) && !isPredefinedRole(target) {
 		return "", &model.Error{Code: "22023", Message: fmt.Sprintf("role %q does not exist", targetRole)}
 	}
-	if !roleIsSuperuser(roles, currentRole) && !roleIsMemberOf(roles, currentRole, target) {
+	if !roleIsSuperuser(roles, currentRole) && !roleCanSetRole(roles, currentRole, target) {
 		return "", &model.Error{Code: "42501", Message: fmt.Sprintf("permission denied to set role %q", targetRole)}
+	}
+	return target, nil
+}
+
+// CheckSetSessionAuthorization verifies that targetRole exists in snapshot
+// (or is a built-in/predefined role) for SET [LOCAL] SESSION AUTHORIZATION.
+func CheckSetSessionAuthorization(ctx context.Context, snapshot CatalogSnapshot, targetRole string, maxRoles uint64) (string, error) {
+	target := normalizeRoleName(targetRole)
+	if target == "" || target == "default" {
+		return "", nil
+	}
+	roles, _, err := loadCatalogRoles(ctx, snapshot, maxRoles)
+	if err != nil {
+		return "", err
+	}
+	if _, exists := roles[target]; !exists && !isBuiltinSuperuserAlias(target) && !isPredefinedRole(target) {
+		return "", &model.Error{Code: "22023", Message: fmt.Sprintf("role %q does not exist", targetRole)}
 	}
 	return target, nil
 }

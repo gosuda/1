@@ -265,8 +265,6 @@ func builtinSettingFeature(name string) (FeatureID, bool) {
 	switch name {
 	case "is_superuser":
 		return "authorization", true
-	case "session_authorization":
-		return "authorization", true
 	case "allow_alter_system":
 		return "server_observability", true
 	case "allow_in_place_tablespaces":
@@ -802,8 +800,6 @@ func builtinSettingFeature(name string) (FeatureID, bool) {
 	case "restore_command":
 		return "server_observability", true
 	case "restrict_nonsystem_relation_kind":
-		return "server_observability", true
-	case "row_security":
 		return "server_observability", true
 	case "scram_iterations":
 		return "server_observability", true

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 
 	"github.com/gosuda/supersql-alpha/internal/controlplane/catalog"
 	"github.com/gosuda/supersql-alpha/internal/model"
@@ -688,7 +689,21 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 		case "skip_locked":
 			bound.skipLocked, err = statisticsBooleanOption(option)
 		case "buffer_usage_limit":
-			if option.Arg == nil || option.Arg.GetString_() == nil || option.Arg.GetString_().GetSval() == "" {
+			if option.Arg == nil {
+				return nil, bindError("22023", "ANALYZE BUFFER_USAGE_LIMIT requires one value", int(option.Location)+1)
+			}
+			if iv := option.Arg.GetInteger(); iv != nil && iv.Ival == 0 {
+				continue
+			}
+			if sv := option.Arg.GetString_(); sv != nil {
+				val := strings.TrimSpace(strings.ToLower(sv.GetSval()))
+				if val == "0" || val == "0kb" || val == "0mb" || val == "0gb" || val == "0b" {
+					continue
+				}
+				if val == "" {
+					return nil, bindError("22023", "ANALYZE BUFFER_USAGE_LIMIT requires one value", int(option.Location)+1)
+				}
+			} else if option.Arg.GetInteger() == nil {
 				return nil, bindError("22023", "ANALYZE BUFFER_USAGE_LIMIT requires one value", int(option.Location)+1)
 			}
 			return nil, unsupported(PhysicalStorage, int(option.Location)+1)
@@ -741,8 +756,20 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 			if rangeVar.Schemaname != "" {
 				parts = []string{rangeVar.Schemaname, rangeVar.Relname}
 			}
+			if rangeVar.Schemaname == "pg_catalog" {
+				b.warnings = append(b.warnings, model.Error{Code: "01000", Message: "skipping \"" + rangeVar.Relname + "\" --- only table or database owner can analyze it"})
+				continue
+			}
 			table, schema, err := resolveNamespaceObject(ctx, snapshot, options.Bind.SearchPath, parts, []model.ObjectKind{model.ObjectTable}, "42P01", int(rangeVar.Location)+1)
 			if err != nil {
+				var diag *model.Error
+				missingTable := isMissingObject(err) || (errors.As(err, &diag) && diag.Code == "42P01")
+				if missingTable && rangeVar.Schemaname == "" && b.options.CatalogRelations != nil {
+					if _, ok := b.options.CatalogRelations.Lookup("pg_catalog", rangeVar.Relname); ok {
+						b.warnings = append(b.warnings, model.Error{Code: "01000", Message: "skipping \"" + rangeVar.Relname + "\" --- only table or database owner can analyze it"})
+						continue
+					}
+				}
 				return nil, err
 			}
 			if seen[table.ID()] {
@@ -772,6 +799,57 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 			}
 			slices.Sort(columns)
 			bound.targets = append(bound.targets, AnalyzeTarget{Table: table, Columns: columns})
+			// For a partitioned parent, also expand owned attached partitions, skipping unowned ones with a warning.
+			if spec.Table != nil && spec.Table.PartitionStrategy != 0 {
+				var queue []*model.Descriptor
+				queue = append(queue, table)
+				for len(queue) > 0 {
+					parent := queue[0]
+					queue = queue[1:]
+					partErr := snapshot.ScanNamespace(ctx, 0, model.ObjectSchema, func(schemaPub catalog.PublishedDescriptor) error {
+						if schemaPub.Descriptor == nil || schemaPub.Descriptor.State() != model.StatePublic {
+							return nil
+						}
+						return snapshot.ScanNamespace(ctx, schemaPub.Descriptor.ID(), model.ObjectTable, func(pub catalog.PublishedDescriptor) error {
+							child := pub.Descriptor
+							if child == nil || child.State() != model.StatePublic || seen[child.ID()] {
+								return nil
+							}
+							childMeta, ok := child.Table()
+							if !ok || childMeta.PartitionBound == nil || childMeta.PartitionState != model.PartitionAttached || !slices.Contains(childMeta.Parents, parent.ID()) {
+								return nil
+							}
+							seen[child.ID()] = true
+							b.dependency(child, 0)
+							if mErr := b.requireTableMaintenance(child, int(rangeVar.Location)+1); mErr != nil {
+								var diag *model.Error
+								if errors.As(mErr, &diag) && diag.Code == "42501" {
+									b.warnings = append(b.warnings, model.Error{Code: "01000", Message: "skipping \"" + child.Name().Name + "\" --- only table or database owner can analyze it"})
+									return nil
+								}
+								return mErr
+							}
+							childCols := make([]model.ColumnID, 0, len(relation.VaCols))
+							for _, columnNode := range relation.VaCols {
+								col, cErr := publicIndexColumn(childMeta.Columns, columnNode.GetString_().GetSval())
+								if cErr != nil {
+									return cErr
+								}
+								childCols = append(childCols, col.ID)
+							}
+							slices.Sort(childCols)
+							bound.targets = append(bound.targets, AnalyzeTarget{Table: child, Columns: childCols})
+							if childMeta.PartitionStrategy != 0 {
+								queue = append(queue, child)
+							}
+							return nil
+						})
+					})
+					if partErr != nil {
+						return nil, partErr
+					}
+				}
+			}
 		}
 	}
 	indexCount := 0

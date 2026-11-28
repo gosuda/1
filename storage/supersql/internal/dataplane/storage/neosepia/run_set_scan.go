@@ -167,6 +167,17 @@ func (cursor *pinnedScanCursor) Next(ctx context.Context, out *columnar.Batch) e
 	return nil
 }
 
+func (cursor *pinnedScanCursor) SampleUnit(lane uint32) (uint64, bool) {
+	cursor.mu.Lock()
+	defer cursor.mu.Unlock()
+	if cursor.cursor == nil {
+		return 0, false
+	}
+	return cursor.cursor.SampleUnit(lane)
+}
+
+var _ storage.SamplingCursor = (*pinnedScanCursor)(nil)
+
 func (cursor *pinnedScanCursor) Close() error {
 	cursor.mu.Lock()
 	defer cursor.mu.Unlock()

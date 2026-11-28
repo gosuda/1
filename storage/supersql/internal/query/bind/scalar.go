@@ -82,6 +82,79 @@ func (b *binder) once(s *scope, input expression) (expression, error) {
 		recordFields: input.recordFields, rowArgs: input.rowArgs, rowSyntax: input.rowSyntax,
 	}, ir.Scalar{Kind: ir.Once}, []expression{input})
 }
+func (b *binder) currentOf(n *zpgparse.CurrentOfExpr, s *scope) (expression, error) {
+	if n == nil || n.CursorName == "" {
+		return expression{}, bindError("0A000", "WHERE CURRENT OF requires a cursor name", 0)
+	}
+	if b.currentOfTarget == nil {
+		return expression{}, bindError("0A000", "WHERE CURRENT OF is only supported in UPDATE and DELETE", 0)
+	}
+	if b.options.CurrentOf == nil {
+		return expression{}, bindError("34000", "cursor \""+n.CursorName+"\" does not exist", 0)
+	}
+	row, err := b.options.CurrentOf(n.CursorName, b.currentOfTarget)
+	if err != nil {
+		return expression{}, err
+	}
+	if len(row.Columns) == 0 || len(row.Columns) != len(row.Values) || len(row.Columns) != len(row.Layouts) {
+		return expression{}, bindError("0A000", "cursor \""+n.CursorName+"\" is not a simply updatable scan", 0)
+	}
+	table, hasTable := b.currentOfTarget.Table()
+	terms := make([]expression, 0, len(row.Columns))
+	for i, colID := range row.Columns {
+		var col column
+		found := false
+		for _, candidate := range s.columns {
+			if info, ok := b.builder.Slot(candidate.Slot); ok && info.Object == b.currentOfTarget.ID() && info.Column == colID {
+				col, found = candidate, true
+				break
+			}
+		}
+		if !found && hasTable {
+			for _, tc := range table.Columns {
+				if tc.ID == colID {
+					for _, candidate := range s.columns {
+						if candidate.Name == tc.Name {
+							col, found = candidate, true
+							break
+						}
+					}
+					break
+				}
+			}
+		}
+		if !found {
+			return expression{}, bindError("0A000", "cursor \""+n.CursorName+"\" is not a simply updatable scan", 0)
+		}
+		colExpr, err := b.reference(s, col, 0)
+		if err != nil {
+			return expression{}, err
+		}
+		val := row.Values[i]
+		if val.IsNull {
+			term, err := b.addScalar(s, expression{typ: b.primitive(16), nullable: false}, ir.Scalar{Kind: ir.NullTest}, []expression{colExpr})
+			if err != nil {
+				return expression{}, err
+			}
+			terms = append(terms, term)
+			continue
+		}
+		valExpr, err := b.addScalar(s, expression{typ: row.Layouts[i], nullable: false, value: val}, ir.Scalar{Kind: ir.Const}, nil)
+		if err != nil {
+			return expression{}, err
+		}
+		term, err := b.syntaxOperator(s, "=", []expression{colExpr, valExpr}, 0)
+		if err != nil {
+			return expression{}, err
+		}
+		terms = append(terms, term)
+	}
+	if len(terms) == 1 {
+		return terms[0], nil
+	}
+	return b.boolean(s, ir.And, terms, 0)
+}
+
 func (b *binder) scalar(node *zpgparse.Node, s *scope) (expression, error) {
 	if err := b.enter(); err != nil {
 		return expression{}, err
@@ -92,6 +165,9 @@ func (b *binder) scalar(node *zpgparse.Node, s *scope) (expression, error) {
 	}
 	if value := node.GetSetToDefault(); value != nil {
 		return expression{}, bindError("42601", "DEFAULT is not allowed in this context", int(value.Location)+1)
+	}
+	if currentOf := node.GetCurrentOfExpr(); currentOf != nil {
+		return b.currentOf(currentOf, s)
 	}
 	if n := node.GetMergeSupportFunc(); n != nil {
 		for current := s; current != nil; current = current.parent {
@@ -190,15 +266,37 @@ func (b *binder) scalar(node *zpgparse.Node, s *scope) (expression, error) {
 		if err != nil {
 			return expression{}, err
 		}
-		if array := n.Arg.GetAArrayExpr(); array != nil && typ.Type.Storage == model.TypeArray && len(typ.Children) == 1 {
-			return b.arrayConstructor(array, s, &typ)
+		domainBase, isDomain, err := b.domainBase(typ)
+		if err != nil {
+			return expression{}, err
 		}
-		if row := n.Arg.GetRowExpr(); row != nil && typ.Type.Storage == model.TypeComposite && typ.Type.ID != 2249 {
+		constructTarget := typ
+		if isDomain {
+			constructTarget = domainBase
+		}
+		if array := n.Arg.GetAArrayExpr(); array != nil && constructTarget.Type.Storage == model.TypeArray && len(constructTarget.Children) == 1 {
+			constructed, err := b.arrayConstructor(array, s, &constructTarget)
+			if err != nil {
+				return expression{}, err
+			}
+			if isDomain {
+				return b.coerce(s, constructed, typ, ir.ExplicitCast)
+			}
+			return constructed, nil
+		}
+		if row := n.Arg.GetRowExpr(); row != nil && constructTarget.Type.Storage == model.TypeComposite && constructTarget.Type.ID != 2249 {
 			args, err := b.rowArguments(row.Args, s, int(row.Location)+1)
 			if err != nil {
 				return expression{}, err
 			}
-			return b.coerceRecord(s, expression{typ: b.primitive(2249), record: recordConstructor, rowArgs: args, position: int(row.Location) + 1}, typ, ir.ExplicitCast)
+			constructed, err := b.coerceRecord(s, expression{typ: b.primitive(2249), record: recordConstructor, rowArgs: args, position: int(row.Location) + 1}, constructTarget, ir.ExplicitCast)
+			if err != nil {
+				return expression{}, err
+			}
+			if isDomain {
+				return b.coerce(s, constructed, typ, ir.ExplicitCast)
+			}
+			return constructed, nil
 		}
 		e, err := b.scalar(n.Arg, s)
 		if err != nil {

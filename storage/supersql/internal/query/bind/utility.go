@@ -179,7 +179,32 @@ func (b *binder) modificationTarget(n *zpgparse.RangeVar) (mutationTarget, error
 			}
 			sequence := published.Descriptor
 			metadata, ok := sequence.Sequence()
-			if !ok || sequence.State() != model.StatePublic || metadata.OwnerTable != d.ID() || metadata.OwnerColumn != column.ID || metadata.Type.Storage != model.TypeInt64 {
+			ownerMatch := ok && metadata.OwnerTable == d.ID() && metadata.OwnerColumn == column.ID
+			if ok && !ownerMatch && table.PartitionBound != nil && len(table.Parents) > 0 {
+				visited := map[model.ObjectID]bool{d.ID(): true}
+				cur := d
+				for cur != nil {
+					tbl, hasTbl := cur.Table()
+					if !hasTbl || tbl.PartitionBound == nil || len(tbl.Parents) == 0 {
+						break
+					}
+					parentID := tbl.Parents[0]
+					if visited[parentID] {
+						break
+					}
+					visited[parentID] = true
+					if parentID == metadata.OwnerTable {
+						ownerMatch = true
+						break
+					}
+					pPub, pErr := b.catalog.Descriptor(b.ctx, parentID)
+					if pErr != nil || pPub.Descriptor == nil {
+						break
+					}
+					cur = pPub.Descriptor
+				}
+			}
+			if !ok || sequence.State() != model.StatePublic || !ownerMatch || metadata.Type.Storage != model.TypeInt64 {
 				return mutationTarget{}, model.ErrInvalidDescriptor
 			}
 			switch metadata.Type.ID {
@@ -395,7 +420,8 @@ func (b *binder) insert(n *zpgparse.InsertStmt, s *scope) (relation, error) {
 			c = target.assignmentColumn(c)
 		}
 		if c.Generated != nil {
-			if slices.ContainsFunc(targets, func(t model.ColumnDescriptor) bool { return t.ID == c.ID }) && !simpleInsertValues(n.SelectStmt.GetSelectStmt()) {
+			suppliedIdx := slices.IndexFunc(targets, func(t model.ColumnDescriptor) bool { return t.ID == c.ID })
+			if suppliedIdx >= 0 && !simpleInsertValues(n.SelectStmt.GetSelectStmt()) && !valuesColumnAllDefault(n.SelectStmt.GetSelectStmt(), suppliedIdx) {
 				b.deferWriteError(bindError("428C9", "cannot insert a non-DEFAULT value into generated column", 0))
 			}
 			continue
@@ -437,7 +463,10 @@ func (b *binder) insert(n *zpgparse.InsertStmt, s *scope) (relation, error) {
 			direct = -1
 		}
 		if supplied && c.IdentityAlways && n.Override != zpgparse.OverridingKind_OVERRIDING_SYSTEM_VALUE && !simpleInsertValues(n.SelectStmt.GetSelectStmt()) {
-			identityError = bindError("428C9", "cannot insert a non-DEFAULT value into identity column", 0)
+			allDefault := direct >= 0 && valuesColumnAllDefault(n.SelectStmt.GetSelectStmt(), direct)
+			if !allDefault {
+				identityError = bindError("428C9", "cannot insert a non-DEFAULT value into identity column", 0)
+			}
 		}
 		var e expression
 		if direct >= 0 {
@@ -612,7 +641,10 @@ func (b *binder) update(n *zpgparse.UpdateStmt, s *scope) (relation, error) {
 	s.columns = input.columns
 	s.namespaces = input.namespaces
 	if n.WhereClause != nil {
+		savedCurrentOf := b.currentOfTarget
+		b.currentOfTarget = target.descriptor
 		predicate, err := b.scalar(n.WhereClause, s)
+		b.currentOfTarget = savedCurrentOf
 		if err != nil {
 			return input, err
 		}
@@ -664,6 +696,7 @@ func (b *binder) updateAssignments(nodes []*zpgparse.Node, s *scope, mutation mu
 		assignmentColumn := mutation.assignmentColumn(c)
 
 		var value expression
+		isDefault := target.Val.GetSetToDefault() != nil
 		multi := target.Val.GetMultiAssignRef()
 		if multi == nil {
 			if tupleNext != 0 {
@@ -679,28 +712,51 @@ func (b *binder) updateAssignments(nodes []*zpgparse.Node, s *scope, mutation mu
 			if count < 1 || ordinal < 1 || ordinal > count || multi.Source == nil {
 				return nil, nil, effects, bindError("42601", "invalid multiple assignment", position)
 			}
-			if ordinal == 1 {
-				if tupleNext != 0 {
-					return nil, nil, effects, bindError("42601", "overlapping multiple assignment", position)
+			if rowExpr := multi.Source.GetRowExpr(); rowExpr != nil && len(rowExpr.Args) == count {
+				if ordinal == 1 {
+					if tupleNext != 0 {
+						return nil, nil, effects, bindError("42601", "overlapping multiple assignment", position)
+					}
+					tupleSource, tupleCount, tupleNext = multi.Source, count, 1
 				}
+				if tupleNext != ordinal || tupleCount != count || (multi.Source != tupleSource && !equivalentAST(multi.Source.ProtoReflect(), tupleSource.ProtoReflect())) {
+					return nil, nil, effects, bindError("42601", "invalid multiple assignment sequence", position)
+				}
+				elem := rowExpr.Args[ordinal-1]
+				isDefault = elem.GetSetToDefault() != nil
 				var err error
-				tuple, err = b.multiAssignmentTuple(multi.Source, count, s, position)
+				value, err = b.assignmentInput(elem, s, assignmentColumn)
 				if err != nil {
 					return nil, nil, effects, err
 				}
-				tupleSource, tupleCount, tupleNext = multi.Source, count, 1
-			}
-			if tupleNext != ordinal || tupleCount != count || (multi.Source != tupleSource && !equivalentAST(multi.Source.ProtoReflect(), tupleSource.ProtoReflect())) {
-				return nil, nil, effects, bindError("42601", "invalid multiple assignment sequence", position)
-			}
-			var err error
-			value, err = b.compositeFieldAt(s, tuple, ordinal-1, position)
-			if err != nil {
-				return nil, nil, effects, err
-			}
-			tupleNext++
-			if tupleNext > tupleCount {
-				tuple, tupleSource, tupleCount, tupleNext = expression{}, nil, 0, 0
+				tupleNext++
+				if tupleNext > tupleCount {
+					tuple, tupleSource, tupleCount, tupleNext = expression{}, nil, 0, 0
+				}
+			} else {
+				if ordinal == 1 {
+					if tupleNext != 0 {
+						return nil, nil, effects, bindError("42601", "overlapping multiple assignment", position)
+					}
+					var err error
+					tuple, err = b.multiAssignmentTuple(multi.Source, count, s, position)
+					if err != nil {
+						return nil, nil, effects, err
+					}
+					tupleSource, tupleCount, tupleNext = multi.Source, count, 1
+				}
+				if tupleNext != ordinal || tupleCount != count || (multi.Source != tupleSource && !equivalentAST(multi.Source.ProtoReflect(), tupleSource.ProtoReflect())) {
+					return nil, nil, effects, bindError("42601", "invalid multiple assignment sequence", position)
+				}
+				var err error
+				value, err = b.compositeFieldAt(s, tuple, ordinal-1, position)
+				if err != nil {
+					return nil, nil, effects, err
+				}
+				tupleNext++
+				if tupleNext > tupleCount {
+					tuple, tupleSource, tupleCount, tupleNext = expression{}, nil, 0, 0
+				}
 			}
 		}
 		destinationDescriptor, destinationColumn := d, c.ID
@@ -721,13 +777,13 @@ func (b *binder) updateAssignments(nodes []*zpgparse.Node, s *scope, mutation mu
 		}
 
 		if assignmentColumn.Generated != nil {
-			if target.Val.GetSetToDefault() == nil {
+			if !isDefault {
 				b.deferWriteError(bindError("428C9", "cannot assign a non-DEFAULT value to generated column", position))
 			}
 			b.dependency(destinationDescriptor, destinationColumn)
 			continue
 		}
-		if assignmentColumn.IdentityAlways && target.Val.GetSetToDefault() == nil && identityError == nil {
+		if assignmentColumn.IdentityAlways && !isDefault && identityError == nil {
 			identityError = bindError("428C9", "identity column can only be updated to DEFAULT", position)
 		}
 		var err error
@@ -757,6 +813,19 @@ func (b *binder) updateAssignments(nodes []*zpgparse.Node, s *scope, mutation mu
 	}
 	b.deferWriteError(identityError)
 	return assignments, updated, effects, nil
+}
+
+func valuesColumnAllDefault(sel *zpgparse.SelectStmt, colIndex int) bool {
+	if sel == nil || len(sel.ValuesLists) == 0 || colIndex < 0 {
+		return false
+	}
+	for _, rowNode := range sel.ValuesLists {
+		list := rowNode.GetList()
+		if list == nil || colIndex >= len(list.Items) || list.Items[colIndex].GetSetToDefault() == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *binder) multiAssignmentTuple(source *zpgparse.Node, count int, s *scope, position int) (expression, error) {
@@ -984,7 +1053,10 @@ func (b *binder) delete(n *zpgparse.DeleteStmt, s *scope) (relation, error) {
 	s.columns = input.columns
 	s.namespaces = input.namespaces
 	if n.WhereClause != nil {
+		savedCurrentOf := b.currentOfTarget
+		b.currentOfTarget = target.descriptor
 		predicate, err := b.scalar(n.WhereClause, s)
+		b.currentOfTarget = savedCurrentOf
 		if err != nil {
 			return input, err
 		}

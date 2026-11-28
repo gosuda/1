@@ -97,7 +97,8 @@ func (d *Descriptor) ValidateSuccessor(ctx context.Context, next *Descriptor) er
 			nextKind = new.Type.DeclaredKind()
 		}
 		shellCompletion := kind == TypeKindShell && nextKind == TypeKindRange && old.Type.Layout.Type == new.Type.Layout.Type
-		if new.Type == nil || !shellCompletion && (kind != nextKind || old.Type.Layout.Type != new.Type.Layout.Type || old.Type.Array != new.Type.Array || old.Type.Relation != new.Type.Relation || old.Type.Base != new.Type.Base || kind != TypeKindArray && !TypeLayoutsEqual(old.Type.BaseLayout, new.Type.BaseLayout) || !equalRangeTypeMetadata(old.Type.Range, new.Type.Range) || new.Type.FieldIDHighWatermark < old.Type.FieldIDHighWatermark) {
+		domainCompositeCascade := kind == TypeKindDomain && old.Type.BaseLayout.Type == new.Type.BaseLayout.Type
+		if new.Type == nil || !shellCompletion && (kind != nextKind || old.Type.Layout.Type != new.Type.Layout.Type || old.Type.Array != new.Type.Array || old.Type.Relation != new.Type.Relation || old.Type.Base != new.Type.Base || kind != TypeKindArray && !domainCompositeCascade && !TypeLayoutsEqual(old.Type.BaseLayout, new.Type.BaseLayout) || !equalRangeTypeMetadata(old.Type.Range, new.Type.Range) || new.Type.FieldIDHighWatermark < old.Type.FieldIDHighWatermark) {
 			return ErrInvalidDescriptor
 		}
 		if kind == TypeKindEnum {

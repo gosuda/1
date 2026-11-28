@@ -30,6 +30,7 @@ const (
 	clientMinMessages
 	applicationName
 	checkFunctionBodies
+	rowSecurity
 	lcMonetary
 	lcNumeric
 	lcTime
@@ -88,6 +89,7 @@ var settingDefinitions = [settingCount]settingDefinition{
 	clientMinMessages:         {"client_min_messages", "notice", stringSetting, 0, 0},
 	applicationName:           {"application_name", "", stringSetting, 0, 0},
 	checkFunctionBodies:       {"check_function_bodies", "on", booleanSetting, 0, 0},
+	rowSecurity:               {"row_security", "on", booleanSetting, 0, 0},
 	lcMonetary:                {"lc_monetary", "C", stringSetting, 0, 0},
 	lcNumeric:                 {"lc_numeric", "C", stringSetting, 0, 0},
 	lcTime:                    {"lc_time", "C", stringSetting, 0, 0},

@@ -20,6 +20,7 @@ import (
 	"github.com/gosuda/supersql-alpha/internal/locks"
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
+	execution "github.com/gosuda/supersql-alpha/internal/query/exec"
 )
 
 type TransactionManager interface {
@@ -136,6 +137,8 @@ type Transactions struct {
 	notifyMarks             []int
 	pendingListenOps        []pendingListenOp
 	listenMarks             []int
+	uncommittedTargets      []execution.MutationTarget
+	uncommittedTargetMarks  []int
 	constraintModes         constraintModeState
 	constraintSavepoints    []constraintModeState
 	typeRuntime             *DeclaredTypeRuntimeOptions
@@ -546,6 +549,10 @@ func (transactions *Transactions) begin(ctx context.Context, start TransactionSt
 	transactions.deferredConstraints = transactions.deferredConstraints[:0]
 	clear(transactions.deferredConstraintMarks)
 	transactions.deferredConstraintMarks = transactions.deferredConstraintMarks[:0]
+	clear(transactions.uncommittedTargets)
+	transactions.uncommittedTargets = transactions.uncommittedTargets[:0]
+	clear(transactions.uncommittedTargetMarks)
+	transactions.uncommittedTargetMarks = transactions.uncommittedTargetMarks[:0]
 	transactions.deferredConstraintBytes = 0
 	transactions.constraintModes = constraintModeState{}
 	clear(transactions.constraintSavepoints)
@@ -767,6 +774,10 @@ func (transactions *Transactions) finishSettings(committed bool) error {
 	transactions.deferredConstraints = transactions.deferredConstraints[:0]
 	clear(transactions.deferredConstraintMarks)
 	transactions.deferredConstraintMarks = transactions.deferredConstraintMarks[:0]
+	clear(transactions.uncommittedTargets)
+	transactions.uncommittedTargets = transactions.uncommittedTargets[:0]
+	clear(transactions.uncommittedTargetMarks)
+	transactions.uncommittedTargetMarks = transactions.uncommittedTargetMarks[:0]
 	transactions.deferredConstraintBytes = 0
 	transactions.constraintModes = constraintModeState{}
 	clear(transactions.constraintSavepoints)
@@ -831,6 +842,7 @@ func (transactions *Transactions) savepoint(ctx context.Context, name string) er
 	transactions.advisoryMarks = append(transactions.advisoryMarks, advisoryMark)
 	transactions.deferredMarks = append(transactions.deferredMarks, len(transactions.deferredTriggers))
 	transactions.deferredConstraintMarks = append(transactions.deferredConstraintMarks, len(transactions.deferredConstraints))
+	transactions.uncommittedTargetMarks = append(transactions.uncommittedTargetMarks, len(transactions.uncommittedTargets))
 	transactions.constraintSavepoints = append(transactions.constraintSavepoints, cloneConstraintModes(transactions.constraintModes))
 	transactions.cursorSavepoints = append(transactions.cursorSavepoints, transactions.named.cursorSerial)
 	transactions.named.temporaryMarks = append(transactions.named.temporaryMarks, len(transactions.named.temporaryChanges))
@@ -963,6 +975,15 @@ func (transactions *Transactions) rollbackTo(ctx context.Context, name string) e
 		clear(transactions.listenMarks[index+1:])
 		transactions.listenMarks = transactions.listenMarks[:index+1]
 	}
+	if index < len(transactions.uncommittedTargetMarks) {
+		mark := transactions.uncommittedTargetMarks[index]
+		if mark >= 0 && mark <= len(transactions.uncommittedTargets) {
+			clear(transactions.uncommittedTargets[mark:])
+			transactions.uncommittedTargets = transactions.uncommittedTargets[:mark]
+		}
+		clear(transactions.uncommittedTargetMarks[index+1:])
+		transactions.uncommittedTargetMarks = transactions.uncommittedTargetMarks[:index+1]
+	}
 	transactions.failure = nil
 	return cleanupErr
 }
@@ -1026,6 +1047,10 @@ func (transactions *Transactions) release(ctx context.Context, name string) erro
 	if index <= len(transactions.listenMarks) {
 		clear(transactions.listenMarks[index:])
 		transactions.listenMarks = transactions.listenMarks[:index]
+	}
+	if index <= len(transactions.uncommittedTargetMarks) {
+		clear(transactions.uncommittedTargetMarks[index:])
+		transactions.uncommittedTargetMarks = transactions.uncommittedTargetMarks[:index]
 	}
 	if transactions.sequences != nil {
 		transactions.sequences.marks = transactions.sequences.marks[:index]
