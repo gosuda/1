@@ -244,3 +244,51 @@ func TestWALArchiveAcceptsPlaintextAfterKeyAdded(t *testing.T) {
 		t.Fatalf("plaintext archive lost its metadata: %v", err)
 	}
 }
+
+func TestWALArchiveRepairFailsClosedOnPlaintextSidecarAfterKeyAdded(t *testing.T) {
+	fixture := openBackendFixture(t)
+	archiveDir := t.TempDir()
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.backend.ApplyMutations(t.Context(), fixture.batch(t, 1, 20, 100, 200)); err != nil {
+		t.Fatal(err)
+	}
+	segment := commitName(1)
+	sidecar := walMetaName(1)
+	originalSegment, err := os.ReadFile(filepath.Join(archiveDir, segment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalMeta, err := os.ReadFile(filepath.Join(archiveDir, sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{7}, encryptionKeySize)
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, key); err != nil {
+		t.Fatalf("EnableWALArchive with key over plaintext archive: %v", err)
+	}
+	// Orphan the plaintext sidecar: the repair cannot reproduce its
+	// checksum under the new key because every encrypted file uses a
+	// fresh random salt, so it must fail closed and keep the sidecar.
+	if err := os.Remove(filepath.Join(archiveDir, segment)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, key); !errors.Is(err, storage.ErrCorruptStorage) {
+		t.Fatalf("repair under a new archive key = %v, want corrupt storage", err)
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, segment)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed repair published a replacement WAL: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(archiveDir, sidecar)); err != nil || !bytes.Equal(got, originalMeta) {
+		t.Fatalf("failed repair changed the original sidecar: %q, %v", got, err)
+	}
+	// Retrying with the original keyless archive cipher still repairs
+	// the segment from the retained local WAL.
+	if err := fixture.backend.EnableWALArchive(t.Context(), archiveDir, nil); err != nil {
+		t.Fatalf("repair with the original archive cipher: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(archiveDir, segment)); err != nil || !bytes.Equal(got, originalSegment) {
+		t.Fatalf("repaired WAL differs from the original archived bytes")
+	}
+}

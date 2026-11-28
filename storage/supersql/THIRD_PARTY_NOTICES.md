@@ -869,7 +869,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Version: v0.49.0
 License: BSD-3-Clause
 Source: https://go.googlesource.com/sys
-Used by: module graph only: reachable only through the amd64-only path github.com/zeebo/xxh3 -> github.com/klauspost/cpuid/v2; not built on this platform
+Used by: internal/dataplane/storage/neosepia on Linux (golang.org/x/sys/unix for the atomic no-replace archive rename); also reachable only through the amd64-only path github.com/zeebo/xxh3 -> github.com/klauspost/cpuid/v2 elsewhere
 License file: LICENSE
 
 ```

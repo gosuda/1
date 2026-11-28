@@ -215,3 +215,13 @@ Recovery bounds each decoded WAL body by `Open.Compaction.WALBytes`, using the
 storage default when unset. Set this limit high enough to read the source
 database's committed WAL segments. Encrypted archives are authenticated in
 chunks and checked against the same plaintext limit.
+
+Archive publication keeps an existing WAL segment or metadata sidecar: a late
+publisher reports that the destination already exists instead of replacing it.
+When hard links are unavailable, Linux uses an atomic rename that rejects an
+occupied destination, including a competing publisher that arrives at the same
+time. Where the platform or filesystem provides no atomic no-replace
+operation, publication fails instead of replacing the destination, so prefer
+filesystems with hard-link or atomic no-replace support for shared archives.
+The local WAL remains available for a retry and cannot be retired until
+archiving succeeds.
