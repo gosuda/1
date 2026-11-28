@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.3.3550000)'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref or commit SHA to build and release'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.3.3540100)'
+        required: true
+        default: 'v0.3.3540100'
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  GOCACHEPROG: ""
+  ZIG_VERSION: '0.17.1'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: depot-ubuntu-24.04
+          - goos: linux
+            goarch: arm64
+            runner: depot-ubuntu-24.04
+          - goos: darwin
+            goarch: arm64
+            runner: depot-macos-latest
+          - goos: darwin
+            goarch: amd64
+            runner: depot-macos-latest
+          - goos: windows
+            goarch: amd64
+            runner: depot-windows-2025
+          - goos: windows
+            goarch: arm64
+            runner: depot-ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - name: Checkout HQQ core
+        shell: bash
+        run: git clone --depth 1 https://github.com/gosuda/HQQ.git ../HQQ
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build cmake clang-18 gcc-13 unzip xz-utils
+
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          cmd.exe /c "call `"$vcvars`" x64 >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              if ($matches[1] -ieq 'PATH') {
+                $entries = @($matches[2] -split ';' | Where-Object { $_ })
+                [array]::Reverse($entries)
+                $entries | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              } else {
+                "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              }
+            }
+          }
+
+      - name: Build hqq-sqlite-server (${{ matrix.goos }}/${{ matrix.goarch }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp_dir="$RUNNER_TEMP"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            tmp_dir=$(cygpath -u "$RUNNER_TEMP")
+          fi
+          adir=$(scripts/release/fetch-sqlite.sh -d "$tmp_dir/sqlite-src")
+          bdir="$tmp_dir/hqq-sqlite-build"
+          if [ "${{ matrix.goos }}" = "windows" ] && [ "${{ matrix.goarch }}" = "arm64" ]; then
+            mkdir -p "$tmp_dir/zig"
+            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$tmp_dir/zig" --strip-components=1
+            "$tmp_dir/zig/zig" cc --version
+            printf '#!/bin/sh\nexec "%s/zig/zig" cc -target aarch64-windows-gnu "$@"\n' "$tmp_dir" > "$tmp_dir/zig-cc"
+            printf '#!/bin/sh\nexec "%s/zig/zig" ar "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ar"
+            printf '#!/bin/sh\nexec "%s/zig/zig" ranlib "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ranlib"
+            chmod +x "$tmp_dir/zig-cc" "$tmp_dir/zig-ar" "$tmp_dir/zig-ranlib"
+            cmake -S sqlite3/server -B "$bdir" -G Ninja \
+              -DCMAKE_SYSTEM_NAME=Windows \
+              -DCMAKE_SYSTEM_PROCESSOR=ARM64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER="$tmp_dir/zig-cc" \
+              -DCMAKE_AR="$tmp_dir/zig-ar" \
+              -DCMAKE_RANLIB="$tmp_dir/zig-ranlib" \
+              -DCMAKE_EXE_LINKER_FLAGS="-s" \
+              -DHQQ_SQLITE_AMALGAMATION_DIR="$adir"
+          elif [ "${{ matrix.goos }}" = "linux" ]; then
+            zig_target="x86_64-linux-gnu.2.28"
+            sys_proc="x86_64"
+            if [ "${{ matrix.goarch }}" = "arm64" ]; then
+              zig_target="aarch64-linux-gnu.2.28"
+              sys_proc="aarch64"
+            fi
+            mkdir -p "$tmp_dir/zig"
+            curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C "$tmp_dir/zig" --strip-components=1
+            "$tmp_dir/zig/zig" cc --version
+            printf '#!/bin/sh\nexec "%s/zig/zig" cc -target %s "$@"\n' "$tmp_dir" "$zig_target" > "$tmp_dir/zig-cc"
+            printf '#!/bin/sh\nexec "%s/zig/zig" ar "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ar"
+            printf '#!/bin/sh\nexec "%s/zig/zig" ranlib "$@"\n' "$tmp_dir" > "$tmp_dir/zig-ranlib"
+            chmod +x "$tmp_dir/zig-cc" "$tmp_dir/zig-ar" "$tmp_dir/zig-ranlib"
+            cmake -S sqlite3/server -B "$bdir" -G Ninja \
+              -DCMAKE_SYSTEM_NAME=Linux \
+              -DCMAKE_SYSTEM_PROCESSOR="$sys_proc" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER="$tmp_dir/zig-cc" \
+              -DCMAKE_AR="$tmp_dir/zig-ar" \
+              -DCMAKE_RANLIB="$tmp_dir/zig-ranlib" \
+              -DCMAKE_EXE_LINKER_FLAGS="-s" \
+              -DHQQ_SQLITE_AMALGAMATION_DIR="$adir"
+          elif [ "${{ matrix.goos }}" = "windows" ]; then
+            clang-cl --version
+            adir=$(cygpath -m "$adir")
+            bdir=$(cygpath -m "$bdir")
+            cmake -S sqlite3/server -B "$bdir" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=clang-cl \
+              -DCMAKE_CXX_COMPILER=clang-cl \
+              -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+              -DHQQ_SQLITE_AMALGAMATION_DIR="$adir"
+          elif [ "${{ matrix.goos }}" = "darwin" ]; then
+            cc --version
+            osx_arch="arm64"
+            if [ "${{ matrix.goarch }}" = "amd64" ]; then osx_arch="x86_64"; fi
+            cmake -S sqlite3/server -B "$bdir" -G "Unix Makefiles" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$osx_arch" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+              -DHQQ_SQLITE_AMALGAMATION_DIR="$adir"
+          fi
+          cmake --build "$bdir" --target hqq-sqlite-server
+          mkdir -p dist
+          ext=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then ext=".exe"; fi
+          out="dist/hqq-sqlite-server_${{ matrix.goos }}_${{ matrix.goarch }}${ext}"
+          cp "$bdir/hqq-sqlite-server${ext}" "$out"
+          if [ "${{ matrix.goos }}" = "darwin" ]; then
+            strip -x "$out"
+            codesign --force --sign - "$out"
+          fi
+
+      - name: Attest SLSA Build Provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: 'dist/hqq-sqlite-server_*'
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build]
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256SUMS, update hashes.go, and verify embedded binary
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          (cd dist && sha256sum hqq-sqlite-server_* | sort -k2 > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+          sqlite_version=$(awk -F= '$1 == "version" { print $2 }' third_party/sqlite/VERSION)
+          sqlite_archive=$(awk -F= '$1 == "archive" { print $2 }' third_party/sqlite/VERSION)
+          sqlite_vernum=$(printf '%s' "$sqlite_archive" | sed -E 's/^sqlite-amalgamation-([0-9]+)\.zip$/\1/')
+          case "$sqlite_vernum" in
+            ''|*[!0-9]*) echo "invalid sqlite_vernum: $sqlite_vernum" >&2; exit 1 ;;
+          esac
+
+          {
+            cat <<EOF
+          package sqlite
+
+          import "gosuda.org/hqq/secureexec"
+
+          // Version follows the v<WrapperMajor>.<WrapperMinor>.<NormalizedCVersion> scheme,
+          // where ${sqlite_vernum} corresponds to SQLITE_VERSION_NUMBER (SQLite ${sqlite_version}).
+          const (
+          	Version             = "${tag}"
+          	SQLiteVersionNumber = ${sqlite_vernum}
+          )
+
+          // ReleaseHashes maps "<GOOS>/<GOARCH>" to the SHA-256 digest of the prebuilt
+          // hqq-sqlite-server binary published with this module version.
+          var ReleaseHashes = map[string]secureexec.Hash{
+          EOF
+            while read -r sum file; do
+              plat="${file#hqq-sqlite-server_}"
+              plat="${plat%.exe}"
+              goos="${plat%_*}"
+              goarch="${plat#*_}"
+              printf '\t"%s/%s": mustHash("%s"),\n' "$goos" "$goarch" "$sum"
+            done < dist/SHA256SUMS
+            cat <<'EOF'
+          }
+
+          // ExpectedHash returns the pinned SHA-256 digest of hqq-sqlite-server for goos/goarch.
+          func ExpectedHash(goos, goarch string) (secureexec.Hash, bool) {
+          	h, ok := ReleaseHashes[goos+"/"+goarch]
+          	return h, ok
+          }
+
+          func mustHash(s string) secureexec.Hash {
+          	h, err := secureexec.ParseHash(s)
+          	if err != nil {
+          		panic(err)
+          	}
+          	return h
+          }
+          EOF
+          } > hashes.go
+          gofmt -w hashes.go
+          cat hashes.go
+
+          if [ -f README.md ]; then
+            sed -i -E "s|^(\tVersion[[:space:]]*=[[:space:]]*)\"[^\"]+\"$|\1\"${tag}\"|" README.md
+            sed -i -E "s|^(\tSQLiteVersionNumber[[:space:]]*=[[:space:]]*)[0-9]+$|\1${sqlite_vernum}|" README.md
+          fi
+
+          mkdir -p internal/embedded/bin
+          cp dist/hqq-sqlite-server_* internal/embedded/bin/
+          chmod +x internal/embedded/bin/hqq-sqlite-server_linux_* internal/embedded/bin/hqq-sqlite-server_darwin_*
+
+          go vet ./...
+          HQQ_SQLITE_SERVER="$PWD/dist/hqq-sqlite-server_linux_amd64" \
+            go test -count=1 -p 1 -race -timeout 10m . ./launcher ./e2e ./internal/... ./scripts/release/sync-sqlite
+          go test -run TestGeneratedFilesAreFresh ./sqlite3
+
+          git add hashes.go internal/embedded/bin/ README.md
+          if [ "$GITHUB_REF_TYPE" != "tag" ] && ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore(release): pin embedded binaries and digests for ${tag}"
+            git push origin HEAD:main
+          fi
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=$(git rev-parse HEAD)
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            git tag -f "$TAG" "$target"
+            git push origin -f "refs/tags/$TAG"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$target" \
+              --title "$TAG" \
+              --generate-notes
+          fi
