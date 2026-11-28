@@ -75,6 +75,20 @@ type ExposeConfig struct {
 	TLSStateDir     string
 	TLSRequireLocal bool
 
+	// Keyless provides optional relay-backed keyless TLS termination for friendly
+	// aliases (e.g. keyless.NewProvider()). Leave nil to compile and run without
+	// github.com/gosuda/keyless_tls (Local TLS / raw TCP / UDP-only modes).
+	Keyless KeylessProvider
+
+	// Datagram provides the optional QUIC datagram backhaul dialer for UDP
+	// exposures (e.g. udp.NewDialer()). Leave nil to compile and run without
+	// github.com/quic-go/quic-go.
+	Datagram DatagramDialer
+
+	// CertObserver optionally observes public CAA/CT state for each active
+	// lease hostname (e.g. certmon.NewFactory(...)).
+	CertObserver CertObserverFactory
+
 	// DisableDiscovery turns off automatic relay discovery, which is on by
 	// default. While enabled, the exposure polls /discovery on its relays and
 	// adds verified candidates until MaxActiveRelays is reached, so the
@@ -108,6 +122,9 @@ type Exposure struct {
 	automaticTLS bool
 	tlsStateDir  string
 	tlsReqLocal  bool
+	keyless      KeylessProvider
+	datagram     DatagramDialer
+	certObserver CertObserverFactory
 	closing      bool
 	allFailed    chan struct{}
 	stateChanged chan struct{}
@@ -183,6 +200,12 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 	if cfg.Replica && (cfg.UDPEnabled || cfg.TCPEnabled) {
 		return nil, errors.New("portalite: Replica cannot be combined with UDPEnabled or TCPEnabled")
 	}
+	if cfg.UDPEnabled && cfg.Datagram == nil {
+		return nil, errors.New("portalite: UDPEnabled requires Datagram dialer")
+	}
+	if !useLocalTLS && !cfg.TCPEnabled && !cfg.UDPEnabled && cfg.Keyless == nil {
+		return nil, errors.New("portalite: Keyless provider is required unless Local TLS, TCP, or UDP-only mode is enabled")
+	}
 	if cfg.TLSCertFile != "" {
 		if err := validateLocalCertificateFiles(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
 			return nil, err
@@ -232,6 +255,9 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 		automaticTLS:        cfg.AutomaticTLS,
 		tlsStateDir:         cfg.TLSStateDir,
 		tlsReqLocal:         cfg.TLSRequireLocal,
+		keyless:             cfg.Keyless,
+		datagram:            cfg.Datagram,
+		certObserver:        cfg.CertObserver,
 		allFailed:           make(chan struct{}),
 		stateChanged:        make(chan struct{}),
 		rejectedRelays:      make(map[string]struct{}),
@@ -292,6 +318,9 @@ func (e *Exposure) addRelay(relayURL string, explicit bool) error {
 	supervisor.automaticTLS = e.automaticTLS
 	supervisor.tlsStateDir = e.tlsStateDir
 	supervisor.tlsRequireLocal = e.tlsReqLocal
+	supervisor.keyless = e.keyless
+	supervisor.datagram = e.datagram
+	supervisor.certObserver = e.certObserver
 	e.mu.Lock()
 	if e.closing || e.ctx.Err() != nil {
 		e.mu.Unlock()

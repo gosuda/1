@@ -19,11 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"github.com/gosuda/keyless_tls/keyless"
-	"github.com/gosuda/keyless_tls/keyless/t13server"
-	"github.com/gosuda/keyless_tls/relay/signrpc"
-
-	"github.com/quic-go/quic-go"
 )
 
 const reverseSessionSlots = 2
@@ -148,13 +143,13 @@ func (t relayTimings) ttlSeconds() int {
 	return seconds
 }
 
-// tenantTLS is the protocol-10 tenant TLS terminator for one lease: a
-// keyless_tls t13server (for friendly aliases) and/or a localTLSManager
+// tenantTLS is the protocol-10 tenant TLS terminator for one lease: an optional
+// KeylessTerminator (for friendly aliases) and/or a localTLSManager
 // (for local-tls-v1 identity-bound canonical hostnames).
 type tenantTLS struct {
-	server            *t13server.Server
-	signer            *leaseTranscriptSigner
+	keyless           KeylessTerminator
 	local             *localTLSManager
+	observer          CertObserver
 	canonicalHostname string
 }
 
@@ -163,8 +158,11 @@ func (t *tenantTLS) close() error {
 		return nil
 	}
 	var errs []error
-	if t.signer != nil && t.signer.signer != nil {
-		if err := t.signer.signer.Close(); err != nil {
+	if t.observer != nil {
+		t.observer.Close()
+	}
+	if t.keyless != nil {
+		if err := t.keyless.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -175,47 +173,6 @@ func (t *tenantTLS) close() error {
 	}
 	return errors.Join(errs...)
 }
-// leaseTranscriptSigner forwards transcript-signing requests to the relay and
-// records failures per reverse-session binding so a handshake failure caused
-// by the signer can be distinguished from an unrelated tenant TLS failure.
-type leaseTranscriptSigner struct {
-	signer *keyless.RemoteSigner
-
-	mu   sync.Mutex
-	errs map[string]error
-}
-
-func (s *leaseTranscriptSigner) SignTranscript(ctx context.Context, request *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
-	response, err := s.signer.SignTranscript(ctx, request)
-	// A cancelled caller context is a session or shutdown decision, not a
-	// signer failure, so only genuine signing errors are attributed.
-	if err != nil && ctx.Err() == nil {
-		s.mu.Lock()
-		if s.errs == nil {
-			s.errs = make(map[string]error)
-		}
-		binding := string(request.Binding)
-		if _, exists := s.errs[binding]; !exists {
-			s.errs[binding] = err
-		}
-		s.mu.Unlock()
-	}
-	return response, err
-}
-
-// takeError returns and clears the recorded signing failure for one binding.
-func (s *leaseTranscriptSigner) takeError(binding []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.errs == nil {
-		return nil
-	}
-	key := string(binding)
-	err := s.errs[key]
-	delete(s.errs, key)
-	return err
-}
-
 type relayLease struct {
 	token             string
 	expiresAt         time.Time
@@ -252,7 +209,9 @@ type relaySupervisor struct {
 	automaticTLS    bool
 	tlsStateDir     string
 	tlsRequireLocal bool
-
+	keyless         KeylessProvider
+	datagram        DatagramDialer
+	certObserver    CertObserverFactory
 	domainReplicas         bool
 	domainNamespaces       []string
 	domainIssuanceDisabled bool
@@ -268,7 +227,7 @@ type relaySupervisor struct {
 	nextLeaseGeneration uint64
 
 	datagramMu   sync.RWMutex
-	datagramConn *quic.Conn
+	datagramConn DatagramConn
 }
 
 func (s *relaySupervisor) useLocalTLS() bool {
@@ -853,6 +812,21 @@ func (s *relaySupervisor) buildTenantTLS(
 	tenant := &tenantTLS{
 		canonicalHostname: canonicalHostname,
 	}
+	monitoredHost := canonicalHostname
+	if monitoredHost == "" {
+		monitoredHost = aliasHostname
+	}
+	if s.certObserver != nil && monitoredHost != "" {
+		obs, err := s.certObserver.Start(monitoredHost)
+		if err != nil {
+			return nil, fmt.Errorf("start certificate observer: %w", err)
+		}
+		tenant.observer = obs
+	}
+	var onLeaf func([]byte)
+	if tenant.observer != nil {
+		onLeaf = tenant.observer.RecordLocalLeafDER
+	}
 	if canonicalHostname != "" {
 		tokenFunc := func() string {
 			if token := s.currentToken(); token != "" {
@@ -871,61 +845,47 @@ func (s *relaySupervisor) buildTenantTLS(
 			tokenFunc,
 			onLocalReady,
 			onCertErr,
+			onLeaf,
 		)
 		if err != nil {
+			_ = tenant.close()
 			return nil, err
 		}
 		tenant.local = local
 	}
 
 	needKeyless := !s.tcpEnabled && (aliasHostname != "" || canonicalHostname == "")
-	if needKeyless {
-		server, signer, err := s.buildKeylessServer(initialToken, s.certificateChain)
+	if needKeyless && s.keyless != nil {
+		terminator, err := s.buildKeylessTerminator(initialToken, s.certificateChain)
 		if err != nil {
 			_ = tenant.close()
 			return nil, err
 		}
-		tenant.server = server
-		tenant.signer = signer
+		tenant.keyless = terminator
+	} else if needKeyless && canonicalHostname == "" && !s.udpEnabled {
+		_ = tenant.close()
+		return nil, errors.New("keyless TLS provider is not configured")
 	}
 	return tenant, nil
 }
 
-func (s *relaySupervisor) buildKeylessServer(initialToken string, chainPEM []byte) (*t13server.Server, *leaseTranscriptSigner, error) {
-	remoteSigner, err := keyless.NewRemoteSigner(keyless.RemoteSignerConfig{
-		Endpoint:   s.relayURL,
-		ServerName: s.hostname,
-		KeyID:      "relay-cert",
-		RootCAPEM:  append([]byte(nil), chainPEM...),
-		Timeout:    s.timings.requestTimeout,
-		Headers: func() http.Header {
-			header := make(http.Header, 1)
-			token := s.currentToken()
-			if token == "" {
-				token = initialToken
+func (s *relaySupervisor) buildKeylessTerminator(initialToken string, chainPEM []byte) (KeylessTerminator, error) {
+	if s.keyless == nil {
+		return nil, errors.New("keyless TLS provider is not configured")
+	}
+	return s.keyless.NewTerminator(KeylessConfig{
+		RelayURL:          s.relayURL,
+		ServerName:        s.hostname,
+		ChainPEM:          append([]byte(nil), chainPEM...),
+		RequestTimeout:    s.timings.requestTimeout,
+		AccessTokenHeader: accessTokenHeader,
+		AccessToken: func() string {
+			if token := s.currentToken(); token != "" {
+				return token
 			}
-			if token != "" {
-				header.Set(accessTokenHeader, token)
-			}
-			return header
+			return initialToken
 		},
 	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	signer := &leaseTranscriptSigner{signer: remoteSigner}
-	server, err := t13server.NewServer(t13server.Config{
-		CertPEM:          append([]byte(nil), chainPEM...),
-		NextProtos:       []string{"http/1.1"},
-		KeyID:            "relay-cert",
-		TranscriptSigner: signer,
-	})
-	if err != nil {
-		_ = remoteSigner.Close()
-		return nil, nil, err
-	}
-	return server, signer, nil
 }
 
 // refreshRelayCertificateChain re-pins the relay's TLS certificate chain after
@@ -946,27 +906,27 @@ func (s *relaySupervisor) refreshRelayCertificateChain(ctx context.Context) (boo
 	if token == "" {
 		return false, nil
 	}
-	server, signer, err := s.buildKeylessServer(token, newChain)
-	if err != nil {
-		return false, err
+	var nextKeyless KeylessTerminator
+	if s.keyless != nil {
+		nextKeyless, err = s.buildKeylessTerminator(token, newChain)
+		if err != nil {
+			return false, err
+		}
 	}
 
-	var oldSigner *keyless.RemoteSigner
+	var oldKeyless KeylessTerminator
 	s.leaseMu.Lock()
 	s.controlTLS = tlsConfig
 	s.certificateChain = newChain
-	if s.lease.tenant != nil && s.lease.tenant.server != nil {
-		if s.lease.tenant.signer != nil {
-			oldSigner = s.lease.tenant.signer.signer
-		}
-		s.lease.tenant.server = server
-		s.lease.tenant.signer = signer
+	if s.lease.tenant != nil && s.lease.tenant.keyless != nil && nextKeyless != nil {
+		oldKeyless = s.lease.tenant.keyless
+		s.lease.tenant.keyless = nextKeyless
 	} else {
-		oldSigner = signer.signer
+		oldKeyless = nextKeyless
 	}
 	s.leaseMu.Unlock()
-	if oldSigner != nil {
-		_ = oldSigner.Close()
+	if oldKeyless != nil {
+		_ = oldKeyless.Close()
 	}
 	return true, nil
 }
@@ -1076,14 +1036,17 @@ func (s *relaySupervisor) runDatagramLoop(
 		if !ok {
 			return errLeaseRefresh
 		}
-		conn, err := dialQUICBackhaul(ctx, s.dialAddress, tlsConfig, token)
+		if s.datagram == nil {
+			return terminalRelay(errors.New("portalite: UDP datagram dialer is not configured"))
+		}
+		conn, err := s.datagram.Dial(ctx, s.dialAddress, tlsConfig, token)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			var rejection *quicBackhaulRejection
+			var rejection DatagramRejection
 			if errors.As(err, &rejection) {
-				code := strings.ToLower(strings.TrimSpace(rejection.Code))
+				code := strings.ToLower(strings.TrimSpace(rejection.RejectionCode()))
 				switch code {
 				case "lease_not_found", "unauthorized":
 					if s.datagramTokenStale(token, generation) {
@@ -1151,7 +1114,7 @@ func (s *relaySupervisor) currentDatagramLease() (
 	return
 }
 
-func (s *relaySupervisor) installDatagramConn(conn *quic.Conn) {
+func (s *relaySupervisor) installDatagramConn(conn DatagramConn) {
 	s.datagramMu.Lock()
 	old := s.datagramConn
 	s.datagramConn = conn
@@ -1161,7 +1124,7 @@ func (s *relaySupervisor) installDatagramConn(conn *quic.Conn) {
 	}
 }
 
-func (s *relaySupervisor) clearDatagramConn(expected *quic.Conn, reason string) {
+func (s *relaySupervisor) clearDatagramConn(expected DatagramConn, reason string) {
 	s.datagramMu.Lock()
 	conn := s.datagramConn
 	if expected == nil || conn == expected {
@@ -1453,9 +1416,9 @@ func (s *relaySupervisor) handshakeTenantTLS(
 	useLocal := false
 	targetConn := conn
 	switch {
-	case tenant.local != nil && tenant.server == nil:
+	case tenant.local != nil && tenant.keyless == nil:
 		useLocal = true
-	case tenant.local != nil && tenant.server != nil:
+	case tenant.local != nil && tenant.keyless != nil:
 		sni, replayed, err := peekClientHelloSNI(conn, s.timings.handshakeTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("peek tenant TLS SNI: %w", err)
@@ -1478,18 +1441,18 @@ func (s *relaySupervisor) handshakeTenantTLS(
 		}
 		return tlsConn, nil
 	}
-	if tenant.server == nil || tenant.signer == nil {
+	if tenant.keyless == nil {
 		return nil, errors.New("tenant TLS configuration is unavailable")
 	}
-	tlsConn := tenant.server.NewConn(targetConn, binding)
-	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-		if signerErr := tenant.signer.takeError(binding); signerErr != nil {
+	tlsConn, err := tenant.keyless.Handshake(handshakeCtx, targetConn, binding)
+	if err != nil {
+		if tenant.keyless.IsSignerError(err) {
 			return nil, &tenantSignerError{
-				err:        signerErr,
+				err:        err,
 				generation: generation,
 			}
 		}
-		return nil, fmt.Errorf("tenant TLS handshake: %w", err)
+		return nil, err
 	}
 	return tlsConn, nil
 }
@@ -1809,7 +1772,7 @@ func (s *relaySupervisor) currentTenant() (*tenantTLS, uint64, error) {
 	tenant := s.lease.tenant
 	generation := s.lease.generation
 	s.leaseMu.RUnlock()
-	if tenant == nil || (tenant.server == nil && tenant.local == nil) {
+	if tenant == nil || (tenant.keyless == nil && tenant.local == nil) {
 		return nil, 0, errors.New("tenant TLS configuration is unavailable")
 	}
 	return tenant, generation, nil
@@ -1818,7 +1781,10 @@ func (s *relaySupervisor) currentTenant() (*tenantTLS, uint64, error) {
 func (s *relaySupervisor) currentReadyInfo() relayReadyInfo {
 	s.leaseMu.RLock()
 	defer s.leaseMu.RUnlock()
-	publicURL := s.lease.aliasURL
+	publicURL := ""
+	if s.lease.tenant != nil && s.lease.tenant.keyless != nil {
+		publicURL = s.lease.aliasURL
+	}
 	if s.lease.canonicalHostname != "" && s.lease.tenant != nil && s.lease.tenant.local != nil && s.lease.tenant.local.ready() {
 		publicURL = s.lease.publicURL
 	}

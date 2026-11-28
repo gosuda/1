@@ -301,6 +301,7 @@ func TestReplicaModeNegotiationAndConflictRetry(t *testing.T) {
 		t.Fatalf("newRelaySupervisor: %v", err)
 	}
 	supervisor.replica = true
+	supervisor.keyless = testKeylessProvider{}
 	defer supervisor.resetControl()
 	if err := supervisor.initializeControl(context.Background()); err != nil {
 		t.Fatalf("initializeControl: %v", err)

@@ -223,6 +223,7 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRelaySupervisor: %v", err)
 	}
+	supervisor.keyless = testKeylessProvider{}
 	defer supervisor.resetControl()
 	if err := supervisor.initializeControl(context.Background()); err != nil {
 		t.Fatalf("initializeControl: %v", err)

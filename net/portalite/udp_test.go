@@ -47,7 +47,7 @@ func TestExposureUDPDatagramsTwoRelays(t *testing.T) {
 	defer relayB.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:     []string{relayA.url, relayB.url},
 		Identity:   newTestIdentity(t),
 		UDPEnabled: true,
@@ -109,7 +109,7 @@ func TestExposureUDPUnsupportedRelayIsIsolated(t *testing.T) {
 	defer unsupported.close()
 	ctx, cancel := context.WithTimeout(context.Background(), fakeRelayWait)
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:     []string{unsupported.url, supported.url},
 		Identity:   newTestIdentity(t),
 		UDPEnabled: true,
@@ -143,7 +143,7 @@ func TestExposureUDPFailureUnblocksDatagramAccept(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithTimeout(context.Background(), fakeRelayWait)
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:     []string{relay.url},
 		Identity:   newTestIdentity(t),
 		UDPEnabled: true,
@@ -169,7 +169,7 @@ func TestExposureUDPRenewReconnectsWithLatestToken(t *testing.T) {
 	timings := testRelayTimings()
 	timings.leaseTTL = 900 * time.Millisecond
 	timings.renewBefore = 300 * time.Millisecond
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:     []string{relay.url},
 		Identity:   newTestIdentity(t),
 		UDPEnabled: true,
@@ -201,7 +201,7 @@ func TestProxyWithConfigServesTCPAndUDP(t *testing.T) {
 	defer closeUDP()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:     []string{relay.url},
 		Identity:   newTestIdentity(t),
 		UDPEnabled: true,

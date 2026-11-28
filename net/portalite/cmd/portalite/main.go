@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"gosuda.org/portalite"
+	"gosuda.org/portalite/certmon"
+	"gosuda.org/portalite/keyless"
+	"gosuda.org/portalite/udp"
 )
 
-const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--no-discovery] [--replica] [--tcp] [--tls-cert FILE --tls-key FILE | --auto-tls-dir DIR [--tls-require-local]] [--udp-target TARGET] [TARGET]\n"
+const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--no-discovery] [--replica] [--tcp] [--tls-cert FILE --tls-key FILE | --auto-tls-dir DIR [--tls-require-local]] [--no-keyless] [--tls-monitor-dir DIR [--tls-monitor-baseline FILE] [--tls-monitor-dns IP:PORT] [--tls-monitor-certspotter-token TOKEN]] [--udp-target TARGET] [TARGET]\n"
 
 type relayFlags []string
 
@@ -103,6 +106,11 @@ func runWithIdentityModes(
 	var tlsKeyFile string
 	var autoTLSDir string
 	var tlsRequireLocal bool
+	var noKeyless bool
+	var tlsMonitorDir string
+	var tlsMonitorBaseline string
+	var tlsMonitorDNS string
+	var tlsMonitorToken string
 	fs.Var(&relayValues, "relay", "relay HTTPS URL")
 	fs.StringVar(&identityPath, "identity", "identity.json", "identity file")
 	fs.StringVar(&name, "name", "", "identity name for a new identity")
@@ -114,6 +122,11 @@ func runWithIdentityModes(
 	fs.StringVar(&tlsKeyFile, "tls-key", "", "local tenant TLS private key PEM file (local-tls-v1)")
 	fs.StringVar(&autoTLSDir, "auto-tls-dir", "", "directory for automatic local-tls-v1 certificate storage")
 	fs.BoolVar(&tlsRequireLocal, "tls-require-local", false, "wait for local TLS certificate before marking relay ready")
+	fs.BoolVar(&noKeyless, "no-keyless", false, "disable keyless TLS for friendly aliases (use Local TLS only)")
+	fs.StringVar(&tlsMonitorDir, "tls-monitor-dir", "", "directory for CAA/CT monitoring public evidence")
+	fs.StringVar(&tlsMonitorBaseline, "tls-monitor-baseline", "", "operator-managed CAA/SPKI baseline JSON file")
+	fs.StringVar(&tlsMonitorDNS, "tls-monitor-dns", "", "independent DNS resolver IP:port for CAA monitoring (default 1.1.1.1:53)")
+	fs.StringVar(&tlsMonitorToken, "tls-monitor-certspotter-token", "", "optional CertSpotter Bearer token")
 	fs.StringVar(&udpTarget, "udp-target", "", "local UDP target")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -174,6 +187,29 @@ func runWithIdentityModes(
 	if err := ctx.Err(); err != nil {
 		return 0
 	}
+	var keylessProvider portalite.KeylessProvider
+	if !tcpEnabled && !noKeyless {
+		keylessProvider = keyless.NewProvider()
+	}
+	var datagramDialer portalite.DatagramDialer
+	if udpTarget != "" {
+		datagramDialer = udp.NewDialer()
+	}
+	var certObserver portalite.CertObserverFactory
+	if tlsMonitorDir != "" {
+		certObserver, err = certmon.NewFactory(certmon.Config{
+			StateDir:         tlsMonitorDir,
+			BaselineFile:     tlsMonitorBaseline,
+			DNSResolver:      tlsMonitorDNS,
+			CertSpotterToken: tlsMonitorToken,
+			OnWarning: func(w certmon.Warning) {
+				fmt.Fprintf(stderr, "portalite: certmon [%s] %s: %s\n", w.Kind, w.Hostname, w.Message)
+			},
+		})
+		if err != nil {
+			return usageError(stderr, err.Error())
+		}
+	}
 	exposure, err := portalite.Expose(ctx, portalite.ExposeConfig{
 		Relays:           relays,
 		Identity:         identity,
@@ -185,6 +221,9 @@ func runWithIdentityModes(
 		AutomaticTLS:     autoTLSDir != "",
 		TLSStateDir:      autoTLSDir,
 		TLSRequireLocal:  tlsRequireLocal,
+		Keyless:          keylessProvider,
+		Datagram:         datagramDialer,
+		CertObserver:     certObserver,
 		DisableDiscovery: noDiscovery,
 	})
 	if err != nil {

@@ -125,7 +125,7 @@ func TestExposureAdoptsDiscoveredRelays(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{seed.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -157,7 +157,7 @@ func TestExposureIgnoresUnsupportedDiscoveryRevision(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -183,7 +183,7 @@ func TestExposureDisableDiscoveryKeepsMembershipFixed(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:           []string{seed.url},
 		Identity:         newTestIdentity(t),
 		DisableDiscovery: true,
@@ -219,7 +219,7 @@ func TestExposureMaxActiveRelaysCapsDiscoveredAdditions(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:          []string{seed.url},
 		Identity:        newTestIdentity(t),
 		MaxActiveRelays: 1,
@@ -276,7 +276,7 @@ func TestExposureDiscoveryExpandsBeyondExplicitSetSize(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:          explicit,
 		Identity:        newTestIdentity(t),
 		MaxActiveRelays: 3, // equal to the explicit set size
@@ -303,7 +303,7 @@ func TestExposureDoesNotReAdoptRejectedRelay(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())

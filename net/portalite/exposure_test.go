@@ -1273,7 +1273,7 @@ func newTargetServer(t *testing.T) (*httptest.Server, string) {
 // perturbed by discovery polling. Discovery has dedicated tests.
 func startTestProxy(t *testing.T, ctx context.Context, identity Identity, relays []string, timings relayTimings, target string) (*Exposure, <-chan error) {
 	t.Helper()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:           relays,
 		Identity:         identity,
 		DisableDiscovery: true,
@@ -1750,7 +1750,7 @@ func TestExposureCloseAbortsStalledTranscriptSignerAndCleansUp(t *testing.T) {
 	timings := testRelayTimings()
 	timings.requestTimeout = 30 * time.Second
 	timings.handshakeTimeout = 30 * time.Second
-	exposure, err := exposeWithTimings(context.Background(), ExposeConfig{
+	exposure, err := exposeWithTestProviders(context.Background(), ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, timings)
@@ -1823,7 +1823,7 @@ func TestExposureReregistrationKeepsRelayDerivedPublicURL(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -1918,7 +1918,7 @@ func TestExposureFailsTerminallyWhenTranscriptSigningIsRefused(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -1971,7 +1971,7 @@ func TestExposureTranscriptSigningRefusalStaysTerminalAfterRenewal(t *testing.T)
 	defer cancel()
 	timings := testRelayTimings()
 	timings.renewBefore = 900 * time.Millisecond
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, timings)
@@ -2025,7 +2025,7 @@ func TestExposureRateLimitedRegistrationRetriesAndRecovers(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -2066,7 +2066,7 @@ func TestExposureRateLimitRetryHonorsRetryAfter(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())
@@ -2093,7 +2093,7 @@ func TestExposureWaitReadyDoesNotConsumeUpdates(t *testing.T) {
 	defer relay.close()
 	ctx, cancel := context.WithTimeout(context.Background(), fakeRelayWait)
 	defer cancel()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+	exposure, err := exposeWithTestProviders(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
 	}, testRelayTimings())

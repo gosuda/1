@@ -17,6 +17,7 @@ import (
 	"syscall"
 
 	"gosuda.org/portalite"
+	"gosuda.org/portalite/keyless"
 )
 
 const usageLine = "Usage: portalite-http-demo [--relay HTTPS_URL]... [--name LABEL]\n"
@@ -80,6 +81,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
 		Relays:           normalizedRelays,
 		Identity:         identity,
+		Keyless:          keyless.NewProvider(),
 		DisableDiscovery: noDiscovery,
 	})
 	if err != nil {

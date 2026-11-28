@@ -125,7 +125,7 @@ type localTLSManager struct {
 	tokenFunc     func() string
 	onReady       func()
 	onError       func(error)
-
+	onLeaf        func([]byte)
 	mu       sync.RWMutex
 	pin      *localCertPin
 	lastErr  error
@@ -145,6 +145,7 @@ func newLocalTLSManager(
 	tokenFunc func() string,
 	onReady func(),
 	onError func(error),
+	onLeaf func([]byte),
 ) (*localTLSManager, error) {
 	m := &localTLSManager{
 		hostname:      hostname,
@@ -156,6 +157,7 @@ func newLocalTLSManager(
 		tokenFunc:     tokenFunc,
 		onReady:       onReady,
 		onError:       onError,
+		onLeaf:        onLeaf,
 	}
 	if certFile != "" {
 		pin, err := loadLocalCertPin(certFile, keyFile, hostname)
@@ -163,6 +165,9 @@ func newLocalTLSManager(
 			return nil, err
 		}
 		m.pin = pin
+		if m.onLeaf != nil && pin.leaf != nil {
+			m.onLeaf(append([]byte(nil), pin.leaf.Raw...))
+		}
 		return m, nil
 	}
 	if automatic {
@@ -172,6 +177,9 @@ func newLocalTLSManager(
 		if bundle, err := m.readBundle(); err == nil && bundle.CertificatePEM != "" {
 			if pin, pinErr := newLocalCertPin([]byte(bundle.CertificatePEM), []byte(bundle.KeyPEM), hostname); pinErr == nil {
 				m.pin = pin
+				if m.onLeaf != nil && pin.leaf != nil {
+					m.onLeaf(append([]byte(nil), pin.leaf.Raw...))
+				}
 			}
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
@@ -243,6 +251,9 @@ func (m *localTLSManager) reloadManual() (bool, error) {
 		return false, nil
 	}
 	m.pin = next
+	if m.onLeaf != nil && next.leaf != nil {
+		m.onLeaf(append([]byte(nil), next.leaf.Raw...))
+	}
 	return true, nil
 }
 
@@ -372,6 +383,9 @@ func (m *localTLSManager) maintainAutomatic(ctx context.Context) {
 		m.pin = pin
 		m.lastErr = nil
 		m.mu.Unlock()
+		if m.onLeaf != nil && pin.leaf != nil {
+			m.onLeaf(append([]byte(nil), pin.leaf.Raw...))
+		}
 		if !wasReady && m.onReady != nil {
 			m.onReady()
 		}
