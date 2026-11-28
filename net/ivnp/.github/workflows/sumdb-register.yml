@@ -1,0 +1,49 @@
+name: Register commit or tag in Go checksum database
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  register-commit:
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOPROXY: https://proxy.golang.org
+      GOSUMDB: sum.golang.org
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Fetch module at commit or tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${GITHUB_SHA}"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            target="${GITHUB_REF_NAME}"
+          fi
+          temp_dir=$(mktemp -d)
+          trap 'rm -rf -- "$temp_dir"' EXIT
+          cd "$temp_dir"
+          go mod init sumdb-registration
+          for attempt in 1 2 3; do
+            if go get "gosuda.org/ivnp@${target}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
