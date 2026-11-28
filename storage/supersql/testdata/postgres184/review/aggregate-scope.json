@@ -1,0 +1,1036 @@
+{
+  "postgres_version": 180004,
+  "setup": [
+    "CREATE TABLE tenk1(unique1 integer, unique2 integer)",
+    "INSERT INTO tenk1 VALUES (0, 7), (1, 9999), (2, 42)",
+    "CREATE TABLE review_keys(y integer NOT NULL)",
+    "INSERT INTO review_keys SELECT unique1 FROM tenk1",
+    "CREATE FUNCTION public.review_accumulate(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS 'SELECT $1 + $2'",
+    "CREATE AGGREGATE public.review_sum(integer) (SFUNC = public.review_accumulate, STYPE = integer, INITCOND = '0')"
+  ],
+  "cases": [
+    {
+      "id": "original-nested-correlated",
+      "sql": "SELECT\n  (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 = o.unique1)))\nFROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-outer",
+      "sql": "SELECT (SELECT max(o.unique2)) FROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "two-level-promotion",
+      "sql": "SELECT (SELECT (SELECT max(o.unique2))) FROM tenk1 o",
+      "rows": [
+        [
+          "9999"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-aggregate",
+      "sql": "SELECT o.unique1, (SELECT max(i.v) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "6"
+        ],
+        [
+          "2",
+          "6"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "mixed-local-and-outer",
+      "sql": "SELECT o.unique1, (SELECT max(i.v + o.unique1) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "no-variable-local",
+      "sql": "SELECT o.unique1, (SELECT count(*)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "1"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "1"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "filter-only-owner",
+      "sql": "SELECT (SELECT count(*) FILTER (WHERE o.unique1 > 0)) FROM tenk1 o",
+      "rows": [
+        [
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "outer-argument-and-filter",
+      "sql": "SELECT (SELECT sum(o.unique2) FILTER (WHERE o.unique1 < 2)) FROM tenk1 o",
+      "rows": [
+        [
+          "10006"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-filter-owner",
+      "sql": "SELECT o.unique1, (SELECT sum(o.unique2) FILTER (WHERE i.v > 4) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "7"
+        ],
+        [
+          "1",
+          "9999"
+        ],
+        [
+          "2",
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "aggregate-order",
+      "sql": "SELECT (SELECT array_agg(o.unique1 ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{0,2,1}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "order-only-owner",
+      "sql": "SELECT (SELECT array_agg(1 ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{1,1,1}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "ordered-set",
+      "sql": "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o.unique2))::text FROM tenk1 o",
+      "rows": [
+        [
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "lower-direct-argument",
+      "sql": "SELECT (SELECT percentile_cont(i.v) WITHIN GROUP (ORDER BY o.unique2) FROM (VALUES (0.5)) i(v)) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "nested-same-level",
+      "sql": "SELECT (SELECT max(sum(o.unique2))) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "nested-subquery-same-level",
+      "sql": "SELECT (SELECT max((SELECT sum(o.unique2)))) FROM tenk1 o",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "outer-where-rejection",
+      "sql": "SELECT unique1 FROM tenk1 o WHERE (SELECT max(o.unique2)) > 0",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "child-where-promotion",
+      "sql": "SELECT (SELECT 1 WHERE max(o.unique2) > 0) FROM tenk1 o",
+      "rows": [
+        [
+          "1"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouped-outer-input",
+      "sql": "SELECT o.unique1, (SELECT max(o.unique2)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "7"
+        ],
+        [
+          "1",
+          "9999"
+        ],
+        [
+          "2",
+          "42"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouped-same-column",
+      "sql": "SELECT o.unique1, (SELECT max(o.unique1)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "grouping-sets-nullability",
+      "sql": "SELECT coalesce(y::text, 'NULL'), (SELECT max(y)) FROM review_keys GROUP BY GROUPING SETS ((y), ()) ORDER BY y NULLS LAST",
+      "rows": [
+        [
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "1"
+        ],
+        [
+          "2",
+          "2"
+        ],
+        [
+          "NULL",
+          "2"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "empty-outer-aggregate",
+      "sql": "SELECT coalesce((SELECT max(o.unique2))::text, 'NULL') FROM tenk1 o WHERE false",
+      "rows": [
+        [
+          "NULL"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "nested-cte-barrier",
+      "sql": "SELECT (WITH c AS (SELECT 1 v) SELECT sum((SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": null,
+      "state": "0A000"
+    },
+    {
+      "id": "argument-local-cte",
+      "sql": "SELECT (SELECT sum((WITH c AS (SELECT 1 v) SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "ancestor-cte",
+      "sql": "WITH c AS (SELECT 1 v) SELECT (SELECT sum((SELECT o.unique2 FROM c))) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "declared-aggregate",
+      "sql": "SELECT (SELECT public.review_sum(o.unique2)) FROM tenk1 o",
+      "rows": [
+        [
+          "10048"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "sqljson-array",
+      "sql": "SELECT (SELECT JSON_ARRAYAGG(o.unique1 ORDER BY o.unique1 RETURNING jsonb))::text FROM tenk1 o",
+      "rows": [
+        [
+          "[0, 1, 2]"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "sqljson-object",
+      "sql": "SELECT (SELECT JSON_OBJECTAGG((o.unique1::text) VALUE o.unique2 RETURNING jsonb))::text FROM tenk1 o",
+      "rows": [
+        [
+          "{\"0\": 7, \"1\": 9999, \"2\": 42}"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "scalar-cardinality-error",
+      "sql": "SELECT (SELECT max((SELECT i.unique2 FROM tenk1 i WHERE i.unique1 >= o.unique1))) FROM tenk1 o",
+      "rows": null,
+      "state": "21000"
+    },
+    {
+      "id": "nearest-intermediate-owner",
+      "sql": "SELECT o.unique1, (SELECT (SELECT max(i.v + o.unique1)) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "local-aggregate-outer-group",
+      "sql": "SELECT o.unique1, (SELECT max(i.v + o.unique1) FROM (VALUES (4), (6)) i(v)) FROM tenk1 o GROUP BY o.unique1 ORDER BY 1",
+      "rows": [
+        [
+          "0",
+          "6"
+        ],
+        [
+          "1",
+          "7"
+        ],
+        [
+          "2",
+          "8"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "earlier-capture-prefix",
+      "sql": "SELECT (SELECT o.unique1 + max(o.unique2)) FROM tenk1 o GROUP BY o.unique1 ORDER BY o.unique1",
+      "rows": [
+        [
+          "7"
+        ],
+        [
+          "10000"
+        ],
+        [
+          "44"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "later-capture-reference",
+      "sql": "SELECT (SELECT max(o.unique2) + o.unique1) FROM tenk1 o GROUP BY o.unique1 ORDER BY o.unique1",
+      "rows": [
+        [
+          "7"
+        ],
+        [
+          "10000"
+        ],
+        [
+          "44"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-percentile",
+      "sql": "SELECT (SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p;",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-direct-expression",
+      "sql": "SELECT (SELECT percentile_cont(o.p + 0::float8) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-direct-subquery",
+      "sql": "SELECT (SELECT percentile_cont((SELECT o.p)) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-direct-nested-subquery",
+      "sql": "SELECT (SELECT percentile_cont((SELECT (SELECT o.p))) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-direct-local-subquery",
+      "sql": "SELECT (SELECT percentile_cont((SELECT o.p + z.delta FROM (VALUES (0::float8)) z(delta))) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-order-subquery",
+      "sql": "SELECT (SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY (SELECT o.v))) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-same-column",
+      "sql": "SELECT (SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.p)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "0.5"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-filter",
+      "sql": "SELECT (SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.v) FILTER (WHERE o.v > 10)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8), (0.5::float8, 30::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "25"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouped-two-groups",
+      "sql": "SELECT o.p, (SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.25::float8, 10::float8), (0.25::float8, 30::float8), (0.75::float8, 20::float8), (0.75::float8, 60::float8)) AS o(p, v) GROUP BY o.p ORDER BY o.p",
+      "rows": [
+        [
+          "0.25",
+          "15"
+        ],
+        [
+          "0.75",
+          "50"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-grouping-sets-null-direct",
+      "sql": "SELECT coalesce(o.p::text, 'NULL'), coalesce((SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.v))::text, 'NULL') FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY GROUPING SETS ((o.p), ()) ORDER BY o.p NULLS LAST",
+      "rows": [
+        [
+          "0.5",
+          "15"
+        ],
+        [
+          "NULL",
+          "NULL"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-constant-direct-control",
+      "sql": "SELECT (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY o.v)) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-local-aggregate-control",
+      "sql": "SELECT percentile_cont(o.p) WITHIN GROUP (ORDER BY o.v) FROM (VALUES (0.5::float8, 10::float8), (0.5::float8, 20::float8)) AS o(p, v) GROUP BY o.p",
+      "rows": [
+        [
+          "15"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-phase-lower-grouped-direct-rejected",
+      "sql": "SELECT array(SELECT percentile_disc(a) WITHIN GROUP (ORDER BY x) FROM (VALUES (0.3),(0.7)) v(a) GROUP BY a) FROM generate_series(1,5) g(x)",
+      "rows": null,
+      "state": "42803"
+    },
+    {
+      "id": "direct-budget-distinct-1",
+      "sql": "SELECT percentile_cont(0::float8) WITHIN GROUP (ORDER BY v) AS p0 FROM (VALUES (0::float8), (128::float8)) AS data(v)",
+      "rows": [
+        [
+          "0"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-budget-distinct-64",
+      "sql": "SELECT percentile_cont(0::float8) WITHIN GROUP (ORDER BY v) AS p0, percentile_cont(0.0078125::float8) WITHIN GROUP (ORDER BY v) AS p1, percentile_cont(0.015625::float8) WITHIN GROUP (ORDER BY v) AS p2, percentile_cont(0.0234375::float8) WITHIN GROUP (ORDER BY v) AS p3, percentile_cont(0.03125::float8) WITHIN GROUP (ORDER BY v) AS p4, percentile_cont(0.0390625::float8) WITHIN GROUP (ORDER BY v) AS p5, percentile_cont(0.046875::float8) WITHIN GROUP (ORDER BY v) AS p6, percentile_cont(0.0546875::float8) WITHIN GROUP (ORDER BY v) AS p7, percentile_cont(0.0625::float8) WITHIN GROUP (ORDER BY v) AS p8, percentile_cont(0.0703125::float8) WITHIN GROUP (ORDER BY v) AS p9, percentile_cont(0.078125::float8) WITHIN GROUP (ORDER BY v) AS p10, percentile_cont(0.0859375::float8) WITHIN GROUP (ORDER BY v) AS p11, percentile_cont(0.09375::float8) WITHIN GROUP (ORDER BY v) AS p12, percentile_cont(0.1015625::float8) WITHIN GROUP (ORDER BY v) AS p13, percentile_cont(0.109375::float8) WITHIN GROUP (ORDER BY v) AS p14, percentile_cont(0.1171875::float8) WITHIN GROUP (ORDER BY v) AS p15, percentile_cont(0.125::float8) WITHIN GROUP (ORDER BY v) AS p16, percentile_cont(0.1328125::float8) WITHIN GROUP (ORDER BY v) AS p17, percentile_cont(0.140625::float8) WITHIN GROUP (ORDER BY v) AS p18, percentile_cont(0.1484375::float8) WITHIN GROUP (ORDER BY v) AS p19, percentile_cont(0.15625::float8) WITHIN GROUP (ORDER BY v) AS p20, percentile_cont(0.1640625::float8) WITHIN GROUP (ORDER BY v) AS p21, percentile_cont(0.171875::float8) WITHIN GROUP (ORDER BY v) AS p22, percentile_cont(0.1796875::float8) WITHIN GROUP (ORDER BY v) AS p23, percentile_cont(0.1875::float8) WITHIN GROUP (ORDER BY v) AS p24, percentile_cont(0.1953125::float8) WITHIN GROUP (ORDER BY v) AS p25, percentile_cont(0.203125::float8) WITHIN GROUP (ORDER BY v) AS p26, percentile_cont(0.2109375::float8) WITHIN GROUP (ORDER BY v) AS p27, percentile_cont(0.21875::float8) WITHIN GROUP (ORDER BY v) AS p28, percentile_cont(0.2265625::float8) WITHIN GROUP (ORDER BY v) AS p29, percentile_cont(0.234375::float8) WITHIN GROUP (ORDER BY v) AS p30, percentile_cont(0.2421875::float8) WITHIN GROUP (ORDER BY v) AS p31, percentile_cont(0.25::float8) WITHIN GROUP (ORDER BY v) AS p32, percentile_cont(0.2578125::float8) WITHIN GROUP (ORDER BY v) AS p33, percentile_cont(0.265625::float8) WITHIN GROUP (ORDER BY v) AS p34, percentile_cont(0.2734375::float8) WITHIN GROUP (ORDER BY v) AS p35, percentile_cont(0.28125::float8) WITHIN GROUP (ORDER BY v) AS p36, percentile_cont(0.2890625::float8) WITHIN GROUP (ORDER BY v) AS p37, percentile_cont(0.296875::float8) WITHIN GROUP (ORDER BY v) AS p38, percentile_cont(0.3046875::float8) WITHIN GROUP (ORDER BY v) AS p39, percentile_cont(0.3125::float8) WITHIN GROUP (ORDER BY v) AS p40, percentile_cont(0.3203125::float8) WITHIN GROUP (ORDER BY v) AS p41, percentile_cont(0.328125::float8) WITHIN GROUP (ORDER BY v) AS p42, percentile_cont(0.3359375::float8) WITHIN GROUP (ORDER BY v) AS p43, percentile_cont(0.34375::float8) WITHIN GROUP (ORDER BY v) AS p44, percentile_cont(0.3515625::float8) WITHIN GROUP (ORDER BY v) AS p45, percentile_cont(0.359375::float8) WITHIN GROUP (ORDER BY v) AS p46, percentile_cont(0.3671875::float8) WITHIN GROUP (ORDER BY v) AS p47, percentile_cont(0.375::float8) WITHIN GROUP (ORDER BY v) AS p48, percentile_cont(0.3828125::float8) WITHIN GROUP (ORDER BY v) AS p49, percentile_cont(0.390625::float8) WITHIN GROUP (ORDER BY v) AS p50, percentile_cont(0.3984375::float8) WITHIN GROUP (ORDER BY v) AS p51, percentile_cont(0.40625::float8) WITHIN GROUP (ORDER BY v) AS p52, percentile_cont(0.4140625::float8) WITHIN GROUP (ORDER BY v) AS p53, percentile_cont(0.421875::float8) WITHIN GROUP (ORDER BY v) AS p54, percentile_cont(0.4296875::float8) WITHIN GROUP (ORDER BY v) AS p55, percentile_cont(0.4375::float8) WITHIN GROUP (ORDER BY v) AS p56, percentile_cont(0.4453125::float8) WITHIN GROUP (ORDER BY v) AS p57, percentile_cont(0.453125::float8) WITHIN GROUP (ORDER BY v) AS p58, percentile_cont(0.4609375::float8) WITHIN GROUP (ORDER BY v) AS p59, percentile_cont(0.46875::float8) WITHIN GROUP (ORDER BY v) AS p60, percentile_cont(0.4765625::float8) WITHIN GROUP (ORDER BY v) AS p61, percentile_cont(0.484375::float8) WITHIN GROUP (ORDER BY v) AS p62, percentile_cont(0.4921875::float8) WITHIN GROUP (ORDER BY v) AS p63 FROM (VALUES (0::float8), (128::float8)) AS data(v)",
+      "rows": [
+        [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19",
+          "20",
+          "21",
+          "22",
+          "23",
+          "24",
+          "25",
+          "26",
+          "27",
+          "28",
+          "29",
+          "30",
+          "31",
+          "32",
+          "33",
+          "34",
+          "35",
+          "36",
+          "37",
+          "38",
+          "39",
+          "40",
+          "41",
+          "42",
+          "43",
+          "44",
+          "45",
+          "46",
+          "47",
+          "48",
+          "49",
+          "50",
+          "51",
+          "52",
+          "53",
+          "54",
+          "55",
+          "56",
+          "57",
+          "58",
+          "59",
+          "60",
+          "61",
+          "62",
+          "63"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-budget-distinct-128",
+      "sql": "SELECT percentile_cont(0::float8) WITHIN GROUP (ORDER BY v) AS p0, percentile_cont(0.0078125::float8) WITHIN GROUP (ORDER BY v) AS p1, percentile_cont(0.015625::float8) WITHIN GROUP (ORDER BY v) AS p2, percentile_cont(0.0234375::float8) WITHIN GROUP (ORDER BY v) AS p3, percentile_cont(0.03125::float8) WITHIN GROUP (ORDER BY v) AS p4, percentile_cont(0.0390625::float8) WITHIN GROUP (ORDER BY v) AS p5, percentile_cont(0.046875::float8) WITHIN GROUP (ORDER BY v) AS p6, percentile_cont(0.0546875::float8) WITHIN GROUP (ORDER BY v) AS p7, percentile_cont(0.0625::float8) WITHIN GROUP (ORDER BY v) AS p8, percentile_cont(0.0703125::float8) WITHIN GROUP (ORDER BY v) AS p9, percentile_cont(0.078125::float8) WITHIN GROUP (ORDER BY v) AS p10, percentile_cont(0.0859375::float8) WITHIN GROUP (ORDER BY v) AS p11, percentile_cont(0.09375::float8) WITHIN GROUP (ORDER BY v) AS p12, percentile_cont(0.1015625::float8) WITHIN GROUP (ORDER BY v) AS p13, percentile_cont(0.109375::float8) WITHIN GROUP (ORDER BY v) AS p14, percentile_cont(0.1171875::float8) WITHIN GROUP (ORDER BY v) AS p15, percentile_cont(0.125::float8) WITHIN GROUP (ORDER BY v) AS p16, percentile_cont(0.1328125::float8) WITHIN GROUP (ORDER BY v) AS p17, percentile_cont(0.140625::float8) WITHIN GROUP (ORDER BY v) AS p18, percentile_cont(0.1484375::float8) WITHIN GROUP (ORDER BY v) AS p19, percentile_cont(0.15625::float8) WITHIN GROUP (ORDER BY v) AS p20, percentile_cont(0.1640625::float8) WITHIN GROUP (ORDER BY v) AS p21, percentile_cont(0.171875::float8) WITHIN GROUP (ORDER BY v) AS p22, percentile_cont(0.1796875::float8) WITHIN GROUP (ORDER BY v) AS p23, percentile_cont(0.1875::float8) WITHIN GROUP (ORDER BY v) AS p24, percentile_cont(0.1953125::float8) WITHIN GROUP (ORDER BY v) AS p25, percentile_cont(0.203125::float8) WITHIN GROUP (ORDER BY v) AS p26, percentile_cont(0.2109375::float8) WITHIN GROUP (ORDER BY v) AS p27, percentile_cont(0.21875::float8) WITHIN GROUP (ORDER BY v) AS p28, percentile_cont(0.2265625::float8) WITHIN GROUP (ORDER BY v) AS p29, percentile_cont(0.234375::float8) WITHIN GROUP (ORDER BY v) AS p30, percentile_cont(0.2421875::float8) WITHIN GROUP (ORDER BY v) AS p31, percentile_cont(0.25::float8) WITHIN GROUP (ORDER BY v) AS p32, percentile_cont(0.2578125::float8) WITHIN GROUP (ORDER BY v) AS p33, percentile_cont(0.265625::float8) WITHIN GROUP (ORDER BY v) AS p34, percentile_cont(0.2734375::float8) WITHIN GROUP (ORDER BY v) AS p35, percentile_cont(0.28125::float8) WITHIN GROUP (ORDER BY v) AS p36, percentile_cont(0.2890625::float8) WITHIN GROUP (ORDER BY v) AS p37, percentile_cont(0.296875::float8) WITHIN GROUP (ORDER BY v) AS p38, percentile_cont(0.3046875::float8) WITHIN GROUP (ORDER BY v) AS p39, percentile_cont(0.3125::float8) WITHIN GROUP (ORDER BY v) AS p40, percentile_cont(0.3203125::float8) WITHIN GROUP (ORDER BY v) AS p41, percentile_cont(0.328125::float8) WITHIN GROUP (ORDER BY v) AS p42, percentile_cont(0.3359375::float8) WITHIN GROUP (ORDER BY v) AS p43, percentile_cont(0.34375::float8) WITHIN GROUP (ORDER BY v) AS p44, percentile_cont(0.3515625::float8) WITHIN GROUP (ORDER BY v) AS p45, percentile_cont(0.359375::float8) WITHIN GROUP (ORDER BY v) AS p46, percentile_cont(0.3671875::float8) WITHIN GROUP (ORDER BY v) AS p47, percentile_cont(0.375::float8) WITHIN GROUP (ORDER BY v) AS p48, percentile_cont(0.3828125::float8) WITHIN GROUP (ORDER BY v) AS p49, percentile_cont(0.390625::float8) WITHIN GROUP (ORDER BY v) AS p50, percentile_cont(0.3984375::float8) WITHIN GROUP (ORDER BY v) AS p51, percentile_cont(0.40625::float8) WITHIN GROUP (ORDER BY v) AS p52, percentile_cont(0.4140625::float8) WITHIN GROUP (ORDER BY v) AS p53, percentile_cont(0.421875::float8) WITHIN GROUP (ORDER BY v) AS p54, percentile_cont(0.4296875::float8) WITHIN GROUP (ORDER BY v) AS p55, percentile_cont(0.4375::float8) WITHIN GROUP (ORDER BY v) AS p56, percentile_cont(0.4453125::float8) WITHIN GROUP (ORDER BY v) AS p57, percentile_cont(0.453125::float8) WITHIN GROUP (ORDER BY v) AS p58, percentile_cont(0.4609375::float8) WITHIN GROUP (ORDER BY v) AS p59, percentile_cont(0.46875::float8) WITHIN GROUP (ORDER BY v) AS p60, percentile_cont(0.4765625::float8) WITHIN GROUP (ORDER BY v) AS p61, percentile_cont(0.484375::float8) WITHIN GROUP (ORDER BY v) AS p62, percentile_cont(0.4921875::float8) WITHIN GROUP (ORDER BY v) AS p63, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p64, percentile_cont(0.5078125::float8) WITHIN GROUP (ORDER BY v) AS p65, percentile_cont(0.515625::float8) WITHIN GROUP (ORDER BY v) AS p66, percentile_cont(0.5234375::float8) WITHIN GROUP (ORDER BY v) AS p67, percentile_cont(0.53125::float8) WITHIN GROUP (ORDER BY v) AS p68, percentile_cont(0.5390625::float8) WITHIN GROUP (ORDER BY v) AS p69, percentile_cont(0.546875::float8) WITHIN GROUP (ORDER BY v) AS p70, percentile_cont(0.5546875::float8) WITHIN GROUP (ORDER BY v) AS p71, percentile_cont(0.5625::float8) WITHIN GROUP (ORDER BY v) AS p72, percentile_cont(0.5703125::float8) WITHIN GROUP (ORDER BY v) AS p73, percentile_cont(0.578125::float8) WITHIN GROUP (ORDER BY v) AS p74, percentile_cont(0.5859375::float8) WITHIN GROUP (ORDER BY v) AS p75, percentile_cont(0.59375::float8) WITHIN GROUP (ORDER BY v) AS p76, percentile_cont(0.6015625::float8) WITHIN GROUP (ORDER BY v) AS p77, percentile_cont(0.609375::float8) WITHIN GROUP (ORDER BY v) AS p78, percentile_cont(0.6171875::float8) WITHIN GROUP (ORDER BY v) AS p79, percentile_cont(0.625::float8) WITHIN GROUP (ORDER BY v) AS p80, percentile_cont(0.6328125::float8) WITHIN GROUP (ORDER BY v) AS p81, percentile_cont(0.640625::float8) WITHIN GROUP (ORDER BY v) AS p82, percentile_cont(0.6484375::float8) WITHIN GROUP (ORDER BY v) AS p83, percentile_cont(0.65625::float8) WITHIN GROUP (ORDER BY v) AS p84, percentile_cont(0.6640625::float8) WITHIN GROUP (ORDER BY v) AS p85, percentile_cont(0.671875::float8) WITHIN GROUP (ORDER BY v) AS p86, percentile_cont(0.6796875::float8) WITHIN GROUP (ORDER BY v) AS p87, percentile_cont(0.6875::float8) WITHIN GROUP (ORDER BY v) AS p88, percentile_cont(0.6953125::float8) WITHIN GROUP (ORDER BY v) AS p89, percentile_cont(0.703125::float8) WITHIN GROUP (ORDER BY v) AS p90, percentile_cont(0.7109375::float8) WITHIN GROUP (ORDER BY v) AS p91, percentile_cont(0.71875::float8) WITHIN GROUP (ORDER BY v) AS p92, percentile_cont(0.7265625::float8) WITHIN GROUP (ORDER BY v) AS p93, percentile_cont(0.734375::float8) WITHIN GROUP (ORDER BY v) AS p94, percentile_cont(0.7421875::float8) WITHIN GROUP (ORDER BY v) AS p95, percentile_cont(0.75::float8) WITHIN GROUP (ORDER BY v) AS p96, percentile_cont(0.7578125::float8) WITHIN GROUP (ORDER BY v) AS p97, percentile_cont(0.765625::float8) WITHIN GROUP (ORDER BY v) AS p98, percentile_cont(0.7734375::float8) WITHIN GROUP (ORDER BY v) AS p99, percentile_cont(0.78125::float8) WITHIN GROUP (ORDER BY v) AS p100, percentile_cont(0.7890625::float8) WITHIN GROUP (ORDER BY v) AS p101, percentile_cont(0.796875::float8) WITHIN GROUP (ORDER BY v) AS p102, percentile_cont(0.8046875::float8) WITHIN GROUP (ORDER BY v) AS p103, percentile_cont(0.8125::float8) WITHIN GROUP (ORDER BY v) AS p104, percentile_cont(0.8203125::float8) WITHIN GROUP (ORDER BY v) AS p105, percentile_cont(0.828125::float8) WITHIN GROUP (ORDER BY v) AS p106, percentile_cont(0.8359375::float8) WITHIN GROUP (ORDER BY v) AS p107, percentile_cont(0.84375::float8) WITHIN GROUP (ORDER BY v) AS p108, percentile_cont(0.8515625::float8) WITHIN GROUP (ORDER BY v) AS p109, percentile_cont(0.859375::float8) WITHIN GROUP (ORDER BY v) AS p110, percentile_cont(0.8671875::float8) WITHIN GROUP (ORDER BY v) AS p111, percentile_cont(0.875::float8) WITHIN GROUP (ORDER BY v) AS p112, percentile_cont(0.8828125::float8) WITHIN GROUP (ORDER BY v) AS p113, percentile_cont(0.890625::float8) WITHIN GROUP (ORDER BY v) AS p114, percentile_cont(0.8984375::float8) WITHIN GROUP (ORDER BY v) AS p115, percentile_cont(0.90625::float8) WITHIN GROUP (ORDER BY v) AS p116, percentile_cont(0.9140625::float8) WITHIN GROUP (ORDER BY v) AS p117, percentile_cont(0.921875::float8) WITHIN GROUP (ORDER BY v) AS p118, percentile_cont(0.9296875::float8) WITHIN GROUP (ORDER BY v) AS p119, percentile_cont(0.9375::float8) WITHIN GROUP (ORDER BY v) AS p120, percentile_cont(0.9453125::float8) WITHIN GROUP (ORDER BY v) AS p121, percentile_cont(0.953125::float8) WITHIN GROUP (ORDER BY v) AS p122, percentile_cont(0.9609375::float8) WITHIN GROUP (ORDER BY v) AS p123, percentile_cont(0.96875::float8) WITHIN GROUP (ORDER BY v) AS p124, percentile_cont(0.9765625::float8) WITHIN GROUP (ORDER BY v) AS p125, percentile_cont(0.984375::float8) WITHIN GROUP (ORDER BY v) AS p126, percentile_cont(0.9921875::float8) WITHIN GROUP (ORDER BY v) AS p127 FROM (VALUES (0::float8), (128::float8)) AS data(v)",
+      "rows": [
+        [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19",
+          "20",
+          "21",
+          "22",
+          "23",
+          "24",
+          "25",
+          "26",
+          "27",
+          "28",
+          "29",
+          "30",
+          "31",
+          "32",
+          "33",
+          "34",
+          "35",
+          "36",
+          "37",
+          "38",
+          "39",
+          "40",
+          "41",
+          "42",
+          "43",
+          "44",
+          "45",
+          "46",
+          "47",
+          "48",
+          "49",
+          "50",
+          "51",
+          "52",
+          "53",
+          "54",
+          "55",
+          "56",
+          "57",
+          "58",
+          "59",
+          "60",
+          "61",
+          "62",
+          "63",
+          "64",
+          "65",
+          "66",
+          "67",
+          "68",
+          "69",
+          "70",
+          "71",
+          "72",
+          "73",
+          "74",
+          "75",
+          "76",
+          "77",
+          "78",
+          "79",
+          "80",
+          "81",
+          "82",
+          "83",
+          "84",
+          "85",
+          "86",
+          "87",
+          "88",
+          "89",
+          "90",
+          "91",
+          "92",
+          "93",
+          "94",
+          "95",
+          "96",
+          "97",
+          "98",
+          "99",
+          "100",
+          "101",
+          "102",
+          "103",
+          "104",
+          "105",
+          "106",
+          "107",
+          "108",
+          "109",
+          "110",
+          "111",
+          "112",
+          "113",
+          "114",
+          "115",
+          "116",
+          "117",
+          "118",
+          "119",
+          "120",
+          "121",
+          "122",
+          "123",
+          "124",
+          "125",
+          "126",
+          "127"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-budget-plain-128-columns",
+      "sql": "SELECT 0::float8 AS p0, 1::float8 AS p1, 2::float8 AS p2, 3::float8 AS p3, 4::float8 AS p4, 5::float8 AS p5, 6::float8 AS p6, 7::float8 AS p7, 8::float8 AS p8, 9::float8 AS p9, 10::float8 AS p10, 11::float8 AS p11, 12::float8 AS p12, 13::float8 AS p13, 14::float8 AS p14, 15::float8 AS p15, 16::float8 AS p16, 17::float8 AS p17, 18::float8 AS p18, 19::float8 AS p19, 20::float8 AS p20, 21::float8 AS p21, 22::float8 AS p22, 23::float8 AS p23, 24::float8 AS p24, 25::float8 AS p25, 26::float8 AS p26, 27::float8 AS p27, 28::float8 AS p28, 29::float8 AS p29, 30::float8 AS p30, 31::float8 AS p31, 32::float8 AS p32, 33::float8 AS p33, 34::float8 AS p34, 35::float8 AS p35, 36::float8 AS p36, 37::float8 AS p37, 38::float8 AS p38, 39::float8 AS p39, 40::float8 AS p40, 41::float8 AS p41, 42::float8 AS p42, 43::float8 AS p43, 44::float8 AS p44, 45::float8 AS p45, 46::float8 AS p46, 47::float8 AS p47, 48::float8 AS p48, 49::float8 AS p49, 50::float8 AS p50, 51::float8 AS p51, 52::float8 AS p52, 53::float8 AS p53, 54::float8 AS p54, 55::float8 AS p55, 56::float8 AS p56, 57::float8 AS p57, 58::float8 AS p58, 59::float8 AS p59, 60::float8 AS p60, 61::float8 AS p61, 62::float8 AS p62, 63::float8 AS p63, 64::float8 AS p64, 65::float8 AS p65, 66::float8 AS p66, 67::float8 AS p67, 68::float8 AS p68, 69::float8 AS p69, 70::float8 AS p70, 71::float8 AS p71, 72::float8 AS p72, 73::float8 AS p73, 74::float8 AS p74, 75::float8 AS p75, 76::float8 AS p76, 77::float8 AS p77, 78::float8 AS p78, 79::float8 AS p79, 80::float8 AS p80, 81::float8 AS p81, 82::float8 AS p82, 83::float8 AS p83, 84::float8 AS p84, 85::float8 AS p85, 86::float8 AS p86, 87::float8 AS p87, 88::float8 AS p88, 89::float8 AS p89, 90::float8 AS p90, 91::float8 AS p91, 92::float8 AS p92, 93::float8 AS p93, 94::float8 AS p94, 95::float8 AS p95, 96::float8 AS p96, 97::float8 AS p97, 98::float8 AS p98, 99::float8 AS p99, 100::float8 AS p100, 101::float8 AS p101, 102::float8 AS p102, 103::float8 AS p103, 104::float8 AS p104, 105::float8 AS p105, 106::float8 AS p106, 107::float8 AS p107, 108::float8 AS p108, 109::float8 AS p109, 110::float8 AS p110, 111::float8 AS p111, 112::float8 AS p112, 113::float8 AS p113, 114::float8 AS p114, 115::float8 AS p115, 116::float8 AS p116, 117::float8 AS p117, 118::float8 AS p118, 119::float8 AS p119, 120::float8 AS p120, 121::float8 AS p121, 122::float8 AS p122, 123::float8 AS p123, 124::float8 AS p124, 125::float8 AS p125, 126::float8 AS p126, 127::float8 AS p127",
+      "rows": [
+        [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19",
+          "20",
+          "21",
+          "22",
+          "23",
+          "24",
+          "25",
+          "26",
+          "27",
+          "28",
+          "29",
+          "30",
+          "31",
+          "32",
+          "33",
+          "34",
+          "35",
+          "36",
+          "37",
+          "38",
+          "39",
+          "40",
+          "41",
+          "42",
+          "43",
+          "44",
+          "45",
+          "46",
+          "47",
+          "48",
+          "49",
+          "50",
+          "51",
+          "52",
+          "53",
+          "54",
+          "55",
+          "56",
+          "57",
+          "58",
+          "59",
+          "60",
+          "61",
+          "62",
+          "63",
+          "64",
+          "65",
+          "66",
+          "67",
+          "68",
+          "69",
+          "70",
+          "71",
+          "72",
+          "73",
+          "74",
+          "75",
+          "76",
+          "77",
+          "78",
+          "79",
+          "80",
+          "81",
+          "82",
+          "83",
+          "84",
+          "85",
+          "86",
+          "87",
+          "88",
+          "89",
+          "90",
+          "91",
+          "92",
+          "93",
+          "94",
+          "95",
+          "96",
+          "97",
+          "98",
+          "99",
+          "100",
+          "101",
+          "102",
+          "103",
+          "104",
+          "105",
+          "106",
+          "107",
+          "108",
+          "109",
+          "110",
+          "111",
+          "112",
+          "113",
+          "114",
+          "115",
+          "116",
+          "117",
+          "118",
+          "119",
+          "120",
+          "121",
+          "122",
+          "123",
+          "124",
+          "125",
+          "126",
+          "127"
+        ]
+      ],
+      "state": ""
+    },
+    {
+      "id": "direct-budget-duplicate-128",
+      "sql": "SELECT percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p0, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p1, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p2, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p3, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p4, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p5, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p6, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p7, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p8, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p9, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p10, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p11, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p12, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p13, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p14, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p15, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p16, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p17, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p18, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p19, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p20, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p21, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p22, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p23, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p24, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p25, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p26, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p27, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p28, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p29, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p30, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p31, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p32, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p33, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p34, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p35, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p36, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p37, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p38, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p39, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p40, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p41, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p42, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p43, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p44, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p45, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p46, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p47, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p48, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p49, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p50, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p51, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p52, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p53, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p54, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p55, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p56, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p57, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p58, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p59, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p60, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p61, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p62, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p63, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p64, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p65, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p66, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p67, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p68, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p69, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p70, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p71, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p72, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p73, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p74, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p75, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p76, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p77, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p78, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p79, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p80, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p81, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p82, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p83, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p84, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p85, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p86, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p87, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p88, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p89, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p90, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p91, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p92, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p93, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p94, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p95, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p96, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p97, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p98, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p99, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p100, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p101, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p102, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p103, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p104, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p105, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p106, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p107, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p108, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p109, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p110, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p111, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p112, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p113, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p114, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p115, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p116, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p117, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p118, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p119, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p120, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p121, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p122, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p123, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p124, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p125, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p126, percentile_cont(0.5::float8) WITHIN GROUP (ORDER BY v) AS p127 FROM (VALUES (0::float8), (128::float8)) AS data(v)",
+      "rows": [
+        [
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64",
+          "64"
+        ]
+      ],
+      "state": ""
+    }
+  ]
+}

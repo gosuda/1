@@ -109,11 +109,15 @@ func reindexPartitionHierarchy(ctx context.Context, b *binder, snapshot CatalogS
 		}
 		spec.Version += versionReserve
 		spec.Physical.Generation++
-		target, err := rebindTargetTableExpressions(ctx, member, &spec, snapshot, options)
+		rebindOptions := options
+		if owner := member.OwnerName(); owner != "" {
+			rebindOptions.Bind.CurrentRole = owner
+		}
+		target, err := rebindTargetTableExpressions(ctx, member, &spec, snapshot, rebindOptions)
 		if err != nil {
 			return nil, err
 		}
-		targetIndexes, err := onlineTargetIndexes(ctx, snapshot, options, sourceIndexes, target, 0)
+		targetIndexes, err := onlineTargetIndexes(ctx, snapshot, rebindOptions, sourceIndexes, target, 0)
 		if err != nil {
 			return nil, err
 		}

@@ -1,6 +1,8 @@
 package bind
 
 import (
+	"slices"
+
 	"github.com/gosuda/supersql-alpha/internal/model"
 	"github.com/gosuda/supersql-alpha/internal/query/builtin"
 	"github.com/gosuda/supersql-alpha/internal/query/ir"
@@ -21,8 +23,15 @@ func (b *binder) orderedSetArguments(n *zpgparse.FuncCall, s *scope, pos int) (c
 	if direct.names != nil {
 		return callArguments{}, 0, bindError("42601", "named arguments are not allowed with WITHIN GROUP", pos)
 	}
+	// Outer column resolution already names grouped outputs for direct inputs.
+	// Admit those resolved slots here; owner selection and IR validation still
+	// reject lower-level or ungrouped direct arguments.
+	available := slices.Clone(s.groupColumns)
+	for parent := s.parent; parent != nil; parent = parent.parent {
+		available = append(available, parent.groupColumns...)
+	}
 	for _, value := range direct.values {
-		if err := aggregateAvailable(value, s.groupColumns, s.parent); err != nil {
+		if err := aggregateAvailable(value, available, s.parent); err != nil {
 			return callArguments{}, 0, err
 		}
 	}

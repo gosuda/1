@@ -97,7 +97,7 @@ func (c *invocation) scanInput(node physical.NodeSpec, decision [32]byte) (_ sto
 	env, spec := &c.portal.env, node.Scan
 	allowAdmitted := c.skipLockedOccurrence(spec.Request.Occurrence)
 	if !c.parallelScanEligible(node) {
-		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: env.Limits.MetadataBytes, allowAdmitted: allowAdmitted}, nil
+		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: env.Limits.MetadataBytes, releasePlan: true, allowAdmitted: allowAdmitted}, nil
 	}
 	groups := min(env.Query.Parallelism(), len(spec.Request.Spans))
 	limit := env.Limits.MetadataBytes
@@ -140,7 +140,7 @@ func (c *invocation) scanInput(node physical.NodeSpec, decision [32]byte) (_ sto
 	if len(spans) < 2 {
 		// Canonicalization is the last eligibility proof, before group creation.
 		claim.Release()
-		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: limit, allowAdmitted: allowAdmitted}, nil
+		return &scanCursor{reader: env.Reader, spec: spec, decision: decision, maxBytes: limit, releasePlan: true, allowAdmitted: allowAdmitted}, nil
 	}
 	groups = min(groups, len(spans))
 	layouts := make([]model.TypeLayout, len(spec.Projection))

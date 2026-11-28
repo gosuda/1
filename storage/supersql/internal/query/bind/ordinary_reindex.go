@@ -69,7 +69,7 @@ func bindReindex(ctx context.Context, statement *zpgparse.ReindexStmt, snapshot 
 	if table == nil || table.State() != model.StatePublic || table.Kind() != model.ObjectTable && table.Kind() != model.ObjectMaterializedView {
 		return nil, model.ErrInvalidDescriptor
 	}
-	if err := b.requireTableOwner(table, int(statement.Relation.Location)+1); err != nil {
+	if err := b.requireTableMaintenance(table, int(statement.Relation.Location)+1); err != nil {
 		return nil, err
 	}
 	b.dependency(table, 0)
@@ -140,11 +140,15 @@ func bindReindex(ctx context.Context, statement *zpgparse.ReindexStmt, snapshot 
 	}
 	spec.Version += versionReserve
 	spec.Physical.Generation++
-	target, err := rebindTargetTableExpressions(ctx, table, &spec, snapshot, options)
+	rebindOptions := options
+	if owner := table.OwnerName(); owner != "" {
+		rebindOptions.Bind.CurrentRole = owner
+	}
+	target, err := rebindTargetTableExpressions(ctx, table, &spec, snapshot, rebindOptions)
 	if err != nil {
 		return nil, err
 	}
-	targetIndexes, err := onlineTargetIndexes(ctx, snapshot, options, sourceIndexes, target, 0)
+	targetIndexes, err := onlineTargetIndexes(ctx, snapshot, rebindOptions, sourceIndexes, target, 0)
 	if err != nil {
 		return nil, err
 	}

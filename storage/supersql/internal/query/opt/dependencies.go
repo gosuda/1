@@ -624,6 +624,10 @@ func (o *optimizer) relationScalars(n *ir.Rel, id ir.RelID, add func(ir.ScalarID
 	for i := range n.AggregateCount() {
 		call, _ := o.graph.Aggregate(id, i)
 		add(call.Filter)
+		for j := range call.DirectArgumentCount() {
+			scalar, _ := o.graph.AggregateDirectArgument(id, i, j)
+			add(scalar)
+		}
 		for j := range call.ArgumentCount() {
 			scalar, _ := o.graph.AggregateArgument(id, i, j)
 			add(scalar)

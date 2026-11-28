@@ -281,6 +281,9 @@ func bindDropRole(ctx context.Context, statement *zpgparse.DropRoleStmt, snapsho
 		command.dependencies = b.dependencies
 		return command, ctx.Err()
 	}
+	if err := checkDroppedRoleGrants(ctx, snapshot, droppedNames, uint64(options.Bind.Limits.MaxOperands)); err != nil {
+		return nil, err
+	}
 	// Clean up MemberOf references in all surviving roles within the same transaction.
 	_, allRoleDescs, err := loadCatalogRoles(ctx, snapshot, uint64(options.Bind.Limits.MaxOperands))
 	if err != nil {
