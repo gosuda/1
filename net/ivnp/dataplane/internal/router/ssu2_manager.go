@@ -1273,7 +1273,7 @@ func (m *SSU2Manager) EnsureSession(ctx context.Context, peer foundation.Hash) e
 			_, err = m.establish(ctx, peer)
 		}
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		m.recordOutboundFailure(peer, err)
 	}
 	return err

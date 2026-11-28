@@ -26,7 +26,7 @@ const (
 	ratchetGarlicClove            = 11
 	ratchetPadding                = 254
 	DefaultTagLookahead           = 512
-	DefaultInitialTagWindow       = 24
+	DefaultInitialTagWindow       = 64
 	defaultMaxSessions            = 256
 	defaultSessionLife            = 10 * 60 * 1000
 	defaultReplayLife             = 5 * 60 * 1000

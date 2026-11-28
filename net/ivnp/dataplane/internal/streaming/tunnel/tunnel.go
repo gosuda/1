@@ -1494,7 +1494,11 @@ func (c *tunnelConn) paceDue(now time.Time) time.Time {
 func (c *tunnelConn) advancePace(now time.Time) {
 	c.mu.Lock()
 	window := time.Duration(c.congestion.Window())
-	interval := c.rto.RTO() / (window * 8)
+	rtt := c.rto.SRTT()
+	if rtt <= 0 {
+		rtt = c.rto.RTO()
+	}
+	interval := rtt / (window * 8)
 	if interval < 250*time.Microsecond {
 		interval = 250 * time.Microsecond
 	} else if interval > 10*time.Millisecond {
@@ -1885,6 +1889,9 @@ func (c *tunnelConn) sendSynchronize(ctx context.Context, originator bool) error
 // +checklocksexclude:c.network.mu
 // +checklocksexclude:c.network.outboundMu
 func (c *tunnelConn) releaseSynchronizeLocked() {
+	if len(c.synchronize) != 0 {
+		c.nextPaced = time.Time{}
+	}
 	c.synchronizeLease.release()
 	c.synchronize = nil
 	c.synchronizeLease = nil

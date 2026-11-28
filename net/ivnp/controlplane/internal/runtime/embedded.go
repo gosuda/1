@@ -98,6 +98,7 @@ func (d *Controller) WaitReady(ctx context.Context) error {
 		if closed || lifetime == nil {
 			return net.ErrClosed
 		}
+		changed := d.exploratoryChanges()
 		if d.pool != nil && d.pool.Owner() == (foundation.Hash{}) && d.maintainer != nil {
 			if _, ready := d.maintainer.Pair(uint64(d.clock.Now().UnixMilli())); ready {
 				return nil
@@ -109,6 +110,7 @@ func (d *Controller) WaitReady(ctx context.Context) error {
 			return ctx.Err()
 		case <-lifetime.Done():
 			return net.ErrClosed
+		case <-changed:
 		case <-ticker.C:
 		}
 	}

@@ -419,6 +419,7 @@ func (e *clientDestinationEndpoint) WaitReady(ctx context.Context) error {
 			return err
 		}
 		runtime := e.runtime
+		changed := runtime.changes()
 		now := runtime.now()
 		inbound := runtime.pool.Count(tunnel.Inbound, now) > 0
 		outbound := runtime.pool.Count(tunnel.Outbound, now) > 0
@@ -432,6 +433,7 @@ func (e *clientDestinationEndpoint) WaitReady(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-changed:
 		case <-ticker.C:
 		}
 	}

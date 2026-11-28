@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ const (
 	minimumSSU2IPv6Peers           = 30
 	minimumIntroducers             = 5
 	transportSessionAttemptTimeout = 10 * time.Second
+	transportLocalFallbackStagger  = 250 * time.Millisecond
+	transportPublicFallbackStagger = 2 * time.Second
 )
 
 type transportCapabilities struct {
@@ -61,8 +64,10 @@ type TransportMuxConfig struct {
 
 // TransportMux reuses an authenticated session before opening another
 // transport. For an unestablished direct peer, Java-compatible transport bids
-// select one handshake; an alternate is attempted only after a retryable
-// pre-delivery failure.
+// select a primary handshake; if the primary fails with a retryable pre-delivery
+// error or does not complete within fallbackStagger (transportLocalFallbackStagger
+// for local/test peers, transportPublicFallbackStagger for public WAN peers), the
+// alternate transport races concurrently and the first established session wins.
 type TransportMux struct {
 	database *controlplanenetdb.Database
 	ntcp2    dataplane.RouterTransportManager
@@ -281,22 +286,184 @@ func (m *TransportMux) PrepareSession(ctx context.Context, peer foundation.Hash)
 		// the alternate transport instead of burning the attempt budget.
 		primary, alternate = alternate, nil
 	}
-	attempts := 1
-	if alternate != nil {
-		attempts++
-	}
-	err := ensureTransportSession(ctx, primary, peer, attempts)
-	if err == nil {
+	if alternate == nil {
+		if err := ensureTransportSession(ctx, primary, peer, 1); err != nil {
+			return nil, err
+		}
 		return m.prepareTransportSession(primary, peer)
 	}
-	retryable := IsRetryableTransportError(err)
-	if alternate == nil || !retryable || ctx.Err() != nil {
-		return nil, err
+	return m.prepareSessionWithFallback(ctx, peer, primary, alternate)
+}
+
+// prepareSessionWithFallback starts the primary transport immediately and, if
+// it remains pending past fallbackStagger (capped to half the remaining caller
+// deadline), starts the alternate transport concurrently (Happy Eyeballs). The
+// first transport to establish a session wins, cancels the other attempt, and
+// drops any redundant session if both complete concurrently.
+func (m *TransportMux) prepareSessionWithFallback(ctx context.Context, peer foundation.Hash, primary, alternate dataplane.RouterTransportManager) (dataplane.RouterSessionSender, error) {
+	primaryCtx, primaryCancel := context.WithCancel(ctx)
+	primaryCh := make(chan error, 1)
+	go func() {
+		primaryCh <- ensureTransportSession(primaryCtx, primary, peer, 1)
+	}()
+
+	staggerDur := m.fallbackStagger(peer)
+	if deadline, ok := ctx.Deadline(); ok {
+		if half := time.Until(deadline) / 2; half > 0 && half < staggerDur {
+			staggerDur = half
+		}
 	}
-	if alternateErr := ensureTransportSession(ctx, alternate, peer, 1); alternateErr != nil {
-		return nil, errors.Join(err, alternateErr)
+	stagger := time.NewTimer(staggerDur)
+	defer stagger.Stop()
+
+	select {
+	case primaryErr := <-primaryCh:
+		primaryCancel()
+		if primaryErr == nil {
+			return m.prepareTransportSession(primary, peer)
+		}
+		if !IsRetryableTransportError(primaryErr) || ctx.Err() != nil {
+			return nil, primaryErr
+		}
+		if alternateErr := ensureTransportSession(ctx, alternate, peer, 1); alternateErr != nil {
+			return nil, errors.Join(primaryErr, alternateErr)
+		}
+		return m.prepareTransportSession(alternate, peer)
+	case <-ctx.Done():
+		primaryCancel()
+		<-primaryCh
+		return nil, ctx.Err()
+	case <-stagger.C:
 	}
-	return m.prepareTransportSession(alternate, peer)
+
+	altCtx, altCancel := context.WithCancel(ctx)
+	altCh := make(chan error, 1)
+	go func() {
+		altCh <- ensureTransportSession(altCtx, alternate, peer, 1)
+	}()
+
+	select {
+	case primaryErr := <-primaryCh:
+		primaryCancel()
+		if primaryErr == nil {
+			altCancel()
+			if altErr := <-altCh; altErr == nil {
+				dropTransportSession(alternate, peer)
+			}
+			return m.prepareTransportSession(primary, peer)
+		}
+		if !IsRetryableTransportError(primaryErr) || ctx.Err() != nil {
+			altCancel()
+			if altErr := <-altCh; altErr == nil {
+				dropTransportSession(alternate, peer)
+			}
+			return nil, primaryErr
+		}
+		altErr := <-altCh
+		altCancel()
+		if altErr == nil {
+			return m.prepareTransportSession(alternate, peer)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, errors.Join(primaryErr, altErr)
+	case altErr := <-altCh:
+		altCancel()
+		if altErr == nil {
+			primaryCancel()
+			if primaryErr := <-primaryCh; primaryErr == nil {
+				dropTransportSession(alternate, peer)
+				return m.prepareTransportSession(primary, peer)
+			}
+			return m.prepareTransportSession(alternate, peer)
+		}
+		primaryErr := <-primaryCh
+		primaryCancel()
+		if primaryErr == nil {
+			return m.prepareTransportSession(primary, peer)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !IsRetryableTransportError(primaryErr) {
+			return nil, primaryErr
+		}
+		return nil, errors.Join(primaryErr, altErr)
+	case <-ctx.Done():
+		primaryCancel()
+		altCancel()
+		<-primaryCh
+		<-altCh
+		return nil, ctx.Err()
+	}
+}
+
+func dropTransportSession(manager dataplane.RouterTransportManager, peer foundation.Hash) {
+	if preferred, ok := manager.(preferredSessionManager); ok {
+		preferred.DropSession(peer)
+	}
+}
+
+// fallbackStagger selects a short Happy Eyeballs stagger for local/private/test
+// peers (low RTT) and a conservative WAN stagger for global unicast peers so
+// healthy intercontinental handshakes finish without duplicate dialing.
+func (m *TransportMux) fallbackStagger(peer foundation.Hash) time.Duration {
+	if m == nil || m.database == nil {
+		return transportPublicFallbackStagger
+	}
+	ref, ok := m.database.Routers().Get(peer)
+	if !ok {
+		return transportPublicFallbackStagger
+	}
+	sawHost := false
+	addresses := ref.Info.Addresses()
+	for {
+		address, hasNext, err := addresses.Next()
+		if err != nil || !hasNext {
+			break
+		}
+		options := address.Options.Iterator()
+		for {
+			key, value, hasOpt, optErr := options.Next()
+			if optErr != nil || !hasOpt {
+				break
+			}
+			if string(key) != "host" {
+				continue
+			}
+			ip, parseErr := netip.ParseAddr(string(value))
+			if parseErr != nil {
+				continue
+			}
+			sawHost = true
+			if !isLocalOrTestAddr(ip) {
+				return transportPublicFallbackStagger
+			}
+		}
+	}
+	if sawHost {
+		return transportLocalFallbackStagger
+	}
+	return transportPublicFallbackStagger
+}
+
+func isLocalOrTestAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if !ip.Is4() {
+		return false
+	}
+	b := ip.As4()
+	// RFC 5737 TEST-NET-1/2/3 (used by loopback/test fixtures).
+	switch [3]byte{b[0], b[1], b[2]} {
+	case [3]byte{192, 0, 2}, [3]byte{198, 51, 100}, [3]byte{203, 0, 113}:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *TransportMux) prepareTransportSession(manager dataplane.RouterTransportManager, peer foundation.Hash) (dataplane.RouterSessionSender, error) {

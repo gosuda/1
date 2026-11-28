@@ -236,6 +236,7 @@ type destinationRuntime struct {
 	maintenanceQueued       atomic.Bool
 	tunnelMaintenanceDirty  atomic.Bool
 	tunnelMaintenanceQueued atomic.Bool
+	publishDirty            atomic.Bool
 	publishQueued           atomic.Bool
 	publishMu               sync.Mutex
 	// +checklocks:publishMu
@@ -451,6 +452,9 @@ type Controller struct {
 	tunnelWake             chan struct{}
 	netdbSaveWake          chan struct{}
 	lastNetDBSaveMillis    atomic.Uint64
+	exploratoryChangeMu    sync.Mutex
+	// +checklocks:exploratoryChangeMu
+	exploratoryChanged chan struct{}
 	// +checklocks:mu
 	startReady                chan struct{}
 	embedded                  bool
@@ -1102,6 +1106,7 @@ func NewController(cfg state.ConfigurationOperating, options ControllerOptions) 
 			CreatorBudget: creatorBudget, Stats: tunnel.NewBuildStatistics(),
 			OnBuildEvent: func() {
 				if d != nil {
+					d.notifyExploratoryChanged()
 					d.requestExploratoryMaintenance()
 				}
 			},
@@ -1303,6 +1308,7 @@ func NewController(cfg state.ConfigurationOperating, options ControllerOptions) 
 		destinationWake:        make(chan *destinationRuntime, max(1, cfg.State.MaxDestinations)),
 		destinationTunnelWake:  make(chan *destinationRuntime, max(1, cfg.State.MaxDestinations)),
 		destinationPublishWake: make(chan *destinationRuntime, max(1, cfg.State.MaxDestinations)),
+		publicationWake:        make(chan struct{}, 1),
 		tunnelWake:             make(chan struct{}, 1),
 		netdbSaveWake:          make(chan struct{}, 1),
 	}
@@ -1444,7 +1450,6 @@ func (d *Controller) startMaintenance() {
 	}
 	interval = min(interval, time.Second)
 	d.maintenanceDone = make(chan struct{})
-	d.publicationWake = make(chan struct{}, 1)
 	destinationWorkers := parallelism.Workers(max(1, d.config.State.MaxDestinations))
 	d.maintenanceWG.Add(5 + destinationWorkers)
 	go d.publicationMaintenanceLoop()
@@ -1478,6 +1483,26 @@ func (d *Controller) requestExploratoryMaintenance() {
 	select {
 	case d.tunnelWake <- struct{}{}:
 	default:
+	}
+}
+
+// +checklocksexclude:d.exploratoryChangeMu
+func (d *Controller) exploratoryChanges() <-chan struct{} {
+	d.exploratoryChangeMu.Lock()
+	defer d.exploratoryChangeMu.Unlock()
+	if d.exploratoryChanged == nil {
+		d.exploratoryChanged = make(chan struct{})
+	}
+	return d.exploratoryChanged
+}
+
+// +checklocksexclude:d.exploratoryChangeMu
+func (d *Controller) notifyExploratoryChanged() {
+	d.exploratoryChangeMu.Lock()
+	defer d.exploratoryChangeMu.Unlock()
+	if d.exploratoryChanged != nil {
+		close(d.exploratoryChanged)
+		d.exploratoryChanged = nil
 	}
 }
 
@@ -1741,6 +1766,10 @@ func (d *Controller) requestDestinationPublication(runtime *destinationRuntime) 
 	if d == nil || runtime == nil || !runtime.active() || d.destinationPublishWake == nil {
 		return
 	}
+	if runtime.publisher != nil && runtime.publisher.NeedsInitialConfirmation() {
+		d.enqueueDestinationPublication(runtime)
+		return
+	}
 	debounce := cmp.Or(d.publishDebounce, destinationPublishDebounce)
 	runtime.publishMu.Lock()
 	now := time.Now()
@@ -1763,6 +1792,7 @@ func (d *Controller) requestDestinationPublication(runtime *destinationRuntime) 
 }
 
 func (d *Controller) enqueueDestinationPublication(runtime *destinationRuntime) {
+	runtime.publishDirty.Store(true)
 	if !runtime.publishQueued.CompareAndSwap(destinationMaintenanceIdle, destinationMaintenanceQueued) {
 		return
 	}
@@ -1774,13 +1804,17 @@ func (d *Controller) enqueueDestinationPublication(runtime *destinationRuntime) 
 }
 
 func (d *Controller) maintainDestinationPublication(runtime *destinationRuntime) {
-	defer runtime.publishQueued.Store(destinationMaintenanceIdle)
-	if !runtime.active() || runtime.publisher == nil {
-		return
+	var err error
+	runtime.publishDirty.Store(false)
+	if runtime.active() && runtime.publisher != nil {
+		publicationContext, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+		_, err = runtime.publisher.Maintain(publicationContext)
+		cancel()
 	}
-	publicationContext, cancel := context.WithTimeout(d.ctx, 30*time.Second)
-	_, err := runtime.publisher.Maintain(publicationContext)
-	cancel()
+	runtime.publishQueued.Store(destinationMaintenanceIdle)
+	if runtime.active() && runtime.publisher != nil && runtime.publishDirty.Load() {
+		d.enqueueDestinationPublication(runtime)
+	}
 	d.recordMaintenanceError(err)
 }
 
@@ -1980,6 +2014,12 @@ func (d *Controller) recordReseedOutcome(err error) {
 	if err == nil {
 		d.registry.IncReseedSuccesses()
 		d.requestAllTunnelMaintenance()
+		if d.publicationWake != nil {
+			select {
+			case d.publicationWake <- struct{}{}:
+			default:
+			}
+		}
 		return
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -2349,6 +2389,13 @@ func (d *Controller) ImportRouterInfo(ctx context.Context, wire []byte) (foundat
 	}
 	if err := db.AdmitRouterInfo(info, false, nowMillis); err != nil {
 		return foundation.Hash{}, fmt.Errorf("controlplane: netdb admission: %w", err)
+	}
+	d.requestAllTunnelMaintenance()
+	if d.publicationWake != nil {
+		select {
+		case d.publicationWake <- struct{}{}:
+		default:
+		}
 	}
 	return peerHash, nil
 }

@@ -27,6 +27,11 @@ type creatorAttempt struct {
 // A timed-out attempt retains its claim but yields the active slot to a retry.
 // +checklocksexclude:m.mu
 func (m *BuildManager) reserveCreator(direction Direction, target, limit int, now, cutoff uint64) (*creatorAttempt, error) {
+	return m.reserveCreatorWithCap(direction, target, target, limit, now, cutoff)
+}
+
+// +checklocksexclude:m.mu
+func (m *BuildManager) reserveCreatorWithCap(direction Direction, target, claimCap, limit int, now, cutoff uint64) (*creatorAttempt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	active := 0
@@ -57,7 +62,7 @@ func (m *BuildManager) reserveCreator(direction Direction, target, limit int, no
 			retry = claim
 		}
 	}
-	if usable >= target || retry == nil && usable+reserved >= target {
+	if usable >= target || retry == nil && usable+reserved >= claimCap {
 		return nil, nil
 	}
 	if err := m.creatorAdmissionErrorLocked(); err != nil {

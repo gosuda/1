@@ -76,8 +76,10 @@ type ntcp2InitiatorFactory func([]byte) (*dataplanentcp2.Initiator, error)
 // binding, derives data-phase directions, and routes authenticated I2NP blocks
 // through Router's TransportBindings callback.
 type ntcp2DialAttempt struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	waiters int
+	cancel  context.CancelFunc
 }
 
 type NTCP2Manager struct {
@@ -320,18 +322,12 @@ func (m *NTCP2Manager) EnsureSession(ctx context.Context, peer foundation.Hash) 
 		m.mu.Unlock()
 		return nil
 	}
-	if pending := m.dialing[peer]; pending != nil {
+	pending := m.dialing[peer]
+	if pending != nil {
+		pending.waiters++
 		done := pending.done
 		m.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			if m.session(peer) != nil {
-				return nil
-			}
-			return pending.err
-		}
+		return m.waitForDialAttempt(ctx, peer, pending, done)
 	}
 	select {
 	case m.pending <- struct{}{}:
@@ -340,39 +336,64 @@ func (m *NTCP2Manager) EnsureSession(ctx context.Context, peer foundation.Hash) 
 		return ErrNTCP2Session
 	}
 	m.wg.Add(1)
-	defer m.wg.Done()
-	defer func() { <-m.pending }()
-	setupCtx, cancelSetup := context.WithCancel(ctx)
-	stopCancel := context.AfterFunc(m.ctx, cancelSetup)
-	defer stopCancel()
-	defer cancelSetup()
-	pending := &ntcp2DialAttempt{done: make(chan struct{})}
+	var setupCtx context.Context
+	var cancelSetup context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		setupCtx, cancelSetup = context.WithDeadline(m.ctx, deadline)
+	} else {
+		setupCtx, cancelSetup = context.WithCancel(m.ctx)
+	}
+	pending = &ntcp2DialAttempt{done: make(chan struct{}), waiters: 1, cancel: cancelSetup}
 	m.dialing[peer] = pending
+	done := pending.done
 	m.mu.Unlock()
 
-	err := m.openOutbound(setupCtx, peer)
-	if m.session(peer) != nil {
-		err = nil
-	}
-	result := err
-	if err != nil {
-		result = errors.Join(ErrNTCP2Peer, err)
-	}
-	m.mu.Lock()
-	delete(m.dialing, peer)
-	pending.err = result
-	close(pending.done)
-	m.mu.Unlock()
-	if err != nil {
-		if m.metrics != nil {
-			m.metrics.IncTransportHandshakeFailures()
+	go func() {
+		defer m.wg.Done()
+		defer func() { <-m.pending }()
+		defer cancelSetup()
+		err := m.openOutbound(setupCtx, peer)
+		if m.session(peer) != nil {
+			err = nil
 		}
-		if m.logger != nil {
-			m.logger.Warn("public transport handshake failed", "transport", "NTCP2", "peer", routerHashDiagnostic(peer), "phase", ntcp2FailurePhase(err), "error", err)
+		result := err
+		if err != nil {
+			result = errors.Join(ErrNTCP2Peer, err)
 		}
-		return result
+		m.mu.Lock()
+		delete(m.dialing, peer)
+		pending.err = result
+		close(pending.done)
+		m.mu.Unlock()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if m.metrics != nil {
+				m.metrics.IncTransportHandshakeFailures()
+			}
+			if m.logger != nil {
+				m.logger.Warn("public transport handshake failed", "transport", "NTCP2", "peer", routerHashDiagnostic(peer), "phase", ntcp2FailurePhase(err), "error", err)
+			}
+		}
+	}()
+	return m.waitForDialAttempt(ctx, peer, pending, done)
+}
+
+// +checklocksexclude:m.mu
+func (m *NTCP2Manager) waitForDialAttempt(ctx context.Context, peer foundation.Hash, pending *ntcp2DialAttempt, done <-chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		m.mu.Lock()
+		pending.waiters--
+		if pending.waiters == 0 && m.dialing[peer] == pending {
+			pending.cancel()
+		}
+		m.mu.Unlock()
+		return ctx.Err()
+	case <-done:
+		if m.session(peer) != nil {
+			return nil
+		}
+		return pending.err
 	}
-	return nil
 }
 
 func (m *NTCP2Manager) HasSession(peer foundation.Hash) bool {

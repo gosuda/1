@@ -455,3 +455,42 @@ func TestPairedMaintainerDoesNotWaitForNewTransportSession(t *testing.T) {
 		t.Fatal("Close did not join the session setup attempt")
 	}
 }
+
+func TestPairedMaintainerBootstrapSpeculativeOverProvisioningWithStats(t *testing.T) {
+	const now = uint64(1_700_000_000_000)
+	inboundSource := &pairedInboundSource{builds: []InboundBuild{
+		pairedInboundBuild(t, 101, now+10_000),
+		pairedInboundBuild(t, 102, now+10_000),
+		pairedInboundBuild(t, 103, now+10_000),
+		pairedInboundBuild(t, 104, now+10_000),
+		pairedInboundBuild(t, 105, now+10_000),
+	}}
+	sender := new(buildCaptureSender)
+	runtime := dataplane.TunnelNewRuntime(dataplane.TunnelRuntimeConfig{Sender: sender, Now: func() uint64 { return now }})
+	pool := NewPool(8)
+	stats := NewBuildStatistics()
+	manager, err := NewBuildManager(BuildManagerConfig{
+		Runtime: runtime, Pool: pool, Sender: sender, ReplyKeys: newBuildReplyRegistry(),
+		LocalRouter: foundation.Hash{1}, LocalDelivery: func(foundation.I2NPMessage) error { return nil },
+		Now:   func() uint64 { return now },
+		Stats: stats,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(manager.ReleaseSensitive)
+	maintainer, err := NewPairedPoolMaintainer(PairedPoolMaintainerConfig{
+		Pool: pool, Runtime: runtime, Builder: manager, InboundSource: inboundSource, OutboundSource: new(pairedOutboundSource),
+		Now: func() uint64 { return now }, InboundTarget: 2, OutboundTarget: 2,
+		BootstrapParallelLimit: manager.ParallelLimit(Inbound, 1), // 4 at 30% cold-start prior
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = maintainer.Close() })
+
+	started, err := maintainer.Maintain(context.Background())
+	if err != nil || started != 4 {
+		t.Fatalf("speculative bootstrap started=%d err=%v, want 4 nil", started, err)
+	}
+}
