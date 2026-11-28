@@ -1,0 +1,84 @@
+{
+  "postgres_version": 180004,
+  "producer": "80e089e4fcdc71760b3435a4d0dceda72395d3c0",
+  "run": 45909237367,
+  "output_sha256": "8d30a95df38ba5eafab20d1f88dfc883c24ed9ea06a3c2f4583ec3efed695aca",
+  "cases": [
+    {
+      "id": "PL_COMMENT",
+      "sql": "DO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1 INTO t; -- should fail;\nEND;\n$$",
+      "state": "42804"
+    },
+    {
+      "id": "PL_NO_COMMENT",
+      "sql": "DO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1 INTO t;\nEND;\n$$",
+      "state": "42804"
+    },
+    {
+      "id": "PL_VALID_ASSIGNMENT",
+      "sql": "DO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1, 2 INTO t; -- should be valid;\nEND;\n$$",
+      "state": "00000"
+    },
+    {
+      "id": "PL_DOLLAR_LITERAL",
+      "sql": "DO $body$\nDECLARE\n  t test_01;\nBEGIN\n  PERFORM $literal$literal; -- not a comment$literal$;\n  SELECT 1 INTO t;\nEND;\n$body$",
+      "state": "42804"
+    },
+    {
+      "id": "PL_QUOTED_LITERAL",
+      "sql": "DO $body$\nDECLARE\n  t test_01;\nBEGIN\n  PERFORM 'literal; -- not a comment';\n  SELECT 1 INTO t;\nEND;\n$body$",
+      "state": "42804"
+    },
+    {
+      "id": "PL_VALID_TRAILING_COMMENT",
+      "sql": "SELECT 1",
+      "state": "00000"
+    },
+    {
+      "id": "PL_REJECTED_TRAILING_COMMENT",
+      "sql": "SELECT 1/0",
+      "state": "22012"
+    },
+    {
+      "id": "PL_QUOTED_TEXT_CONTROL",
+      "sql": "SELECT 'semicolon; -- quoted literal'",
+      "state": "00000"
+    },
+    {
+      "id": "PL_DOLLAR_TEXT_CONTROL",
+      "sql": "SELECT $literal$semicolon; -- dollar literal$literal$",
+      "state": "00000"
+    },
+    {
+      "id": "PL_MULTILINE_TEXT_CONTROL",
+      "sql": "SELECT 'first line\nsemicolon; -- multiline literal\nlast line'",
+      "state": "00000"
+    },
+    {
+      "id": "PL_MULTILINE_REJECTION",
+      "sql": "SELECT ('first line\nsemicolon; -- multiline literal\nlast line')::integer",
+      "state": "22P02"
+    },
+    {
+      "id": "PL_NESTED_COMMENT_REJECTION",
+      "sql": "DO $body$\nDECLARE\n  t test_01;\nBEGIN\n  /* outer comment ; -- data\n     /* inner comment ; -- data */\n  */\n  SELECT 1 INTO t;\nEND;\n$body$",
+      "state": "42804"
+    },
+    {
+      "id": "PL_REPEAT_MISSING_BEFORE",
+      "sql": "SELECT v FROM pr15_repeat_table",
+      "state": "42P01"
+    },
+    {
+      "id": "PL_REPEAT_PRESENT",
+      "sql": "SELECT v FROM pr15_repeat_table",
+      "state": "00000"
+    },
+    {
+      "id": "PL_REPEAT_MISSING_AFTER",
+      "sql": "SELECT v FROM pr15_repeat_table",
+      "state": "42P01"
+    }
+  ],
+  "source": "\\set ON_ERROR_STOP on\nSELECT 'VERSION', current_setting('server_version_num');\nCREATE TABLE test_01(a int, b int, c int);\nALTER TABLE test_01 DROP COLUMN a;\nSET plpgsql.extra_errors TO 'strict_multi_assignment';\n\\set ON_ERROR_STOP off\nDO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1 INTO t; -- should fail;\nEND;\n$$;\n\\echo PL_COMMENT :SQLSTATE\nDO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1 INTO t;\nEND;\n$$;\n\\echo PL_NO_COMMENT :SQLSTATE\nDO $$\nDECLARE\n  t test_01;\nBEGIN\n  SELECT 1, 2 INTO t; -- should be valid;\nEND;\n$$;\n\\echo PL_VALID_ASSIGNMENT :SQLSTATE\nDO $body$\nDECLARE\n  t test_01;\nBEGIN\n  PERFORM $literal$literal; -- not a comment$literal$;\n  SELECT 1 INTO t;\nEND;\n$body$;\n\\echo PL_DOLLAR_LITERAL :SQLSTATE\nDO $body$\nDECLARE\n  t test_01;\nBEGIN\n  PERFORM 'literal; -- not a comment';\n  SELECT 1 INTO t;\nEND;\n$body$;\n\\echo PL_QUOTED_LITERAL :SQLSTATE\nSELECT 1; -- trailing top-level comment\n\\echo PL_VALID_TRAILING_COMMENT :SQLSTATE\nSELECT 1/0; -- rejected trailing top-level comment\n\\echo PL_REJECTED_TRAILING_COMMENT :SQLSTATE\nSELECT 'semicolon; -- quoted literal';\n\\echo PL_QUOTED_TEXT_CONTROL :SQLSTATE\nSELECT $literal$semicolon; -- dollar literal$literal$;\n\\echo PL_DOLLAR_TEXT_CONTROL :SQLSTATE\nSELECT 'first line\nsemicolon; -- multiline literal\nlast line';\n\\echo PL_MULTILINE_TEXT_CONTROL :SQLSTATE\nSELECT ('first line\nsemicolon; -- multiline literal\nlast line')::integer;\n\\echo PL_MULTILINE_REJECTION :SQLSTATE\nDO $body$\nDECLARE\n  t test_01;\nBEGIN\n  /* outer comment ; -- data\n     /* inner comment ; -- data */\n  */\n  SELECT 1 INTO t;\nEND;\n$body$;\n\\echo PL_NESTED_COMMENT_REJECTION :SQLSTATE\nSELECT v FROM pr15_repeat_table;\n\\echo PL_REPEAT_MISSING_BEFORE :SQLSTATE\nCREATE TABLE pr15_repeat_table(v integer);\nINSERT INTO pr15_repeat_table VALUES (7);\nSELECT v FROM pr15_repeat_table;\n\\echo PL_REPEAT_PRESENT :SQLSTATE\nDROP TABLE pr15_repeat_table;\nSELECT v FROM pr15_repeat_table;\n\\echo PL_REPEAT_MISSING_AFTER :SQLSTATE\n\\set ON_ERROR_STOP on\nRESET plpgsql.extra_errors;\nDROP TABLE test_01;\n"
+}
