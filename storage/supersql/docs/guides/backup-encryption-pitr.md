@@ -178,6 +178,19 @@ base backup. A failed archive update leaves the previous destination active.
 When `WALArchiveKey` is empty, an encrypted live database uses its
 live key for archived WAL; an unencrypted database writes plaintext archives.
 
+If an archived WAL segment is missing but its metadata sidecar remains, a retry
+repairs it only when the local WAL reproduces the original size and SHA-256
+checksum under the same archive encryption state and key. The sidecar stays in
+place throughout repair, including a retry after publication before directory
+sync. Plaintext copies, and encrypted copies made when the archive cipher
+matches the live database cipher, can be restored byte for byte. Any segment
+encrypted under an archive key distinct from the live database encryption
+state, including an encrypted archive of an otherwise unencrypted database,
+uses a fresh random per-file salt, so its bytes cannot be reconstructed from
+the sidecar's ciphertext checksum alone; repair fails closed with
+storage.ErrCorruptStorage without changing the sidecar. Recover the original
+archived bytes from a backup instead of substituting a new segment or checksum.
+
 The PITR target is a `clock.Instant` in the database's clock scale. It is a
 positional argument, not a field in `PITRRestoreOptions`. Recovery replays
 contiguous WAL through the last commit at or before that target:

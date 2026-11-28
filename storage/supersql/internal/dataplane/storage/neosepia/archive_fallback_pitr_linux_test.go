@@ -221,6 +221,57 @@ func TestArchiveFallbackPITR(t *testing.T) {
 			if !slices.Equal(gotAgain, [][2]int64{{1, 100}, {2, 200}}) {
 				t.Fatalf("PITR rows through the repaired archive = %v, want rows 1 and 2", gotAgain)
 			}
+			// The repaired segment must replay, not just validate as the
+			// cutoff: restore past the third insert and require its row.
+			afterInsert, err := clk.Read(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			restoredFull, resultFull, err := supersql.RestorePITR(t.Context(), backup, archive, afterInsert.Latest, supersql.PITRRestoreOptions{
+				Open: supersql.OpenOptions{
+					Directory:     filepath.Join(t.TempDir(), "restored-full"),
+					Clock:         clk,
+					EncryptionKey: liveKey,
+				},
+				EncryptionKey: backupKey,
+				WALArchiveKey: archiveKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			restoredFullConnector := supersql.NewConnectorWithCatalog(restoredFull)
+			restoredFullDB := sql.OpenDB(restoredFullConnector)
+			t.Cleanup(func() {
+				if err := errors.Join(restoredFullDB.Close(), restoredFullConnector.Close()); err != nil {
+					t.Error(err)
+				}
+			})
+			if resultFull.ReplayedSegments == 0 || resultFull.RecoveredCommitTS <= target.Latest {
+				t.Fatalf("PITR did not replay the repaired segment past the old cutoff: %+v", resultFull)
+			}
+			rowsFull, err := restoredFullDB.QueryContext(t.Context(), "SELECT id, val FROM events ORDER BY id")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := rowsFull.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			var gotFull [][2]int64
+			for rowsFull.Next() {
+				var row [2]int64
+				if err := rowsFull.Scan(&row[0], &row[1]); err != nil {
+					t.Fatal(err)
+				}
+				gotFull = append(gotFull, row)
+			}
+			if err := rowsFull.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(gotFull, [][2]int64{{1, 100}, {2, 200}, {3, 300}}) {
+				t.Fatalf("PITR rows through the repaired archive = %v, want rows 1, 2 and 3", gotFull)
+			}
 		})
 	}
 }
