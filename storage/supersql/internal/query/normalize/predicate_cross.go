@@ -83,6 +83,16 @@ func (n *normalizer) predicateCrossJoin(id ir.RelID, source ir.Rel, spec ir.RelS
 	} else {
 		parts = append(parts, pred)
 	}
+	// A volatile conjunct evaluates once per row the filter sees, and an
+	// erroring conjunct raises for the first failing row: moving any other
+	// conjunct into a join changes how many rows reach them, so the sequence
+	// advances fewer times or the error goes silent. Keep the original
+	// filter and cross joins intact when any conjunct can vary or fail.
+	for _, part := range parts {
+		if part.n.Effects.Volatility == ir.Volatile || part.n.Effects.MayError {
+			return relResult{}, false
+		}
+	}
 	// Slot sets use normalized operands, which is what the rebuilt joins
 	// evaluate. Slots outside every leaf (parameters, outer captures) never
 	// constrain placement.
@@ -143,6 +153,65 @@ func (n *normalizer) predicateCrossJoin(id ir.RelID, source ir.Rel, spec ir.RelS
 		}
 		return found, true
 	}
+	// hasSubquery reports whether the scalar tree contains a subquery. A
+	// subquery reads its outer captures, which are not ordinary scalar
+	// operands, so placement by operand leaves alone would attach it to a
+	// join that cannot supply those captures. Such conjuncts stay in the
+	// residual filter above the new joins.
+	hasSubquery := func(sid ir.ScalarID) (bool, bool) {
+		found := false
+		seen := make(map[ir.ScalarID]bool)
+		var walk func(ir.ScalarID, uint32) bool
+		walk = func(cur ir.ScalarID, d uint32) bool {
+			if found || cur == 0 || d >= n.o.Limits.MaxDepth || !n.step(1) {
+				return found && d < n.o.Limits.MaxDepth
+			}
+			if seen[cur] {
+				return true
+			}
+			seen[cur] = true
+			s, ok := n.b.Scalar(cur)
+			if !ok {
+				return false
+			}
+			if s.Kind == ir.Subquery {
+				found = true
+				return true
+			}
+			for j := range s.OperandCount() {
+				child, _ := n.b.Operand(cur, j)
+				if !walk(child, d+1) {
+					return false
+				}
+			}
+			return true
+		}
+		if !walk(sid, 0) {
+			return false, false
+		}
+		return found, true
+	}
+	// A part's leaves and subqueries never change across prefixes, so
+	// analyze each part once instead of recomputing it at every join.
+	partOwners := make([]map[int]bool, len(parts))
+	partSkipped := make([]bool, len(parts))
+	for j, part := range parts {
+		if part.n.Effects.Volatility != ir.Immutable {
+			continue
+		}
+		owned, ok := slotLeaves(part.id)
+		if !ok {
+			n.err = ErrInvalid
+			return relResult{}, true
+		}
+		partOwners[j] = owned
+		sub, ok := hasSubquery(part.id)
+		if !ok {
+			n.err = ErrInvalid
+			return relResult{}, true
+		}
+		partSkipped[j] = sub
+	}
 	attached := make([]bool, len(parts))
 	attachedTotal := 0
 	present := make([]bool, len(leaves))
@@ -156,16 +225,11 @@ func (n *normalizer) predicateCrossJoin(id ir.RelID, source ir.Rel, spec ir.RelS
 		present[i] = true
 		var selected []scalarResult
 		for j, part := range parts {
-			if attached[j] || part.n.Effects.Volatility != ir.Immutable {
+			if attached[j] || partSkipped[j] || part.n.Effects.Volatility != ir.Immutable {
 				continue
 			}
-			owners, ok := slotLeaves(part.id)
-			if !ok {
-				n.err = ErrInvalid
-				return relResult{}, true
-			}
 			ready := true
-			for leaf := range owners {
+			for leaf := range partOwners[j] {
 				if !present[leaf] {
 					ready = false
 					break
