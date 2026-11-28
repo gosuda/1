@@ -1,0 +1,131 @@
+{
+  "toolchain": "go1.27.0",
+  "goos": "darwin",
+  "goarch": "arm64",
+  "cpu": "Apple M1",
+  "cgo_enabled": false,
+  "parser_command": "CGO_ENABLED=0 go test ./internal/zpgparse/...",
+  "parser_result": "passed (cached parser package)",
+  "root_contract_command": "CGO_ENABLED=0 go test . -run 'Test(TimeTravelReadsHistoricalVersion|MVCCGCRejectsExpiredSnapshot|TruncatePreservesHistoryAndSurvivesRestart|TransactionalTruncatePublishesOnlyAtCommit|PreparedStatementLifecycle|PrimaryKeyUpdate.*|ReopenReplaysCommittedWAL|ReopenIgnoresTruncatedWALTail|HotBackupRestoresMultipleTables)$' -count=1",
+  "root_contract_result": "passed",
+  "benchmark_command": "CGO_ENABLED=0 go test . -run '^$' -bench 'Benchmark(PointLookup|VectorizedScanVsRowScan|HTAPConcurrentWorkload)$' -benchmem -count=5",
+  "benchmark_columns": [
+    "ns/op",
+    "B/op",
+    "allocs/op"
+  ],
+  "benchmark_runs": {
+    "HTAPConcurrentWorkload": [
+      [
+        1120219,
+        962068,
+        1489
+      ],
+      [
+        1198137,
+        998128,
+        1543
+      ],
+      [
+        1826178,
+        1241417,
+        1916
+      ],
+      [
+        1076084,
+        853749,
+        1319
+      ],
+      [
+        1183937,
+        1031845,
+        1594
+      ]
+    ],
+    "PointLookup": [
+      [
+        5454,
+        14824,
+        142
+      ],
+      [
+        5448,
+        14824,
+        142
+      ],
+      [
+        5464,
+        14824,
+        142
+      ],
+      [
+        5464,
+        14824,
+        142
+      ],
+      [
+        5488,
+        14824,
+        142
+      ]
+    ],
+    "VectorizedFilterAndProject": [
+      [
+        25124,
+        67152,
+        27
+      ],
+      [
+        25143,
+        67152,
+        27
+      ],
+      [
+        25158,
+        67152,
+        27
+      ],
+      [
+        25154,
+        67152,
+        27
+      ],
+      [
+        25240,
+        67152,
+        27
+      ]
+    ],
+    "RowByRowMaterialization": [
+      [
+        15279304,
+        62020183,
+        13006
+      ],
+      [
+        15301312,
+        62020177,
+        13006
+      ],
+      [
+        15349775,
+        62020148,
+        13005
+      ],
+      [
+        15383450,
+        62020152,
+        13005
+      ],
+      [
+        15696352,
+        62020202,
+        13006
+      ]
+    ]
+  },
+  "notes": [
+    "Baseline public pipeline was unchanged. Dependency resolution and independent new-package work overlapped the benchmark process; these measurements are not a controlled performance comparison.",
+    "No live-heap measurement or new-pipeline speedup is established."
+  ]
+}

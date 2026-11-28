@@ -1,0 +1,111 @@
+name: Track Chromium
+
+# Follows the Chromium Stable channel. When a new stable release appears:
+#   1. pin: rewrites third_party/chromium with `engine.py pin` and pushes the commit to
+#      chromium/<version>;
+#   2. engine: builds and tests all six engines from that branch (engine.yml);
+#   3. promote: attests the six engines that step 2 built and tested, pins them in
+#      internal/embedded (binaries, hashes.go) with their license texts, and pushes the pins and
+#      the binaries to main as one commit. The bot owns exactly those files in gosuda/0 (per-file
+#      OWNERS), so the lander lands the push into the monorepo tree.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Chromium version to pin (default: latest stable)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: track-chromium
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      branch: ${{ steps.pin.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: Pin the Chromium release
+        id: pin
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/engine/engine.py pin --version "${INPUT_VERSION:-latest-stable}")
+          branch="chromium/$version"
+          if git diff --quiet -- third_party/chromium; then
+            echo "Chromium $version is already pinned"
+            exit 0
+          fi
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then
+            echo "$branch already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add third_party/chromium
+          git commit -m "third_party/chromium: update to Chromium $version"
+          git push origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+  engine:
+    needs: [pin]
+    if: needs.pin.outputs.branch != ''
+    uses: ./.github/workflows/engine.yml
+    with:
+      ref: ${{ needs.pin.outputs.branch }}
+
+  promote:
+    needs: [pin, engine]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.pin.outputs.branch }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: engine-*
+          path: dist
+          merge-multiple: true
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: 'dist/chrome_net_server_*'
+      - name: Push the pins and the engines to main as one commit
+        env:
+          BRANCH: ${{ needs.pin.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "main moved since the pin was made; rerun this workflow" >&2
+            exit 1
+          fi
+          chromium=$(sed -n 's/^version=//p' third_party/chromium/VERSION)
+          scripts/engine/pin-embedded.sh dist "chromium-$chromium" "$chromium"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git reset --soft origin/main
+          git add third_party/chromium internal/embedded
+          git commit -m "net/chromenet: update to Chromium $chromium" \
+            -m "Pins the Chromium $chromium source archive and toolchains, and embeds the six chrome_net_server binaries built and tested from them."
+          git push origin "HEAD:refs/heads/main"
+          git push origin --delete "$BRANCH"
