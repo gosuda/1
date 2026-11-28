@@ -1,0 +1,145 @@
+name: Engine
+
+# Builds chrome_net_server from the pinned Chromium release (third_party/chromium) and runs the Go
+# tests against the fresh binaries. Linux and Windows engines build in a gvx sandbox on Linux;
+# macOS engines build natively. release.yml calls this workflow to produce release binaries.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - 'scripts/engine/**'
+      - 'third_party/chromium/**'
+      - 'chrome_net.idl'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/engine.yml'
+  pull_request:
+    paths:
+      - 'engine/**'
+      - 'scripts/engine/**'
+      - 'third_party/chromium/**'
+      - 'chrome_net.idl'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/engine.yml'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Commit or branch to build (default: the calling commit)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-host:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-amd64, linux-arm64, windows-amd64, windows-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Use the runner's scratch disk
+        run: |
+          sudo mkdir -p /mnt/chromenet-engine
+          sudo chown "$(id -u):$(id -g)" /mnt/chromenet-engine
+          df -h / /mnt
+      - name: Cache the rungv release archive
+        uses: actions/cache@v6.1.0
+        with:
+          path: /mnt/chromenet-engine/rungv-*.tar.gz
+          key: rungv-${{ hashFiles('scripts/engine/BUILDENV') }}
+      - name: Build ${{ matrix.target }} in gvx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/engine/build.sh -w /mnt/chromenet-engine -d dist ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [darwin-arm64, darwin-amd64]
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Select the newest Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+      - name: Build ${{ matrix.target }}
+        run: scripts/engine/build.sh -w "$RUNNER_TEMP/chromenet-engine" -d dist ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  test:
+    name: test ${{ matrix.target }}
+    needs: [build-linux-host, build-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-amd64
+            runner: macos-15-intel
+          - target: windows-amd64
+            runner: windows-2025
+          - target: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist
+      - name: Go tests against the fresh engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=$(ls "$PWD"/dist/chrome_net_server_*)
+          chmod +x "$bin"
+          HQQ_CHROME_NET_SERVER="$bin" GOWORK=off go test -count=1 -timeout 15m ./...

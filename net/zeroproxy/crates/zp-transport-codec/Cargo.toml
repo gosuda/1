@@ -1,0 +1,18 @@
+[package]
+name = "zp-transport-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Pure-byte protocol codecs shared by `zp-kernel-bundle`'s wasm32 async
+# transport stack and host-side `cargo test`. Contains byte-to-struct codecs
+# (RFC 1928 / RFC 1929 SOCKS5, RFC 9112 HTTP/1.1 request line and headers) so
+# parsers can be unit-tested on the host without wasm-pack.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Shared major version with the WASM async wrapper so HTTP/1.1 response-head
+# parsing stays byte-identical across host tests and WASM runtime.
+httparse = { workspace = true }

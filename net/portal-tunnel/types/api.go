@@ -1,0 +1,279 @@
+package types
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type APIEnvelope[T any] struct {
+	Data  T         `json:"data,omitempty"`
+	Error *APIError `json:"error,omitempty"`
+	OK    bool      `json:"ok"`
+}
+
+type APIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type APIRequestError struct {
+	RetryAfter time.Duration `json:"-"`
+	StatusCode int           `json:"-"`
+	Code       string        `json:"code,omitempty"`
+	Message    string        `json:"message,omitempty"`
+}
+
+// IsRateLimited identifies temporary admission failures, including a gateway
+// HTTP 429 without Portal's JSON envelope.
+func (e *APIRequestError) IsRateLimited() bool {
+	return e != nil && (e.StatusCode == http.StatusTooManyRequests || e.Code == APIErrorCodeRateLimited)
+}
+
+func (e *APIRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	code := strings.TrimSpace(e.Code)
+	message := strings.TrimSpace(e.Message)
+	if code != "" {
+		return code + ": " + message
+	}
+	if message != "" {
+		return message
+	}
+	if e.StatusCode > 0 {
+		return fmt.Sprintf("api request failed with status %d", e.StatusCode)
+	}
+	return "api request failed"
+}
+
+func (e *APIRequestError) Is(target error) bool {
+	other, ok := target.(*APIRequestError)
+	if !ok {
+		return false
+	}
+	if other.Code != "" && e.Code != other.Code {
+		return false
+	}
+	if other.StatusCode != 0 && e.StatusCode != other.StatusCode {
+		return false
+	}
+	return true
+}
+
+type RegisterRequest struct {
+	ChallengeID   string `json:"challenge_id"`
+	SIWEMessage   string `json:"siwe_message"`
+	SIWESignature string `json:"siwe_signature"`
+	ReportedIP    string `json:"reported_ip,omitempty"`
+}
+
+type RegisterChallengeRequest struct {
+	Cache    bool `json:"cache,omitempty"`
+	CacheTTL int  `json:"cache_ttl,omitempty"` // Requested offline seconds; clamped by the relay.
+	// AllowCanonicalFallback permits registration to continue without the friendly alias.
+	AllowCanonicalFallback bool          `json:"allow_canonical_fallback,omitempty"`
+	Identity               Identity      `json:"identity"`
+	Metadata               LeaseMetadata `json:"metadata"`
+	Overlay                bool          `json:"overlay,omitempty"`
+	TTL                    int           `json:"ttl,omitempty"` // Non-positive values default to 120 seconds; maximum 600.
+	UDPEnabled             bool          `json:"udp_enabled,omitempty"`
+	TCPEnabled             bool          `json:"tcp_enabled,omitempty"`
+}
+
+type RegisterChallengeResponse struct {
+	ChallengeID string    `json:"challenge_id"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	SIWEMessage string    `json:"siwe_message"`
+}
+
+// ReverseEndpoint authorizes one class of operation: opening reverse streams.
+// Capability is opaque to SDK callers and cannot mutate the owning lease.
+type ReverseEndpoint struct {
+	URL        string           `json:"url"`
+	Capability string           `json:"capability"`
+	ExpiresAt  time.Time        `json:"expires_at"`
+	Overlay    bool             `json:"overlay,omitempty"`
+	Gateway    *RelayDescriptor `json:"gateway,omitempty"`
+}
+
+type RegisterResponse struct {
+	Identity          Identity        `json:"identity"`
+	Hostname          string          `json:"hostname"`
+	CanonicalHostname string          `json:"canonical_hostname"`
+	ExpiresAt         time.Time       `json:"expires_at"`
+	AccessToken       string          `json:"access_token"`
+	ReverseEndpoint   ReverseEndpoint `json:"reverse_endpoint"`
+	UDPAddr           string          `json:"udp_addr,omitempty"`
+	UDPEnabled        bool            `json:"udp_enabled,omitempty"`
+	TCPAddr           string          `json:"tcp_addr,omitempty"`
+	TCPEnabled        bool            `json:"tcp_enabled,omitempty"`
+}
+
+// MaxDiscoveryResponseBytes is the decoded-byte budget for both discovery
+// readers and producers.
+const MaxDiscoveryResponseBytes int64 = 1 << 20
+
+// MaxDiscoveryEntries bounds retained relay peers and each metadata collection.
+// The relays wire field permits one additional descriptor for the serving relay.
+const MaxDiscoveryEntries = 1024
+
+// MaxDiscoveryVersionBytes bounds untrusted protocol and release labels.
+const MaxDiscoveryVersionBytes = 128
+
+type DiscoveryResponse struct {
+	ProtocolVersion    string                   `json:"protocol_version"`
+	GeneratedAt        time.Time                `json:"generated_at"`
+	Relays             []RelayDescriptor        `json:"relays"`
+	IncompatibleRelays []IncompatibleRelayEntry `json:"incompatible_relays,omitempty"`
+	ReleaseVersion     string                   `json:"release_version,omitempty"`
+	// RelayReleaseVersions maps peer relay URLs to the release versions this
+	// relay directly observed from those peers' own /discovery responses.
+	// Optional, unsigned observation metadata; never participates in routing,
+	// trust, signature verification, or compatibility decisions.
+	RelayReleaseVersions map[string]string `json:"relay_release_versions,omitempty"`
+}
+
+// IncompatibleRelayEntry describes a relay the serving relay contacted
+// directly whose discovery protocol version is incompatible with its own.
+// Such relays stay visible during rolling upgrades but never become
+// routable descriptors.
+type IncompatibleRelayEntry struct {
+	URL             string    `json:"url"`
+	ProtocolVersion string    `json:"protocol_version"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
+}
+
+type DiscoveryAnnounceRequest struct {
+	ProtocolVersion string          `json:"protocol_version"`
+	Descriptor      RelayDescriptor `json:"descriptor"`
+}
+
+type DiscoveryAnnounceResponse struct {
+	ProtocolVersion string `json:"protocol_version"`
+	Accepted        bool   `json:"accepted"`
+}
+
+type RenewRequest struct {
+	AccessToken string        `json:"access_token"`
+	TTL         int           `json:"ttl,omitempty"` // Non-positive values default to 120 seconds; maximum 600.
+	ReportedIP  string        `json:"reported_ip,omitempty"`
+	Metadata    LeaseMetadata `json:"metadata"`
+	// RepinsChain says the tenant re-pins the relay certificate chain by itself.
+	// A relay asks a lease without it to register again when it serves a
+	// certificate the chain pinned at registration no longer verifies. Relays
+	// that predate it ignore the field.
+	RepinsChain bool `json:"repins_chain,omitempty"`
+}
+
+type RenewResponse struct {
+	ExpiresAt       time.Time       `json:"expires_at"`
+	AccessToken     string          `json:"access_token"`
+	ReverseEndpoint ReverseEndpoint `json:"reverse_endpoint"`
+}
+
+type ReverseEndpointRequest struct {
+	AccessToken string `json:"access_token"`
+	FailedURL   string `json:"failed_url,omitempty"`
+}
+
+type UnregisterRequest struct {
+	AccessToken string `json:"access_token"`
+}
+
+type DomainResponse struct {
+	Cache           *StaticCacheLimits `json:"cache,omitempty"`
+	ProtocolVersion string             `json:"protocol_version"`
+	ReleaseVersion  string             `json:"release_version"`
+	ENS             ENSStatus          `json:"ens"`
+}
+
+type ENSStatus struct {
+	Enabled     bool   `json:"enabled"`
+	Verified    bool   `json:"verified"`
+	Provider    string `json:"provider,omitempty"`
+	Address     string `json:"address,omitempty"`
+	DNSSECState string `json:"dnssec_state,omitempty"`
+	DSRecord    string `json:"ds_record,omitempty"`
+	Message     string `json:"message,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+type PublicStateResponse struct {
+	Leases []Lease `json:"leases,omitempty"`
+}
+
+type AdminAuthLoginRequest struct {
+	Token string `json:"token"`
+}
+
+type AdminAuthLoginResponse struct {
+	AccessToken string `json:"access_token,omitempty"`
+}
+
+type AdminAuthStatusResponse struct {
+	Authenticated bool `json:"authenticated"`
+}
+
+type WalletAuthChallengeRequest struct {
+	Address string `json:"address"`
+}
+
+type WalletAuthChallengeResponse struct {
+	ChallengeID string    `json:"challenge_id"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	SIWEMessage string    `json:"siwe_message"`
+}
+
+type WalletAuthLoginRequest struct {
+	ChallengeID   string `json:"challenge_id"`
+	SIWEMessage   string `json:"siwe_message"`
+	SIWESignature string `json:"siwe_signature"`
+}
+
+type WalletAuthLoginResponse struct {
+	AccessToken   string `json:"access_token,omitempty"`
+	WalletAddress string `json:"wallet_address,omitempty"`
+}
+
+type WalletAuthStatusResponse struct {
+	Authenticated bool   `json:"authenticated"`
+	WalletAddress string `json:"wallet_address,omitempty"`
+}
+
+type PolicyStateResponse struct {
+	Policy PolicySettings `json:"policy"`
+	Leases []PolicyLease  `json:"leases,omitempty"`
+}
+
+// LeaseAccess is a relay's routing decision for one service identity.
+type LeaseAccess string
+
+const (
+	LeaseRoutable LeaseAccess = "routable"
+	// LeasePending is not routable yet: no admin has approved the identity.
+	LeasePending LeaseAccess = "pending"
+	// LeaseDenied is not routable: an admin denied or banned the identity.
+	LeaseDenied LeaseAccess = "denied"
+)
+
+type PolicySettings struct {
+	ApprovalMode string             `json:"approval_mode"`
+	UDP          PolicyPortSettings `json:"udp"`
+	TCPPort      PolicyPortSettings `json:"tcp_port"`
+}
+
+type LeasePolicyUpdate struct {
+	IdentityKey string `json:"identity_key"`
+	BPS         *int64 `json:"bps,omitempty"`
+	IsApproved  *bool  `json:"is_approved,omitempty"`
+	IsBanned    *bool  `json:"is_banned,omitempty"`
+	IsDenied    *bool  `json:"is_denied,omitempty"`
+}
+
+type PolicyPortSettings struct {
+	Enabled   bool `json:"enabled"`
+	MaxLeases int  `json:"max_leases"`
+}
