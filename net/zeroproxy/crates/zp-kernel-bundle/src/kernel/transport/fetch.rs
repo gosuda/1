@@ -1,0 +1,653 @@
+//! Transport-stack entry point used by `kernel_fetch`. Drives the client-side
+//! connection and HTTP pipeline so the relay server only forwards opaque bytes:
+//!
+//! 1. Parse `target_url` into scheme, host, port, and request path.
+//! 2. Reuse a live HTTP/2 client or pooled HTTP/1.1 connection for
+//!    `(scheme, host, port, isolation_key)` when available.
+//! 3. On a pool miss, dial a fresh byte stream through [`super::dialer::dialer`]
+//!    (defaulting to a `yamux` stream over `/zp/ws-pipe` plus SOCKS5 `CONNECT`),
+//!    and negotiate `rustls` with ALPN (`h2`, `http/1.1`) for `https` targets.
+//! 4. Send the request over HTTP/2 or HTTP/1.1 and wrap the buffered or
+//!    streaming response in a `web_sys::Response`.
+//!
+//! ## Response contract
+//!
+//! * No redirect follow: surfaces 3xx responses to the caller. `kernel_fetch`
+//!   handles redirects at the outer layer so the cookie jar and virtual URL
+//!   state stay consistent.
+//! * HTTP/1.1 body consumption owns the connection; only complete framing and
+//!   successful decoding return it to the pool. Both HTTP versions support
+//!   streaming response bodies.
+
+use js_sys::Uint8Array;
+use wasm_bindgen::prelude::*;
+use web_sys::{Headers, Response, ResponseInit, Url};
+
+use super::dialer::{dialer, TargetAddr};
+use super::http1::{self, HttpResponse};
+use super::http2::{self, Http2Client};
+use super::pool::{self, PoolKey, PooledConn};
+use super::tls::{self, TlsStream};
+
+/// Top-level entry. The caller (`kernel_fetch`) supplies a fully parsed
+/// JS Request as `(url, method, headers, body)`; this function does the
+/// rest and returns a JS `Response` for the SW to forward to the page.
+///
+/// Connection sharing layers:
+/// 1. **Pool**: same (scheme,host,port) reuses an already-handshaken
+///    `TlsStream` + the live yamux stream beneath it. Zero round-trips
+///    on cache hit.
+/// 2. **Yamux**: pool miss still skips the WebSocket+TCP handshake by
+///    multiplexing onto the singleton session. One yamux SYN per stream.
+/// 3. **WebSocket**: the singleton session opens its WS lazily on the
+///    very first request and reuses it forever after.
+///
+/// TLS runs *inside* each yamux stream regardless of pool hit/miss, so
+/// the relay never sees plaintext.
+pub(crate) async fn fetch(
+    target_url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    armed_challenge_compat: bool,
+    isolation_key: Option<&str>,
+) -> Result<JsValue, JsValue> {
+    let parsed = parse_url(target_url).map_err(jserr_str)?;
+    let relay_url = pick_relay_url().map_err(jserr_str)?;
+    let key = PoolKey {
+        scheme: parsed.scheme.clone(),
+        host: parsed.host.clone(),
+        port: parsed.port,
+        isolation_key: isolation_key.unwrap_or("").to_string(),
+    };
+    let host_h = host_header(&parsed);
+    let t0 = now_ms();
+    crate::kernel::push_trace(&format!(
+        "tx:start host={} port={} scheme={} t=0",
+        parsed.host, parsed.port, parsed.scheme
+    ));
+
+    // Fastest path: live HTTP/2 client for this origin. h2 multiplex means
+    // every concurrent fetch reuses the same TLS connection without any
+    // per-request handshake.
+    if let Some(client) = pool::get_http2(&key) {
+        let t_req = now_ms();
+        match http2::send_request(
+            &client,
+            method,
+            &parsed.scheme,
+            &host_h,
+            &parsed.path,
+            headers,
+            body,
+        )
+        .await
+        {
+            Ok(resp) => {
+                crate::kernel::push_trace(&format!(
+                    "tx:h2-reuse-ok host={} status={} http={}ms total={}ms",
+                    parsed.host,
+                    resp.status(),
+                    delta_ms(t_req),
+                    delta_ms(t0)
+                ));
+                return finish_h2_response(resp, target_url, armed_challenge_compat);
+            }
+            Err(e) => {
+                crate::kernel::push_trace(&format!(
+                    "tx:h2-reuse-err host={} err={} t={}ms (reopening)",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                // h2 0.4 can't detect a dead connection synchronously, so
+                // the pool happily kept handing out the same dead clone.
+                // Evict here so the cold path replaces the entry instead
+                // of falling through forever on every subsequent fetch.
+                pool::remove_http2(&key);
+            }
+        }
+    }
+
+    // Fast path: warm conn from the per-origin HTTP/1.1 pool. On stale
+    // (write or read fails on the cached conn), fall through to fresh.
+    if let Some(conn) = pool::take(&key) {
+        crate::kernel::push_trace(&format!(
+            "tx:pool-hit host={} t={}ms",
+            parsed.host,
+            delta_ms(t0)
+        ));
+        let t_req = now_ms();
+        match http1::send_request(
+            conn,
+            key.clone(),
+            method,
+            &host_h,
+            &parsed.path,
+            headers,
+            body,
+        )
+        .await
+        {
+            Ok(resp) => {
+                crate::kernel::push_trace(&format!(
+                    "tx:pool-reuse-ok host={} status={} http={}ms total={}ms",
+                    parsed.host,
+                    resp.status(),
+                    delta_ms(t_req),
+                    delta_ms(t0)
+                ));
+                return finish_h2_response(resp, target_url, armed_challenge_compat);
+            }
+            Err(e) => {
+                crate::kernel::push_trace(&format!(
+                    "tx:pool-stale host={} err={} t={}ms (reopening)",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                // Drop `conn`; pool entry for this key is now empty.
+            }
+        }
+    }
+
+    // Cold path: open a fresh connection (yamux + SOCKS5 + TLS) and send.
+    // Header completion returns the live body; no timer fabricates body EOF.
+    cold_request(
+        &parsed,
+        &relay_url,
+        &key,
+        &host_h,
+        method,
+        headers,
+        body,
+        target_url,
+        armed_challenge_compat,
+        t0,
+    )
+    .await
+}
+
+/// One cold-path attempt: open a fresh connection (yamux + SOCKS5 + TLS),
+/// branch on negotiated ALPN, send the request, and build the JS response.
+/// Cancel-safe: dropping the returned future mid-flight tears down the h2
+/// stream / TLS conn cleanly (the caller does this on a deadline timeout).
+#[allow(clippy::too_many_arguments)]
+async fn cold_request(
+    parsed: &ParsedUrl,
+    relay_url: &str,
+    key: &PoolKey,
+    host_h: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    target_url: &str,
+    armed_challenge_compat: bool,
+    t0: f64,
+) -> Result<JsValue, JsValue> {
+    let isolation_key = (!key.isolation_key.is_empty()).then_some(key.isolation_key.as_str());
+    let opened = open_fresh(parsed, relay_url, isolation_key, t0).await?;
+    match opened {
+        FreshConn::Http2(client) => {
+            // Cache the h2 client immediately so any concurrent fetches
+            // queued behind us hit `pool::get_http2` instead of opening
+            // their own connection. The first response timing pays the
+            // full handshake; everyone else pays nothing.
+            pool::put_http2(key.clone(), client.clone());
+            let t_req = now_ms();
+            let resp = http2::send_request(
+                &client,
+                method,
+                &parsed.scheme,
+                host_h,
+                &parsed.path,
+                headers,
+                body,
+            )
+            .await
+            .map_err(|e| {
+                crate::kernel::push_trace(&format!(
+                    "tx:h2-err host={} err={} t={}ms",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                jserr("TARGET_HTTP_FAILED", &e)
+            })?;
+            crate::kernel::push_trace(&format!(
+                "tx:h2-ok host={} status={} http={}ms total={}ms",
+                parsed.host,
+                resp.status(),
+                delta_ms(t_req),
+                delta_ms(t0)
+            ));
+            finish_h2_response(resp, target_url, armed_challenge_compat)
+        }
+        FreshConn::Http1(conn) => {
+            let t_req = now_ms();
+            let resp = http1::send_request(
+                conn,
+                key.clone(),
+                method,
+                host_h,
+                &parsed.path,
+                headers,
+                body,
+            )
+            .await
+            .map_err(|e| {
+                crate::kernel::push_trace(&format!(
+                    "tx:http-err host={} err={} t={}ms",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                jserr("TARGET_HTTP_FAILED", &e)
+            })?;
+            crate::kernel::push_trace(&format!(
+                "tx:http-ok host={} status={} http={}ms total={}ms",
+                parsed.host,
+                resp.status(),
+                delta_ms(t_req),
+                delta_ms(t0)
+            ));
+            finish_h2_response(resp, target_url, armed_challenge_compat)
+        }
+    }
+}
+
+/// Outcome of `open_fresh`: either we got an HTTP/1.1 byte stream the
+/// caller drives one request at a time, or we landed on HTTP/2 and
+/// already have a cloneable client handle that serves N concurrent
+/// streams.
+enum FreshConn {
+    Http1(PooledConn),
+    Http2(Http2Client),
+}
+
+/// Hosts where h2 is disabled and only `http/1.1` is advertised in ALPN.
+fn host_h2_denied(_host: &str) -> bool {
+    false
+}
+
+/// Wall-clock millisecond reading via `Date.now()`. Lower resolution than
+/// `performance.now()` but doesn't need a Performance web-sys feature
+/// import. Adequate for stage-level (10ms+) timing diagnostics.
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+fn delta_ms(t0: f64) -> u32 {
+    (now_ms() - t0).max(0.0) as u32
+}
+
+/// Build a fresh `PooledConn` from scratch: yamux stream + SOCKS5 +
+/// (TLS if https). Retries once if the yamux session itself looks stale.
+/// `t0` is the parent caller's start time; we report each stage as a
+/// delta off t0 so it's easy to spot which layer dominates total latency.
+async fn open_fresh(
+    parsed: &ParsedUrl,
+    relay_url: &str,
+    isolation_key: Option<&str>,
+    t0: f64,
+) -> Result<FreshConn, JsValue> {
+    // Raw-byte dial sits behind the injectable Dialer; default RelayDialer
+    // runs the yamux + SOCKS5 path.
+    let addr = TargetAddr {
+        host: parsed.host.clone(),
+        port: parsed.port,
+        isolation_key: isolation_key.filter(|k| !k.is_empty()).map(str::to_string),
+    };
+    let stream = dialer()
+        .connect(&addr, relay_url)
+        .await
+        .map_err(|e| e.into_js_error())?;
+
+    if parsed.scheme == "https" {
+        let t_tls = now_ms();
+        // Per-host h2 deny list. When active, ALPN-advertise http/1.1 only.
+        let alpn_list: &[&[u8]] = if host_h2_denied(&parsed.host) {
+            &[b"http/1.1"]
+        } else {
+            &[b"h2", b"http/1.1"]
+        };
+        // Advertise both protocols. The server picks one; we branch on
+        // `tls.alpn_protocol()` after the handshake to wire either the
+        // h2 multiplex client or the HTTP/1.1 per-stream client.
+        let first = TlsStream::connect(stream, &parsed.host, alpn_list).await;
+        // The browser-shaped hello lists legacy suites the TLS stack cannot negotiate. A server whose own preference puts one of them first
+        // answers with it, and the handshake cannot complete, though the same server accepts an AEAD suite when none of the legacy ones is
+        // offered (DCInside prefers ECDHE-RSA-AES256-SHA over its GCM suites). Make the connection again, on a new stream, with a hello
+        // that lists only what can be negotiated, and remember the host so its next connection starts there.
+        let tls = match first {
+            Err(e) if tls::is_unoffered_suite(&e) => {
+                crate::kernel::push_trace(&format!(
+                    "tx:tls-retry host={} reason=legacy-suite err={} t={}ms",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                tls::remember_plain_suites(&parsed.host);
+                let again = dialer()
+                    .connect(&addr, relay_url)
+                    .await
+                    .map_err(|e| e.into_js_error())?;
+                TlsStream::connect_with(again, &parsed.host, alpn_list, false).await
+            }
+            other => other,
+        }
+        .map_err(|e| {
+            crate::kernel::push_trace(&format!(
+                "tx:tls-err host={} err={} t={}ms",
+                parsed.host,
+                e,
+                delta_ms(t0)
+            ));
+            jserr("TARGET_TLS_FAILED", &e)
+        })?;
+        let alpn = tls.alpn_protocol();
+        crate::kernel::push_trace(&format!(
+            "tx:tls-ok host={} tls={}ms t={}ms alpn={}",
+            parsed.host,
+            delta_ms(t_tls),
+            delta_ms(t0),
+            alpn.as_deref()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_else(|| "(none)".to_string())
+        ));
+        if alpn.as_deref() == Some(b"h2".as_slice()) {
+            let t_h2 = now_ms();
+            let client = http2::handshake(tls).await.map_err(|e| {
+                crate::kernel::push_trace(&format!(
+                    "tx:h2-hs-err host={} err={} t={}ms",
+                    parsed.host,
+                    e,
+                    delta_ms(t0)
+                ));
+                jserr("TARGET_HTTP_FAILED", &e)
+            })?;
+            crate::kernel::push_trace(&format!(
+                "tx:h2-hs-ok host={} h2={}ms t={}ms",
+                parsed.host,
+                delta_ms(t_h2),
+                delta_ms(t0)
+            ));
+            Ok(FreshConn::Http2(client))
+        } else {
+            Ok(FreshConn::Http1(PooledConn::Tls(Box::new(tls))))
+        }
+    } else {
+        Ok(FreshConn::Http1(PooledConn::Plain(stream)))
+    }
+}
+
+struct ParsedUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+/// Parse `http[s]://host[:port]/path[?query]` via the browser's `URL`
+/// constructor. WHATWG semantics handle punycode, percent-encoding, and
+/// default ports.
+fn parse_url(url: &str) -> Result<ParsedUrl, String> {
+    let u = Url::new(url).map_err(|_| format!("bad URL: {url}"))?;
+    let proto = u.protocol(); // e.g. "https:"
+    let scheme = proto.trim_end_matches(':').to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported scheme: {scheme}"));
+    }
+    let host = u.hostname();
+    if host.is_empty() {
+        return Err(format!("empty host in URL: {url}"));
+    }
+    let port_str = u.port();
+    let port: u16 = if port_str.is_empty() {
+        if scheme == "https" {
+            443
+        } else {
+            80
+        }
+    } else {
+        port_str
+            .parse()
+            .map_err(|_| format!("bad port: {port_str}"))?
+    };
+    let mut path = u.pathname();
+    let search = u.search();
+    if !search.is_empty() {
+        path.push_str(&search);
+    }
+    if path.is_empty() {
+        path = "/".to_string();
+    }
+    Ok(ParsedUrl {
+        scheme,
+        host,
+        port,
+        path,
+    })
+}
+
+/// `Host:` header content. Default-port pairings get host only; non-default
+/// ports get `host:port` (per RFC 7230 §5.4).
+fn host_header(u: &ParsedUrl) -> String {
+    let default = matches!((u.scheme.as_str(), u.port), ("http", 80) | ("https", 443));
+    if default {
+        u.host.clone()
+    } else {
+        format!("{}:{}", u.host, u.port)
+    }
+}
+
+/// Build the relay WebSocket URL from `self.location`. Targets the
+/// `/zp/ws-pipe` yamux endpoint; the server runs `yamuxconn.Server()`
+/// on the WebSocket and bridges each yamux stream through
+/// `bridgeTargetStream` (SOCKS5 to upstream).
+pub(crate) fn pick_relay_url() -> Result<String, String> {
+    let global = js_sys::global();
+    let location = js_sys::Reflect::get(&global, &JsValue::from_str("location"))
+        .map_err(|_| "SW_NOT_READY: no location".to_string())?;
+    let host = js_sys::Reflect::get(&location, &JsValue::from_str("host"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let protocol = js_sys::Reflect::get(&location, &JsValue::from_str("protocol"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "http:".to_string());
+    if host.is_empty() {
+        return Err("SW_NOT_READY: empty host".to_string());
+    }
+    let scheme = if protocol == "https:" { "wss" } else { "ws" };
+    Ok(format!("{}://{}/zp/ws-pipe", scheme, host))
+}
+
+/// Convert the buffered HTTP response into a web_sys::Response. Headers
+/// are appended (not set) so multi-valued headers like `Set-Cookie` and
+/// repeated `Link` survive.
+fn build_js_response(
+    resp: HttpResponse,
+    final_url: &str,
+    armed_challenge_compat: bool,
+) -> Result<JsValue, JsValue> {
+    crate::kernel::push_trace(&format!(
+        "tx:resp-body url={} status={} body={}B ct={}",
+        final_url,
+        resp.status,
+        resp.body.len(),
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("(none)")
+    ));
+    let headers = build_response_headers(&resp.headers, final_url, armed_challenge_compat)?;
+    let body_array = Uint8Array::new_with_length(resp.body.len() as u32);
+    body_array.copy_from(&resp.body);
+
+    let init = ResponseInit::new();
+    init.set_status(resp.status);
+    init.set_status_text(&resp.reason);
+    init.set_headers(&headers);
+
+    // A "null body status" (101/103/204/205/304) MUST be constructed with a
+    // null body; the Response constructor throws `Response with null body
+    // status cannot have body` otherwise.
+    let response = if resp.null_body {
+        Response::new_with_opt_buffer_source_and_init(None, &init)?
+    } else {
+        Response::new_with_opt_buffer_source_and_init(Some(&body_array.buffer()), &init)?
+    };
+    Ok(response.into())
+}
+
+use zp_transport_codec::http1::is_null_body_status;
+
+/// Build the `web_sys::Headers` for a response: copy permitted upstream headers,
+/// mirror Set-Cookie into the `X-ZP-Set-Cookie` sidechannel, and emit the
+/// challenge-compat marker when armed. Shared by the buffered and streaming
+/// response builders so both paths carry identical SW-facing header semantics.
+fn build_response_headers(
+    resp_headers: &[(String, String)],
+    final_url: &str,
+    armed_challenge_compat: bool,
+) -> Result<Headers, JsValue> {
+    let headers = Headers::new()?;
+    // SW cookie-jar side-channel: web_sys::Response's response-guard strips
+    // Set-Cookie in many runtimes (the Fetch spec puts it on the forbidden
+    // response-header list for non-SW callers, and several engines apply
+    // that filter inside the Response constructor regardless). As a result
+    // `response.headers.getSetCookie()` returns empty in the SW even when
+    // upstream actually sent NACT-style anti-bot tokens. Mirror every
+    // Set-Cookie value into the X-ZP-Set-Cookie sidechannel so the SW's
+    // RFC-6265 jar can consume them. Tab separator stays inside the HTTP
+    // header line shape (no newlines) and the SW splits on it.
+    let mut set_cookies: Vec<&str> = Vec::new();
+    for (k, v) in resp_headers {
+        // Only the kernel may select HTML streaming or body lifetime tracking.
+        // Reject upstream markers even on buffered responses, where no trusted
+        // marker would otherwise overwrite a forged value.
+        if k.eq_ignore_ascii_case("x-zp-body-stream") || k.eq_ignore_ascii_case("x-zp-stream") {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("set-cookie") {
+            set_cookies.push(v.as_str());
+        }
+        // Headers.append rejects a few wire-level header names by spec
+        // (e.g. forbidden response headers). Ignore failures so a single
+        // hostile header doesn't abort the whole response.
+        let _ = headers.append(k, v);
+    }
+    if !set_cookies.is_empty() {
+        let joined = set_cookies.join("\t");
+        crate::kernel::push_trace(&format!(
+            "tx:resp-set-cookie url={} count={} len={}",
+            final_url,
+            set_cookies.len(),
+            joined.len()
+        ));
+        let _ = headers.append("X-ZP-Set-Cookie", &joined);
+    }
+    // Two-signal challenge-compat marker. Emitted ONLY when the SW armed this
+    // tab (operator opt-in via `X-ZP-Arm-Challenge-Compat: 1`, captured in
+    // `kernel/mod.rs` before x-zp-* strip) AND the response classifies as a
+    // Cloudflare challenge document. The SW `addCSP` consumes and deletes the
+    // marker before the page sees it. Mirrors
+    // `internal/headers/ApplyChallengeCompat` on the Go side via the shared
+    // `zp_shared::is_challenge_document` predicate.
+    if armed_challenge_compat {
+        let cf = resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cf-mitigated"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        // parse_url handles scheme + host extraction; on malformed URLs we
+        // simply skip the emission so we never panic.
+        let (host, path) = match parse_url(final_url) {
+            Ok(u) => (u.host, u.path),
+            Err(_) => (String::new(), String::new()),
+        };
+        if zp_shared::is_challenge_document(cf, &host, &path) {
+            crate::kernel::push_trace(&format!(
+                "tx:challenge-compat-mark url={} cf={} host={}",
+                final_url, cf, host
+            ));
+            let _ = headers.append("X-ZP-Challenge-Compat", "1");
+        }
+    }
+    Ok(headers)
+}
+
+/// Both HTTP versions use the same buffered / streaming response contract.
+fn finish_h2_response(
+    resp: http2::H2Response,
+    final_url: &str,
+    armed_challenge_compat: bool,
+) -> Result<JsValue, JsValue> {
+    match resp {
+        http2::H2Response::Buffered(r) => build_js_response(r, final_url, armed_challenge_compat),
+        http2::H2Response::Streaming(s) => {
+            build_streaming_js_response(s, final_url, armed_challenge_compat)
+        }
+    }
+}
+
+/// Convert a live decoded kernel body into a JS Response. The generic body
+/// marker controls lifetime; the HTML-only marker selects HtmlTxn rewriting.
+fn build_streaming_js_response(
+    resp: http2::StreamingResponse,
+    final_url: &str,
+    armed_challenge_compat: bool,
+) -> Result<JsValue, JsValue> {
+    crate::kernel::push_trace(&format!(
+        "tx:resp-stream url={} status={} ct={}",
+        final_url,
+        resp.status,
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("(none)")
+    ));
+    let headers = build_response_headers(&resp.headers, final_url, armed_challenge_compat)?;
+    headers.set("X-ZP-Body-Stream", "1")?;
+    let is_html = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+        .unwrap_or(false);
+    if is_html {
+        headers.set("X-ZP-Stream", "1")?;
+    }
+    let init = ResponseInit::new();
+    init.set_status(resp.status);
+    init.set_status_text(&resp.reason);
+    init.set_headers(&headers);
+    // Same null-body-status rule as the buffered path; a streaming 204/304
+    // would otherwise throw in the Response constructor and become a 502.
+    let response = if is_null_body_status(resp.status) {
+        Response::new_with_opt_readable_stream_and_init(None, &init)?
+    } else {
+        Response::new_with_opt_readable_stream_and_init(Some(&resp.stream), &init)?
+    };
+    Ok(response.into())
+}
+
+fn jserr_str(e: impl std::fmt::Display) -> JsValue {
+    JsValue::from_str(&format!("{e}"))
+}
+
+/// Shared by `dialer::RelayDialer` so `TARGET_CONNECT_FAILED:*` codes and
+/// messages stay in one place.
+pub(crate) fn jserr(prefix: &str, e: &impl std::fmt::Display) -> JsValue {
+    JsValue::from_str(&format!("{prefix}: {e}"))
+}
