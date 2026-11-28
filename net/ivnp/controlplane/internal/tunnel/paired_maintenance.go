@@ -162,9 +162,9 @@ func (m *PairedPoolMaintainer) maintainActive(ctx context.Context, hooks []Maint
 	var attempts []*creatorAttempt
 	var resultErr error
 	waiting := false
-	reserve := func(direction Direction, target, limit int, deadline uint64) {
+	reserve := func(direction Direction, target, claimCap, limit int, deadline uint64) {
 		for range limit {
-			attempt, err := m.builder.reserveCreator(direction, target, limit, now, deadline)
+			attempt, err := m.builder.reserveCreatorWithCap(direction, target, claimCap, limit, now, deadline)
 			if err != nil {
 				waiting = waiting || errors.Is(err, ErrBuildPending)
 				resultErr = errors.Join(resultErr, err)
@@ -179,11 +179,21 @@ func (m *PairedPoolMaintainer) maintainActive(ctx context.Context, hooks []Maint
 	switch {
 	case !haveInbound:
 		limit := m.bootstrapParallelLimit
-		reserve(Inbound, min(m.inboundTarget, limit), limit, now)
+		target := min(m.inboundTarget, limit)
+		claimCap := target
+		if m.builder.stats != nil {
+			claimCap = min(limit, max(target, target*2))
+		}
+		reserve(Inbound, target, claimCap, limit, now)
 	case !haveOutbound:
 		if inbound.Gateway != (foundation.Hash{}) && inbound.GatewayTunnelID != 0 {
 			limit := m.bootstrapParallelLimit
-			reserve(Outbound, min(m.outboundTarget, limit), limit, now)
+			target := min(m.outboundTarget, limit)
+			claimCap := target
+			if m.builder.stats != nil {
+				claimCap = min(limit, max(target, target*2))
+			}
+			reserve(Outbound, target, claimCap, limit, now)
 		}
 	default:
 		inboundTarget, outboundTarget := m.inboundTarget, m.outboundTarget
@@ -202,10 +212,10 @@ func (m *PairedPoolMaintainer) maintainActive(ctx context.Context, hooks []Maint
 			outLimit = m.builder.ParallelLimit(Outbound, outNeeded)
 		}
 		if inLimit > 0 {
-			reserve(Inbound, inboundTarget, inLimit, cutoff)
+			reserve(Inbound, inboundTarget, inboundTarget, inLimit, cutoff)
 		}
 		if outLimit > 0 {
-			reserve(Outbound, outboundTarget, outLimit, cutoff)
+			reserve(Outbound, outboundTarget, outboundTarget, outLimit, cutoff)
 		}
 	}
 	if !waiting {

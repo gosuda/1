@@ -6,6 +6,7 @@ import (
 	"crypto/ecdh"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -989,5 +990,97 @@ func TestTransportMuxClockAndPolymorphicPeerInspectors(t *testing.T) {
 	}
 	if err := mux.EnsureSession(t.Context(), peer); !errors.Is(err, ErrTransportUnavailable) {
 		t.Fatalf("EnsureSession with stale RouterInfo = %v, want ErrTransportUnavailable", err)
+	}
+}
+
+func TestTransportMuxStaggeredFallbackRacesAlternateAfterStagger(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		database, peer := muxTestPeer(t, true, true)
+		ntcp2, ssu2 := newMuxSessionTransport(), newMuxSessionTransport()
+		mux, err := NewTransportMux(TransportMuxConfig{Database: database, NTCP2: ntcp2, SSU2: ssu2})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		done := make(chan error, 1)
+		started := time.Now()
+		go func() {
+			done <- mux.Send(t.Context(), peer, foundation.I2NPMessage{Payload: []byte("staggered")})
+		}()
+
+		<-ntcp2.ensureStarted
+		<-time.After(transportLocalFallbackStagger - time.Millisecond)
+		synctest.Wait()
+		select {
+		case <-ssu2.ensureStarted:
+			t.Fatal("alternate transport started before stagger elapsed")
+		default:
+		}
+
+		<-time.After(time.Millisecond)
+		<-ssu2.ensureStarted
+		ssu2.ensureRelease <- nil
+		if err := <-done; err != nil {
+			t.Fatalf("Send via staggered alternate = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed != transportLocalFallbackStagger {
+			t.Fatalf("staggered fallback elapsed = %v, want %v", elapsed, transportLocalFallbackStagger)
+		}
+		_, _, _, primaryWrites := ntcp2.counts()
+		_, _, _, alternateWrites := ssu2.counts()
+		if primaryWrites != 0 || alternateWrites != 1 {
+			t.Fatalf("writes = primary %d, alternate %d; want 0, 1", primaryWrites, alternateWrites)
+		}
+	})
+}
+
+func TestTransportMuxStaggeredFallbackPrimaryWinsAfterStagger(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		database, peer := muxTestPeer(t, true, true)
+		ntcp2, ssu2 := newMuxSessionTransport(), newMuxSessionTransport()
+		mux, err := NewTransportMux(TransportMuxConfig{Database: database, NTCP2: ntcp2, SSU2: ssu2})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- mux.Send(t.Context(), peer, foundation.I2NPMessage{Payload: []byte("primary-late-win")})
+		}()
+
+		<-ntcp2.ensureStarted
+		<-time.After(transportLocalFallbackStagger)
+		<-ssu2.ensureStarted
+		ntcp2.ensureRelease <- nil
+		if err := <-done; err != nil {
+			t.Fatalf("Send via late primary = %v", err)
+		}
+		_, _, _, primaryWrites := ntcp2.counts()
+		_, _, _, alternateWrites := ssu2.counts()
+		if primaryWrites != 1 || alternateWrites != 0 {
+			t.Fatalf("writes = primary %d, alternate %d; want 1, 0", primaryWrites, alternateWrites)
+		}
+	})
+}
+
+func TestTransportMuxLocalityAwareFallbackStagger(t *testing.T) {
+	cases := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"10.0.0.5", true},
+		{"192.168.1.10", true},
+		{"192.0.2.10", true},
+		{"198.51.100.1", true},
+		{"203.0.113.5", true},
+		{"8.8.8.8", false},
+		{"1.1.1.1", false},
+		{"2001:4860:4860::8888", false},
+	}
+	for _, tc := range cases {
+		if got := isLocalOrTestAddr(netip.MustParseAddr(tc.addr)); got != tc.want {
+			t.Fatalf("isLocalOrTestAddr(%s) = %t, want %t", tc.addr, got, tc.want)
+		}
 	}
 }

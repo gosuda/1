@@ -636,3 +636,46 @@ func TestLeaseSetPublisherUsesLocalAcknowledgementDeadline(t *testing.T) {
 		})
 	}
 }
+
+func TestLeaseSetPublisherInvokesOnConfirmedCallback(t *testing.T) {
+	localDestination, err := foundation.GenerateLocalDestination()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localDestination.ReleaseSensitive()
+	local, err := NewLocalLeaseSet2(localDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database := NewDatabase(foundation.Hash{}, DefaultBucketCapacity)
+	addRequestTestFloodfill(database, requestTestHash(3))
+	sender := new(publisherSender)
+	now := uint64(10_000)
+	registry := NewPublicationTokenRegistry(func() uint64 { return now }, func() uint32 { return 19 })
+	confirmedCalls := 0
+	publisher, err := NewLeaseSetPublisher(LeaseSetPublisherConfig{
+		Local2: local, Database: database, Sender: sender,
+		InboundLeases: &publisherLeaseSource{leases: []foundation.NetworkDatabaseLease{{TunnelID: 7, EndDate: 600_000}}},
+		Sign:          localDestination.Sign, Now: func() uint64 { return now }, Random: func() uint32 { return 19 },
+		FloodfillLimit: 1, Registry: registry, ReplyPath: publicationTestRoute{gateway: requestTestHash(8)},
+		OnConfirmed: func() { confirmedCalls++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close()
+	if sent, err := publisher.Maintain(t.Context()); err != nil || sent != 1 {
+		t.Fatalf("publication = %d, %v; want one send", sent, err)
+	}
+	store, err := foundation.I2NPParseDatabaseStore(sender.published[0].message.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := foundation.I2NPDeliveryStatusMessage{MessageID: store.ReplyToken, Timestamp: now}
+	if !registry.HandleDeliveryStatus(ack) {
+		t.Fatal("shared token registry did not accept LeaseSet confirmation")
+	}
+	if confirmedCalls != 1 {
+		t.Fatalf("OnConfirmed calls = %d, want 1", confirmedCalls)
+	}
+}

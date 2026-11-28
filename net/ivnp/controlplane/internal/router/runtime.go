@@ -656,7 +656,7 @@ func (r *Router) verifyReseedAnchors(ctx context.Context, anchors []foundation.H
 	if !ok {
 		return
 	}
-	slots := make(chan struct{}, 4)
+	slots := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for _, anchor := range anchors {
 		select {

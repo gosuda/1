@@ -155,13 +155,16 @@ type confirmedPublication struct {
 	// +checklocks:mu
 	confirmed int
 	// +checklocks:mu
+	everConfirmed bool
+	// +checklocks:mu
 	nextRetry uint64
 	// dispatched counts stores handed to the sender from the current target
 	// snapshot. Only a dispatched store may arm the confirmation backoff.
 	// +checklocks:mu
-	dispatched int
-	logger     *slog.Logger
-	mu         sync.Mutex
+	dispatched  int
+	logger      *slog.Logger
+	onConfirmed func()
+	mu          sync.Mutex
 }
 
 func newConfirmedPublication(database *Database, sender LeaseSetPublishSender, route ReplyPathSource, registry *PublicationTokenRegistry, now func() uint64, random func() uint32, key foundation.Hash, typeID foundation.I2NPStoreType, preferred []foundation.Hash, targetK int, logger *slog.Logger) *confirmedPublication {
@@ -416,19 +419,22 @@ func targetEligible(sender LeaseSetPublishSender, target RouterRef) bool {
 
 func (p *confirmedPublication) confirm(token uint32, generation uint64) bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	attempt, ok := p.attempts[uint32(token)]
 	// Floodfills set the DSM timestamp from their own clock; Java I2P also
 	// randomizes it backwards by up to three seconds. Expire on local receipt.
 	now := p.now()
 	if !ok || p.generation != generation || now >= attempt.deadline {
+		p.mu.Unlock()
 		return false
 	}
 	delete(p.attempts, uint32(token))
 	if _, alreadyConfirmed := p.confirmedTargets[attempt.target.Hash]; !alreadyConfirmed {
 		p.confirmedTargets[attempt.target.Hash] = struct{}{}
 		p.confirmed++
+		p.everConfirmed = true
 	}
+	onConfirmed := p.onConfirmed
+	p.mu.Unlock()
 	if metrics := p.database.Metrics(); metrics != nil {
 		switch p.typeID {
 		case foundation.I2NPStoreRouterInfo:
@@ -443,6 +449,9 @@ func (p *confirmedPublication) confirm(token uint32, generation uint64) bool {
 			latency = now - attempt.sentAt
 		}
 		p.logger.Info("netdb publication confirmed", "store_type", uint8(p.typeID), "target", foundation.EncodeI2PBase64(attempt.target.Hash[:]), "generation", generation, "latency_ms", latency)
+	}
+	if onConfirmed != nil {
+		onConfirmed()
 	}
 	return true
 }
@@ -469,4 +478,13 @@ func (p *confirmedPublication) confirmationCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.confirmed
+}
+
+func (p *confirmedPublication) wasEverConfirmed() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.everConfirmed
 }

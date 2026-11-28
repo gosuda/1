@@ -607,6 +607,11 @@ func (f *destinationRuntimeFactory) create(name string, local *foundation.LocalD
 		FloodfillLimit:  cmp.Or(f.cfg.NetDB.LeaseSetFloodfillK, netdb.LeaseSetPublicationFloodfillK),
 		RepublishBefore: uint64(tunnelPolicy.RenewBefore.Milliseconds()), Registry: f.publicationTokens,
 		ReplyPath: daemonReplyRoute{local: f.localRouter, maintainer: maintainer, now: f.now}, PreferredTargets: preferredPeers, Logger: f.logger,
+		OnConfirmed: func() {
+			if runtime != nil {
+				runtime.notifyChanged()
+			}
+		},
 	}
 	var encrypted *netdb.LocalEncryptedLeaseSet
 	if policy != nil {

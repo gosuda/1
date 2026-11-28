@@ -75,9 +75,10 @@ type LeaseSetPublisherConfig struct {
 	PreferredTargets []foundation.Hash
 	// Registry and ReplyPath enable DeliveryStatus-confirmed publication. They
 	// are supplied once by the daemon and shared with RouterInfo publication.
-	Registry  *PublicationTokenRegistry
-	ReplyPath ReplyPathSource
-	Logger    *slog.Logger
+	Registry    *PublicationTokenRegistry
+	ReplyPath   ReplyPathSource
+	OnConfirmed func()
+	Logger      *slog.Logger
 }
 
 // LeaseSetPublisher refreshes local inbound leases and publishes their signed
@@ -102,9 +103,10 @@ type LeaseSetPublisher struct {
 	floodfillLimit  int
 	republishBefore uint64
 	// +checklocks:mu
-	confirmed *confirmedPublication
-	storeType foundation.I2NPStoreType
-	hash      foundation.Hash
+	confirmed   *confirmedPublication
+	onConfirmed func()
+	storeType   foundation.I2NPStoreType
+	hash        foundation.Hash
 
 	// opGate drains sends before mutation or Close; mu keeps ACK/readiness
 	// access independent of network I/O and protects confirmed replacement and
@@ -178,11 +180,13 @@ func NewLeaseSetPublisher(config LeaseSetPublisherConfig) (*LeaseSetPublisher, e
 		random:          config.Random,
 		floodfillLimit:  config.FloodfillLimit,
 		republishBefore: config.RepublishBefore,
+		onConfirmed:     config.OnConfirmed,
 		storeType:       storeType,
 		hash:            hash,
 	}
 	if config.ReplyPath != nil {
 		publisher.confirmed = newConfirmedPublication(config.Database, config.Sender, config.ReplyPath, config.Registry, config.Now, config.Random, hash, storeType, config.PreferredTargets, config.FloodfillLimit, config.Logger)
+		publisher.confirmed.onConfirmed = config.OnConfirmed
 	}
 	return publisher, nil
 }
@@ -251,6 +255,17 @@ func (p *LeaseSetPublisher) Confirmed() bool {
 	return !p.closed && p.confirmed != nil && p.confirmed.confirmationCount() > 0
 }
 
+// NeedsInitialConfirmation reports whether confirmed publication is configured
+// and has not yet received its first floodfill acknowledgment since creation.
+func (p *LeaseSetPublisher) NeedsInitialConfirmation() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.closed && p.confirmed != nil && !p.confirmed.wasEverConfirmed()
+}
+
 // Close retires outstanding publication tokens and releases all copied
 // signing/encryption material and any owned encrypted LeaseSet policy.
 func (p *LeaseSetPublisher) Close() {
@@ -313,6 +328,7 @@ func (p *LeaseSetPublisher) publish(ctx context.Context, force bool) (int, error
 					previous := p.confirmed
 					previous.close()
 					p.confirmed = newConfirmedPublication(p.database, p.sender, previous.route, previous.registry, p.now, p.random, hash, p.storeType, previous.preferred, p.floodfillLimit, previous.logger)
+					p.confirmed.onConfirmed = p.onConfirmed
 				}
 				p.mu.Unlock()
 			}

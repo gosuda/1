@@ -12,6 +12,7 @@ import (
 type ownedLeaseSetPublisher interface {
 	netdb.ConfirmedPublisher
 	Confirmed() bool
+	NeedsInitialConfirmation() bool
 	Close()
 }
 
@@ -32,3 +33,6 @@ func (p *destinationPublisher) HandleDeliveryStatus(status foundation.I2NPDelive
 func (p *destinationPublisher) Close() { p.publisher.Close() }
 
 func (p *destinationPublisher) Confirmed() bool { return p.publisher.Confirmed() }
+func (p *destinationPublisher) NeedsInitialConfirmation() bool {
+	return p != nil && p.publisher.NeedsInitialConfirmation()
+}

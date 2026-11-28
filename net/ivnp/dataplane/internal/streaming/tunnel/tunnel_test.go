@@ -1149,3 +1149,29 @@ func (f *streamFabric) SendTunnel(ctx context.Context, delivery Delivery) error 
 	}
 	return err
 }
+
+// +checklocksignore
+func TestTunnelHandshakeClearsPreRTTPacingAndPacesFromSRTT(t *testing.T) {
+	network := &TunnelNetwork{retransmit: time.Second, maxRetries: 4, readCapacity: 1}
+	connection := network.newConn(1, 2, foundation.Hash{1}, foundation.Identity{}, 1, 2, true)
+	now := time.Now()
+
+	connection.synchronize = []byte{1}
+	connection.syncSent = now.Add(-5 * time.Millisecond)
+	connection.syncRetries = 1
+	connection.nextPaced = now.Add(10 * time.Millisecond)
+
+	connection.rto.Observe(now.Sub(connection.syncSent))
+	connection.releaseSynchronizeLocked()
+	if !connection.nextPaced.IsZero() {
+		t.Fatalf("nextPaced after handshake = %v, want zero", connection.nextPaced)
+	}
+	if srtt := connection.rto.SRTT(); srtt <= 0 || srtt > 50*time.Millisecond {
+		t.Fatalf("SRTT after handshake = %v, want observed ~5ms sample", srtt)
+	}
+	connection.advancePace(now)
+	wantInterval := connection.rto.SRTT() / (time.Duration(connection.congestion.Window()) * 8)
+	if interval := connection.nextPaced.Sub(now); interval != wantInterval {
+		t.Fatalf("post-handshake pacing interval = %v, want %v", interval, wantInterval)
+	}
+}
