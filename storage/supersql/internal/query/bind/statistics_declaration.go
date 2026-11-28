@@ -713,7 +713,7 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 					if _, ok := table.Descriptor.Table(); !ok {
 						return bindError("42809", "ANALYZE target is not a table", 0)
 					}
-					if err := b.requireTableOwner(table.Descriptor, 0); err != nil {
+					if err := b.requireTableMaintenance(table.Descriptor, 0); err != nil {
 						var diagnostic *model.Error
 						if errors.As(err, &diagnostic) && diagnostic.Code == "42501" {
 							return nil
@@ -755,7 +755,7 @@ func BindAnalyze(ctx context.Context, statement *zpgparse.VacuumStmt, snapshot C
 			if err != nil {
 				return nil, err
 			}
-			if err := b.requireTableOwner(table, int(rangeVar.Location)+1); err != nil {
+			if err := b.requireTableMaintenance(table, int(rangeVar.Location)+1); err != nil {
 				return nil, err
 			}
 			columns := make([]model.ColumnID, 0, len(relation.VaCols))

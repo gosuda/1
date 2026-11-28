@@ -1,0 +1,27 @@
+\set VERBOSITY terse
+SELECT 3 \p
+SELECT 3 
+UNION SELECT 4 \p
+SELECT 3 
+UNION SELECT 4 
+UNION SELECT 5
+ORDER BY 1;
+ ?column? 
+----------
+        3
+        4
+        5
+(3 rows)
+
+\echo BUFFER_STATE :SQLSTATE
+BUFFER_STATE 00000
+\echo BUFFER_ROWS :ROW_COUNT
+BUFFER_ROWS 3
+SELECT 9 AS after_buffer;
+ after_buffer 
+--------------
+            9
+(1 row)
+
+\echo AFTER_STATE :SQLSTATE
+AFTER_STATE 00000

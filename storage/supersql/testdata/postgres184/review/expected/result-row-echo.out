@@ -1,0 +1,13 @@
+\set VERBOSITY terse
+SELECT 'SELECT missing_echo_probe();' AS echoed;
+            echoed            
+------------------------------
+ SELECT missing_echo_probe();
+(1 row)
+
+\echo ECHO_LITERAL :SQLSTATE
+ECHO_LITERAL 00000
+SELECT missing_echo_probe();
+ERROR:  function missing_echo_probe() does not exist at character 8
+\echo ECHO_MISSING :SQLSTATE
+ECHO_MISSING 42883

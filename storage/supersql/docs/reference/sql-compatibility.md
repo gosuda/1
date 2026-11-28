@@ -665,7 +665,7 @@ No resolved catalog objects.
 
 ## Additional 0A000 rejections outside the profile table
 
-134 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
+135 call sites in non-test code reject SQL with SQLSTATE `0A000`; the profile table above documents the feature classes, this list names every literal site.
 
 | Location | Message |
 | --- | --- |
@@ -675,9 +675,10 @@ No resolved catalog objects.
 | internal/controlplane/catalog/type_service.go:1075 | `model.Error{Code: "0A000"}` |
 | internal/controlplane/schema/index_scheduler.go:28 | `model.Error{Code: "0A000"}` |
 | internal/dataplane/txn/transaction_historical.go:12 | `model.Error{Code: "0A000"}` |
-| internal/query/bind/aggregate_invocation.go:205 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/aggregate_invocation.go:208 | `DISTINCT is not implemented for window functions` |
-| internal/query/bind/aggregate_invocation.go:211 | `aggregate ORDER BY is not implemented for window functions` |
+| internal/query/bind/aggregate_invocation.go:210 | `ordered-set aggregates cannot be used as window functions` |
+| internal/query/bind/aggregate_invocation.go:213 | `DISTINCT is not implemented for window functions` |
+| internal/query/bind/aggregate_invocation.go:216 | `aggregate ORDER BY is not implemented for window functions` |
+| internal/query/bind/aggregate_scope.go:170 | `outer-level aggregate cannot use a nested CTE` |
 | internal/query/bind/catalog_relation.go:17 | `cross-database reference is not supported` |
 | internal/query/bind/declaration.go:1013 | `cross-database reference is not supported` |
 | internal/query/bind/declaration_constraint.go:27 | `CHECK and NOT NULL constraints cannot be DEFERRABLE` |
@@ -689,8 +690,8 @@ No resolved catalog objects.
 | internal/query/bind/definition_declaration.go:321 | `support function arguments must be inferred from the declaration` |
 | internal/query/bind/features.go:58 | `model.Error{Code: "0A000"}` |
 | internal/query/bind/function.go:217 | `ordered-set aggregates cannot be used as window functions` |
-| internal/query/bind/function.go:542 | `routine dependency is no longer available` |
-| internal/query/bind/function.go:547 | `routine semantic definition encoding is unavailable` |
+| internal/query/bind/function.go:546 | `routine dependency is no longer available` |
+| internal/query/bind/function.go:551 | `routine semantic definition encoding is unavailable` |
 | internal/query/bind/function_arguments.go:268 | `function defaults cannot contain subqueries` |
 | internal/query/bind/function_window.go:123 | `DISTINCT is not implemented for window functions` |
 | internal/query/bind/function_window.go:126 | `aggregate ORDER BY is not implemented for window functions` |
@@ -721,7 +722,7 @@ No resolved catalog objects.
 | internal/query/bind/object_declaration.go:409 | `WITH CHECK OPTION is supported only on automatically updatable views` |
 | internal/query/bind/ordinary_alter.go:593 | `WITH CHECK OPTION is supported only on automatically updatable views` |
 | internal/query/bind/ordinary_alter.go:667 | `statistics target can only be set for an index expression` |
-| internal/query/bind/ordinary_reindex.go:223 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
+| internal/query/bind/ordinary_reindex.go:227 | `REINDEX INDEX CONCURRENTLY cannot rebuild an exclusion constraint index` |
 | internal/query/bind/partition_alter.go:174 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
 | internal/query/bind/partition_alter.go:185 | `attached hierarchy mixes declarative partitioning and ordinary inheritance` |
 | internal/query/bind/partition_alter.go:680 | `CONCURRENTLY requires DETACH PARTITION` |
@@ -757,7 +758,7 @@ No resolved catalog objects.
 | internal/query/bind/select_recursive.go:32 | `with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT` |
 | internal/query/bind/select_set.go:127 | `WITH clause containing a data-modifying statement must be at the top level` |
 | internal/query/bind/sequence_identity_owner.go:22 | `cannot change ownership of identity sequence` |
-| internal/query/bind/sqljson.go:501 | `JSON FORMAT ENCODING requires bytea input` |
+| internal/query/bind/sqljson.go:500 | `JSON FORMAT ENCODING requires bytea input` |
 | internal/query/bind/statistics_declaration.go:258 | `unsupported statistics kind` |
 | internal/query/bind/statistics_declaration.go:559 | `DROP STATISTICS CONCURRENTLY is not supported` |
 | internal/query/bind/statistics_declaration.go:696 | `unsupported ANALYZE option` |

@@ -349,10 +349,15 @@ func (c *cursor) configure(ctx context.Context) error {
 	}
 	o.Calls = nil
 	o.Builtin = builtin.ResolveOptions{}
-	c.perGroup = 256 + o.MaxRecordBytes*9 + uint64(len(c.calls))*(uint64(unsafe.Sizeof(transition{}))+o.MaxRecordBytes*2) + uint64(len(o.GroupColumns))*uint64(unsafe.Sizeof(model.Value{}))
-	// Scalar bit transitions retain one M-byte value and allocate at most one
-	// M-byte replacement; both fit the per-call allowance above.
+	c.perGroup = 256 + o.MaxRecordBytes*9 + uint64(len(c.calls))*uint64(unsafe.Sizeof(transition{})) + uint64(len(o.GroupColumns))*uint64(unsafe.Sizeof(model.Value{}))
 	for _, call := range c.calls {
+		// Scalar float8 continuous percentiles retain only a count and an
+		// inline result. Their input rows use the separately admitted spool.
+		// Other calls keep the two-record state/output allowance, including
+		// variable-width values, percentile arrays, and scalar bit replacement.
+		if call.op != percentileContinuous || call.arrayPercentile || call.output.Storage != model.TypeFloat64 {
+			c.perGroup += o.MaxRecordBytes * 2
+		}
 		if call.op == jsonAggregate {
 			c.perGroup += o.MaxRecordBytes * 8
 		}

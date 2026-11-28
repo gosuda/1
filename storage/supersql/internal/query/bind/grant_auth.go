@@ -154,6 +154,12 @@ func (b *binder) checkObjectPrivilege(descriptor *model.Descriptor, required mod
 	return permissionDeniedError(descriptor, pos)
 }
 
+// requireTableMaintenance admits owners and roles holding MAINTAIN through
+// the same direct, PUBLIC and inherited ACL checks as other object privileges.
+func (b *binder) requireTableMaintenance(table *model.Descriptor, pos int) error {
+	return b.checkObjectPrivilege(table, model.PrivilegeMaintain, pos)
+}
+
 func (b *binder) checkObjectPrivilegeAny(descriptor *model.Descriptor, anyOf model.PrivilegeMask, pos int) error {
 	if descriptor == nil || anyOf == 0 || normalizeRoleName(b.options.CurrentRole) == "" {
 		return nil

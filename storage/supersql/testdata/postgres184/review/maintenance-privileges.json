@@ -1,0 +1,665 @@
+{
+  "postgres_version": 180004,
+  "cases": [
+    {
+      "name": "direct",
+      "steps": [
+        {
+          "id": "role",
+          "sql": "CREATE ROLE maint_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "table",
+          "sql": "CREATE TABLE maintain_direct(n int PRIMARY KEY)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows",
+          "sql": "INSERT INTO maintain_direct VALUES(1),(2)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "index",
+          "sql": "CREATE INDEX maintain_direct_idx ON maintain_direct(n)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "owner-analyze",
+          "sql": "ANALYZE maintain_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "owner-reindex",
+          "sql": "REINDEX TABLE maintain_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "grant",
+          "sql": "GRANT MAINTAIN ON maintain_direct TO maint_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "assume",
+          "sql": "SET ROLE maint_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-analyze",
+          "sql": "ANALYZE maintain_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-reindex-table",
+          "sql": "REINDEX TABLE maintain_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-reindex-index",
+          "sql": "REINDEX INDEX maintain_direct_idx",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "unrelated-alter",
+          "sql": "ALTER TABLE maintain_direct ADD COLUMN denied int",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "unrelated-drop-index",
+          "sql": "DROP INDEX maintain_direct_idx",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "unrelated-drop-table",
+          "sql": "DROP TABLE maintain_direct",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "begin-access-share",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-access-share",
+          "sql": "LOCK TABLE maintain_direct IN ACCESS SHARE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-access-share",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-row-share",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-row-share",
+          "sql": "LOCK TABLE maintain_direct IN ROW SHARE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-row-share",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-row-exclusive",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-row-exclusive",
+          "sql": "LOCK TABLE maintain_direct IN ROW EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-row-exclusive",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-share-update-exclusive",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-share-update-exclusive",
+          "sql": "LOCK TABLE maintain_direct IN SHARE UPDATE EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-share-update-exclusive",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-share",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-share",
+          "sql": "LOCK TABLE maintain_direct IN SHARE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-share",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-share-row-exclusive",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-share-row-exclusive",
+          "sql": "LOCK TABLE maintain_direct IN SHARE ROW EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-share-row-exclusive",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-exclusive",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-exclusive",
+          "sql": "LOCK TABLE maintain_direct IN EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-exclusive",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin-access-exclusive",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock-access-exclusive",
+          "sql": "LOCK TABLE maintain_direct IN ACCESS EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback-access-exclusive",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reset",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoke",
+          "sql": "REVOKE MAINTAIN ON maintain_direct FROM maint_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reassume",
+          "sql": "SET ROLE maint_direct",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoked-analyze",
+          "sql": "ANALYZE maintain_direct",
+          "state": "",
+          "query": false,
+          "embedded_state": "42501"
+        },
+        {
+          "id": "revoked-reindex",
+          "sql": "REINDEX TABLE maintain_direct",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "revoked-lock-begin",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoked-lock",
+          "sql": "LOCK TABLE maintain_direct IN ACCESS EXCLUSIVE MODE",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "revoked-lock-rollback",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reset-final",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows-retained",
+          "sql": "SELECT count(*) FROM maintain_direct",
+          "state": "",
+          "query": true,
+          "rows": [
+            [
+              "2"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "inherited",
+      "steps": [
+        {
+          "id": "role",
+          "sql": "CREATE ROLE maint_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "table",
+          "sql": "CREATE TABLE maintain_inherited(n int)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows",
+          "sql": "INSERT INTO maintain_inherited VALUES(7)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "index",
+          "sql": "CREATE INDEX maintain_inherited_idx ON maintain_inherited(n)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "group",
+          "sql": "CREATE ROLE maint_group",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "membership",
+          "sql": "GRANT maint_group TO maint_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "grant",
+          "sql": "GRANT MAINTAIN ON maintain_inherited TO maint_group",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "assume",
+          "sql": "SET ROLE maint_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-analyze",
+          "sql": "ANALYZE maintain_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-reindex",
+          "sql": "REINDEX TABLE maintain_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock",
+          "sql": "LOCK TABLE maintain_inherited IN ACCESS EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "unrelated-alter",
+          "sql": "ALTER TABLE maintain_inherited ADD COLUMN denied int",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "reset",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoke",
+          "sql": "REVOKE MAINTAIN ON maintain_inherited FROM maint_group",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reassume",
+          "sql": "SET ROLE maint_inherited",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoked-reindex",
+          "sql": "REINDEX TABLE maintain_inherited",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "reset-final",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows-retained",
+          "sql": "SELECT count(*) FROM maintain_inherited",
+          "state": "",
+          "query": true,
+          "rows": [
+            [
+              "1"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "public",
+      "steps": [
+        {
+          "id": "role",
+          "sql": "CREATE ROLE maint_public",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "table",
+          "sql": "CREATE TABLE maintain_public(n int)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows",
+          "sql": "INSERT INTO maintain_public VALUES(7)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "index",
+          "sql": "CREATE INDEX maintain_public_idx ON maintain_public(n)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "grant",
+          "sql": "GRANT MAINTAIN ON maintain_public TO PUBLIC",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "assume",
+          "sql": "SET ROLE maint_public",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-analyze",
+          "sql": "ANALYZE maintain_public",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-reindex",
+          "sql": "REINDEX TABLE maintain_public",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "begin",
+          "sql": "BEGIN",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-lock",
+          "sql": "LOCK TABLE maintain_public IN ACCESS EXCLUSIVE MODE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rollback",
+          "sql": "ROLLBACK",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "unrelated-alter",
+          "sql": "ALTER TABLE maintain_public ADD COLUMN denied int",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "reset",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoke",
+          "sql": "REVOKE MAINTAIN ON maintain_public FROM PUBLIC",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reassume",
+          "sql": "SET ROLE maint_public",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "revoked-reindex",
+          "sql": "REINDEX TABLE maintain_public",
+          "state": "42501",
+          "query": false
+        },
+        {
+          "id": "reset-final",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows-retained",
+          "sql": "SELECT count(*) FROM maintain_public",
+          "state": "",
+          "query": true,
+          "rows": [
+            [
+              "1"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "analyze-all",
+      "steps": [
+        {
+          "id": "role",
+          "sql": "CREATE ROLE maint_all",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "table",
+          "sql": "CREATE TABLE maintain_all(n int)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "rows",
+          "sql": "INSERT INTO maintain_all VALUES(1),(2)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "other-table",
+          "sql": "CREATE TABLE maintain_all_other(n int)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "other-rows",
+          "sql": "INSERT INTO maintain_all_other VALUES(3)",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "grant",
+          "sql": "GRANT MAINTAIN ON maintain_all TO maint_all",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "assume",
+          "sql": "SET ROLE maint_all",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "delegated-analyze-all",
+          "sql": "ANALYZE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "reset",
+          "sql": "RESET ROLE",
+          "state": "",
+          "query": false
+        },
+        {
+          "id": "granted-stats",
+          "sql": "SELECT count(*) FROM pg_stats WHERE schemaname = 'public' AND tablename = 'maintain_all' AND attname = 'n' AND NOT inherited",
+          "state": "",
+          "query": true,
+          "rows": [
+            [
+              "1"
+            ]
+          ]
+        },
+        {
+          "id": "ungranted-stats",
+          "sql": "SELECT count(*) FROM pg_stats WHERE schemaname = 'public' AND tablename = 'maintain_all_other' AND attname = 'n' AND NOT inherited",
+          "state": "",
+          "query": true,
+          "rows": [
+            [
+              "0"
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "scope": "Revised PostgreSQL18.4 maintenance contract: 86 unchanged direct/inherited/PUBLIC steps plus 11 analyze-all steps with explicit user-column statistics. The original unfiltered count exposed an existing hidden-identity pg_stats row and remains recorded separately. REFRESH delegation remains unresolved; explicit ANALYZE denial retains its existing SQLSTATE42501 policy.",
+  "evidence": {
+    "producer": "bb89c01035242e315d50d75e1ac92eb68e902f5e",
+    "run": 45926829065,
+    "job": 140269986498,
+    "artifact": 15166309161,
+    "artifact_sha256": "a7c730c71009edef6ce3809749da1986e9315a1218fbd09cb1180bcb6f0bd1e7"
+  },
+  "existing_catalog_limitation": {
+    "producer": "d4541578791392d877e7ae80dd88eba81d7d1ad0",
+    "run": 45930490978,
+    "job": 140281731302,
+    "artifact": 15168402116,
+    "artifact_sha256": "243b6ead11e71ebe9beff71836be58d51059f18a8589718030cdbcde01a8ec3d",
+    "unchanged_source": "8ae3f651829f4d591f02bdf071d384eacf31dec9",
+    "native_rows": [
+      [
+        "n",
+        "false"
+      ]
+    ],
+    "embedded_rows": [
+      [
+        "__supersql_row_identity",
+        "false"
+      ],
+      [
+        "n",
+        "false"
+      ]
+    ]
+  }
+}

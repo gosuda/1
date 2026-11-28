@@ -93,10 +93,10 @@ func (b *binder) bindTableLock(statement *zpgparse.LockStmt) (Command, []ResultC
 func tableLockRequiredPrivileges(mode txn.TableLockMode) model.PrivilegeMask {
 	switch mode {
 	case txn.AccessShareTableLock:
-		return model.PrivilegeSelect | model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+		return model.PrivilegeSelect | model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate | model.PrivilegeMaintain
 	case txn.RowExclusiveTableLock:
-		return model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+		return model.PrivilegeInsert | model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate | model.PrivilegeMaintain
 	default:
-		return model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate
+		return model.PrivilegeUpdate | model.PrivilegeDelete | model.PrivilegeTruncate | model.PrivilegeMaintain
 	}
 }

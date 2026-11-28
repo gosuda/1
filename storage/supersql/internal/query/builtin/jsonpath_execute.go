@@ -30,6 +30,8 @@ type jsonPathItem struct {
 	boolean  bool
 	temporal model.Value
 	typeID   model.TypeID
+	timeZoneOffset int32
+	hasTimeZone bool
 	baseID   int64
 	baseRoot int
 }
@@ -761,7 +763,12 @@ func (execution *jsonPathExecution) datetimeMethod(item jsonPathItem, method *js
 		value, err = call.Call(execution.ctx, []model.Value{value, model.Int64Val(precision)}, execution.budget)
 		if err != nil { return err }
 	}
-	return emit(jsonPathItem{kind: jsonTextString, temporal: value, typeID: targetID})
+	result := jsonPathItem{kind: jsonTextString, temporal: value, typeID: targetID}
+	if sourceID == 1184 && targetID == 1184 {
+		result.timeZoneOffset, result.hasTimeZone, err = execution.datetimeTimeZone(text)
+		if err != nil { return err }
+	}
+	return emit(result)
 }
 
 func jsonPathDatetimeType(name string) model.TypeID {
@@ -855,10 +862,15 @@ func parseJSONPathDatetimeTemplate(input, template string) (string, string, erro
 func (execution *jsonPathExecution) temporalOutput(item jsonPathItem) (string, error) {
 	id := model.FunctionID(0)
 	switch item.typeID { case 1082: id = 1085; case 1083: id = 1144; case 1266: id = 1351; case 1114: id = 1313; case 1184: id = 1151 }
-	call, err := Resolve(id, execution.options); if err != nil { return "", err }
+	options := execution.options
+	if item.typeID == 1082 || item.typeID == 1114 || item.typeID == 1184 { options.DateStyle = DateISO }
+	if item.typeID == 1184 && item.hasTimeZone {
+		options.TimeZone = TimeZoneContext{Name: "UTC", Fixed: true, OffsetSeconds: item.timeZoneOffset}
+	}
+	call, err := Resolve(id, options); if err != nil { return "", err }
 	value, err := call.Call(execution.ctx, []model.Value{item.temporal}, execution.budget)
 	if err != nil { return "", err }
-	return value.StrVal, nil
+	return jsonDatetimeText(item.typeID, value.StrVal)
 }
 
 func (execution *jsonPathExecution) keyValue(item jsonPathItem, emit func(jsonPathItem) error) error {

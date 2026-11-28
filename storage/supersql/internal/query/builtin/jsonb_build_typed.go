@@ -242,31 +242,11 @@ func (plan *jsonbDatumPlan) emit(writer *jsonbBuildWriter, argument []model.Valu
 			return writer.raw(text.StrVal)
 		}
 	case 1114, 1184:
-		// XSD differs from ISO output by its date/time separator and mandatory
-		// timezone minutes. The fixed-size buffer covers PostgreSQL timestamps.
-		var scratch [timestamptzOutputMaxBytes + 3]byte
-		if len(text.StrVal) > len(scratch)-3 {
-			return sqlError("22008", "timestamp out of range")
+		formatted, err := jsonDatetimeText(plan.typ.ID, text.StrVal)
+		if err != nil {
+			return err
 		}
-		length := copy(scratch[:], text.StrVal)
-		for i := range length {
-			if scratch[i] == ' ' && i+1 < length && scratch[i+1] >= '0' && scratch[i+1] <= '9' {
-				scratch[i] = 'T'
-				break
-			}
-		}
-		if plan.typ.ID == 1184 {
-			end := length
-			if strings.HasSuffix(text.StrVal, " BC") {
-				end -= 3
-			}
-			if end >= 3 && (scratch[end-3] == '+' || scratch[end-3] == '-') {
-				copy(scratch[end+3:], scratch[end:length])
-				copy(scratch[end:end+3], ":00")
-				length += 3
-			}
-		}
-		return writer.quoted(string(scratch[:length]))
+		return writer.quoted(formatted)
 	}
 	return writer.quoted(text.StrVal)
 }
