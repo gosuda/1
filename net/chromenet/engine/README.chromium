@@ -1,0 +1,14 @@
+Name: chromenet engine
+Short Name: chromenet
+URL: https://github.com/gosuda/chromenet
+Version: N/A
+Update Mechanism: Static
+License: MIT
+License File: LICENSE
+Security Critical: yes
+Shipped: yes
+
+Description:
+The chrome_net_server glue between the HQQ RPC runtime and //net. scripts/engine/engine.py copies
+this directory to //third_party/chromenet, adds the HQQ C runtime as //third_party/chromenet/hqq,
+and writes LICENSE with the chromenet and HQQ licenses.

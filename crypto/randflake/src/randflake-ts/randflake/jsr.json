@@ -1,0 +1,15 @@
+{
+  "name": "@safe/randflake",
+  "version": "2.1.0",
+  "exports": {
+    ".": "./src/index.ts",
+    "./v2": "./src/v2.ts"
+  },
+  "publish": {
+    "include": [
+      "src/index.ts",
+      "src/core.ts",
+      "src/v2.ts"
+    ]
+  }
+}
