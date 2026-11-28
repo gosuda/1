@@ -352,16 +352,20 @@ func (o *optimizer) exploreJoin(id ir.RelID, r ir.Rel, seed *expression) {
 	// sides share one statement snapshot, and a stable input scanned once
 	// reads exactly what rescanning it would read. Volatile inputs stay on the
 	// nested loop because materializing them once would change their values.
-	// Error behavior is pinned by the keys, not the whole relation: joinKeys
-	// only admits strict immutable non-erroring equalities, and the residual
-	// rechecks those same conjuncts on every candidate pair. A relation whose
-	// key conjuncts are clean therefore raises exactly when the nested loop
-	// would: on the same pair, on the same conjunct.
+	// Keyed plans evaluate the residual only for key-matching pairs, so every
+	// conjunct must be immutable and non-erroring: an erroring conjunct
+	// before a key would raise in the nested loop for pairs the keys now
+	// discard, and a volatile conjunct would evaluate fewer times. joinKeys
+	// already limits keys to strict immutable non-erroring equalities; the
+	// check below covers the remaining conjuncts evaluated in the residual.
 	if r.Effects.Volatility == ir.Volatile || r.JoinKind == ir.CrossJoin || r.JoinKind == ir.MarkJoin {
 		return
 	}
 	keys := o.joinKeys(id, seed.children[0].node.Output, seed.children[1].node.Output)
 	if len(keys) == 0 || o.err != nil {
+		return
+	}
+	if !o.predicateKeyable(r.Predicate, 0) || o.err != nil {
 		return
 	}
 	for _, algorithm := range []physical.Algorithm{physical.HashJoin, physical.MergeJoin, physical.LookupJoin} {
@@ -477,6 +481,32 @@ func lookupMatches(o *optimizer, right *expression, keys []physical.JoinKey) boo
 	}
 	return true
 }
+
+// predicateKeyable reports whether every top-level conjunct of the join
+// predicate is immutable and non-erroring. Keyed plans evaluate the
+// residual only for key-matching pairs, so any other conjunct would
+// observe fewer pairs than the nested loop over all pairs.
+func (o *optimizer) predicateKeyable(id ir.ScalarID, depth uint32) bool {
+	if !o.step(1) {
+		return false
+	}
+	if depth >= o.options.IR.MaxDepth {
+		o.err = ErrLimit
+		return false
+	}
+	s, _ := o.graph.Scalar(id)
+	if s.Kind == ir.Bool && s.BoolOp == ir.And {
+		for i := range s.OperandCount() {
+			child, _ := o.graph.Operand(id, i)
+			if !o.predicateKeyable(child, depth+1) {
+				return false
+			}
+		}
+		return true
+	}
+	return s.Effects.Volatility == ir.Immutable && !s.Effects.MayError
+}
+
 func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physical.JoinKey {
 	r, _ := o.graph.Rel(id)
 	var keys []physical.JoinKey
@@ -497,6 +527,17 @@ func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physica
 			}
 			return
 		}
+		// Only strict immutable non-erroring comparisons over a hash- or
+		// merge-joinable operator can prune pairs: any other conjunct shape
+		// (inequality, non-operator call, OR branch) must not become a key,
+		// or keyed plans would reject hash and merge joins or fail plan
+		// validation on the lookup path.
+		if s.Kind != ir.Call || s.OperandCount() != 2 || !s.Strict || s.Effects.Volatility != ir.Immutable || s.Effects.MayError {
+			return
+		}
+		if op, ok := builtin.LookupOperator(s.Operator); !ok || !op.HashJoinable && !op.MergeJoinable {
+			return
+		}
 		lhs, _ := o.graph.Operand(id, 0)
 		rhs, _ := o.graph.Operand(id, 1)
 		lo, _ := o.graph.Scalar(lhs)
@@ -512,14 +553,21 @@ func (o *optimizer) joinKeys(id ir.RelID, left, right []physical.Slot) []physica
 		if l.Kind != ir.Slot || rr.Kind != ir.Slot {
 			return
 		}
+		// The executor encodes both sides with the left slot layout, so a
+		// Relabel must leave the runtime representation untouched: text to
+		// bpchar blank padding and int to oid range reinterpretation hash
+		// differently than the resolved equality compares. Only identical
+		// slot and operand layouts may key.
+		if !o.graph.SameLayout(l.Layout, lo.Layout) || !o.graph.SameLayout(rr.Layout, ro.Layout) {
+			return
+		}
 		lk, rk := o.key(l.Slot), o.key(rr.Slot)
 		// The key types come from the predicate operands, not the slots: the
-		// binder coerced each side to the resolved operator's argument type,
-		// so a relabeled slot carries its coerced type here. Verification
-		// (ir/verify_scalar.go) guarantees a Relabel preserves its operand's
-		// runtime representation, therefore hashing the underlying slot bytes
-		// is consistent with the resolved equality, and the residual
-		// rechecks every candidate pair with the original predicate.
+		// binder coerced each side to the resolved operator's argument type.
+		// The layout check above keeps the coerced type identical to the
+		// slot type, so hashing the underlying slot bytes agrees with the
+		// resolved equality, and the residual rechecks every candidate
+		// pair with the original predicate.
 		lType, lOK := o.graph.Type(lo.Layout)
 		rType, rOK := o.graph.Type(ro.Layout)
 		if !lOK || !rOK {

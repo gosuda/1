@@ -102,40 +102,59 @@ func TestStableJoinInputsPickHashJoin(t *testing.T) {
 	lower(t, result.Plan)
 }
 
-// A binary-coercible relabel (regproc slot compared as oid) must still hash:
-// the relabel preserves the runtime representation, so the underlying slot
-// bytes are consistent with the resolved oid equality.
-func TestBinaryRelabelJoinKeysPickHashJoin(t *testing.T) {
-	f := newFixture(t)
-	regprocLayout, err := f.b.AddLayout(t.Context(), model.TypeLayout{Type: model.Type{ID: 24, Storage: model.TypeInt64}})
-	if err != nil {
-		t.Fatal(err)
+// A cross-type Relabel must not form a hash key even when the coercion is an
+// implicit binary cast: the executor encodes both sides with the left slot
+// layout, so text compared as bpchar keeps trailing spaces in the key while
+// bpchar equality ignores them, and an int slot compared as oid encodes a
+// different range than the resolved oid equality compares.
+func TestCrossTypeRelabelJoinKeysStayNestedLoop(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		left, op  model.TypeID
+		operator  model.OperatorID
+		storage   model.DataType
+		collation model.CollationID
+	}{
+		{"regprocToOID", 24, 26, 607, model.TypeInt64, 0},
+		{"textToBPChar", 25, 1042, 1054, model.TypeString, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			slotLayout, err := f.b.AddLayout(t.Context(), model.TypeLayout{Type: model.Type{ID: tc.left, Storage: tc.storage, Collation: tc.collation}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			opLayout, err := f.b.AddLayout(t.Context(), model.TypeLayout{Type: model.Type{ID: tc.op, Storage: tc.storage, Collation: tc.collation}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			left, l := catalogLikeSource(f, 10, slotLayout, ir.Effects{})
+			right, r := catalogLikeSource(f, 20, opLayout, ir.Effects{})
+			relabel := f.scalar(ir.ScalarSpec{
+				Scalar: ir.Scalar{Kind: ir.Relabel, Scope: f.scope, Layout: opLayout, CastContext: ir.ImplicitCast}, Operands: []ir.ScalarID{slotScalar(f, slotLayout, l)},
+			})
+			signature, err := f.b.AddSignature(t.Context(), ir.SignatureSpec{Signature: ir.Signature{Operator: tc.operator, Result: f.boolean, Strict: true}, Parameters: []ir.LayoutID{opLayout, opLayout}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			predicate := callScalar(f, f.boolean, signature, tc.operator, []ir.ScalarID{relabel, slotScalar(f, opLayout, r)})
+			join := f.rel(ir.RelSpec{
+				Rel:     ir.Rel{Kind: ir.Join, Scope: f.scope, JoinKind: ir.InnerJoin, Predicate: predicate},
+				Inputs:  []ir.RelID{left, right},
+				Outputs: []model.SlotID{l, r},
+			})
+			options := testOptions()
+			options.Access = catalogAccessStub{layouts: map[model.ObjectID]model.TypeLayout{10: {Type: model.Type{ID: tc.left, Storage: tc.storage, Collation: tc.collation}}, 20: {Type: model.Type{ID: tc.op, Storage: tc.storage, Collation: tc.collation}}}}
+			result, err := Optimize(t.Context(), f.build(join), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, alg := range planAlgorithms(t, result.Plan, options.Plan.MaxBytes) {
+				if alg == physical.HashJoin || alg == physical.MergeJoin || alg == physical.LookupJoin {
+					t.Fatalf("cross-type relabel must not use a keyed join, got %v", planAlgorithms(t, result.Plan, options.Plan.MaxBytes))
+				}
+			}
+			lower(t, result.Plan)
+		})
 	}
-	oidLayout, err := f.b.AddLayout(t.Context(), model.TypeLayout{Type: model.Type{ID: 26, Storage: model.TypeInt64}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	left, l := catalogLikeSource(f, 10, regprocLayout, ir.Effects{})
-	right, r := catalogLikeSource(f, 20, oidLayout, ir.Effects{})
-	relabel := f.scalar(ir.ScalarSpec{
-		Scalar: ir.Scalar{Kind: ir.Relabel, Scope: f.scope, Layout: oidLayout, CastContext: ir.ImplicitCast}, Operands: []ir.ScalarID{slotScalar(f, regprocLayout, l)},
-	})
-	signature, err := f.b.AddSignature(t.Context(), ir.SignatureSpec{Signature: ir.Signature{Operator: 607, Result: f.boolean, Strict: true}, Parameters: []ir.LayoutID{oidLayout, oidLayout}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	predicate := callScalar(f, f.boolean, signature, 607, []ir.ScalarID{relabel, slotScalar(f, oidLayout, r)})
-	join := f.rel(ir.RelSpec{
-		Rel:     ir.Rel{Kind: ir.Join, Scope: f.scope, JoinKind: ir.InnerJoin, Predicate: predicate},
-		Inputs:  []ir.RelID{left, right},
-		Outputs: []model.SlotID{l, r},
-	})
-	options := testOptions()
-	options.Access = catalogAccessStub{layouts: map[model.ObjectID]model.TypeLayout{10: {Type: model.Type{ID: 24, Storage: model.TypeInt64}}, 20: {Type: model.Type{ID: 26, Storage: model.TypeInt64}}}}
-	result, err := Optimize(t.Context(), f.build(join), options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hashJoinSelected(t, result.Plan, options.Plan.MaxBytes)
-	lower(t, result.Plan)
 }
