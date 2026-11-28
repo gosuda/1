@@ -14,11 +14,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
 	"github.com/gosuda/keyless_tls/keyless"
 	"github.com/gosuda/keyless_tls/keyless/t13server"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
@@ -35,6 +35,16 @@ const maxReverseResponseHeadBytes int64 = 1 << 20
 // unbounded time; past this bound the supervisor retries on its own schedule.
 const maxRelayRetryDelay = 5 * time.Minute
 
+// defaultChainRefreshInterval is how often a lease checks for a rotated relay
+// certificate chain during renewals.
+const defaultChainRefreshInterval = 10 * time.Minute
+
+type relayReadyInfo struct {
+	publicURL  string
+	aliasURL   string
+	aliasEpoch string
+	tcpAddr    string
+}
 // parseRetryAfter reads the relay's Retry-After header, accepting both the
 // delta-seconds and the HTTP-date forms. It returns zero when absent or
 // unusable.
@@ -139,20 +149,32 @@ func (t relayTimings) ttlSeconds() int {
 }
 
 // tenantTLS is the protocol-10 tenant TLS terminator for one lease: a
-// keyless_tls t13server whose CertificateVerify signatures are produced by
-// the relay's transcript-bound /v1/sign endpoint.
+// keyless_tls t13server (for friendly aliases) and/or a localTLSManager
+// (for local-tls-v1 identity-bound canonical hostnames).
 type tenantTLS struct {
-	server *t13server.Server
-	signer *leaseTranscriptSigner
+	server            *t13server.Server
+	signer            *leaseTranscriptSigner
+	local             *localTLSManager
+	canonicalHostname string
 }
 
 func (t *tenantTLS) close() error {
-	if t == nil || t.signer == nil || t.signer.signer == nil {
+	if t == nil {
 		return nil
 	}
-	return t.signer.signer.Close()
+	var errs []error
+	if t.signer != nil && t.signer.signer != nil {
+		if err := t.signer.signer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if t.local != nil {
+		if err := t.local.close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
-
 // leaseTranscriptSigner forwards transcript-signing requests to the relay and
 // records failures per reverse-session binding so a handshake failure caused
 // by the signer can be distinguished from an unrelated tenant TLS failure.
@@ -195,33 +217,51 @@ func (s *leaseTranscriptSigner) takeError(binding []byte) error {
 }
 
 type relayLease struct {
-	token          string
-	expiresAt      time.Time
-	publicURL      string
-	udpAddr        string
-	sniPort        int
-	reverse        reverseEndpoint
-	tenant         *tenantTLS
-	generation     uint64
-	renewing       bool
-	tokenUncertain bool
+	token             string
+	expiresAt         time.Time
+	publicURL         string
+	aliasURL          string
+	aliasEpoch        string
+	canonicalHostname string
+	aliasHostname     string
+	udpAddr           string
+	tcpAddr           string
+	reverse           reverseEndpoint
+	tenant            *tenantTLS
+	generation        uint64
+	chainCheckedAt    time.Time
+	renewing          bool
+	tokenUncertain    bool
 }
 
 type relaySupervisor struct {
-	relayURL       string
-	authority      string
-	hostname       string
-	relayPort      string
-	dialAddress    string
-	publicHostname string
-	identity       Identity
-	timings        relayTimings
-	udpEnabled     bool
+	relayURL        string
+	parsedRelayURL  *url.URL
+	authority       string
+	hostname        string
+	relayPort       string
+	dialAddress     string
+	publicHostname  string
+	identity        Identity
+	timings         relayTimings
+	udpEnabled      bool
+	tcpEnabled      bool
+	replica         bool
+	tlsCertFile     string
+	tlsKeyFile      string
+	automaticTLS    bool
+	tlsStateDir     string
+	tlsRequireLocal bool
+
+	domainReplicas         bool
+	domainNamespaces       []string
+	domainIssuanceDisabled bool
 
 	controlTLS       *tls.Config
 	certificateChain []byte
 	controlTransport *http.Transport
 	controlClient    *http.Client
+	chainRefreshMu   sync.Mutex
 
 	leaseMu             sync.RWMutex
 	lease               relayLease
@@ -229,6 +269,10 @@ type relaySupervisor struct {
 
 	datagramMu   sync.RWMutex
 	datagramConn *quic.Conn
+}
+
+func (s *relaySupervisor) useLocalTLS() bool {
+	return s.automaticTLS || s.tlsCertFile != ""
 }
 
 type terminalRelayError struct{ err error }
@@ -301,13 +345,14 @@ func newRelaySupervisor(relayURL string, identity Identity, timings relayTimings
 		port = "443"
 	}
 	return &relaySupervisor{
-		relayURL:    relayURL,
-		authority:   parsed.Host,
-		hostname:    parsed.Hostname(),
-		relayPort:   parsed.Port(),
-		dialAddress: net.JoinHostPort(parsed.Hostname(), port),
-		identity:    identity,
-		timings:     timings.withDefaults(),
+		relayURL:       relayURL,
+		parsedRelayURL: parsed,
+		authority:      parsed.Host,
+		hostname:       parsed.Hostname(),
+		relayPort:      parsed.Port(),
+		dialAddress:    net.JoinHostPort(parsed.Hostname(), port),
+		identity:       identity,
+		timings:        timings.withDefaults(),
 	}, nil
 }
 
@@ -315,8 +360,10 @@ func newRelaySupervisor(relayURL string, identity Identity, timings relayTimings
 // separate a terminal relay failure from best-effort shutdown failures.
 func (s *relaySupervisor) run(
 	ctx context.Context,
-	ready func(string),
+	ready func(relayReadyInfo),
 	datagramReady func(string),
+	approval func(RelayApproval),
+	certErr func(error),
 	offer func(context.Context, net.Conn) bool,
 	offerDatagram func(context.Context, DatagramFrame) bool,
 ) (runErr, cleanupErr error) {
@@ -343,7 +390,7 @@ func (s *relaySupervisor) run(
 			continue
 		}
 
-		if err := s.registerLeaseWithRetry(ctx); err != nil {
+		if err := s.registerLeaseWithRetry(ctx, ready, approval, certErr); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err(), nil
 			}
@@ -353,7 +400,7 @@ func (s *relaySupervisor) run(
 			return err, nil
 		}
 
-		err := s.runLease(ctx, ready, datagramReady, offer, offerDatagram)
+		err := s.runLease(ctx, ready, datagramReady, approval, offer, offerDatagram)
 		if ctx.Err() != nil {
 			return ctx.Err(), nil
 		}
@@ -402,13 +449,24 @@ func (s *relaySupervisor) initializeControl(ctx context.Context) error {
 	if err := s.doAPI(ctx, http.MethodGet, pathDomain, nil, &domain); err != nil {
 		return classifyRelayError(err, false)
 	}
-	if domain.ProtocolVersion != ProtocolVersion {
-		return terminalRelay(fmt.Errorf("unsupported relay protocol version %q (want %q)", domain.ProtocolVersion, ProtocolVersion))
+	if !domain.supportsProtocol(ProtocolVersion) {
+		return terminalRelay(fmt.Errorf("unsupported relay protocol version %q (supported=%v, want %q)", domain.ProtocolVersion, domain.SupportedProtocolVersions, ProtocolVersion))
+	}
+	s.domainReplicas = domain.Replicas
+	s.domainNamespaces = slices.Clone(domain.Namespaces)
+	s.domainIssuanceDisabled = domain.TenantCertificateIssuance != nil && !*domain.TenantCertificateIssuance
+	if s.replica && !s.domainReplicas {
+		return terminalRelay(errors.New("relay does not support HTTP replicas"))
+	}
+	if s.useLocalTLS() && !slices.Contains(s.domainNamespaces, LocalTLSNamespaceV1) {
+		return terminalRelay(fmt.Errorf("relay does not support namespace %q", LocalTLSNamespaceV1))
 	}
 
-	s.publicHostname = s.identity.Name() + "." + s.hostname
-	if err := leaf.VerifyHostname(s.publicHostname); err != nil {
-		return terminalRelay(fmt.Errorf("relay certificate does not cover public hostname %q: %w", s.publicHostname, err))
+	if !s.useLocalTLS() && !s.tcpEnabled && s.identity.Name() != "" {
+		s.publicHostname = s.identity.Name() + "." + s.hostname
+		if err := leaf.VerifyHostname(s.publicHostname); err != nil {
+			return terminalRelay(fmt.Errorf("relay certificate does not cover public hostname %q: %w", s.publicHostname, err))
+		}
 	}
 	return nil
 }
@@ -505,7 +563,12 @@ func (a *registerAttempt) valid(now time.Time) bool {
 // The signed challenge stays in this loop's scope: a throttled relay is never
 // charged for a second challenge, and a challenge signed for one identity can
 // never be reused after an identity or relay generation change.
-func (s *relaySupervisor) registerLeaseWithRetry(ctx context.Context) error {
+func (s *relaySupervisor) registerLeaseWithRetry(
+	ctx context.Context,
+	ready func(relayReadyInfo),
+	approval func(RelayApproval),
+	certErr func(error),
+) error {
 	var attempt *registerAttempt
 	for {
 		if err := ctx.Err(); err != nil {
@@ -514,6 +577,9 @@ func (s *relaySupervisor) registerLeaseWithRetry(ctx context.Context) error {
 		if !attempt.valid(time.Now()) {
 			fresh, err := s.requestRegisterChallenge(ctx)
 			if err != nil {
+				if app := relayApprovalFromError(err); app != "" && approval != nil {
+					approval(app)
+				}
 				if isTerminalRelayFailure(err) {
 					return err
 				}
@@ -524,9 +590,12 @@ func (s *relaySupervisor) registerLeaseWithRetry(ctx context.Context) error {
 			}
 			attempt = fresh
 		}
-		err := s.submitRegistration(ctx, attempt)
+		err := s.submitRegistration(ctx, attempt, ready, certErr)
 		if err == nil {
 			return nil
+		}
+		if app := relayApprovalFromError(err); app != "" && approval != nil {
+			approval(app)
 		}
 		if isTerminalRelayFailure(err) {
 			return err
@@ -537,16 +606,26 @@ func (s *relaySupervisor) registerLeaseWithRetry(ctx context.Context) error {
 	}
 }
 
-// requestRegisterChallenge obtains and signs a fresh registration challenge.
+// requestRegisterChallenge obtains, validates, and signs a fresh registration challenge.
 func (s *relaySupervisor) requestRegisterChallenge(ctx context.Context) (*registerAttempt, error) {
 	requestIdentity := identityRef{Name: s.identity.Name(), Address: s.identity.Address()}
+	req := challengeRequest{
+		ProtocolVersion: ProtocolVersion,
+		Replica:         s.replica,
+		Identity:        requestIdentity,
+		TTL:             s.timings.ttlSeconds(),
+		UDPEnabled:      s.udpEnabled,
+		TCPEnabled:      s.tcpEnabled,
+	}
+	if s.useLocalTLS() {
+		req.Namespace = LocalTLSNamespaceV1
+	}
 	var challenge challengeResponse
-	if err := s.doAPI(ctx, http.MethodPost, pathRegisterChallenge, challengeRequest{
-		Identity:   requestIdentity,
-		TTL:        s.timings.ttlSeconds(),
-		UDPEnabled: s.udpEnabled,
-	}, &challenge); err != nil {
+	if err := s.doAPI(ctx, http.MethodPost, pathRegisterChallenge, req, &challenge); err != nil {
 		return nil, classifyRelayError(err, false)
+	}
+	if s.replica && !challenge.Replica {
+		return nil, terminalRelay(errors.New("relay did not confirm replica registration"))
 	}
 	if strings.TrimSpace(challenge.ChallengeID) == "" {
 		return nil, terminalRelay(errors.New("register challenge has an empty challenge_id"))
@@ -556,6 +635,9 @@ func (s *relaySupervisor) requestRegisterChallenge(ctx context.Context) (*regist
 	}
 	if !challenge.ExpiresAt.After(time.Now()) {
 		return nil, terminalRelay(errors.New("register challenge is expired"))
+	}
+	if err := validateRegisterSIWEChallenge(challenge, s.parsedRelayURL, s.identity.Address(), time.Now()); err != nil {
+		return nil, terminalRelay(err)
 	}
 
 	signature, err := s.identity.signEthereumPersonalMessage(challenge.SIWEMessage)
@@ -571,8 +653,17 @@ func (s *relaySupervisor) requestRegisterChallenge(ctx context.Context) (*regist
 }
 
 // submitRegistration exchanges one signed challenge for a lease and installs it.
-func (s *relaySupervisor) submitRegistration(ctx context.Context, attempt *registerAttempt) error {
+func (s *relaySupervisor) submitRegistration(
+	ctx context.Context,
+	attempt *registerAttempt,
+	ready func(relayReadyInfo),
+	certErr func(error),
+) error {
 	requestIdentity := identityRef{Name: s.identity.Name(), Address: s.identity.Address()}
+	requestedNamespace := ""
+	if s.useLocalTLS() {
+		requestedNamespace = LocalTLSNamespaceV1
+	}
 	var response registerResponse
 	if err := s.doAPI(ctx, http.MethodPost, pathRegister, registerRequest{
 		ChallengeID:   attempt.challengeID,
@@ -604,12 +695,12 @@ func (s *relaySupervisor) submitRegistration(ctx context.Context, attempt *regis
 	if err != nil {
 		return invalid(err)
 	}
-	if response.SNIPort < 0 || response.SNIPort > 65535 {
-		return invalid(fmt.Errorf("register response has invalid sni_port %d", response.SNIPort))
-	}
-	responseName, err := normalizeIdentityName(response.Identity.Name)
-	if err != nil {
-		return invalid(fmt.Errorf("register response has invalid identity name: %w", err))
+	var responseName string
+	if strings.TrimSpace(response.Identity.Name) != "" {
+		responseName, err = normalizeIdentityName(response.Identity.Name)
+		if err != nil {
+			return invalid(fmt.Errorf("register response has invalid identity name: %w", err))
+		}
 	}
 	responseAddress, err := normalizeEthereumAddress(response.Identity.Address)
 	if err != nil {
@@ -618,31 +709,66 @@ func (s *relaySupervisor) submitRegistration(ctx context.Context, attempt *regis
 	if responseName != requestIdentity.Name || responseAddress != requestIdentity.Address {
 		return invalid(errors.New("register response identity does not match requested identity"))
 	}
+	if response.Namespace != requestedNamespace {
+		return invalid(fmt.Errorf("register response namespace %q does not match requested %q", response.Namespace, requestedNamespace))
+	}
+
+	canonicalHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(response.CanonicalHostname), "."))
+	if requestedNamespace == LocalTLSNamespaceV1 {
+		expectedCanonical, err := LocalTLSHostname(s.identity.Name(), s.identity.Address(), s.hostname)
+		if err != nil || canonicalHost != expectedCanonical {
+			return invalid(fmt.Errorf("register response canonical_hostname %q does not match expected %q", canonicalHost, expectedCanonical))
+		}
+	} else {
+		canonicalHost = ""
+	}
+
+	aliasHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(response.Hostname), "."))
+	if aliasHost != "" && !matchesAlias(aliasHost, s.identity.Name(), s.hostname) {
+		aliasHost = ""
+	}
+	if requestedNamespace == "" && !s.tcpEnabled && !s.udpEnabled && aliasHost == "" {
+		return invalid(errors.New("register response did not grant a public hostname"))
+	}
+
 	udpAddr := ""
 	if s.udpEnabled {
 		if !response.UDPEnabled {
 			return invalid(errors.New("register response did not enable UDP"))
-		}
-		if response.SNIPort <= 0 {
-			return invalid(errors.New("register response has no sni_port for UDP"))
 		}
 		udpAddr, err = NormalizeTarget(response.UDPAddr)
 		if err != nil {
 			return invalid(fmt.Errorf("register response has invalid udp_addr: %w", err))
 		}
 	}
+	tcpAddr := ""
+	if s.tcpEnabled {
+		if !response.TCPEnabled {
+			return invalid(errors.New("register response did not enable TCP"))
+		}
+		tcpAddr, err = NormalizeTarget(response.TCPAddr)
+		if err != nil {
+			return invalid(fmt.Errorf("register response has invalid tcp_addr: %w", err))
+		}
+	}
 
-	// Protocol 10 deprecates sni_port for URL derivation: the public URL
-	// follows the relay origin the caller configured, and sni_port is only
-	// meaningful for the UDP backhaul.
-	publicURL := s.derivedPublicURL()
+	aliasURL := s.urlForHostname(aliasHost)
+	publicURL := aliasURL
+	if canonicalHost != "" {
+		publicURL = s.urlForHostname(canonicalHost)
+	}
 
 	s.leaseMu.Lock()
 	s.nextLeaseGeneration++
 	generation := s.nextLeaseGeneration
 	s.leaseMu.Unlock()
 
-	tenant, err := s.buildTenantTLS(responseToken)
+	onLocalReady := func() {
+		if ready != nil {
+			ready(s.currentReadyInfo())
+		}
+	}
+	tenant, err := s.buildTenantTLS(responseToken, canonicalHost, aliasHost, onLocalReady, certErr)
 	if err != nil {
 		unregisterCtx, cancel := context.WithTimeout(context.Background(), s.timings.shutdownTimeout)
 		unregisterErr := s.unregisterToken(unregisterCtx, responseToken)
@@ -655,26 +781,32 @@ func (s *relaySupervisor) submitRegistration(ctx context.Context, attempt *regis
 
 	s.leaseMu.Lock()
 	s.lease = relayLease{
-		token:      responseToken,
-		expiresAt:  response.ExpiresAt,
-		publicURL:  publicURL,
-		udpAddr:    udpAddr,
-		sniPort:    response.SNIPort,
-		reverse:    reverse,
-		tenant:     tenant,
-		generation: generation,
+		token:             responseToken,
+		expiresAt:         response.ExpiresAt,
+		publicURL:         publicURL,
+		aliasURL:          aliasURL,
+		aliasEpoch:        strings.TrimSpace(response.AliasEpoch),
+		canonicalHostname: canonicalHost,
+		aliasHostname:     aliasHost,
+		udpAddr:           udpAddr,
+		tcpAddr:           tcpAddr,
+		reverse:           reverse,
+		tenant:            tenant,
+		generation:        generation,
+		chainCheckedAt:    time.Now(),
 	}
 	s.leaseMu.Unlock()
 	return nil
 }
 
-// derivedPublicURL builds the public ingress URL for this relay's lease from
-// the configured relay origin, matching protocol 10 semantics.
-func (s *relaySupervisor) derivedPublicURL() string {
-	if s.relayPort != "" && s.relayPort != "443" {
-		return "https://" + net.JoinHostPort(s.publicHostname, s.relayPort)
+func (s *relaySupervisor) urlForHostname(host string) string {
+	if host == "" {
+		return ""
 	}
-	return "https://" + s.publicHostname
+	if s.relayPort != "" && s.relayPort != "443" {
+		return "https://" + net.JoinHostPort(host, s.relayPort)
+	}
+	return "https://" + host
 }
 
 // validateReverseEndpoint checks that a relay-issued reverse endpoint is
@@ -711,12 +843,60 @@ func (s *relaySupervisor) validateReverseEndpoint(endpoint reverseEndpoint, leas
 // /v1/sign endpoint, so no digest-signing probe is possible or needed: key
 // possession is proven on each handshake. The signer reads the current access
 // token per request, so one terminator serves every lease generation.
-func (s *relaySupervisor) buildTenantTLS(initialToken string) (*tenantTLS, error) {
+func (s *relaySupervisor) buildTenantTLS(
+	initialToken string,
+	canonicalHostname string,
+	aliasHostname string,
+	onLocalReady func(),
+	onCertErr func(error),
+) (*tenantTLS, error) {
+	tenant := &tenantTLS{
+		canonicalHostname: canonicalHostname,
+	}
+	if canonicalHostname != "" {
+		tokenFunc := func() string {
+			if token := s.currentToken(); token != "" {
+				return token
+			}
+			return initialToken
+		}
+		local, err := newLocalTLSManager(
+			canonicalHostname,
+			s.tlsCertFile,
+			s.tlsKeyFile,
+			s.automaticTLS,
+			s.tlsStateDir,
+			s.relayURL,
+			s.controlClient,
+			tokenFunc,
+			onLocalReady,
+			onCertErr,
+		)
+		if err != nil {
+			return nil, err
+		}
+		tenant.local = local
+	}
+
+	needKeyless := !s.tcpEnabled && (aliasHostname != "" || canonicalHostname == "")
+	if needKeyless {
+		server, signer, err := s.buildKeylessServer(initialToken, s.certificateChain)
+		if err != nil {
+			_ = tenant.close()
+			return nil, err
+		}
+		tenant.server = server
+		tenant.signer = signer
+	}
+	return tenant, nil
+}
+
+func (s *relaySupervisor) buildKeylessServer(initialToken string, chainPEM []byte) (*t13server.Server, *leaseTranscriptSigner, error) {
 	remoteSigner, err := keyless.NewRemoteSigner(keyless.RemoteSignerConfig{
 		Endpoint:   s.relayURL,
 		ServerName: s.hostname,
 		KeyID:      "relay-cert",
-		RootCAPEM:  append([]byte(nil), s.certificateChain...),
+		RootCAPEM:  append([]byte(nil), chainPEM...),
 		Timeout:    s.timings.requestTimeout,
 		Headers: func() http.Header {
 			header := make(http.Header, 1)
@@ -731,27 +911,71 @@ func (s *relaySupervisor) buildTenantTLS(initialToken string) (*tenantTLS, error
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	signer := &leaseTranscriptSigner{signer: remoteSigner}
 	server, err := t13server.NewServer(t13server.Config{
-		CertPEM:          append([]byte(nil), s.certificateChain...),
+		CertPEM:          append([]byte(nil), chainPEM...),
 		NextProtos:       []string{"http/1.1"},
 		KeyID:            "relay-cert",
 		TranscriptSigner: signer,
 	})
 	if err != nil {
 		_ = remoteSigner.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	return &tenantTLS{server: server, signer: signer}, nil
+	return server, signer, nil
+}
+
+// refreshRelayCertificateChain re-pins the relay's TLS certificate chain after
+// a zero-downtime relay certificate rotation and swaps the active Keyless
+// terminator without dropping existing connections.
+func (s *relaySupervisor) refreshRelayCertificateChain(ctx context.Context) (bool, error) {
+	s.chainRefreshMu.Lock()
+	defer s.chainRefreshMu.Unlock()
+
+	tlsConfig, newChain, _, err := s.bootstrapTLS(ctx)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(newChain, s.certificateChain) {
+		return false, nil
+	}
+	token := s.currentToken()
+	if token == "" {
+		return false, nil
+	}
+	server, signer, err := s.buildKeylessServer(token, newChain)
+	if err != nil {
+		return false, err
+	}
+
+	var oldSigner *keyless.RemoteSigner
+	s.leaseMu.Lock()
+	s.controlTLS = tlsConfig
+	s.certificateChain = newChain
+	if s.lease.tenant != nil && s.lease.tenant.server != nil {
+		if s.lease.tenant.signer != nil {
+			oldSigner = s.lease.tenant.signer.signer
+		}
+		s.lease.tenant.server = server
+		s.lease.tenant.signer = signer
+	} else {
+		oldSigner = signer.signer
+	}
+	s.leaseMu.Unlock()
+	if oldSigner != nil {
+		_ = oldSigner.Close()
+	}
+	return true, nil
 }
 
 func (s *relaySupervisor) runLease(
 	ctx context.Context,
-	ready func(string),
+	ready func(relayReadyInfo),
 	datagramReady func(string),
+	approval func(RelayApproval),
 	offer func(context.Context, net.Conn) bool,
 	offerDatagram func(context.Context, DatagramFrame) bool,
 ) error {
@@ -774,11 +998,18 @@ func (s *relaySupervisor) runLease(
 
 	var readyOnce sync.Once
 	announceReady := func() {
-		readyOnce.Do(func() { ready(s.currentPublicURL()) })
+		info := s.currentReadyInfo()
+		if s.useLocalTLS() && s.tlsRequireLocal && !s.isLocalTLSReady() {
+			return
+		}
+		if info.publicURL == "" && info.aliasURL == "" && info.tcpAddr == "" && !s.udpEnabled {
+			return
+		}
+		readyOnce.Do(func() { ready(info) })
 	}
 	for range reverseSessionSlots {
 		startWorker(func() error {
-			return s.runReverseSlot(leaseCtx, announceReady, offer)
+			return s.runReverseSlot(leaseCtx, announceReady, approval, offer)
 		})
 	}
 	startWorker(func() error { return s.runRenewLoop(leaseCtx) })
@@ -787,7 +1018,6 @@ func (s *relaySupervisor) runLease(
 			return s.runDatagramLoop(leaseCtx, datagramReady, offerDatagram)
 		})
 	}
-
 	var firstResult error
 	haveFirstResult := false
 	select {
@@ -842,12 +1072,11 @@ func (s *relaySupervisor) runDatagramLoop(
 			s.clearDatagramConn(nil, "lease stopped")
 			return err
 		}
-		token, generation, sniPort, udpAddr, tlsConfig, ok := s.currentDatagramLease()
+		token, generation, udpAddr, tlsConfig, ok := s.currentDatagramLease()
 		if !ok {
 			return errLeaseRefresh
 		}
-		address := net.JoinHostPort(s.hostname, fmt.Sprint(sniPort))
-		conn, err := dialQUICBackhaul(ctx, address, tlsConfig, token)
+		conn, err := dialQUICBackhaul(ctx, s.dialAddress, tlsConfig, token)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -856,12 +1085,12 @@ func (s *relaySupervisor) runDatagramLoop(
 			if errors.As(err, &rejection) {
 				code := strings.ToLower(strings.TrimSpace(rejection.Code))
 				switch code {
-				case "lease_not_found", "lease_rejected", "unauthorized":
+				case "lease_not_found", "unauthorized":
 					if s.datagramTokenStale(token, generation) {
 						continue
 					}
 					return errLeaseRefresh
-				case "transport_mismatch":
+				case "lease_denied", "transport_mismatch":
 					return terminalRelay(err)
 				}
 			}
@@ -906,7 +1135,6 @@ func (s *relaySupervisor) runDatagramLoop(
 func (s *relaySupervisor) currentDatagramLease() (
 	token string,
 	generation uint64,
-	sniPort int,
 	udpAddr string,
 	tlsConfig *tls.Config,
 	ok bool,
@@ -914,9 +1142,8 @@ func (s *relaySupervisor) currentDatagramLease() (
 	s.leaseMu.RLock()
 	token = s.lease.token
 	generation = s.lease.generation
-	sniPort = s.lease.sniPort
 	udpAddr = s.lease.udpAddr
-	ok = s.udpEnabled && token != "" && sniPort > 0 && udpAddr != "" && s.controlTLS != nil
+	ok = s.udpEnabled && token != "" && udpAddr != "" && s.controlTLS != nil
 	if ok {
 		tlsConfig = s.controlTLS.Clone()
 	}
@@ -968,7 +1195,7 @@ func (s *relaySupervisor) sendDatagram(frame DatagramFrame) error {
 	return nil
 }
 
-func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offer func(context.Context, net.Conn) bool) error {
+func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), approval func(RelayApproval), offer func(context.Context, net.Conn) bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -977,6 +1204,9 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if app := relayApprovalFromError(err); app != "" && approval != nil {
+				approval(app)
 			}
 			var upgradeErr *reverseUpgradeError
 			if errors.As(err, &upgradeErr) && isLostLeaseError(err) &&
@@ -1013,14 +1243,19 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 			// replenished immediately rather than consuming the retry interval.
 			continue
 		}
-		if signerErr != nil && s.signerGenerationStale(signerErr.generation) {
-			// The request was pinned to a token that rotated while /v1/sign was
-			// in flight. Replenish the slot instead of treating the old token's
-			// response as a relay or signer failure.
-			if !waitForRelayRetry(ctx, s.timings.retryWait) {
-				return ctx.Err()
+		if signerErr != nil {
+			if strings.Contains(signerErr.Error(), keylessUnknownCertificateMessage) {
+				refreshCtx, cancel := context.WithTimeout(ctx, s.timings.requestTimeout)
+				_, _ = s.refreshRelayCertificateChain(refreshCtx)
+				cancel()
+				continue
 			}
-			continue
+			if s.signerGenerationStale(signerErr.generation) {
+				if !waitForRelayRetry(ctx, s.timings.retryWait) {
+					return ctx.Err()
+				}
+				continue
+			}
 		}
 		sessionErr = classifyRelayError(sessionErr, true)
 		if errors.Is(sessionErr, errLeaseRefresh) || isTerminalRelayFailure(sessionErr) {
@@ -1162,7 +1397,21 @@ func (s *relaySupervisor) runReverseSession(ctx context.Context, conn net.Conn, 
 		case markerKeepalive:
 			continue
 		case markerRaw:
-			return false, false, terminalRelay(errors.New("relay requested unsupported raw stream marker 0x01"))
+			if !s.tcpEnabled {
+				return false, false, terminalRelay(errors.New("relay requested unsupported raw stream marker 0x01"))
+			}
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				return false, true, fmt.Errorf("clear reverse marker deadline: %w", err)
+			}
+			if !stopClose() && ctx.Err() != nil {
+				_ = conn.Close()
+				return false, true, ctx.Err()
+			}
+			if !offer(ctx, conn) {
+				_ = conn.Close()
+				return false, true, ctx.Err()
+			}
+			return true, true, nil
 		case markerTLS:
 			var binding [tlsBindingSize]byte
 			if _, err := io.ReadFull(conn, binding[:]); err != nil {
@@ -1171,22 +1420,13 @@ func (s *relaySupervisor) runReverseSession(ctx context.Context, conn net.Conn, 
 			if err := conn.SetDeadline(time.Time{}); err != nil {
 				return false, true, fmt.Errorf("clear reverse marker deadline: %w", err)
 			}
-			server, signer, generation, err := s.currentTenantTLS()
+			tenant, generation, err := s.currentTenant()
 			if err != nil {
 				return false, true, err
 			}
-			tlsConn := server.NewConn(conn, binding[:])
-			handshakeCtx, cancel := context.WithTimeout(ctx, s.timings.handshakeTimeout)
-			err = tlsConn.HandshakeContext(handshakeCtx)
-			cancel()
+			tlsConn, err := s.handshakeTenantTLS(ctx, conn, binding[:], tenant, generation)
 			if err != nil {
-				if signerErr := signer.takeError(binding[:]); signerErr != nil {
-					return false, true, &tenantSignerError{
-						err:        signerErr,
-						generation: generation,
-					}
-				}
-				return false, true, fmt.Errorf("tenant TLS handshake: %w", err)
+				return false, true, err
 			}
 			if !stopClose() && ctx.Err() != nil {
 				_ = tlsConn.Close()
@@ -1201,6 +1441,57 @@ func (s *relaySupervisor) runReverseSession(ctx context.Context, conn net.Conn, 
 			return false, false, terminalRelay(fmt.Errorf("relay sent unknown stream marker 0x%02x", marker[0]))
 		}
 	}
+}
+
+func (s *relaySupervisor) handshakeTenantTLS(
+	ctx context.Context,
+	conn net.Conn,
+	binding []byte,
+	tenant *tenantTLS,
+	generation uint64,
+) (net.Conn, error) {
+	useLocal := false
+	targetConn := conn
+	switch {
+	case tenant.local != nil && tenant.server == nil:
+		useLocal = true
+	case tenant.local != nil && tenant.server != nil:
+		sni, replayed, err := peekClientHelloSNI(conn, s.timings.handshakeTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("peek tenant TLS SNI: %w", err)
+		}
+		targetConn = replayed
+		useLocal = sni == tenant.canonicalHostname
+	}
+
+	handshakeCtx, cancel := context.WithTimeout(ctx, s.timings.handshakeTimeout)
+	defer cancel()
+
+	if useLocal {
+		cfg, err := tenant.local.tlsConfig()
+		if err != nil {
+			return nil, fmt.Errorf("local tenant TLS: %w", err)
+		}
+		tlsConn := tls.Server(targetConn, cfg)
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+			return nil, fmt.Errorf("local tenant TLS handshake: %w", err)
+		}
+		return tlsConn, nil
+	}
+	if tenant.server == nil || tenant.signer == nil {
+		return nil, errors.New("tenant TLS configuration is unavailable")
+	}
+	tlsConn := tenant.server.NewConn(targetConn, binding)
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+		if signerErr := tenant.signer.takeError(binding); signerErr != nil {
+			return nil, &tenantSignerError{
+				err:        signerErr,
+				generation: generation,
+			}
+		}
+		return nil, fmt.Errorf("tenant TLS handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
@@ -1219,10 +1510,16 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 		if !s.beginRenewal(token, generation) {
 			return errLeaseRefresh
 		}
+		var localTLSNotAfter time.Time
+		if expiry := s.localTLSCertificateExpiry(); !expiry.IsZero() {
+			localTLSNotAfter = expiry
+		}
 		var response renewResponse
 		err := s.doAPI(ctx, http.MethodPost, pathRenew, renewRequest{
-			AccessToken: token,
-			TTL:         s.timings.ttlSeconds(),
+			LocalTLSNotAfter: localTLSNotAfter,
+			AccessToken:      token,
+			TTL:              s.timings.ttlSeconds(),
+			RepinsChain:      true,
 		}, &response)
 		if err != nil {
 			s.endRenewal(generation)
@@ -1269,8 +1566,22 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 		s.lease.renewing = false
 		s.lease.tokenUncertain = false
 		s.lease.generation = s.nextLeaseGeneration
+		shouldCheckChain := time.Since(s.lease.chainCheckedAt) >= defaultChainRefreshInterval
+		tenant := s.lease.tenant
 		s.leaseMu.Unlock()
 		s.clearDatagramConn(nil, "lease renewed")
+		if shouldCheckChain {
+			refreshCtx, cancel := context.WithTimeout(ctx, s.timings.requestTimeout)
+			if _, err := s.refreshRelayCertificateChain(refreshCtx); err == nil {
+				s.leaseMu.Lock()
+				s.lease.chainCheckedAt = time.Now()
+				s.leaseMu.Unlock()
+			}
+			cancel()
+		}
+		if tenant != nil && tenant.local != nil {
+			_, _ = tenant.local.reloadManual()
+		}
 	}
 }
 
@@ -1493,37 +1804,88 @@ func (s *relaySupervisor) signerGenerationStale(generation uint64) bool {
 	return stale
 }
 
-// currentTenantTLS returns the active lease's tenant TLS terminator, its
-// transcript signer, and the lease generation that is current right now. The
-// caller compares that generation later to decide whether a signing failure
-// belongs to the live lease or to a token that rotated mid-handshake.
-func (s *relaySupervisor) currentTenantTLS() (*t13server.Server, *leaseTranscriptSigner, uint64, error) {
+func (s *relaySupervisor) currentTenant() (*tenantTLS, uint64, error) {
 	s.leaseMu.RLock()
 	tenant := s.lease.tenant
 	generation := s.lease.generation
 	s.leaseMu.RUnlock()
-	if tenant == nil || tenant.server == nil || tenant.signer == nil {
-		return nil, nil, 0, errors.New("tenant TLS configuration is unavailable")
+	if tenant == nil || (tenant.server == nil && tenant.local == nil) {
+		return nil, 0, errors.New("tenant TLS configuration is unavailable")
 	}
-	return tenant.server, tenant.signer, generation, nil
+	return tenant, generation, nil
+}
+
+func (s *relaySupervisor) currentReadyInfo() relayReadyInfo {
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+	publicURL := s.lease.aliasURL
+	if s.lease.canonicalHostname != "" && s.lease.tenant != nil && s.lease.tenant.local != nil && s.lease.tenant.local.ready() {
+		publicURL = s.lease.publicURL
+	}
+	return relayReadyInfo{
+		publicURL:  publicURL,
+		aliasURL:   s.lease.aliasURL,
+		aliasEpoch: s.lease.aliasEpoch,
+		tcpAddr:    s.lease.tcpAddr,
+	}
+}
+
+func (s *relaySupervisor) isLocalTLSReady() bool {
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+	return s.lease.tenant != nil && s.lease.tenant.local != nil && s.lease.tenant.local.ready()
+}
+
+func (s *relaySupervisor) localTLSCertificateExpiry() time.Time {
+	s.leaseMu.RLock()
+	defer s.leaseMu.RUnlock()
+	if s.lease.tenant != nil && s.lease.tenant.local != nil && s.lease.tenant.local.ready() {
+		return s.lease.tenant.local.certificateExpiry()
+	}
+	return time.Time{}
 }
 
 // terminalAPIErrorCodes are the relay responses that permanently reject this
-// lease or configuration. The relay SDK contract lists exactly these as
-// terminal; every other relay API error is retried, including throttles and
-// the transient capacity responses that also arrive as HTTP 503.
+// lease or configuration.
 var terminalAPIErrorCodes = map[string]struct{}{
-	"feature_unavailable": {},
-	"hostname_conflict":   {},
-	"http11_only":         {},
-	"tcp_port_disabled":   {},
-	"transport_mismatch":  {},
-	"udp_disabled":        {},
+	"feature_unavailable":   {},
+	"hostname_conflict":     {},
+	"http11_only":           {},
+	"lease_denied":          {},
+	"protocol_incompatible": {},
+	"source_not_allowed":    {},
+	"tcp_port_disabled":     {},
+	"transport_mismatch":    {},
+	"udp_disabled":          {},
 }
 
 func isTerminalAPIErrorCode(code string) bool {
 	_, terminal := terminalAPIErrorCodes[strings.ToLower(strings.TrimSpace(code))]
 	return terminal
+}
+
+func isRetryableAPIErrorCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "replica_conflict", "lease_rejected", "approval_queue_full":
+		return true
+	default:
+		return false
+	}
+}
+
+func relayApprovalFromError(err error) RelayApproval {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(apiErr.Code)) {
+	case "lease_rejected":
+		return RelayApprovalPending
+	case "lease_denied":
+		return RelayApprovalRefused
+	default:
+		return ""
+	}
 }
 
 // isRateLimitedAPIError identifies a throttled response, which arrives either
@@ -1547,18 +1909,15 @@ func classifyRelayError(err error, allowLeaseRefresh bool) error {
 	if errors.As(err, &malformed) {
 		return terminalRelay(err)
 	}
-	if isCertificateValidationError(err) {
+	if isCertificateValidationError(err) || errors.Is(err, ErrLocalCertificate) {
 		return terminalRelay(err)
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		// The code decides, not the status range: a terminal rejection is
-		// terminal at any status, and a throttle or a transient 503 is
-		// retryable even though both look like ordinary failures.
 		if isTerminalAPIErrorCode(apiErr.Code) {
 			return terminalRelay(err)
 		}
-		if isRateLimitedAPIError(apiErr) || apiErr.StatusCode >= 500 {
+		if isRateLimitedAPIError(apiErr) || isRetryableAPIErrorCode(apiErr.Code) || apiErr.StatusCode >= 500 {
 			return err
 		}
 		return terminalRelay(err)
@@ -1582,7 +1941,6 @@ func isLostLeaseError(err error) bool {
 	code := strings.ToLower(strings.TrimSpace(apiErr.Code))
 	return code == "lease_not_found" || code == "unauthorized"
 }
-
 func isCertificateValidationError(err error) bool {
 	var verificationError *tls.CertificateVerificationError
 	if errors.As(err, &verificationError) {

@@ -111,9 +111,11 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IdentityFromPrivateKey: %v", err)
 	}
-	challengeExpiry := time.Now().Add(5 * time.Minute).UTC()
-	leaseExpiry := time.Now().Add(10 * time.Minute).UTC()
+	now := time.Now().UTC().Truncate(time.Second)
+	challengeExpiry := now.Add(4 * time.Minute)
+	leaseExpiry := now.Add(10 * time.Minute)
 
+	var expectedSIWE string
 	var relay *protocolTestTLSServer
 	relay = newProtocolTestTLSServer(t, []string{"localhost", "alice.localhost"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -131,7 +133,7 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 				t.Errorf("read challenge request: %v", readErr)
 				return
 			}
-			want := `{"identity":{"name":"alice","address":"` + scalarOneAddress + `"},"ttl":120}`
+			want := `{"protocol_version":"10","identity":{"name":"alice","address":"` + scalarOneAddress + `"},"ttl":120}`
 			if string(body) != want {
 				t.Errorf("challenge JSON = %s, want exact %s", body, want)
 			}
@@ -141,10 +143,26 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 			if got := r.Header.Get(accessTokenHeader); got != "" {
 				t.Errorf("challenge unexpectedly sent access token %q", got)
 			}
+			domain := strings.TrimPrefix(relay.URL, "https://")
+			var formatErr error
+			expectedSIWE, formatErr = formatSIWEMessage(siweMessage{
+				Domain:    domain,
+				Address:   scalarOneAddress,
+				URI:       relay.URL + pathRegister,
+				Statement: registerLeaseSIWEStatement,
+				Nonce:     "exactnonce1234",
+				RequestID: "challenge-1",
+				IssuedAt:  now,
+				ExpiresAt: challengeExpiry,
+			})
+			if formatErr != nil {
+				t.Errorf("formatSIWEMessage: %v", formatErr)
+				return
+			}
 			protocolTestWriteOK(t, w, challengeResponse{
 				ChallengeID: "challenge-1",
 				ExpiresAt:   challengeExpiry,
-				SIWEMessage: fixedSIWEMessage,
+				SIWEMessage: expectedSIWE,
 			})
 		case pathRegister:
 			if r.Method != http.MethodPost {
@@ -171,11 +189,11 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 			if request.ChallengeID != "challenge-1" {
 				t.Errorf("register challenge_id = %q", request.ChallengeID)
 			}
-			if request.SIWEMessage != fixedSIWEMessage {
+			if request.SIWEMessage != expectedSIWE {
 				t.Errorf("register changed exact SIWE message:\n%s", request.SIWEMessage)
 			}
-			assertPersonalSignatureRecovers(t, fixedSIWEMessage, request.SIWESignature, scalarOnePublicKey)
-			encodedMessage, _ := json.Marshal(fixedSIWEMessage)
+			assertPersonalSignatureRecovers(t, expectedSIWE, request.SIWESignature, scalarOnePublicKey)
+			encodedMessage, _ := json.Marshal(expectedSIWE)
 			want := `{"challenge_id":"challenge-1","siwe_message":` + string(encodedMessage) + `,"siwe_signature":"` + request.SIWESignature + `"}`
 			if string(body) != want {
 				t.Errorf("register JSON = %s, want exact %s", body, want)
@@ -185,6 +203,7 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 			}
 			protocolTestWriteOK(t, w, registerResponse{
 				Identity:    identityRef{Name: " ALICE ", Address: strings.ToLower(scalarOneAddress)},
+				Hostname:    "alice.localhost",
 				ExpiresAt:   leaseExpiry,
 				AccessToken: "lease-token",
 				ReverseEndpoint: reverseEndpoint{
@@ -192,7 +211,6 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 					Capability: "cap-1",
 					ExpiresAt:  leaseExpiry,
 				},
-				SNIPort: 8443,
 			})
 		default:
 			// Protocol 10 has no registration-time digest oracle: a valid
@@ -209,7 +227,7 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	if err := supervisor.initializeControl(context.Background()); err != nil {
 		t.Fatalf("initializeControl: %v", err)
 	}
-	if err := supervisor.registerLeaseWithRetry(context.Background()); err != nil {
+	if err := supervisor.registerLeaseWithRetry(context.Background(), nil, nil, nil); err != nil {
 		t.Fatalf("registerLeaseWithRetry: %v", err)
 	}
 	if got := supervisor.currentToken(); got != "lease-token" {

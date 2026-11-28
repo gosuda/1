@@ -296,15 +296,10 @@ func TestDefaultAndExplicitRelaySelection(t *testing.T) {
 	}
 	wantDefaults := []string{
 		"https://gosunuts.xyz",
-		"https://kakashit.org",
-		"https://korokorok.com",
-		"https://portal.damn.it.com",
-		"https://portal.dawnfullstack.com",
-		"https://portal.naratteu.dynv6.net",
-		"https://portal.rabbitson87.dev",
-		"https://portal.thumbgo.kr",
-		"https://rly.best",
 		"https://s-h.day",
+		"https://kakashit.org",
+		"https://portal.rabbitson87.dev",
+		"https://portal.dawnfullstack.com",
 	}
 	if len(defaults) != len(wantDefaults) {
 		t.Fatalf("default relay count = %d, want %d", len(defaults), len(wantDefaults))
@@ -931,14 +926,19 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		if input.Identity.Name == "" || input.Identity.Address == "" || input.TTL != 120 {
 			r.recordFailure(fmt.Errorf("unexpected challenge request: %+v", input))
 		}
+		now := time.Now().UTC().Truncate(time.Second)
+		expiresAt := now.Add(time.Minute)
+		domain := strings.TrimPrefix(r.url, "https://")
+		siweMsg := fmt.Sprintf("%s wants you to sign in with your Ethereum account:\n%s\n\nRegister a portal lease\n\nURI: %s/sdk/register\nVersion: 1\nChain ID: 1\nNonce: clitestnonce1\nIssued At: %s\nExpiration Time: %s\nRequest ID: cli-test-challenge",
+			domain, input.Identity.Address, r.url, now.Format(time.RFC3339), expiresAt.Format(time.RFC3339))
 		r.mu.Lock()
 		r.identityName = input.Identity.Name
 		r.identityAddress = input.Identity.Address
 		r.mu.Unlock()
 		r.writeOK(w, map[string]any{
 			"challenge_id": "cli-test-challenge",
-			"expires_at":   time.Now().Add(time.Minute),
-			"siwe_message": "exact cli test SIWE message",
+			"expires_at":   expiresAt,
+			"siwe_message": siweMsg,
 		})
 	case "/sdk/register":
 		var input struct {
@@ -949,7 +949,7 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		if !r.decode(request, &input) {
 			return
 		}
-		if input.ChallengeID != "cli-test-challenge" || input.SIWEMessage != "exact cli test SIWE message" || len(input.SIWESignature) != 132 || !strings.HasPrefix(input.SIWESignature, "0x") {
+		if input.ChallengeID != "cli-test-challenge" || input.SIWEMessage == "" || len(input.SIWESignature) != 132 || !strings.HasPrefix(input.SIWESignature, "0x") {
 			r.recordFailure(fmt.Errorf("unexpected register request: %+v", input))
 		}
 		r.mu.Lock()
@@ -959,6 +959,7 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		expiresAt := time.Now().Add(5 * time.Minute)
 		r.writeOK(w, map[string]any{
 			"identity":     map[string]string{"name": name, "address": address},
+			"hostname":     name + ".localhost",
 			"expires_at":   expiresAt,
 			"access_token": "cli-test-token",
 			"reverse_endpoint": map[string]any{
@@ -966,7 +967,6 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 				"capability": "cli-test-capability",
 				"expires_at": expiresAt,
 			},
-			"sni_port": r.port,
 		})
 	case "/sdk/renew":
 		var input struct {

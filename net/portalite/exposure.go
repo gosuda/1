@@ -25,13 +25,27 @@ const (
 	RelayFailed     RelayState = "failed"
 )
 
+// RelayApproval reports whether a relay is holding or refusing a lease under
+// manual approval policy.
+type RelayApproval string
+
+const (
+	RelayApprovalPending RelayApproval = "pending"
+	RelayApprovalRefused RelayApproval = "refused"
+)
+
 // RelayStatus is an immutable snapshot of one relay's externally visible state.
 type RelayStatus struct {
-	RelayURL  string
-	PublicURL string
-	UDPAddr   string
-	State     RelayState
-	Err       error
+	RelayURL       string
+	PublicURL      string
+	AliasURL       string
+	AliasEpoch     string
+	UDPAddr        string
+	TCPAddr        string
+	State          RelayState
+	Approval       RelayApproval
+	CertificateErr error
+	Err            error
 }
 
 // ExposeConfig configures a multi-relay exposure.
@@ -39,6 +53,27 @@ type ExposeConfig struct {
 	Relays     []string
 	Identity   Identity
 	UDPEnabled bool
+	TCPEnabled bool
+
+	// Replica joins concurrent HTTP leases sharing the same service identity
+	// across relays that advertise replica support. Cannot be combined with
+	// UDPEnabled or TCPEnabled.
+	Replica bool
+
+	// TLSCertFile and TLSKeyFile configure manual Local TLS (local-tls-v1)
+	// using a locally held certificate and private key for the canonical
+	// hostname. Must be supplied together and cannot be combined with
+	// AutomaticTLS or TCPEnabled.
+	TLSCertFile string
+	TLSKeyFile  string
+
+	// AutomaticTLS obtains and renews Local TLS (local-tls-v1) certificates
+	// via POST /v1/tenant-certificate while keeping the private key persisted
+	// inside TLSStateDir. Cannot be combined with TLSCertFile/TLSKeyFile or
+	// TCPEnabled.
+	AutomaticTLS    bool
+	TLSStateDir     string
+	TLSRequireLocal bool
 
 	// DisableDiscovery turns off automatic relay discovery, which is on by
 	// default. While enabled, the exposure polls /discovery on its relays and
@@ -51,7 +86,6 @@ type ExposeConfig struct {
 	// default.
 	MaxActiveRelays int
 }
-
 // Exposure is a net.Listener that fans in tenant connections from all relays.
 type Exposure struct {
 	ctx    context.Context
@@ -67,11 +101,17 @@ type Exposure struct {
 	relayCount   int
 	failedCount  int
 	udpEnabled   bool
+	tcpEnabled   bool
+	replica      bool
+	tlsCertFile  string
+	tlsKeyFile   string
+	automaticTLS bool
+	tlsStateDir  string
+	tlsReqLocal  bool
 	closing      bool
 	allFailed    chan struct{}
 	stateChanged chan struct{}
 	failedOnce   sync.Once
-
 	// rejectedRelays records relays that failed terminally, so discovery
 	// never re-adds a relay this exposure already gave up on.
 	rejectedRelays map[string]struct{}
@@ -121,8 +161,32 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if cfg.Identity.Name() == "" || cfg.Identity.Address() == "" || cfg.Identity.PublicKey() == "" {
+	useLocalTLS := cfg.AutomaticTLS || cfg.TLSCertFile != "" || cfg.TLSKeyFile != ""
+	if cfg.Identity.Address() == "" || cfg.Identity.PublicKey() == "" {
 		return nil, errors.New("portalite: invalid identity")
+	}
+	if cfg.Identity.Name() == "" && !useLocalTLS {
+		return nil, errors.New("portalite: invalid identity")
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return nil, errors.New("portalite: TLSCertFile and TLSKeyFile must be supplied together")
+	}
+	if cfg.AutomaticTLS && cfg.TLSCertFile != "" {
+		return nil, errors.New("portalite: AutomaticTLS cannot be combined with TLSCertFile/TLSKeyFile")
+	}
+	if cfg.AutomaticTLS && cfg.TLSStateDir == "" {
+		return nil, errors.New("portalite: AutomaticTLS requires TLSStateDir")
+	}
+	if useLocalTLS && cfg.TCPEnabled {
+		return nil, errors.New("portalite: local TLS cannot be combined with TCPEnabled")
+	}
+	if cfg.Replica && (cfg.UDPEnabled || cfg.TCPEnabled) {
+		return nil, errors.New("portalite: Replica cannot be combined with UDPEnabled or TCPEnabled")
+	}
+	if cfg.TLSCertFile != "" {
+		if err := validateLocalCertificateFiles(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			return nil, err
+		}
 	}
 	// Normalize once so every derived deadline, including the discovery
 	// interval, has a usable value.
@@ -161,6 +225,13 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 		datagrams:           make(chan DatagramFrame, datagramCapacity),
 		statuses:            make(map[string]RelayStatus, capacity),
 		udpEnabled:          cfg.UDPEnabled,
+		tcpEnabled:          cfg.TCPEnabled,
+		replica:             cfg.Replica,
+		tlsCertFile:         cfg.TLSCertFile,
+		tlsKeyFile:          cfg.TLSKeyFile,
+		automaticTLS:        cfg.AutomaticTLS,
+		tlsStateDir:         cfg.TLSStateDir,
+		tlsReqLocal:         cfg.TLSRequireLocal,
 		allFailed:           make(chan struct{}),
 		stateChanged:        make(chan struct{}),
 		rejectedRelays:      make(map[string]struct{}),
@@ -214,7 +285,13 @@ func (e *Exposure) addRelay(relayURL string, explicit bool) error {
 		return fmt.Errorf("portalite: relay %s: %w", relayURL, err)
 	}
 	supervisor.udpEnabled = e.udpEnabled
-
+	supervisor.tcpEnabled = e.tcpEnabled
+	supervisor.replica = e.replica
+	supervisor.tlsCertFile = e.tlsCertFile
+	supervisor.tlsKeyFile = e.tlsKeyFile
+	supervisor.automaticTLS = e.automaticTLS
+	supervisor.tlsStateDir = e.tlsStateDir
+	supervisor.tlsRequireLocal = e.tlsReqLocal
 	e.mu.Lock()
 	if e.closing || e.ctx.Err() != nil {
 		e.mu.Unlock()
@@ -293,6 +370,7 @@ func (e *Exposure) refreshDiscovery() {
 	e.mu.RLock()
 	seeds := discoverySeeds(e.activeRelaysLocked())
 	requireUDP := e.udpEnabled
+	requireTCP := e.tcpEnabled
 	e.mu.RUnlock()
 
 	now := time.Now()
@@ -306,8 +384,7 @@ func (e *Exposure) refreshDiscovery() {
 		}
 		e.candidates.merge(now, candidates)
 	}
-	e.adoptDiscoveredRelays(now, requireUDP)
-
+	e.adoptDiscoveredRelays(now, requireUDP, requireTCP)
 	// Discovery has now had its say. If every member still failed and no
 	// candidate was adopted, the exposure is genuinely exhausted and callers
 	// should learn that instead of waiting forever.
@@ -321,12 +398,12 @@ func (e *Exposure) refreshDiscovery() {
 }
 
 // adoptDiscoveredRelays starts supervisors for fresh, verified candidates.
-func (e *Exposure) adoptDiscoveredRelays(now time.Time, requireUDP bool) {
+func (e *Exposure) adoptDiscoveredRelays(now time.Time, requireUDP, requireTCP bool) {
 	e.mu.RLock()
 	active := e.activeRelaysLocked()
 	e.mu.RUnlock()
 
-	for _, relayURL := range e.candidates.selectRelays(now, active, requireUDP) {
+	for _, relayURL := range e.candidates.selectRelays(now, active, requireUDP, requireTCP) {
 		if e.ctx.Err() != nil {
 			return
 		}
@@ -419,8 +496,10 @@ func (e *Exposure) runSupervisor(supervisor *relaySupervisor) {
 	defer e.supervisors.Done()
 	runErr, cleanupErr := supervisor.run(
 		e.ctx,
-		func(publicURL string) { e.markReady(supervisor.relayURL, publicURL) },
+		func(info relayReadyInfo) { e.markReady(supervisor.relayURL, info) },
 		func(udpAddr string) { e.markDatagramReady(supervisor.relayURL, udpAddr) },
+		func(approval RelayApproval) { e.markApproval(supervisor.relayURL, approval) },
+		func(certErr error) { e.markCertErr(supervisor.relayURL, certErr) },
 		e.offer,
 		e.offerDatagram,
 	)
@@ -462,28 +541,65 @@ func (e *Exposure) offerDatagram(relayCtx context.Context, frame DatagramFrame) 
 	}
 }
 
-func (e *Exposure) markReady(relayURL, publicURL string) {
+func (e *Exposure) markReady(relayURL string, info relayReadyInfo) {
 	e.mu.Lock()
 	status, exists := e.statuses[relayURL]
 	if !exists || e.closing || e.ctx.Err() != nil || status.State == RelayFailed {
 		e.mu.Unlock()
 		return
 	}
-	status.PublicURL = publicURL
+	changed := status.PublicURL != info.publicURL ||
+		status.AliasURL != info.aliasURL ||
+		status.AliasEpoch != info.aliasEpoch ||
+		status.TCPAddr != info.tcpAddr ||
+		status.Approval != ""
+	status.PublicURL = info.publicURL
+	status.AliasURL = info.aliasURL
+	status.AliasEpoch = info.aliasEpoch
+	status.TCPAddr = info.tcpAddr
+	status.Approval = ""
 	status.Err = nil
-	if status.State == RelayReady {
-		e.statuses[relayURL] = status
-		e.notifyStateChangedLocked()
+	wasReady := status.State == RelayReady
+	status.State = RelayReady
+	e.statuses[relayURL] = status
+	e.notifyStateChangedLocked()
+	e.mu.Unlock()
+	if !wasReady || changed {
+		e.publishUpdate(status)
+	}
+}
+
+func (e *Exposure) markApproval(relayURL string, approval RelayApproval) {
+	e.mu.Lock()
+	status, exists := e.statuses[relayURL]
+	if !exists || e.closing || e.ctx.Err() != nil || status.State == RelayFailed {
 		e.mu.Unlock()
 		return
 	}
-	status.State = RelayReady
+	if status.Approval == approval {
+		e.mu.Unlock()
+		return
+	}
+	status.Approval = approval
 	e.statuses[relayURL] = status
 	e.notifyStateChangedLocked()
 	e.mu.Unlock()
 	e.publishUpdate(status)
 }
 
+func (e *Exposure) markCertErr(relayURL string, certErr error) {
+	e.mu.Lock()
+	status, exists := e.statuses[relayURL]
+	if !exists || e.closing || e.ctx.Err() != nil || status.State == RelayFailed {
+		e.mu.Unlock()
+		return
+	}
+	status.CertificateErr = certErr
+	e.statuses[relayURL] = status
+	e.notifyStateChangedLocked()
+	e.mu.Unlock()
+	e.publishUpdate(status)
+}
 func (e *Exposure) markFailed(relayURL string, relayErr error) {
 	e.mu.Lock()
 	status, exists := e.statuses[relayURL]

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
-
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"golang.org/x/crypto/sha3"
@@ -54,6 +54,26 @@ func IdentityFromPrivateKey(name, privateKeyHex string) (Identity, error) {
 	return identityFromKey(normalizedName, key), nil
 }
 
+// GenerateUnnamedIdentity creates a new identity without a friendly service
+// name, for use with Local TLS canonical hostnames.
+func GenerateUnnamedIdentity() (Identity, error) {
+	key, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		return Identity{}, fmt.Errorf("generate secp256k1 private key: %w", err)
+	}
+	return identityFromKey("", key), nil
+}
+
+// UnnamedIdentityFromPrivateKey constructs an unnamed identity from a 32-byte
+// secp256k1 private key encoded as hexadecimal.
+func UnnamedIdentityFromPrivateKey(privateKeyHex string) (Identity, error) {
+	key, err := parsePrivateKey(privateKeyHex)
+	if err != nil {
+		return Identity{}, err
+	}
+	return identityFromKey("", key), nil
+}
+
 // ParseIdentity parses and validates a persisted identity JSON document.
 func ParseIdentity(data []byte) (Identity, error) {
 	var identity Identity
@@ -82,12 +102,12 @@ func (i Identity) PublicKey() string {
 // intentionally included so the result can be used as the persisted identity
 // file consumed by ParseIdentity.
 func (i Identity) MarshalJSON() ([]byte, error) {
-	if i.key == nil || i.name == "" || i.address == "" || i.publicKey == "" || i.privateKey == "" {
+	if i.key == nil || i.address == "" || i.publicKey == "" || i.privateKey == "" {
 		return nil, errors.New("cannot marshal an uninitialized identity")
 	}
 
 	type persistedIdentity struct {
-		Name       string `json:"name"`
+		Name       string `json:"name,omitempty"`
 		Address    string `json:"address"`
 		PublicKey  string `json:"public_key"`
 		PrivateKey string `json:"private_key"`
@@ -125,7 +145,13 @@ func (i *Identity) UnmarshalJSON(data []byte) error {
 		return errors.New("identity private_key is required")
 	}
 
-	candidate, err := IdentityFromPrivateKey(stored.Name, stored.PrivateKey)
+	var candidate Identity
+	var err error
+	if strings.TrimSpace(stored.Name) == "" {
+		candidate, err = UnnamedIdentityFromPrivateKey(stored.PrivateKey)
+	} else {
+		candidate, err = IdentityFromPrivateKey(stored.Name, stored.PrivateKey)
+	}
 	if err != nil {
 		return err
 	}
@@ -170,6 +196,85 @@ func normalizeIdentityName(name string) (string, error) {
 		return "", errors.New("identity name must be a single ASCII DNS label containing only letters, digits, and hyphens")
 	}
 	return name, nil
+}
+
+func hasCanonicalShape(label string) bool {
+	if isHexAddress(label) {
+		return true
+	}
+	prefix, address, ok := strings.Cut(label[max(len(label)-41, 0):], "-")
+	return ok && prefix == "" && isHexAddress(address)
+}
+
+func isHexAddress(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func aliasHostname(name, rootHost string) (string, error) {
+	label, err := normalizeIdentityName(name)
+	if err != nil {
+		return "", err
+	}
+	root := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rootHost), "."))
+	if root == "" {
+		return "", errors.New("root host is required")
+	}
+	if ip := net.ParseIP(root); ip != nil && ip.IsLoopback() {
+		root = "localhost"
+	}
+	return label + "." + root, nil
+}
+
+func matchesAlias(hostname, name, rootHost string) bool {
+	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	if hostname == "" {
+		return true
+	}
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	expected, err := aliasHostname(name, rootHost)
+	return err == nil && hostname == expected
+}
+
+// LocalTLSHostname returns the identity-bound canonical hostname for Local TLS
+// under rootHost. An empty name uses the reserved "default" label.
+func LocalTLSHostname(name, address, rootHost string) (string, error) {
+	label := unnamedServiceLabel
+	if strings.TrimSpace(name) != "" {
+		var err error
+		label, err = normalizeIdentityName(name)
+		if err != nil {
+			return "", err
+		}
+		if hasCanonicalShape(label) {
+			return "", errors.New("service name must not look like a canonical address")
+		}
+		if label == unnamedServiceLabel {
+			return "", fmt.Errorf("service name %q is reserved for unnamed services", label)
+		}
+	}
+	hexAddr := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(address), "0x"))
+	hexAddr = strings.TrimPrefix(hexAddr, "0X")
+	if !isHexAddress(hexAddr) {
+		return "", errors.New("address must contain 40 hexadecimal characters")
+	}
+	root := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rootHost), "."))
+	if root == "" {
+		return "", errors.New("root host is required")
+	}
+	if ip := net.ParseIP(root); ip != nil && ip.IsLoopback() {
+		root = "localhost"
+	}
+	hostname := label + "." + hexAddr + "." + root
+	if len(hostname) > 253 {
+		return "", errors.New("local TLS hostname exceeds DNS length limit")
+	}
+	return hostname, nil
 }
 
 func parsePrivateKey(raw string) (*secp256k1.PrivateKey, error) {

@@ -19,7 +19,7 @@ import (
 	"gosuda.org/portalite"
 )
 
-const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--no-discovery] [--udp-target TARGET] [TARGET]\n"
+const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--no-discovery] [--replica] [--tcp] [--tls-cert FILE --tls-key FILE | --auto-tls-dir DIR [--tls-require-local]] [--udp-target TARGET] [TARGET]\n"
 
 type relayFlags []string
 
@@ -97,11 +97,23 @@ func runWithIdentityModes(
 	var udpTarget string
 	var ephemeral bool
 	var noDiscovery bool
+	var replica bool
+	var tcpEnabled bool
+	var tlsCertFile string
+	var tlsKeyFile string
+	var autoTLSDir string
+	var tlsRequireLocal bool
 	fs.Var(&relayValues, "relay", "relay HTTPS URL")
 	fs.StringVar(&identityPath, "identity", "identity.json", "identity file")
 	fs.StringVar(&name, "name", "", "identity name for a new identity")
 	fs.BoolVar(&ephemeral, "ephemeral", false, "keep the identity in memory and never write it to disk")
 	fs.BoolVar(&noDiscovery, "no-discovery", false, "use only the relays given with --relay")
+	fs.BoolVar(&replica, "replica", false, "join concurrent HTTP leases sharing the same service identity")
+	fs.BoolVar(&tcpEnabled, "tcp", false, "expose raw TCP streams instead of HTTP")
+	fs.StringVar(&tlsCertFile, "tls-cert", "", "local tenant TLS certificate PEM file (local-tls-v1)")
+	fs.StringVar(&tlsKeyFile, "tls-key", "", "local tenant TLS private key PEM file (local-tls-v1)")
+	fs.StringVar(&autoTLSDir, "auto-tls-dir", "", "directory for automatic local-tls-v1 certificate storage")
+	fs.BoolVar(&tlsRequireLocal, "tls-require-local", false, "wait for local TLS certificate before marking relay ready")
 	fs.StringVar(&udpTarget, "udp-target", "", "local UDP target")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -166,6 +178,13 @@ func runWithIdentityModes(
 		Relays:           relays,
 		Identity:         identity,
 		UDPEnabled:       udpTarget != "",
+		TCPEnabled:       tcpEnabled,
+		Replica:          replica,
+		TLSCertFile:      tlsCertFile,
+		TLSKeyFile:       tlsKeyFile,
+		AutomaticTLS:     autoTLSDir != "",
+		TLSStateDir:      autoTLSDir,
+		TLSRequireLocal:  tlsRequireLocal,
 		DisableDiscovery: noDiscovery,
 	})
 	if err != nil {
@@ -209,9 +228,18 @@ func runWithIdentityModes(
 func writeRelayStatus(stdout, stderr io.Writer, status portalite.RelayStatus) {
 	switch status.State {
 	case portalite.RelayReady:
-		fmt.Fprintf(stdout, "URL %s\n", status.PublicURL)
+		if status.PublicURL != "" {
+			fmt.Fprintf(stdout, "URL %s\n", status.PublicURL)
+		}
+		if status.TCPAddr != "" {
+			fmt.Fprintf(stdout, "TCP %s\n", status.TCPAddr)
+		}
 	case portalite.RelayUDPReady:
 		fmt.Fprintf(stdout, "UDP %s\n", status.UDPAddr)
+	case portalite.RelayConnecting:
+		if status.Approval == portalite.RelayApprovalPending {
+			fmt.Fprintf(stderr, "portalite: relay %s: waiting for approval\n", status.RelayURL)
+		}
 	case portalite.RelayFailed:
 		fmt.Fprintf(stderr, "portalite: relay %s: %v\n", status.RelayURL, status.Err)
 	}

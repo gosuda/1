@@ -9,13 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
@@ -35,6 +36,7 @@ const (
 	defaultMaxActiveRelays = 8
 
 	maxDiscoveryResponseBytes int64 = 1 << 20
+	maxDiscoveryEntries             = 1024
 )
 
 // relayDescriptor is one relay advertisement from a /discovery document.
@@ -149,6 +151,7 @@ type discoveryCandidates struct {
 	mu      sync.Mutex
 	relays  map[string]time.Time // relay URL -> descriptor expiry
 	udpOnly map[string]bool      // relay URL -> advertises a UDP backhaul
+	tcpOnly map[string]bool      // relay URL -> advertises a TCP ingress
 	seen    map[string]struct{}  // relay URLs ever accepted, so a failure is not retried blindly
 }
 
@@ -156,6 +159,7 @@ func newDiscoveryCandidates() *discoveryCandidates {
 	return &discoveryCandidates{
 		relays:  make(map[string]time.Time),
 		udpOnly: make(map[string]bool),
+		tcpOnly: make(map[string]bool),
 		seen:    make(map[string]struct{}),
 	}
 }
@@ -168,16 +172,22 @@ func (c *discoveryCandidates) merge(now time.Time, entries map[string]discoveryC
 		if !entry.expiresAt.After(now) {
 			delete(c.relays, rawURL)
 			delete(c.udpOnly, rawURL)
+			delete(c.tcpOnly, rawURL)
+			continue
+		}
+		if _, exists := c.relays[rawURL]; !exists && len(c.relays) >= maxDiscoveryEntries {
 			continue
 		}
 		c.relays[rawURL] = entry.expiresAt
 		c.udpOnly[rawURL] = entry.supportsUDP
+		c.tcpOnly[rawURL] = entry.supportsTCP
 		c.seen[rawURL] = struct{}{}
 	}
 	for rawURL, expiresAt := range c.relays {
 		if !expiresAt.After(now) {
 			delete(c.relays, rawURL)
 			delete(c.udpOnly, rawURL)
+			delete(c.tcpOnly, rawURL)
 		}
 	}
 }
@@ -192,9 +202,9 @@ func (c *discoveryCandidates) known(rawURL string) bool {
 }
 
 // selectRelays returns fresh candidate URLs not already active, sorted for
-// deterministic behavior, filtered to relays advertising a UDP backhaul when
-// the exposure requires one.
-func (c *discoveryCandidates) selectRelays(now time.Time, active map[string]struct{}, requireUDP bool) []string {
+// deterministic behavior, filtered to relays advertising UDP or TCP when
+// the exposure requires them.
+func (c *discoveryCandidates) selectRelays(now time.Time, active map[string]struct{}, requireUDP, requireTCP bool) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	selected := make([]string, 0, len(c.relays))
@@ -208,6 +218,9 @@ func (c *discoveryCandidates) selectRelays(now time.Time, active map[string]stru
 		if requireUDP && !c.udpOnly[rawURL] {
 			continue
 		}
+		if requireTCP && !c.tcpOnly[rawURL] {
+			continue
+		}
 		selected = append(selected, rawURL)
 	}
 	sort.Strings(selected)
@@ -217,8 +230,8 @@ func (c *discoveryCandidates) selectRelays(now time.Time, active map[string]stru
 type discoveryCandidate struct {
 	expiresAt   time.Time
 	supportsUDP bool
+	supportsTCP bool
 }
-
 // discoveryClient fetches and verifies /discovery documents.
 type discoveryClient struct {
 	http *http.Client
@@ -317,8 +330,10 @@ func (c *discoveryClient) fetch(ctx context.Context, relayURL string, now time.T
 		return nil, fmt.Errorf("relay discovery protocol %q is unsupported", document.ProtocolVersion)
 	}
 
-	candidates := make(map[string]discoveryCandidate, len(document.Relays))
-	for _, descriptor := range document.Relays {
+	allowLocalCandidates := isLocalRelayHostname(host)
+	limit := min(len(document.Relays), maxDiscoveryEntries+1)
+	candidates := make(map[string]discoveryCandidate, limit)
+	for _, descriptor := range document.Relays[:limit] {
 		if err := verifyRelayDescriptor(descriptor, now); err != nil {
 			continue
 		}
@@ -326,15 +341,52 @@ func (c *discoveryClient) fetch(ctx context.Context, relayURL string, now time.T
 		if err != nil {
 			continue
 		}
+		if !allowLocalCandidates && isNonPublicRelayURL(candidateURL) {
+			continue
+		}
 		candidates[candidateURL] = discoveryCandidate{
 			expiresAt:   descriptor.ExpiresAt,
 			supportsUDP: descriptor.SupportsUDP,
+			supportsTCP: descriptor.SupportsTCP,
 		}
 	}
 	if len(candidates) == 0 {
 		return nil, errors.New("relay discovery advertised no verifiable relays")
 	}
 	return candidates, nil
+}
+
+// isNonPublicRelayURL rejects untrusted discovery descriptors pointing at
+// loopback, private, link-local, multicast, or unspecified addresses (SSRF).
+func isNonPublicRelayURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return true
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return isNonPublicIP(addr)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if addr, ok := netip.AddrFromSlice(ip); ok {
+			return isNonPublicIP(addr.Unmap())
+		}
+	}
+	return false
+}
+
+func isNonPublicIP(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	return !addr.IsValid() ||
+		addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified()
 }
 
 // discoverySeeds returns the relay URLs a discovery refresh should poll.

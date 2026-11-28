@@ -483,7 +483,24 @@ func (r *fakeRelay) handleChallenge(response http.ResponseWriter, request *http.
 	r.mu.Lock()
 	r.challengeCount++
 	challengeID := fmt.Sprintf("%s-challenge-%d", r.name, r.challengeCount)
-	message := fmt.Sprintf("%s.localhost wants you to sign in with your Ethereum account:\n%s\n\nPortalite relay test\nNonce: %s", body.Identity.Name, body.Identity.Address, challengeID)
+	now := time.Now().UTC().Truncate(time.Second)
+	expiresAt := now.Add(time.Minute)
+	domain := strings.TrimPrefix(r.url, "https://")
+	message, err := formatSIWEMessage(siweMessage{
+		Domain:    domain,
+		Address:   body.Identity.Address,
+		URI:       r.url + pathRegister,
+		Statement: registerLeaseSIWEStatement,
+		Nonce:     fmt.Sprintf("nonce%08d", r.challengeCount),
+		RequestID: challengeID,
+		IssuedAt:  now,
+		ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		r.mu.Unlock()
+		r.badRequest(response, fmt.Errorf("format siwe: %w", err))
+		return
+	}
 	r.challengeID = challengeID
 	r.challengeMessage = message
 	r.challengeIdentity = body.Identity
@@ -492,7 +509,7 @@ func (r *fakeRelay) handleChallenge(response http.ResponseWriter, request *http.
 	r.mu.Unlock()
 	r.success(response, challengeResponse{
 		ChallengeID: challengeID,
-		ExpiresAt:   time.Now().Add(time.Minute),
+		ExpiresAt:   expiresAt,
 		SIWEMessage: message,
 	})
 }
@@ -563,14 +580,6 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 	if registration > 1 {
 		leaseDuration = r.options.recoveredLease
 	}
-	sniPort := r.port
-	if len(r.options.registrationSNIPorts) > 0 {
-		portIndex := registration - 1
-		if portIndex >= len(r.options.registrationSNIPorts) {
-			portIndex = len(r.options.registrationSNIPorts) - 1
-		}
-		sniPort = r.options.registrationSNIPorts[portIndex]
-	}
 	stale := make([]net.Conn, 0, len(r.sessions))
 	if registration > 1 {
 		for id, session := range r.sessions {
@@ -587,6 +596,7 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 	leaseExpiresAt := time.Now().Add(leaseDuration)
 	result := registerResponse{
 		Identity:    identity,
+		Hostname:    identity.Name + ".localhost",
 		ExpiresAt:   leaseExpiresAt,
 		AccessToken: token,
 		ReverseEndpoint: reverseEndpoint{
@@ -594,7 +604,6 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 			Capability: capability,
 			ExpiresAt:  leaseExpiresAt,
 		},
-		SNIPort: sniPort,
 	}
 	if udpEnabled {
 		result.UDPEnabled = true
